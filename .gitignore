@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+
+# macOS
+.DS_Store
+
+# Claude Code 本地设置
+.claude/settings.local.json
+
+# 本地备份
+*.bak*
+
+# 敏感配置：api_id / api_hash / bot_token 真实密钥，不入库（模板 tg_secrets.example.json 除外）
+tg_secrets.json
