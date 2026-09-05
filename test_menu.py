@@ -36,6 +36,7 @@ class MenuDataCodecTest(unittest.TestCase):
             ("wl_add", "-1001234567890"),
             ("back", "home"),
             ("cd2", None),
+            ("cd2_stop", None),
         ):
             data = tg.encode_menu_data(action, arg)
             self.assertEqual(
@@ -59,7 +60,8 @@ class MenuTextTest(unittest.TestCase):
     def test_main_menu_buttons_contain_all_entries(self):
         texts = [b.text for row in tg.main_menu_buttons() for b in row]
         for label in ("📊 状态", "📈 进度", "📜 下载记录",
-                      "📋 白名单", "🧵 并发", "🧹 清理", "🖥 启动CD2"):
+                      "📋 白名单", "🧵 并发", "🧹 清理",
+                      "🖥 启动CD2", "🛑 停止CD2"):
             self.assertIn(label, texts)
 
     def test_main_menu_text_non_empty(self):
@@ -164,6 +166,32 @@ class CD2ConfigTest(unittest.TestCase):
         command, port = tg.cd2_config()
         self.assertEqual(command, "cd2")
         self.assertEqual(port, 19798)
+
+
+class CD2PidParseTest(unittest.TestCase):
+    """_cd2_pids_from_ps_output：从 ps 输出筛出 CD2 进程 PID（纯函数）。"""
+
+    PS = (
+        " 56136 /Users/u/software/cd/clouddrive\n"
+        " 56137 /Users/u/software/cd/clouddrive Start-Service 56136\n"
+        "   772 /System/Library/.../CloudDocs.iCloudDriveFileProvider\n"
+        "   670 /System/Library/.../iCloudDriveCore/.../bird\n"
+    )
+
+    def test_matches_main_and_service_children(self):
+        pids = tg._cd2_pids_from_ps_output(
+            self.PS, "/Users/u/software/cd/clouddrive"
+        )
+        self.assertEqual(pids, [56136, 56137])
+
+    def test_no_match_when_not_running(self):
+        pids = tg._cd2_pids_from_ps_output(
+            "  1 /sbin/launchd\n", "/Users/u/software/cd/clouddrive"
+        )
+        self.assertEqual(pids, [])
+
+    def test_empty_output(self):
+        self.assertEqual(tg._cd2_pids_from_ps_output("", "/x/clouddrive"), [])
 
 
 class WhitelistCommitTest(unittest.TestCase):

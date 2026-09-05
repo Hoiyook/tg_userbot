@@ -2,6 +2,7 @@ import os
 import json
 import re
 import uuid
+import signal
 import asyncio
 import logging
 import subprocess
@@ -257,7 +258,7 @@ MENU_ACTIONS = (
     "home", "status", "progress", "done", "wl", "wl_add",
     "wl_del", "thread", "clean", "back",
     "queue", "queue_del", "retry", "retry_run", "retry_del",
-    "cd2",
+    "cd2", "cd2_stop",
 )
 
 # ------------------------------------------------------------
@@ -2432,7 +2433,8 @@ def main_menu_buttons():
          Button.inline("🔁 待重试", encode_menu_data("retry"))],
         [Button.inline("🧵 并发", encode_menu_data("thread")),
          Button.inline("🧹 清理", encode_menu_data("clean"))],
-        [Button.inline("🖥 启动CD2", encode_menu_data("cd2"))],
+        [Button.inline("🖥 启动CD2", encode_menu_data("cd2")),
+         Button.inline("🛑 停止CD2", encode_menu_data("cd2_stop"))],
     ]
 
 
@@ -2719,6 +2721,84 @@ async def cd2_start_or_status():
     )
 
 
+def _cd2_pids_from_ps_output(ps_output, command):
+    """从 `ps -eo pid=,command=` 的文本里筛出可执行路径为 command 的进程 PID。
+
+    主进程与其 Start-Service 子进程都是同一个可执行文件，都会被匹配到。
+    用“完整路径开头”匹配，避免误伤系统里名称带 clouddrive 的 iCloud 进程
+    （那些是 /System/... 下不同的程序）。返回 PID 列表，纯函数可单测。
+    """
+    pids = []
+    for line in ps_output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid_str, _, cmd = line.partition(" ")
+        if cmd.startswith(command):
+            try:
+                pids.append(int(pid_str))
+            except ValueError:
+                pass
+    return pids
+
+
+def _cd2_pids():
+    """返回本机正在运行的 CD2 进程 PID 列表（未配置或未启动时返回空）。"""
+    command, _ = cd2_config()
+    command = os.path.expanduser(command or "")
+    if not command:
+        return []
+    try:
+        ps_output = subprocess.run(
+            ["ps", "-eo", "pid=,command="], capture_output=True, text=True
+        ).stdout
+    except Exception:
+        return []
+    return _cd2_pids_from_ps_output(ps_output, command)
+
+
+async def cd2_stop_or_status():
+    """【停止 CD2】动作主体：未运行 → 提示；运行中 → SIGTERM，
+    管理端口未按时关闭再 SIGKILL 兜底。"""
+    _, port = cd2_config()
+    running = await cd2_is_running(port)
+    pids = _cd2_pids()
+    if not running and not pids:
+        return "✅ CloudDrive2 未在运行，无需停止"
+    if not pids:
+        return (
+            f"❌ 端口 {port} 有进程监听，但未匹配到配置路径的 CD2 进程，"
+            "为安全起见不强行终止，请手动检查"
+        )
+    logger.info(f"🛑 停止 CD2：对进程 {pids} 发送 SIGTERM（优雅退出）")
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            logger.warning(f"停止 CD2 失败（PID {pid}）：{e}")
+    # 轮询管理端口：优雅退出后应关闭，最长约 20 秒
+    for _ in range(10):
+        await asyncio.sleep(2)
+        if not await cd2_is_running(port):
+            logger.info("🛑 CD2 已优雅退出（管理端口已关闭）")
+            return "🛑 CloudDrive2 已停止"
+    # 优雅退出超时 → 强制终止仍存活的进程
+    killed = []
+    for pid in _cd2_pids():
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed.append(pid)
+        except ProcessLookupError:
+            pass
+    await asyncio.sleep(2)
+    if not await cd2_is_running(port):
+        logger.info(f"🛑 CD2 已强制停止：{killed}")
+        return "🛑 CloudDrive2 已停止（优雅退出超时，已强制终止）"
+    return f"❌ 未能停止 CloudDrive2（端口 {port} 仍开放），请手动检查"
+
+
 def forward_source_info(fwd_from):
     """从转发头提取 (chat_id, 标题)，不依赖网络解析。
 
@@ -2855,6 +2935,8 @@ async def handle_menu_action(action, arg, event):
         return f"🧹 清理完成，共删除 {count} 个临时文件", back_home_buttons()
     if action == "cd2":
         return await cd2_start_or_status(), back_home_buttons()
+    if action == "cd2_stop":
+        return await cd2_stop_or_status(), back_home_buttons()
     if action == "queue":
         return format_queue_text(QUEUE), queue_menu_buttons()
     if action == "queue_del":
