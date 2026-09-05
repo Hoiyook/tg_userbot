@@ -28,6 +28,11 @@ EXECUTING = set()  # 正在执行的任务 id（防重复触发）
 DOWNLOAD_SEMAPHORE = None  # config.AdjustableSemaphore，main() 里创建
 DOWNLOAD_CONCURRENCY = config.DOWNLOAD_CONCURRENCY  # 当前并发数（默认 3）
 
+# 多 worker 下载池（见 workers.py）：DOWNLOAD_CONCURRENCY 条独立连接并发拉文件
+DOWNLOAD_WORKERS = []       # 存活 worker 客户端列表（main() spawn_pool 后填充）
+DOWNLOAD_WORKER_QUEUE = None  # asyncio.Queue 空闲 worker，main() 里创建；None=池禁用
+DOWNLOAD_WORKER_TARGET = 0    # 目标存活 worker 数（/thread 与 spawn 时更新）
+
 # 平台链接（抖音/Instagram）已投递给解析 bot 的消息 id（防重复触发）
 PROCESSING_DOUYIN_IDS = set()
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TG Userbot v2.9 —— 运行薄壳。
+"""TG Userbot v2.10 —— 运行薄壳。
 
 代码已重构进 tg_userbot/ 扁平包（config/log/state + 各子系统模块，见
 CLAUDE.md「模块索引」）。本文件只负责运行入口：起事件循环、调用

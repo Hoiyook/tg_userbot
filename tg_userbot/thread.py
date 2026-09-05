@@ -8,8 +8,10 @@ load_thread_config 失败时保持当前值不变（与单文件时代语义一�
 import os
 import json
 import re
+import asyncio
 
 from . import state
+from . import workers
 from .config import (
     DOWNLOAD_CONCURRENCY_MAX,
     DOWNLOAD_CONCURRENCY_MIN,
@@ -60,5 +62,13 @@ def apply_thread_limit(value):
     state.DOWNLOAD_CONCURRENCY = n
     if state.DOWNLOAD_SEMAPHORE is not None:
         state.DOWNLOAD_SEMAPHORE.set_limit(n)
+    # 多 worker 下载：目标 worker 数随并发走，运行时即时加/减连接
+    # （池未启用时 QUEUE=None，sync_pool_to_target 是 no-op）
+    state.DOWNLOAD_WORKER_TARGET = n
+    if state.DOWNLOAD_WORKER_QUEUE is not None:
+        try:
+            asyncio.create_task(workers.sync_pool_to_target())
+        except Exception as e:
+            logger.warning(f"调度下载 worker 扩缩容失败：{e}")
     save_thread_config(n)
     return True, f"✅ 并发下载数已设置为 {n}"

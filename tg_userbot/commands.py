@@ -81,7 +81,8 @@ async def handle_command(event, cmd_text):
         if len(parts) == 1:
             await event.reply(
                 f"🧵 当前并发下载数：{state.DOWNLOAD_CONCURRENCY}\n"
-                f"用法：/thread 3（{DOWNLOAD_CONCURRENCY_MIN}-{DOWNLOAD_CONCURRENCY_MAX}）"
+                f"用法：/thread 3（{DOWNLOAD_CONCURRENCY_MIN}-{DOWNLOAD_CONCURRENCY_MAX}）\n"
+                "每条下载各占一条独立连接，n 路 ≈ n 倍单路速度"
             )
             logger.info("执行命令：/thread（查询）")
             return True
@@ -243,7 +244,8 @@ async def handle_command(event, cmd_text):
             "/done 20 关键词 - 最近 20 条中模糊匹配\n"
             "/progress - 查看进行中下载的进度\n"
             "/thread - 查看当前并发下载数\n"
-            "/thread 5 - 设置并发下载数为 5（1-10）\n"
+            f"/thread 5 - 设置并行下载路数为 5"
+            f"（{DOWNLOAD_CONCURRENCY_MIN}-{DOWNLOAD_CONCURRENCY_MAX}，每条各占一条独立连接）\n"
             "/wl - 查看下载白名单\n"
             "/wl add @用户名 - 加入白名单（也可回复转发消息后 /wl add）\n"
             "/wl del ID或序号 - 移出白名单\n"

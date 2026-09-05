@@ -8,7 +8,7 @@ Button 为 Telethon 类型（telethon.Button），import 期无副作用。
 from telethon import Button
 
 from . import state
-from .config import MENU_ACTIONS
+from .config import DOWNLOAD_CONCURRENCY_MAX, MENU_ACTIONS
 
 
 def encode_menu_data(action, arg=None):
@@ -104,9 +104,11 @@ def wl_menu_buttons():
 
 
 def thread_menu_buttons():
-    return [
-        [Button.inline("3", encode_menu_data("thread", "3")),
-         Button.inline("5", encode_menu_data("thread", "5")),
-         Button.inline("10", encode_menu_data("thread", "10"))],
-        [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
+    # 预设档位（只出不大于 DOWNLOAD_CONCURRENCY_MAX 的），每行 3 个
+    presets = [p for p in (3, 5, 10, 15, 20, 25) if p <= DOWNLOAD_CONCURRENCY_MAX]
+    rows = [
+        [Button.inline(str(p), encode_menu_data("thread", str(p))) for p in presets[i:i + 3]]
+        for i in range(0, len(presets), 3)
     ]
+    rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
+    return rows

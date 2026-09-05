@@ -23,6 +23,7 @@ from . import whitelist
 from . import platform
 from . import cleanup
 from . import bot
+from . import workers
 from .config import (
     API_HASH,
     API_ID,
@@ -654,7 +655,7 @@ async def main():
     state.client.add_event_handler(new_message_handler, events.NewMessage())
 
     logger.info("=====================")
-    logger.info("🚀 TG Userbot v2.9 正在启动")
+    logger.info("🚀 TG Userbot v2.10 正在启动")
     logger.info(f"运行平台：{'Termux/Android' if IS_TERMUX else 'macOS/桌面'}")
     if PROXY:
         logger.info(f"代理：已启用（{PROXY[0]} {PROXY[1]}:{PROXY[2]}）")
@@ -679,7 +680,7 @@ async def main():
     if BOT_TOKEN:
         logger.info(f"🤖 bot 菜单：{BOT_USERNAME}")
     logger.info("自动重试：3 次")
-    logger.info(f"并发下载数：{state.DOWNLOAD_CONCURRENCY}（/thread 可调整）")
+    logger.info(f"并发下载数：{state.DOWNLOAD_CONCURRENCY}（/thread 可调，每条占一条独立连接）")
     logger.info(
         f"抖音解析机器人：{DOUYIN_BOT_USERNAME}（链接转发，回复视频自动进收藏夹下载）"
     )
@@ -697,6 +698,13 @@ async def main():
         f"✅ 登录成功 | 用户：{me.first_name or ''} "
         f"{me.last_name or ''} | ID={state.MY_ID}"
     )
+
+    # 建立多 worker 下载池：DOWNLOAD_CONCURRENCY 条独立连接并发拉文件，
+    # 破掉主客户端单 socket 的聚合瓶颈。失败自动降级回单连接（功能不丢）。
+    try:
+        await workers.spawn_pool(state.DOWNLOAD_CONCURRENCY)
+    except Exception as e:
+        logger.exception(f"启动下载 worker 池失败：{e}")
 
     # 恢复持久化队列：重启前没跑完的任务自动重新执行
     if state.QUEUE["tasks"]:
@@ -733,7 +741,7 @@ async def main():
             logger.error("❌ 保存目录不可写，请检查目录权限")
 
     logger.info(
-        "🟢 TG Userbot v2.9 已启动，等待 Saved Messages / 白名单 chat 的媒体与抖音链接"
+        "🟢 TG Userbot v2.10 已启动，等待 Saved Messages / 白名单 chat 的媒体与抖音链接"
     )
     logger.info("💡 测试：在 Saved Messages 发送 /status")
     logger.info("💡 下载：把文件转发到 Saved Messages")
@@ -755,6 +763,11 @@ async def main():
     try:
         await state.client.run_until_disconnected()
     finally:
+        # 断开下载 worker 连接（尽力而为，不影响主客户端退出）
+        try:
+            await workers.shutdown()
+        except Exception:
+            pass
         if cleanup_task:
             cleanup_task.cancel()
             try:

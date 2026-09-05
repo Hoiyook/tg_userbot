@@ -143,16 +143,22 @@ PROXY = parse_proxy(os.environ.get("TG_PROXY"))
 # ------------------------------------------------------------
 # TG_CONNECTION=full       → ConnectionTcpFull（TLS 传输，Telethon 默认）
 # TG_CONNECTION=obfuscated → ConnectionTcpObfuscated（MTProto 混淆传输，无 TLS）
-# 默认规则：设置了代理时用 obfuscated —— TLS 传输的握手是同步阻塞的，
-# 代理节点一旦卡住会冻结整个事件循环且超时无效；混淆传输全程异步，
-# 卡住时超时/自动重试可以正常工作。不设代理时保持 full（安卓原行为不变）。
+# 默认规则：一律 full（2026-09-05 起，此前是「设了代理就用 obfuscated」）。
+# 改默认的原因（实测）：obfuscated 传输对每一条连接的每一帧都做 AES-CTR 加密，
+# 而 telethon 1.44 的 AESModeCTR（crypto/aesctr.py，注释还留着 TODO Use libssl）
+# 只走纯 Python pyaes、单事件循环线程 → 单核 ~274KB/s，是聚合吞吐的真天花板，
+# 多 worker 并行连接也绕不开（实测 10 worker 仍 ~213KB/s）。full 无此每帧加密，
+# 配合多 worker 才真正并行（实测 10 worker → ~2.3-2.6MB/s）。代价：full 的
+# TLS 握手是同步阻塞的，代理节点挂起时可能不可取消，靠 start_with_retry 看门狗
+# 与重启兜底。需要抗封锁/混淆（或遇代理不稳定）时用 TG_CONNECTION=obfuscated
+# 显式切回，两值对主客户端与下载 worker（_connection_class）同生效。
 def pick_connection_type():
     value = os.environ.get("TG_CONNECTION", "").strip().lower()
     if value in ("full", "tls", "tcpfull"):
         return "full"
     if value in ("obfuscated", "obf", "tcpobfuscated"):
         return "obfuscated"
-    return "obfuscated" if PROXY else "full"
+    return "full"
 
 
 CONNECTION_TYPE = pick_connection_type()
@@ -215,12 +221,21 @@ INSTAGRAM_URL_PATTERN = re.compile(
 # ============================================================
 # 下载并发
 # ============================================================
-# 同时进行的下载数量（普通下载与抖音/Instagram 视频下载共享并发池）。
-# 可通过 /thread 指令运行时调整（1-10），并持久化到 thread_config.json。
+# 同时进行的下载数量 = 并行下载连接数（worker）：每条下载各占一条独立
+# Telethon 连接（须 full 传输才真正并行；obfuscated 有纯 Python AES-CTR
+# 单核天花板，见 pick_connection_type）。实测（2026-09-05）：单条 ~0.3MB/s，
+# n 路聚合先随 n 涨、后到墙 —— 本机经当时 Hiddify 节点到 TG DC 聚合封顶
+# ~2.3–2.6MB/s（~21Mbps），10 路与 24 路同速；墙在 ~8–10 路附近，位置取决于
+# 线路/代理节点/TG 路径。上限保留到 25（2026-09-05 起按用户要求，勿收窄到
+# 10）：Hiddify 节点带宽时快时慢，瓶颈在节点总带宽而不在 bot，节点快时把
+# /thread 开过 10 能吃到该节点更高的聚合（10 只是当时节点的实测墙）；何时用
+# 10 还是 25 由用户在运行时自行决定，慢节点开多只摊薄单文件速度、不加聚合。
+# 普通下载与抖音/IG 视频共享并发池。可通过 /thread 指令运行时调整（1-25），
+# 并持久化到 thread_config.json。
 # 默认值（当前值存 state.DOWNLOAD_CONCURRENCY，运行时可改）。
 DOWNLOAD_CONCURRENCY = 3
 DOWNLOAD_CONCURRENCY_MIN = 1
-DOWNLOAD_CONCURRENCY_MAX = 10
+DOWNLOAD_CONCURRENCY_MAX = 25
 THREAD_CONFIG_FILE = os.path.join(SAVE_FOLDER, "thread_config.json")
 
 # 下载白名单：除 Saved Messages 外，白名单内的 chat 收到媒体消息也会

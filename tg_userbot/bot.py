@@ -64,7 +64,8 @@ async def handle_menu_action(action, arg, event):
     if action == "thread":
         if arg is None:
             return (
-                f"🧵 当前并发下载数：{state.DOWNLOAD_CONCURRENCY}\n选择新值：",
+                f"🧵 当前并发下载数：{state.DOWNLOAD_CONCURRENCY}"
+                "（每条占一条独立连接）\n选择新值：",
                 menu.thread_menu_buttons(),
             )
         ok, msg = thread.apply_thread_limit(arg)

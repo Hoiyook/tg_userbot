@@ -12,6 +12,7 @@ from datetime import datetime
 from telethon.errors import RPCError
 
 from . import state
+from . import workers
 from .config import DOWNLOAD_RETRIES, PROGRESS_STEP, SAVE_FOLDER
 from .log import logger
 from .history import append_history
@@ -119,7 +120,12 @@ async def download_file(message, source_override=None, caption_override=None):
             link=message_source_link(message, message.chat_id),
         )
 
+        worker = None
         try:
+            # 借一条下载专用连接（多 worker 池启用时）。信号量先于借 worker、
+            # 并发下载数恒不大于存活 worker 数 → 不会饿死；None = 池禁用，
+            # 照旧走主客户端单连接（原行为）。
+            worker = await workers.borrow()
             logger.info("=" * 60)
             logger.info("📥 开始下载")
             logger.info(f"消息 ID：{message.id}")
@@ -176,10 +182,21 @@ async def download_file(message, source_override=None, caption_override=None):
                         f" | {os.path.basename(final_path)}"
                     )
 
-                    result = await message.download_media(
-                        file=temp_path,
-                        progress_callback=progress,
-                    )
+                    # 传字节的连接：池启用时用 worker（独立 socket，避开主客户端
+                    # 单 socket 的聚合瓶颈）；否则沿用消息自带客户端（原行为）。
+                    # 消息 media 的 dc_id/access_hash/file_reference 都内嵌在消息
+                    # 里，worker.download_media(message) 无需解析实体即可拉取。
+                    if worker is not None:
+                        result = await worker.download_media(
+                            message,
+                            file=temp_path,
+                            progress_callback=progress,
+                        )
+                    else:
+                        result = await message.download_media(
+                            file=temp_path,
+                            progress_callback=progress,
+                        )
 
                     if not result or not os.path.exists(temp_path):
                         raise RuntimeError("Telegram 返回下载结果，但临时文件不存在")
@@ -235,9 +252,10 @@ async def download_file(message, source_override=None, caption_override=None):
                         await asyncio.sleep(3)
 
                         try:
-                            if not state.client.is_connected():
+                            transfer = worker or state.client
+                            if not transfer.is_connected():
                                 logger.info("🔌 Telegram 连接已断开，正在重新连接...")
-                                await state.client.connect()
+                                await transfer.connect()
                                 logger.info("✅ Telegram 重新连接成功")
                         except Exception as reconnect_error:
                             logger.exception(
@@ -275,5 +293,7 @@ async def download_file(message, source_override=None, caption_override=None):
             return False
 
         finally:
+            if worker is not None:
+                await workers.release(worker)
             unregister_download(did)
             _RESERVED_FINAL_PATHS.discard(final_path)
