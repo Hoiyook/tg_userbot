@@ -9,7 +9,7 @@ import subprocess
 import mimetypes
 from pathlib import Path
 from urllib.parse import urlparse
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from collections import deque
 
 from telethon import TelegramClient, events, Button
@@ -258,7 +258,7 @@ MENU_ACTIONS = (
     "home", "status", "progress", "done", "wl", "wl_add",
     "wl_del", "thread", "clean", "back",
     "queue", "queue_del", "retry", "retry_run", "retry_del",
-    "cd2", "cd2_stop",
+    "cd2", "cd2_stop", "bak",
 )
 
 # ------------------------------------------------------------
@@ -2435,6 +2435,7 @@ def main_menu_buttons():
          Button.inline("🧹 清理", encode_menu_data("clean"))],
         [Button.inline("🖥 启动CD2", encode_menu_data("cd2")),
          Button.inline("🛑 停止CD2", encode_menu_data("cd2_stop"))],
+        [Button.inline("🗂 备份记录", encode_menu_data("bak"))],
     ]
 
 
@@ -2655,6 +2656,16 @@ def cd2_config():
     return command, port
 
 
+def cd2_log_dir():
+    """读取 CD2 备份日志目录（tg_secrets.json 的 cd2.log_dir）；空串=未配置。
+
+    备份逐文件记录在 <数据目录>/log/backup.<日期>.log 里，目录含本机用户名，
+    故也属敏感配置放 tg_secrets.json，不入库。
+    """
+    cfg = _SECRET_CONFIG.get("cd2") or {}
+    return (cfg.get("log_dir") or "").strip()
+
+
 async def cd2_is_running(port):
     """探测 CD2 是否已在运行：管理端口能连上即视为运行中。"""
     try:
@@ -2799,6 +2810,97 @@ async def cd2_stop_or_status():
     return f"❌ 未能停止 CloudDrive2（端口 {port} 仍开放），请手动检查"
 
 
+# ------------------------------------------------------------
+# 【备份记录】菜单按钮：查看 CD2 已经备份到 115、并按“完成=删除源”清理了本地
+# 的媒体文件记录。数据来自 CD2 的 <数据目录>/log/backup.<日期>.log：
+#   “handle_localfs/cloudfs_notify: delete file and remove from all dests "<路径>”"
+# 即文件已同步到所有目标、随后删除本地源的那一行（时间戳 + 完整路径）。
+# 注意：同一文件会有 cloudfs/localfs 双通知，需按路径去重；日志里没有文件大小。
+# ------------------------------------------------------------
+BACKUP_MEDIA_EXTS = frozenset(
+    "mp4 mkv mov avi wmv flv webm ts m4v mpg mpeg 3gp "
+    "jpg jpeg png gif webp heic bmp tiff "
+    "mp3 m4a ogg opus flac wav aac".split()
+)
+
+# 匹配备份日志里的“删除源文件”逐文件行，捕获（时间, 虚拟路径）
+_BACKUP_LINE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\S+\s+INFO\s+cloudapi::backup_manager:\s+"
+    r"(?:handle_localfs_notify|handle_cloudfs_notify): delete file and remove "
+    r'from all dests "(.+)"\s*$'
+)
+
+
+def parse_backup_log_lines(lines):
+    """从备份日志的文本行解析出 (时间, 虚拟路径)，媒体白名单内、按路径去重。
+
+    只认两种逐文件“delete file...”行；批量的 notify callback 行跳过（重复）。
+    返回按时间倒序的 [(时间, 路径), ...]，纯函数可单测。
+    """
+    seen = {}
+    for raw in lines:
+        m = _BACKUP_LINE_RE.match(raw.strip())
+        if not m:
+            continue
+        ts, path = m.group(1), m.group(2)
+        ext = os.path.splitext(path)[1].lstrip(".").lower()
+        if ext not in BACKUP_MEDIA_EXTS:
+            continue
+        seen[path] = ts  # 同一路径多次出现保留最后时间
+    items = [(ts, path) for path, ts in seen.items()]
+    items.sort(reverse=True)
+    return items
+
+
+def read_cd2_backup_records(log_dir=None, days=7, limit=15):
+    """读取最近 days 天 backup.<日期>.log 里的媒体备份记录。
+
+    log_dir 为空或目录不存在返回 None（调用方据此提示未配置）。
+    否则返回去重、按时间倒序、最多 limit 条的 [(时间, 路径)]。
+    """
+    log_dir = os.path.expanduser(log_dir or cd2_log_dir())
+    if not log_dir or not os.path.isdir(log_dir):
+        return None
+    lines = []
+    today = date.today()
+    for i in range(days):
+        d = today - timedelta(days=i)
+        p = os.path.join(log_dir, f"backup.{d.isoformat()}.log")
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                lines.extend(f.read().splitlines())
+        except (OSError, ValueError):
+            continue
+    return parse_backup_log_lines(lines)[:limit]
+
+
+def backup_records_text(days=7, limit=15):
+    """【备份记录】菜单的文本。无日志目录 → 提示未配置；无记录 → 提示空。"""
+    items = read_cd2_backup_records(None, days, limit)
+    if items is None:
+        return (
+            "❌ 未配置 CD2 备份日志目录：请在 tg_secrets.json 的 cd2.log_dir "
+            "填入 CloudDrive2 数据目录下的 log 目录（如 ~/Waytech/CloudDrive2/log）"
+        )
+    if not items:
+        return f"🗂 近 {days} 天没有 CD2 备份清理记录（没有媒体被处理过）"
+    head = (
+        f"🗂 CD2 备份记录（媒体已备份到 115 并删除本地）\n"
+        f"近 {days} 天内最新 {len(items)} 条\n\n"
+    )
+    out = []
+    for ts, path in items:
+        folder = os.path.basename(os.path.dirname(path))
+        name = os.path.basename(path)
+        mmdd = ts[5:16]  # MM-DD HH:MM
+        display = f"{folder}/{name}" if folder else name
+        if len(display) > 70:
+            display = display[:69] + "…"
+        out.append(f"· {mmdd}  {display}")
+    text = head + "\n".join(out)
+    return text[:4000]
+
+
 def forward_source_info(fwd_from):
     """从转发头提取 (chat_id, 标题)，不依赖网络解析。
 
@@ -2937,6 +3039,8 @@ async def handle_menu_action(action, arg, event):
         return await cd2_start_or_status(), back_home_buttons()
     if action == "cd2_stop":
         return await cd2_stop_or_status(), back_home_buttons()
+    if action == "bak":
+        return backup_records_text(), back_home_buttons()
     if action == "queue":
         return format_queue_text(QUEUE), queue_menu_buttons()
     if action == "queue_del":

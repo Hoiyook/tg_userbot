@@ -37,6 +37,7 @@ class MenuDataCodecTest(unittest.TestCase):
             ("back", "home"),
             ("cd2", None),
             ("cd2_stop", None),
+            ("bak", None),
         ):
             data = tg.encode_menu_data(action, arg)
             self.assertEqual(
@@ -61,7 +62,7 @@ class MenuTextTest(unittest.TestCase):
         texts = [b.text for row in tg.main_menu_buttons() for b in row]
         for label in ("📊 状态", "📈 进度", "📜 下载记录",
                       "📋 白名单", "🧵 并发", "🧹 清理",
-                      "🖥 启动CD2", "🛑 停止CD2"):
+                      "🖥 启动CD2", "🛑 停止CD2", "🗂 备份记录"):
             self.assertIn(label, texts)
 
     def test_main_menu_text_non_empty(self):
@@ -192,6 +193,64 @@ class CD2PidParseTest(unittest.TestCase):
 
     def test_empty_output(self):
         self.assertEqual(tg._cd2_pids_from_ps_output("", "/x/clouddrive"), [])
+
+
+class BackupLogParseTest(unittest.TestCase):
+    """parse_backup_log_lines：从 CD2 backup.<日期>.log 解析备份清理记录。"""
+
+    LINE = (
+        "2026-09-05 12:54:47.481  INFO cloudapi::backup_manager: "
+        'handle_localfs_notify: delete file and remove from all dests "{}"'
+    )
+    A = "/u/Downloads/Nagram/Douyin/她头上为什么顶着两个妙脆角.mp4"
+    B = "/u/Downloads/Nagram/抖音TikTok去水印bot/标题_ #绝区零.mp4"
+
+    def _line(self, path, ts="2026-09-05 12:54:47.481", kind="localfs"):
+        return (
+            f"{ts}  INFO cloudapi::backup_manager: handle_{kind}_notify: "
+            f'delete file and remove from all dests "{path}"'
+        )
+
+    def test_dedupes_pair_and_drops_non_media(self):
+        lines = [
+            self._line(self.A),                      # localfs
+            self._line(self.A, kind="cloudfs"),      # 同文件另一通知
+            self._line(self.B),
+            self._line("/u/Downloads/Nagram/孤儿.mp4.download"),
+            self._line("/u/Downloads/Nagram/download.log"),
+            "2026-09-05 13:00:00.000 INFO cloudapi::backup_manager: "
+            'now handle notify callback: "/s", [Delete("/r/a.mp4")]',
+        ]
+        items = tg.parse_backup_log_lines(lines)
+        paths = [p for _, p in items]
+        self.assertEqual(sorted(paths), sorted([self.A, self.B]))
+        self.assertEqual(len(items), 2)
+
+    def test_sorted_newest_first(self):
+        lines = [
+            self._line(self.B, ts="2026-09-05 10:00:00.000"),
+            self._line(self.A, ts="2026-09-05 12:00:00.000"),
+        ]
+        items = tg.parse_backup_log_lines(lines)
+        self.assertEqual([p for _, p in items], [self.A, self.B])
+
+    def test_empty_lines(self):
+        self.assertEqual(tg.parse_backup_log_lines([]), [])
+
+
+class CD2LogDirTest(unittest.TestCase):
+    """cd2_log_dir：读取 tg_secrets.json 的 cd2.log_dir。"""
+
+    def test_unconfigured_is_empty(self):
+        with mock.patch.object(tg, "_SECRET_CONFIG", {}):
+            self.assertEqual(tg.cd2_log_dir(), "")
+
+    def test_reads_log_dir(self):
+        with mock.patch.object(
+            tg, "_SECRET_CONFIG",
+            {"cd2": {"log_dir": "~/Waytech/CloudDrive2/log"}},
+        ):
+            self.assertEqual(tg.cd2_log_dir(), "~/Waytech/CloudDrive2/log")
 
 
 class WhitelistCommitTest(unittest.TestCase):
