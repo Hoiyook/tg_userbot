@@ -241,6 +241,69 @@ class QueueDeadlockRegressionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.QUEUE["retry"], [])
 
 
+class QueueTaskCancellationRegressionTest(unittest.IsolatedAsyncioTestCase):
+    """回归（静默死亡 bug）：
+    - 执行失败（download 重试耗尽返回 False）→ 任务必须落 retry 并持久化，绝不
+      再像旧代码那样因 CancelledError 逃逸而永远卡在 tasks（「队列有任务
+      /progress 却没数据」的根因）。
+    - 真正的 Task.cancel()（进程退出等主动取消）→ 原样放行，记录留在 tasks 原位，
+      重启后由 recover_queue_tasks 重跑 —— 不被误移入 retry。"""
+
+    async def asyncSetUp(self):
+        self.old_queue = state.QUEUE
+        self.old_lock = state.QUEUE_LOCK
+        self.old_exec = state.EXECUTING
+        self.old_save = queue.save_queue
+        state.QUEUE_LOCK = asyncio.Lock()
+        state.QUEUE = {"tasks": [], "retry": []}
+        state.EXECUTING = set()
+        queue.save_queue = mock.MagicMock()  # 测试期间不写真实文件
+
+    def tearDown(self):
+        state.QUEUE = self.old_queue
+        state.QUEUE_LOCK = self.old_lock
+        state.EXECUTING = self.old_exec
+        queue.save_queue = self.old_save
+
+    async def test_failed_run_moves_record_to_retry(self):
+        rec = queue.queue_enqueue(state.QUEUE, media_record(label="视频.mp4"))
+
+        async def always_fail(record):
+            return False  # download_file 重试耗尽后的真实返回值
+
+        with mock.patch.object(queue, "_run_queued_task", side_effect=always_fail):
+            await queue.execute_queued_task(rec)
+
+        self.assertNotIn(
+            rec["id"], [r["id"] for r in state.QUEUE["tasks"]],
+        )
+        self.assertIn(rec["id"], [r["id"] for r in state.QUEUE["retry"]])
+        self.assertEqual(state.QUEUE["retry"][0]["attempts"], 1)
+        queue.save_queue.assert_called()  # 落 retry 后必须持久化
+
+    async def test_genuine_task_cancel_stays_in_tasks(self):
+        rec = queue.queue_enqueue(state.QUEUE, media_record(label="视频.mp4"))
+        started = asyncio.Event()
+
+        async def hang(record):
+            started.set()
+            await asyncio.sleep(3600)
+
+        with mock.patch.object(queue, "_run_queued_task", side_effect=hang):
+            task = asyncio.create_task(queue.execute_queued_task(rec))
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        # 真取消应放行：既不在 retry，也不该被当成失败改状态；仍留在 tasks 原位
+        self.assertNotIn(
+            rec["id"], [r["id"] for r in state.QUEUE["retry"]],
+        )
+        self.assertIn(rec["id"], [r["id"] for r in state.QUEUE["tasks"]])
+        self.assertEqual(state.QUEUE["tasks"][0]["attempts"], 0)
+
+
 class QueueFormatTest(unittest.TestCase):
     """队列/待重试列表文本格式化。"""
 

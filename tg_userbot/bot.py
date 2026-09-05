@@ -105,7 +105,7 @@ async def handle_menu_action(action, arg, event):
             return "❌ 任务已不存在", menu.back_home_buttons()
         if record["id"] in state.EXECUTING:
             return "⏳ 该任务正在执行中", menu.back_home_buttons()
-        asyncio.create_task(queue.execute_queued_task(record))
+        queue.spawn_execute(record)
         return (
             f"▶️ 已重新执行：{record.get('label', '')}",
             menu.back_home_buttons(),

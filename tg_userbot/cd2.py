@@ -19,7 +19,7 @@ from datetime import date, datetime, timedelta
 
 from . import config
 from . import state
-from .config import SAVE_FOLDER
+from .config import CD2_LAUNCH_LOG
 from .log import logger
 
 
@@ -64,11 +64,11 @@ async def cd2_is_running(port):
 def cd2_launch(command):
     """后台启动 CD2 独立进程，脱离本进程组（随 userbot 退出不会被连带终止）。
 
-    输出追加写入 SAVE_FOLDER/cd2_launch.log 便于排查。返回日志文件路径。
+    输出追加写入 RUNTIME_DIR/cd2_launch.log 便于排查。返回日志文件路径。
     进程句柄存 state._CD2_PROC（无人读取，仅防 GC 回收后台进程）。
     """
     command = os.path.expanduser(command)
-    log_path = os.path.join(SAVE_FOLDER, "cd2_launch.log")
+    log_path = CD2_LAUNCH_LOG
     log_file = open(log_path, "a", encoding="utf-8")
     log_file.write(
         f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 启动 CD2：{command}\n"

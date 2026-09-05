@@ -2,8 +2,10 @@
 
 拆包前这些都在单文件 tg_userbot_final.py 顶部。这里保持同样的求值顺序：
 secrets → 平台探测 → 保存目录/日志 → 代理/传输 → 其余常量 → AdjustableSemaphore，
-模块末尾才做 import 期的两个文件系统副作用：mkdir(SAVE_FOLDER) 与
-log.configure(LOG_FILE)。
+模块末尾才做 import 期的文件系统副作用：mkdir(SAVE_FOLDER) 与
+mkdir(RUNTIME_DIR)、把旧版散在根目录的运行时文件迁入 runtime/、然后
+log.configure(LOG_FILE, LOG_RETENTION_DAYS)（download.log 按天轮转、
+只保留最近 7 天）。
 
 可变的运行态全局不在这里（见 state.py）；本模块导出的都是只读常量，
 consumer 模块可用 `from .config import SAVE_FOLDER` 别名（值永不变化）。
@@ -83,7 +85,17 @@ else:
     DEFAULT_SAVE_FOLDER = str(Path.home() / "Downloads" / "Nagram")
 
 SAVE_FOLDER = os.environ.get("TG_SAVE_FOLDER", DEFAULT_SAVE_FOLDER)
-LOG_FILE = os.path.join(SAVE_FOLDER, "download.log")
+
+# 运行时文件（非媒体的配置/日志/队列）统一归集到 SAVE_FOLDER/runtime/ 子目录：
+# download.log（按天轮转）、download_history.txt、4 个运行时 JSON、cd2_launch.log。
+# 历史版本散在 SAVE_FOLDER 根下的同名文件在启动时自动迁入（_migrate_runtime_files）。
+# 媒体仍存 SAVE_FOLDER/<来源>/（递归范围被 CD2 白名单搬到 115）；运行时文件因为
+# 不是媒体扩展名、天然不被 CD2 备份/删除规则碰（与归集前等价），归集只为了收拢
+# 目录、避免根目录越来越杂。该目录与媒体都在同一 SAVE_FOLDER 里，无跨盘问题。
+RUNTIME_DIR = os.path.join(SAVE_FOLDER, "runtime")
+LOG_RETENTION_DAYS = 7  # download.log 按天轮转，只保留最近 7 天
+LOG_FILE = os.path.join(RUNTIME_DIR, "download.log")
+CD2_LAUNCH_LOG = os.path.join(RUNTIME_DIR, "cd2_launch.log")
 
 
 # ------------------------------------------------------------
@@ -169,17 +181,35 @@ CONNECTION_TYPE = pick_connection_type()
 # 下载失败自动重试次数
 DOWNLOAD_RETRIES = 3
 
+# 跨 DC 首次授权导出「竞态」的专用加量重试：多 worker 池里每条连接都是独立
+# 客户端、各自首次跨 DC 下载都要做一次 auth.exportAuthorization（导出成功结果
+# 按 DC 缓存在该 worker 上、此后不再导出）。同一账号的 N 条新连接同时对同一 DC
+# 做首次导出时，Telegram 只让极少数成功（AuthBytesInvalidError，谁先落地谁赢；
+# 实测 6 路并发就有 5/6 首轮失败）。该错误秒级失败、发生在任何字节写出之前，
+# 不像断流要等 DOWNLOAD_IDLE_TIMEOUT——重试代价极低。且竞争会随「导出成功者
+# 退出」自然消散（成功 worker 带热缓存回池，后续文件借到它直接免导出），所以只
+# 对这一类快速失败放宽上限即可收敛，普通网络/其他 RPC 失败仍按 DOWNLOAD_RETRIES
+# 兜底，绝不无限重试。
+EXPORT_RACE_EXTRA_RETRIES = 6
+
 # 进度日志间隔（百分比）
 PROGRESS_STEP = 5
+
+# 下载「无进度」看门狗（秒）：Telethon 请求没有读超时，连接僵死时既不报错也不
+# 出数据，会永远占住信号量槽位（另一个静默卡死的来源）。单次下载尝试超过该秒数
+# 没有任何进度回调即判定僵死：取消本次、抛 TimeoutError，走重试分支重连重下。
+# 实际数据分块回调远密于该阈值（单 worker 满速 ~0.3MB/s，1MB 分块约 3-4 秒一次
+# 进度），只在代理节点彻底断流时才触发；误判顶多浪费一次尝试、重下即可。
+DOWNLOAD_IDLE_TIMEOUT = 120
 
 # 文件名按 UTF-8 字节上限截断。macOS(APFS/HFS+) 与 Android(ext4) 的单文件名
 # 上限都是 255 字节；这里留出 ".download" 临时后缀与重名 " (n)" 的余量。
 # 只影响超限的罕见超长标题/说明，正常文件名原样保留。
 MAX_FILENAME_BYTES = 200
 
-# 下载历史记录文件（SAVE_FOLDER 下），每行一条已完成下载：
+# 下载历史记录文件（RUNTIME_DIR 下），每行一条已完成下载：
 # 时间 | 类型(普通/抖音) | 文件名 | 大小 | 来源
-DOWNLOAD_HISTORY_FILE = os.path.join(SAVE_FOLDER, "download_history.txt")
+DOWNLOAD_HISTORY_FILE = os.path.join(RUNTIME_DIR, "download_history.txt")
 DONE_DEFAULT_LINES = 10  # /done 默认显示行数
 DONE_MAX_LINES = 50      # /done 允许的最大行数
 
@@ -236,12 +266,12 @@ INSTAGRAM_URL_PATTERN = re.compile(
 DOWNLOAD_CONCURRENCY = 3
 DOWNLOAD_CONCURRENCY_MIN = 1
 DOWNLOAD_CONCURRENCY_MAX = 25
-THREAD_CONFIG_FILE = os.path.join(SAVE_FOLDER, "thread_config.json")
+THREAD_CONFIG_FILE = os.path.join(RUNTIME_DIR, "thread_config.json")
 
 # 下载白名单：除 Saved Messages 外，白名单内的 chat 收到媒体消息也会
 # 自动下载（保存到 SAVE_FOLDER/<chat标题>/）。通过 /wl 指令运行时管理，
 # 持久化到 whitelist_config.json。
-WHITELIST_FILE = os.path.join(SAVE_FOLDER, "whitelist_config.json")
+WHITELIST_FILE = os.path.join(RUNTIME_DIR, "whitelist_config.json")
 
 # ------------------------------------------------------------
 # bot 按钮菜单（可选）：用一个 bot 账号在私聊里提供可点击的按钮菜单。
@@ -266,7 +296,7 @@ MENU_ACTIONS = (
 # 持久化下载队列：任务先入队（媒体存消息引用、平台链接存完整 URL），
 # 重启后自动恢复执行。失败任务移入 retry 列表停靠，由用户手动重试。
 # ------------------------------------------------------------
-QUEUE_FILE = os.path.join(SAVE_FOLDER, "download_queue.json")
+QUEUE_FILE = os.path.join(RUNTIME_DIR, "download_queue.json")
 
 # Telethon 的请求没有读超时：代理节点卡住时 get_messages 等请求会永久挂起，
 # 把信号量槽位占满、整条队列堵死。取消息步骤必须加外部超时。
@@ -285,7 +315,7 @@ CLEAN_MESSAGE_AGE_MINUTES = 1
 
 # 自动清理执行间隔，默认 1 分钟，可通过 /setcleartime 修改
 DEFAULT_CLEAR_INTERVAL_SECONDS = 60
-CLEAR_TIME_CONFIG_FILE = os.path.join(SAVE_FOLDER, "clear_time.json")
+CLEAR_TIME_CONFIG_FILE = os.path.join(RUNTIME_DIR, "clear_time.json")
 
 # 需要自动清理的命令（精确匹配）
 CLEAN_COMMANDS = {
@@ -415,8 +445,47 @@ class AdjustableSemaphore:
         self.release()
 
 
+def _migrate_runtime_files(save_folder=None, runtime_dir=None):
+    """把历史版本散在 SAVE_FOLDER 根下的运行时文件迁入 runtime/（幂等）。
+
+    save_folder/runtime_dir 可显式传入（供单测用临时目录）；默认取模块常量。
+    仅当 runtime/ 下尚不存在同名文件时才移动：重复 import / 进程已在跑新版本
+    都 no-op。返回本次实际迁入的文件名列表。运行时文件本来就是根目录里「非媒体
+    扩展名」的那一撮，不会被 CD2 的备份/删除规则碰（按媒体扩展名白名单过滤），
+    搬进子目录后依然免疫，故移动安全。只处理下面 7 个确切 basename，绝不误伤
+    其它用户文件。失败不阻塞启动（下轮启动或手动处理）。
+    """
+    if save_folder is None:
+        save_folder = SAVE_FOLDER
+    if runtime_dir is None:
+        runtime_dir = RUNTIME_DIR
+    basenames = (
+        "download.log", "download_history.txt", "thread_config.json",
+        "whitelist_config.json", "download_queue.json", "clear_time.json",
+        "cd2_launch.log",
+    )
+    moved = []
+    for name in basenames:
+        src = os.path.join(save_folder, name)
+        dst = os.path.join(runtime_dir, name)
+        if os.path.exists(src) and not os.path.exists(dst):
+            try:
+                os.replace(src, dst)
+                moved.append(name)
+            except OSError:
+                pass
+    return moved
+
+
 # ============================================================
 # import 期一次性副作用（保持单文件时的时机：先建目录、再配日志）
 # ============================================================
 os.makedirs(SAVE_FOLDER, exist_ok=True)
-log.configure(LOG_FILE)
+os.makedirs(RUNTIME_DIR, exist_ok=True)
+_migrated_runtime_files = _migrate_runtime_files()
+log.configure(LOG_FILE, LOG_RETENTION_DAYS)
+if _migrated_runtime_files:
+    log.logger.info(
+        "已把历史运行时文件迁入 runtime/ 目录："
+        + "、".join(_migrated_runtime_files)
+    )

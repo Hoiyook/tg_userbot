@@ -227,7 +227,7 @@ async def handle_command(event, cmd_text):
             if record["id"] in state.EXECUTING:
                 await event.reply("⏳ 该任务正在执行中")
                 return True
-            asyncio.create_task(queue.execute_queued_task(record))
+            queue.spawn_execute(record)
             await event.reply(f"▶️ 已重新执行：{record.get('label', '')}")
         logger.info(f"执行命令：/retry {parts[1] if len(parts) > 1 else ''}")
         return True

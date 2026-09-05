@@ -224,6 +224,146 @@ class DownloadWorkerRoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.DOWNLOAD_WORKER_QUEUE.qsize(), 1)
         self.assertEqual(len(state.DOWNLOAD_WORKERS), 1)
 
+    async def test_network_cancel_retried_not_propagated(self):
+        """回归：download_media 抛网络层 CancelledError（telethon 断线时对 pending
+        请求 future 调 cancel()）时应走重试重下，而不是把 CancelledError 一路打出
+        download_file —— 旧代码它逃逸到队列层、except Exception 拦不住（py3.8+
+        CancelledError 是 BaseException），任务静默死亡、记录永远卡在队列。"""
+        # 关池 → download_file 走消息自带客户端路径（message.download_media）
+        state.DOWNLOAD_WORKER_QUEUE = None
+        state.DOWNLOAD_WORKERS = []
+        state.DOWNLOAD_WORKER_TARGET = 0
+
+        calls = []
+
+        async def flaky_download_media(file=None, progress_callback=None):
+            calls.append(file)
+            if len(calls) == 1:
+                raise asyncio.CancelledError("网络层 future.cancel()")
+            with open(file, "wb") as f:
+                f.write(b"x")
+            return file
+
+        self.fake_message.download_media = flaky_download_media
+
+        async def _instant_sleep(*args, **kwargs):
+            return None
+
+        with mock.patch.object(asyncio, "sleep", _instant_sleep):
+            ok = await asyncio.wait_for(
+                download.download_file(self.fake_message, "测试来源"),
+                timeout=10,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2)  # 首次被取消后重试并成功，不再向上抛
+
+    async def _retry_exhaustion(self, err, retries, extra):
+        """让 worker.download_media 每次抛同一错误，测重试耗尽时的尝试次数。"""
+        calls = []
+
+        async def failing_download_media(message, *, file=None,
+                                         progress_callback=None):
+            calls.append(file)
+            raise err
+
+        self.worker.download_media = failing_download_media
+
+        async def _instant_sleep(*args, **kwargs):
+            return None
+
+        with mock.patch.object(asyncio, "sleep", _instant_sleep), \
+                mock.patch.object(download, "DOWNLOAD_RETRIES", retries), \
+                mock.patch.object(download, "EXPORT_RACE_EXTRA_RETRIES", extra):
+            ok = await asyncio.wait_for(
+                download.download_file(self.fake_message, "测试来源"),
+                timeout=10,
+            )
+        return ok, calls
+
+    async def test_authbytes_invalid_gets_extended_retries(self):
+        """回归：跨 DC 授权导出竞态（AuthBytesInvalidError）应放宽重试上限 ——
+        该错误秒级失败在首字节前、且竞争随成功者退出而消散，落败者多试几次才可能
+        赢；上限 = DOWNLOAD_RETRIES + EXPORT_RACE_EXTRA_RETRIES。"""
+        from telethon.errors import AuthBytesInvalidError
+
+        ok, calls = await self._retry_exhaustion(
+            AuthBytesInvalidError(None), retries=1, extra=3
+        )
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 4)  # 上限 1 + 3，而非 1 次就放弃
+
+    async def test_other_rpc_error_respects_plain_retry_cap(self):
+        """对照：普通网络错误（非导出竞态）仍按 DOWNLOAD_RETRIES 封顶，
+        不因特例被放大 —— 防止导出竞态宽松被误用到一切失败上。"""
+        ok, calls = await self._retry_exhaustion(
+            ConnectionError("连接被重置"), retries=2, extra=6
+        )
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 2)  # 正好 DOWNLOAD_RETRIES 次，不加量
+
+    async def test_authbytes_then_success_converges(self):
+        """导出竞态的本质是「谁先落地谁赢」：几次失败后成功（竞争消散）应成功，
+        验证放宽上限确实给了落败者继续尝试的机会。"""
+        from telethon.errors import AuthBytesInvalidError
+
+        calls = []
+
+        async def converges_download_media(message, *, file=None,
+                                           progress_callback=None):
+            calls.append(file)
+            if len(calls) < 3:
+                raise AuthBytesInvalidError(None)
+            with open(file, "wb") as f:
+                f.write(b"w")
+            return file
+
+        self.worker.download_media = converges_download_media
+
+        async def _instant_sleep(*args, **kwargs):
+            return None
+
+        with mock.patch.object(asyncio, "sleep", _instant_sleep), \
+                mock.patch.object(download, "DOWNLOAD_RETRIES", 1), \
+                mock.patch.object(download, "EXPORT_RACE_EXTRA_RETRIES", 6):
+            ok = await asyncio.wait_for(
+                download.download_file(self.fake_message, "测试来源"),
+                timeout=10,
+            )
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 3)  # 前 2 次竞态失败，第 3 次落地成功
+
+    async def test_idle_timeout_fails_cleanly_and_cleans_temp(self):
+        """回归：无进度看门狗 —— 连接僵死（既不报错也不出数据）时，应在超时后取消
+        本次尝试（抛 TimeoutError）失败收场，并保证 .download 半成品被 finally
+        清理、不残留孤儿临时文件（曾被异常退出留下的死文件）。"""
+        state.DOWNLOAD_WORKER_QUEUE = None
+        state.DOWNLOAD_WORKERS = []
+        state.DOWNLOAD_WORKER_TARGET = 0
+
+        async def hangy_download_media(file=None, progress_callback=None):
+            with open(file, "wb") as f:
+                f.write(b"partial")  # 先落点数据 → .download 存在，验证被清
+            await asyncio.sleep(3600)  # 永不回调进度、永不结束
+
+        self.fake_message.download_media = hangy_download_media
+
+        with mock.patch.object(download, "DOWNLOAD_IDLE_TIMEOUT", 0.5), \
+                mock.patch.object(download, "DOWNLOAD_RETRIES", 1):
+            ok = await asyncio.wait_for(
+                download.download_file(self.fake_message, "测试来源"),
+                timeout=15,
+            )
+
+        self.assertFalse(ok)
+        leftovers = [
+            os.path.join(root, f)
+            for root, _dirs, files in os.walk(_TMP)
+            for f in files
+            if f.endswith(".download")
+        ]
+        self.assertEqual(leftovers, [])
+
 
 if __name__ == "__main__":
     unittest.main()

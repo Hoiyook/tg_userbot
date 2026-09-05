@@ -27,8 +27,21 @@ from .config import (
     QUEUE_FILE,
     QUEUE_KIND_LABELS,
 )
-from .log import logger
+from .log import clear_trace, logger, set_trace
 from .sources import message_link
+
+# 对 create_task 产出的执行任务持有强引用：事件循环只对 Task 持有弱引用，任务在
+# 完成前可能被 GC（asyncio 官方建议显式持引用；3.9 下 pending 任务实测虽不会被
+# 回收，仍按最佳实践持有，兼为未来 Python 版本兜底）。done 回调里自我移除。
+_SPAWNED_TASKS = set()
+
+
+def spawn_execute(record):
+    """后台执行一个队列任务并持有强引用（入队/启动恢复/手动重试共用）。"""
+    task = asyncio.create_task(execute_queued_task(record))
+    _SPAWNED_TASKS.add(task)
+    task.add_done_callback(_SPAWNED_TASKS.discard)
+    return task
 
 
 def is_queue_command(text):
@@ -173,7 +186,7 @@ async def enqueue_and_start(record):
         # 否则 execute_queued_task 按 id 收尾时对不上队列里的记录。
         record = queue_enqueue(state.QUEUE, record)
         save_queue(state.QUEUE)
-    asyncio.create_task(execute_queued_task(record))
+    spawn_execute(record)
 
 
 async def _run_queued_task(record):
@@ -183,22 +196,58 @@ async def _run_queued_task(record):
     """
     kind = record.get("kind")
     if kind == "media":
+        # 取消息（原消息引用）跑在子任务上：Telethon 请求没有读超时，代理卡住会
+        # 永久挂起 → 手动在「子任务完成 / 超时」间等待（QUEUE_FETCH_TIMEOUT 硬顶）。
+        # 不用 asyncio.wait_for：它会把子任务的网络层 CancelledError（telethon 断线
+        # 对 pending 请求 future 调 cancel()）也当普通取消抛上来，与真取消难分辨。
+        # 规则与 download_file 一致：子任务以 CancelledError 收场 = 网络层 → 按失败
+        # 转待重试；父任务被真取消只在 await 处出现 → 放行，记录留在队列原位。
+        fetch = asyncio.ensure_future(
+            state.client.get_messages(record["chat_id"], ids=record["msg_id"])
+        )
         try:
-            message = await asyncio.wait_for(
-                state.client.get_messages(
-                    record["chat_id"], ids=record["msg_id"]
-                ),
-                timeout=QUEUE_FETCH_TIMEOUT,
-            )
+            try:
+                await asyncio.wait({fetch}, timeout=QUEUE_FETCH_TIMEOUT)
+            except asyncio.CancelledError:
+                if not fetch.done():
+                    fetch.cancel()
+                    try:
+                        await fetch
+                    except asyncio.CancelledError:
+                        pass
+                raise
+            if not fetch.done():
+                fetch.cancel()
+                try:
+                    await fetch
+                except asyncio.CancelledError:
+                    pass
+                logger.error(
+                    f"⏰ 队列任务取消息超时（{QUEUE_FETCH_TIMEOUT}s）："
+                    f"{record.get('label') or '(无)'}"
+                )
+                return False
+            try:
+                message = fetch.result()
+            except asyncio.CancelledError as exc:
+                # 网络层 future.cancel()：不冒充父任务取消，按失败转待重试
+                logger.warning(
+                    "队列任务取消息被底层连接取消（网络层 future.cancel()），"
+                    "转入待重试",
+                    exc_info=True,
+                )
+                return False
+            except Exception as e:
+                logger.warning(f"队列任务取消息失败：{e}")
+                return False
         except asyncio.TimeoutError:
             logger.error(
                 f"⏰ 队列任务取消息超时（{QUEUE_FETCH_TIMEOUT}s）："
                 f"{record.get('label') or '(无)'}"
             )
             return False
-        except Exception as e:
-            logger.warning(f"队列任务取消息失败：{e}")
-            return False
+        except asyncio.CancelledError:
+            raise
         if not message:
             label = record.get("label") or ""
             logger.warning(f"队列任务原消息已被删除：{label}")
@@ -225,6 +274,10 @@ async def execute_queued_task(record):
     """执行队列任务并更新持久化状态：
     成功 → 移除；失败 → 移入 retry（已在 retry 的手动重试失败则留原处）。
     """
+    # 全链路追踪：以队列记录 id 前 8 位作 trace，写进本任务 contextvar，
+    # 随 await 自动传导到取消息/download_file/通知等全部下游日志（[T=xxxx]）。
+    # 每个任务一个独立 context，互不串扰；finally 里清除。
+    set_trace(record["id"][:8])
     state.EXECUTING.add(record["id"])
     logger.info(
         f"▶️ 队列任务开始：{record.get('label') or record.get('url') or '(无)'}"
@@ -235,7 +288,15 @@ async def execute_queued_task(record):
             # 会 acquire 同一个信号量，队列层再包一层会嵌套死锁（并发 ≥2
             # 时槽位互相等待）。真正的下载并发仍由内部信号量约束。
             success = await _run_queued_task(record)
-        except Exception as e:
+        except BaseException as e:
+            # py3.8+ CancelledError 是 BaseException，except Exception 拦不住。
+            # 网络层的 future.cancel() 已在 download_file 与取消息处转成普通失败
+            # （重试耗尽返回 False / ConnectionError），能作为 CancelledError 逃到
+            # 这里的是「真取消」（进程退出等主动 Task.cancel()）—— 原样放行，让
+            # 队列记录留在 tasks、重启后由 recover_queue_tasks 重新执行。若把真取消
+            # 吞掉当失败移入 retry，会在每次退出时把在途任务误标成失败。
+            if isinstance(e, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
             logger.exception(f"队列任务执行异常：{e}")
             success = False
 
@@ -259,9 +320,10 @@ async def execute_queued_task(record):
             save_queue(state.QUEUE)
     finally:
         state.EXECUTING.discard(record["id"])
+        clear_trace()
 
 
 def recover_queue_tasks():
     """启动时重新触发活跃队列中的任务（失败/中断的任务重启后自动重来）。"""
     for record in list(state.QUEUE["tasks"]):
-        asyncio.create_task(execute_queued_task(record))
+        spawn_execute(record)
