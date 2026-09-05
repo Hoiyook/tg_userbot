@@ -35,6 +35,7 @@ class MenuDataCodecTest(unittest.TestCase):
             ("wl_del", "-100123"),
             ("wl_add", "-1001234567890"),
             ("back", "home"),
+            ("cd2", None),
         ):
             data = tg.encode_menu_data(action, arg)
             self.assertEqual(
@@ -58,7 +59,7 @@ class MenuTextTest(unittest.TestCase):
     def test_main_menu_buttons_contain_all_entries(self):
         texts = [b.text for row in tg.main_menu_buttons() for b in row]
         for label in ("📊 状态", "📈 进度", "📜 下载记录",
-                      "📋 白名单", "🧵 并发", "🧹 清理"):
+                      "📋 白名单", "🧵 并发", "🧹 清理", "🖥 启动CD2"):
             self.assertIn(label, texts)
 
     def test_main_menu_text_non_empty(self):
@@ -134,6 +135,35 @@ class CleanTempFilesTest(unittest.TestCase):
         self.assertEqual(count, 2)
         remaining = sorted(os.listdir(self.dir))
         self.assertEqual(remaining, ["keep.mp4"])
+
+
+class CD2ConfigTest(unittest.TestCase):
+    """cd2_config：读取 tg_secrets.json 的 cd2 段（command/port）。"""
+
+    def _patch_secrets(self, value):
+        patcher = mock.patch.object(tg, "_SECRET_CONFIG", value)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_missing_cd2_defaults_to_empty_command(self):
+        self._patch_secrets({})
+        command, port = tg.cd2_config()
+        self.assertEqual(command, "")
+        self.assertEqual(port, 19798)
+
+    def test_reads_command_and_port(self):
+        self._patch_secrets({"cd2": {
+            "command": "~/software/cd2/clouddrive", "port": 19798,
+        }})
+        command, port = tg.cd2_config()
+        self.assertEqual(command, "~/software/cd2/clouddrive")
+        self.assertEqual(port, 19798)
+
+    def test_non_numeric_port_falls_back(self):
+        self._patch_secrets({"cd2": {"command": "cd2", "port": "abc"}})
+        command, port = tg.cd2_config()
+        self.assertEqual(command, "cd2")
+        self.assertEqual(port, 19798)
 
 
 class WhitelistCommitTest(unittest.TestCase):

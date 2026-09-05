@@ -4,6 +4,7 @@ import re
 import uuid
 import asyncio
 import logging
+import subprocess
 import mimetypes
 from pathlib import Path
 from urllib.parse import urlparse
@@ -256,6 +257,7 @@ MENU_ACTIONS = (
     "home", "status", "progress", "done", "wl", "wl_add",
     "wl_del", "thread", "clean", "back",
     "queue", "queue_del", "retry", "retry_run", "retry_del",
+    "cd2",
 )
 
 # ------------------------------------------------------------
@@ -2430,6 +2432,7 @@ def main_menu_buttons():
          Button.inline("🔁 待重试", encode_menu_data("retry"))],
         [Button.inline("🧵 并发", encode_menu_data("thread")),
          Button.inline("🧹 清理", encode_menu_data("clean"))],
+        [Button.inline("🖥 启动CD2", encode_menu_data("cd2"))],
     ]
 
 
@@ -2628,6 +2631,94 @@ def clean_temp_files(root=None):
     return count
 
 
+# ------------------------------------------------------------
+# 【启动 CD2】菜单按钮：CloudDrive2（本机网盘挂载/备份程序）独立进程的路径
+# 含本机用户名，属敏感配置，存在 tg_secrets.json 的 cd2 段，不入库。例如：
+#     "cd2": {
+#         "command": "~/software/clouddrive-2-macos-aarch64-1.0.10/clouddrive",
+#         "port": 19798
+#     }
+# 该按钮只出现在 owner 的 bot 私聊菜单里，owner 点击后先探测管理端口，
+# 已运行则提示无需重启，否则后台拉起独立进程并轮询端口确认。
+# ------------------------------------------------------------
+def cd2_config():
+    """读取 CD2 启动配置，返回 (command, port)。command 为空串表示未配置。"""
+    cfg = _SECRET_CONFIG.get("cd2") or {}
+    command = (cfg.get("command") or "").strip()
+    port = cfg.get("port") or 19798
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = 19798
+    return command, port
+
+
+async def cd2_is_running(port):
+    """探测 CD2 是否已在运行：管理端口能连上即视为运行中。"""
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", port), timeout=2
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+_CD2_PROC = None  # 启动的 CD2 子进程句柄（模块级持有，避免被 GC 告警/误关）
+
+
+def cd2_launch(command):
+    """后台启动 CD2 独立进程，脱离本进程组（随 userbot 退出不会被连带终止）。
+
+    输出追加写入 SAVE_FOLDER/cd2_launch.log 便于排查。返回日志文件路径。
+    """
+    global _CD2_PROC
+    command = os.path.expanduser(command)
+    log_path = os.path.join(SAVE_FOLDER, "cd2_launch.log")
+    log_file = open(log_path, "a", encoding="utf-8")
+    log_file.write(
+        f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 启动 CD2：{command}\n"
+    )
+    log_file.flush()
+    _CD2_PROC = subprocess.Popen(
+        [command],
+        stdout=log_file,
+        stderr=log_file,
+        start_new_session=True,
+        close_fds=True,
+    )
+    return log_path
+
+
+async def cd2_start_or_status():
+    """【启动 CD2】动作主体：已在运行 → 提示无需重启；否则启动并轮询端口。"""
+    command, port = cd2_config()
+    if await cd2_is_running(port):
+        return f"✅ CloudDrive2 已在运行（端口 {port}），无需重启"
+    if not command:
+        return (
+            "❌ 未配置 CD2 启动路径：请在 tg_secrets.json 的 cd2 段填 "
+            "command（独立程序绝对路径）后重试"
+        )
+    try:
+        log_path = cd2_launch(command)
+    except Exception as e:
+        return f"❌ 启动 CD2 失败：{type(e).__name__}: {e}"
+    for _ in range(20):
+        await asyncio.sleep(1.5)
+        if await cd2_is_running(port):
+            return f"✅ CloudDrive2 已启动（端口 {port}）"
+    return (
+        f"⏳ 启动命令已执行，但 {port} 端口约 30 秒内未就绪，"
+        f"可能仍在初始化。启动日志：{log_path}"
+    )
+
+
 def forward_source_info(fwd_from):
     """从转发头提取 (chat_id, 标题)，不依赖网络解析。
 
@@ -2762,6 +2853,8 @@ async def handle_menu_action(action, arg, event):
     if action == "clean":
         count = clean_temp_files()
         return f"🧹 清理完成，共删除 {count} 个临时文件", back_home_buttons()
+    if action == "cd2":
+        return await cd2_start_or_status(), back_home_buttons()
     if action == "queue":
         return format_queue_text(QUEUE), queue_menu_buttons()
     if action == "queue_del":
@@ -3090,6 +3183,18 @@ async def main():
             "如需菜单请在 %s 中补充 bot_token / bot_username。",
             SECRETS_FILE,
         )
+
+    # 启动清理：此时尚无任何下载，安全地删除历史遗留的 .download 半成品
+    # 临时文件（正常中断会由队列重启恢复，这里只清异常退出或文件名变更
+    # 产生的孤儿文件，避免它们长期占用磁盘）。
+    try:
+        _cleaned = clean_temp_files()
+        if _cleaned:
+            logger.warning(
+                f"🧹 启动清理：删除 {_cleaned} 个遗留 .download 临时文件"
+            )
+    except Exception as e:
+        logger.warning(f"启动清理 .download 临时文件失败：{e}")
 
     # 必须在事件循环内创建（见上方“Telegram Client”一节说明）
     client = create_client()
