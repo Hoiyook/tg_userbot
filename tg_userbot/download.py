@@ -16,6 +16,7 @@ from telethon.errors import AuthBytesInvalidError, RPCError
 
 from . import state
 from . import workers
+from . import config
 from .config import (
     DOWNLOAD_IDLE_TIMEOUT,
     DOWNLOAD_RETRIES,

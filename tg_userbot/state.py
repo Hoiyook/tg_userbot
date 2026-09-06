@@ -36,6 +36,9 @@ DOWNLOAD_WORKER_TARGET = 0    # 目标存活 worker 数（/thread 与 spawn 时�
 # 平台链接（抖音/Instagram）已投递给解析 bot 的消息 id（防重复触发）
 PROCESSING_DOUYIN_IDS = set()
 
+# bot 菜单「🍪 抖音Cookie」的等待输入标记：monotonic 时间戳，超过即窗口关闭
+COOKIE_INPUT_UNTIL = 0.0
+
 MY_ID = None  # 本人（owner）用户 id，登录后填充
 
 # 进行中下载注册表（/progress 指令用）

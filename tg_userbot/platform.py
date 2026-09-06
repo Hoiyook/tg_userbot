@@ -68,8 +68,12 @@ def extract_link_comment(text, urls):
     都会把这些碎屑拼进文件名。与媒体转发的待关联标注窗口不同，链接的
     评论必须和链接同一条消息（媒体是「前一条评论消息 + 后续媒体」）。
     """
+    # 已见的分享口令变体：'复制此链接，打开Dou音搜索…' 与
+    # '复制打开抖音，看看【xx的作品】…'——标记词按出现过的格式累加；
+    # 长度上限兜住没见过的新变体（真用户标注不会长到 60 字）
     _share_junk_markers = (
-        "复制此链接", "打开Dou音搜索", "打开抖音搜索", "直接观看视频",
+        "复制此链接", "复制打开抖音", "打开Dou音搜索", "打开抖音搜索",
+        "直接观看视频", "看看【",
     )
     if not text:
         return None
@@ -78,6 +82,8 @@ def extract_link_comment(text, urls):
         comment = comment.replace(url, " ")
     comment = re.sub(r"\s+", " ", comment).strip()
     if not comment or comment.startswith("/"):
+        return None
+    if len(comment) > 60:
         return None
     if any(marker in comment for marker in _share_junk_markers):
         return None
@@ -150,12 +156,28 @@ async def _handle_douyin_urls(message, douyin_urls):
     user_label = extract_link_comment(message.message or "", douyin_urls)
     remaining = []
     for url in douyin_urls:
-        result = await resolver.resolve_douyin(url)
+        try:
+            result = await resolver.resolve_douyin(url)
+        except Exception as e:
+            # resolve_douyin 理论上不抛（内部已全捕获），防御性兜底：
+            # 任何异常一律视同解析失败走 bot，链接绝不静默丢失
+            logger.warning(
+                f"⚠️ 本地解析异常，降级 bot：{type(e).__name__}: {e} | {url}"
+            )
+            result = None
         if result is None:
             remaining.append(url)
             continue
-        record = build_url_record("douyin", url, result, user_label=user_label)
-        await queue.enqueue_and_start(record)
+        try:
+            record = build_url_record("douyin", url, result, user_label=user_label)
+            await queue.enqueue_and_start(record)
+        except Exception as e:
+            # 入队失败（锁/磁盘等）同样不能让链接静默丢失 → bot 兜底
+            logger.warning(
+                f"⚠️ url 任务入队失败，降级 bot：{type(e).__name__}: {e} | {url}"
+            )
+            remaining.append(url)
+            continue
         logger.info(f"🛠 抖音链接已本地解析并入队下载：{record['final_name']}")
         try:
             await state.client.send_message(

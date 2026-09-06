@@ -71,6 +71,15 @@ class CleanupTextMessageTest(unittest.TestCase):
         msg = make_msg(text="🎬 抖音视频下载完成\n\n文件：x.mp4")
         self.assertTrue(cleanup.is_cleanup_message(msg))
 
+    def test_resolver_notification_prefixes_cleaned(self):
+        # 本地解析链的两条新通知也要纳入自动清理（2026-09-06 线上漏清理）
+        self.assertTrue(cleanup.is_cleanup_message(
+            make_msg(text="🛠 本地解析成功，已入队下载\n\n文件：x.mp4\n链接：…")
+        ))
+        self.assertTrue(cleanup.is_cleanup_message(
+            make_msg(text="❌ 直链下载失败\n\n文件：x.mp4\n请查看 download.log")
+        ))
+
     def test_setcleartime_command_cleaned(self):
         self.assertTrue(cleanup.is_cleanup_message(make_msg(text="/setcleartime 1m")))
 

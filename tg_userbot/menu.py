@@ -8,6 +8,7 @@ Button 为 Telethon 类型（telethon.Button），import 期无副作用。
 from telethon import Button
 
 from . import state
+from . import config
 from .config import DOWNLOAD_CONCURRENCY_MAX, MENU_ACTIONS
 
 
@@ -52,6 +53,7 @@ def main_menu_buttons():
          Button.inline("🔁 待重试", encode_menu_data("retry"))],
         [Button.inline("🧵 并发", encode_menu_data("thread")),
          Button.inline("🧹 清理", encode_menu_data("clean"))],
+        [Button.inline("🍪 抖音Cookie", encode_menu_data("cookie"))],
         [Button.inline("🖥 启动CD2", encode_menu_data("cd2")),
          Button.inline("🛑 停止CD2", encode_menu_data("cd2_stop"))],
         [Button.inline("🗂 备份记录", encode_menu_data("bak"))],
@@ -91,6 +93,34 @@ def retry_menu_buttons():
 
 def back_home_buttons():
     return [[Button.inline("🔙 返回主菜单", encode_menu_data("home"))]]
+
+
+def cookie_status_text():
+    """【🍪 抖音Cookie】按钮的状态视图（调用时动态读内存值，实时）。"""
+    cookie = getattr(config, "DOUYIN_COOKIE", "") or ""
+    if not cookie:
+        return (
+            "🍪 抖音 Cookie\n\n"
+            "状态：未配置\n"
+            "（本地解析大概率失败，抖音链接将走解析 bot 兜底）"
+        )
+    sess = "含登录态 sessionid ✅" if "sessionid=" in cookie else (
+        "⚠️ 未检测到 sessionid（可能非登录态）"
+    )
+    return (
+        "🍪 抖音 Cookie\n\n"
+        f"状态：已配置（{len(cookie)} 字符，{sess}）\n"
+        f"片段：{config.mask_douyin_cookie(cookie)}\n"
+        "来源：tg_secrets.json（更新后实时生效）"
+    )
+
+
+def cookie_menu_buttons():
+    return [
+        [Button.inline("✏️ 更新", encode_menu_data("cookie_set")),
+         Button.inline("🗑 清除", encode_menu_data("cookie_clear"))],
+        [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
+    ]
 
 
 def wl_menu_buttons():

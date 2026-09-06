@@ -77,6 +77,21 @@ class ExtractLinkCommentTest(unittest.TestCase):
             extract_link_comment(text, ["https://v.douyin.com/4ON7srxPgME/"])
         )
 
+    def test_douyin_share_variant_copy_open_app_is_not_label(self):
+        # '复制打开抖音，看看【xx的作品】…' 变体（2026-09-06 线上实抓）
+        text = ("2.02 Bgb__ 05_18 _2pm R@x.se "
+                "https://v.douyin.com/4Me3dEXUHEs/ "
+                "复制打开抖音，看看【大胜锅锅的作品】《逝后道歉》")
+        self.assertIsNone(
+            extract_link_comment(text, ["https://v.douyin.com/4Me3dEXUHEs/"])
+        )
+
+    def test_overlong_remainder_is_not_label(self):
+        # 未知新变体的兜底：>60 字的剩余文本不可能是手打标注
+        junk = "字" * 61
+        self.assertIsNone(extract_link_comment(f"{junk} https://v.douyin.com/x/",
+                                               ["https://v.douyin.com/x/"]))
+
 
 class ComputeUrlFilenameTest(unittest.TestCase):
     """compute_url_filename：日期前缀 + #标注 + 标题，与媒体流同一视觉。"""

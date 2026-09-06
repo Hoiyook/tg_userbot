@@ -116,6 +116,24 @@ class DouyinRoutingTest(unittest.TestCase):
         self.assertEqual(enq.await_count, 0)
         self.assertEqual(len(self._douyin_relay_calls(relay)), 1)
 
+    def test_enqueue_failure_falls_back_to_bot(self):
+        # 入队抛异常（锁/磁盘等）也不许静默丢链接 → 该链接走 bot 兜底
+        message = mock.Mock()
+        message.id = 2
+        message.message = "https://v.douyin.com/x/"
+        with mock.patch.object(config, "RESOLVER_ENABLED", True), \
+             mock.patch("tg_userbot.resolver.resolve_douyin",
+                        new=mock.AsyncMock(return_value=_result())), \
+             mock.patch.object(queue, "enqueue_and_start",
+                               new=mock.AsyncMock(side_effect=RuntimeError("锁炸了"))), \
+             mock.patch.object(platform, "_relay_kind_links",
+                               new=mock.AsyncMock()) as relay, \
+             mock.patch.object(state, "client", new=mock.AsyncMock()):
+            asyncio.new_event_loop().run_until_complete(
+                platform.relay_platform_links(message, ["https://v.douyin.com/x/"], [])
+            )
+        self.assertEqual(len(self._douyin_relay_calls(relay)), 1)
+
 
 class DownloadUrlMediaTest(unittest.TestCase):
     """download_url_media 用 httpx MockTransport 模拟 CDN 的真实流式写盘。"""
@@ -131,6 +149,18 @@ class DownloadUrlMediaTest(unittest.TestCase):
 
     def _run(self, coro):
         return self.loop.run_until_complete(coro)
+
+    def test_make_http_client_constructible_with_douyin_headers(self):
+        # 回归：download 曾漏 import config（NameError），测试里 mock 掉
+        # 工厂恰好没执行到——这里真实构造一次客户端，验证可直接用
+        client = download._make_http_client(5)
+        try:
+            ua = client.headers.get("user-agent", "")
+            self.assertIn("Mozilla/5.0", ua)
+            self.assertEqual(client.headers.get("referer"), config.DOUYIN_HEADERS["Referer"])
+        finally:
+            import asyncio as _aio
+            self.loop.run_until_complete(client.aclose())
 
     def test_success_writes_and_replaces(self):
         record = {

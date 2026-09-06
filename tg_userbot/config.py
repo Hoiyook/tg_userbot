@@ -292,6 +292,10 @@ DOUYIN_HEADERS = {
     "Referer": "https://www.douyin.com/",
 }
 
+# bot 菜单更新 cookie 的等待输入窗口（秒）：超时后 bot 对话里的普通文本
+# 不再当作 cookie 内容，需重新点【✏️ 更新】
+COOKIE_INPUT_WINDOW_SECONDS = 120
+
 # ============================================================
 # 下载并发
 # ============================================================
@@ -334,7 +338,58 @@ MENU_ACTIONS = (
     "wl_del", "thread", "clean", "back",
     "queue", "queue_del", "retry", "retry_run", "retry_del",
     "cd2", "cd2_stop", "bak",
+    "cookie", "cookie_set", "cookie_clear",
 )
+
+
+def mask_douyin_cookie(cookie):
+    """把 cookie 掩码成可展示片段：前 12 字符 + … + 后 4 字符（纯函数）。"""
+    raw = str(cookie or "").strip()
+    if not raw:
+        return ""
+    if len(raw) <= 20:
+        return raw[:4] + "…"
+    return f"{raw[:12]}…{raw[-4:]}"
+
+
+def save_douyin_cookie(value, path=None):
+    """把抖音 cookie 写入 tg_secrets.json（原子替换）并更新内存值。
+
+    实时生效的关键：resolver._douyin_kwargs 每次解析都动态读
+    config.DOUYIN_COOKIE 属性，这里同步更新后立即作用于下一次解析。
+    保留文件里其它字段（api_id/bot_token/cd2 等）。返回错误文案，None=成功。
+    """
+    global DOUYIN_COOKIE
+    target = path or SECRETS_FILE
+    # 直接重新读盘，拿文件里最新的其它字段
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except FileNotFoundError:
+        data = {}
+    except Exception:
+        return f"tg_secrets.json 解析失败，拒绝覆盖（请手工修复该文件）"
+
+    value = str(value or "").strip()
+    data["douyin_cookie"] = value
+
+    tmp_path = target + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, target)
+    except Exception as e:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return f"写入失败：{type(e).__name__}: {e}"
+
+    DOUYIN_COOKIE = value
+    return None
 
 # ------------------------------------------------------------
 # 持久化下载队列：任务先入队（媒体存消息引用、平台链接存完整 URL），
@@ -393,6 +448,9 @@ CLEAN_NOTIFICATION_PREFIXES = (
     "🎬 抖音视频下载完成",
     "❌ 抖音视频下载失败",
     "❌ 抖音链接处理失败",
+    # 本地解析链（url 任务）的通知
+    "🛠 本地解析成功",
+    "❌ 直链下载失败",
     # /setcleartime 的回复
     "✅ 自动清理间隔已设置为",
     "⏸ 自动清理已关闭。",

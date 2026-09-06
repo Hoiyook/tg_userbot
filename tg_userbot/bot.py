@@ -9,6 +9,7 @@ DOWNLOAD_CONCURRENCY / WHITELIST_CHATS）；共享服务函数分布在 text / m
 queue / thread / whitelist / cleanup / cd2 模块，以模块对象调用。
 """
 import asyncio
+import time
 
 from telethon import Button
 from telethon.utils import get_peer_id
@@ -21,6 +22,7 @@ from . import thread
 from . import whitelist
 from . import cleanup
 from . import cd2
+from . import config
 from .config import DONE_DEFAULT_LINES
 from .log import logger
 from .naming import sanitize_filename
@@ -79,6 +81,27 @@ async def handle_menu_action(action, arg, event):
         return await cd2.cd2_stop_or_status(), menu.back_home_buttons()
     if action == "bak":
         return cd2.backup_records_text(), menu.back_home_buttons()
+    if action == "cookie":
+        return menu.cookie_status_text(), menu.cookie_menu_buttons()
+    if action == "cookie_set":
+        state.COOKIE_INPUT_UNTIL = (
+            time.monotonic() + config.COOKIE_INPUT_WINDOW_SECONDS
+        )
+        return (
+            "🍪 请直接发送 cookie 内容（整段粘贴，发到本对话）。\n\n"
+            f"⚠️ 你发的这条消息会被立即删除；"
+            f"{config.COOKIE_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "超时请重新点【✏️ 更新】。发送 / 开头的命令可取消。",
+            menu.back_home_buttons(),
+        )
+    if action == "cookie_clear":
+        err = config.save_douyin_cookie("")
+        if err:
+            return f"❌ {err}", menu.cookie_menu_buttons()
+        return (
+            "🗑 已清除（实时生效，抖音链接将走解析 bot 兜底）",
+            menu.cookie_menu_buttons(),
+        )
     if action == "queue":
         return queue.format_queue_text(state.QUEUE), menu.queue_menu_buttons()
     if action == "queue_del":
@@ -137,6 +160,15 @@ async def bot_message_handler(event):
     fwd = getattr(message, "fwd_from", None)
     from_id = getattr(fwd, "from_id", None) if fwd else None
 
+    # cookie 等待窗口：普通文本当作 cookie 内容（/ 开头视为命令退出窗口）。
+    # 窗口一次即关：无论存没存上，都不会把后续普通文本误吃成 cookie。
+    if state.COOKIE_INPUT_UNTIL and time.monotonic() < state.COOKIE_INPUT_UNTIL:
+        if not text.startswith("/"):
+            state.COOKIE_INPUT_UNTIL = 0.0
+            await _handle_cookie_input(event, text)
+            return
+        state.COOKIE_INPUT_UNTIL = 0.0
+
     if from_id:
         chat_id, title = await whitelist.resolve_wl_target(
             state.bot_client, None, fwd
@@ -174,6 +206,38 @@ async def bot_message_handler(event):
         state.MY_ID,
         menu.build_main_menu_text(),
         buttons=menu.main_menu_buttons(),
+    )
+
+
+async def _handle_cookie_input(event, text):
+    """处理等待窗口内发来的 cookie 文本：立即删原文 → 原子持久化 → 实时生效。
+
+    敏感凭据不留在对话里：即使保存失败也先删原文（失败可重新粘贴）。
+    """
+    try:
+        await event.delete()
+    except Exception as e:
+        logger.warning(f"删除 cookie 消息失败（不影响保存）：{e}")
+
+    if not text:
+        await state.bot_client.send_message(state.MY_ID, "❌ 内容为空，已取消")
+        return
+
+    err = config.save_douyin_cookie(text)
+    if err:
+        await state.bot_client.send_message(state.MY_ID, f"❌ 保存失败：{err}")
+        return
+
+    cookie = config.DOUYIN_COOKIE
+    sess = "含登录态 sessionid ✅" if "sessionid=" in cookie else (
+        "⚠️ 未检测到 sessionid（可能非登录态，公开视频仍可解析）"
+    )
+    await state.bot_client.send_message(
+        state.MY_ID,
+        "✅ 抖音 Cookie 已更新，实时生效\n\n"
+        f"长度：{len(cookie)} 字符\n"
+        f"片段：{config.mask_douyin_cookie(cookie)}\n"
+        f"{sess}",
     )
 
 
