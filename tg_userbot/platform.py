@@ -63,9 +63,14 @@ def extract_link_comment(text, urls):
     """从「评论 + 链接」混合消息里提取链接外的文字作为命名标注（纯函数）。
 
     例：'自存 https://v.douyin.com/x' → '自存'。纯链接、命令（/ 开头）、
-    空文本 → None。与媒体转发的待关联标注窗口不同，链接的评论必须和链接
-    同一条消息（媒体是「前一条评论消息 + 后续媒体」两种事件）。
+    空文本 → None。抖音分享口令的剩余文案（'6.46 mqR:/ … 复制此链接，
+    打开Dou音搜索…'）不是用户标注，也判 None——否则每次粘贴分享文案
+    都会把这些碎屑拼进文件名。与媒体转发的待关联标注窗口不同，链接的
+    评论必须和链接同一条消息（媒体是「前一条评论消息 + 后续媒体」）。
     """
+    _share_junk_markers = (
+        "复制此链接", "打开Dou音搜索", "打开抖音搜索", "直接观看视频",
+    )
     if not text:
         return None
     comment = text
@@ -73,6 +78,8 @@ def extract_link_comment(text, urls):
         comment = comment.replace(url, " ")
     comment = re.sub(r"\s+", " ", comment).strip()
     if not comment or comment.startswith("/"):
+        return None
+    if any(marker in comment for marker in _share_junk_markers):
         return None
     return comment
 

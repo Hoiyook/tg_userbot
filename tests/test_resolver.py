@@ -68,6 +68,15 @@ class ExtractLinkCommentTest(unittest.TestCase):
     def test_empty_text_returns_none(self):
         self.assertIsNone(extract_link_comment("", ["x"]))
 
+    def test_douyin_share_text_is_not_treated_as_label(self):
+        # 分享口令粘贴：链接外的剩余全是口令碎屑，不能当标注拼进文件名
+        text = ("6.46 mqR:/ 11/07 :5pm C@u.FH # 瑜伽裤仿佛没有极限 "
+                "https://v.douyin.com/4ON7srxPgME/ "
+                "复制此链接，打开Dou音搜索，直接观看视频！")
+        self.assertIsNone(
+            extract_link_comment(text, ["https://v.douyin.com/4ON7srxPgME/"])
+        )
+
 
 class ComputeUrlFilenameTest(unittest.TestCase):
     """compute_url_filename：日期前缀 + #标注 + 标题，与媒体流同一视觉。"""
