@@ -119,6 +119,9 @@ def cookie_menu_buttons():
     return [
         [Button.inline("✏️ 更新", encode_menu_data("cookie_set")),
          Button.inline("🗑 清除", encode_menu_data("cookie_clear"))],
+        [Button.inline("🌐 Chrome", encode_menu_data("cookie_imp", "chrome")),
+         Button.inline("🌐 Edge", encode_menu_data("cookie_imp", "edge")),
+         Button.inline("🌐 Firefox", encode_menu_data("cookie_imp", "firefox"))],
         [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
     ]
 

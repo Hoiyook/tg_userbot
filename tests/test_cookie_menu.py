@@ -6,6 +6,7 @@
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -17,6 +18,7 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 import telethon  # noqa: E402
 
 from tg_userbot import bot, config, menu, state  # noqa: E402
+from tg_userbot import browser_cookies  # noqa: E402
 
 
 def _write_secrets(path, extra=None):
@@ -175,3 +177,88 @@ class CookieInputHandlingTest(unittest.TestCase):
             bc.send_message = mock.AsyncMock()
             self._run(bot._handle_cookie_input(event, ""))
         self.assertIn("内容为空", bc.send_message.await_args.args[1])
+
+
+class _FakeCookie:
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+
+
+class _FakeJar:
+    def __init__(self, cookies):
+        self._cookies = cookies
+
+    def __iter__(self):
+        return iter(self._cookies)
+
+
+class BrowserImportTest(unittest.TestCase):
+    """从浏览器导入：loader 选择/拼接/错误路径（mock browser_cookie3）。"""
+
+    def setUp(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.path = os.path.join(_TMP, f"secrets_imp_{id(self)}.json")
+        _write_secrets(self.path)
+        self._orig_cookie = config.DOUYIN_COOKIE
+
+    def tearDown(self):
+        config.DOUYIN_COOKIE = self._orig_cookie
+        asyncio.set_event_loop(None)
+        self.loop.close()
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _run(self, coro):
+        return self.loop.run_until_complete(coro)
+
+    def _fake_bc3(self, cookies):
+        mod = mock.Mock()
+        mod.chrome = mock.Mock(return_value=_FakeJar(cookies))
+        return mod
+
+    def test_joins_cookies_with_sessionid(self):
+        jar = _FakeJar([
+            _FakeCookie("ttwid", "1%7C"),
+            _FakeCookie("sessionid", "XYZ"),
+            _FakeCookie("nullval", None),  # 无值 cookie 跳过
+        ])
+        with mock.patch.dict(sys.modules, {"browser_cookie3": self._fake_bc3(jar)}):
+            cookie, err = browser_cookies.load_browser_cookie_string("chrome")
+        self.assertIsNone(err)
+        self.assertEqual(cookie, "ttwid=1%7C; sessionid=XYZ")
+
+    def test_empty_jar_errors(self):
+        with mock.patch.dict(sys.modules, {"browser_cookie3": self._fake_bc3([])}):
+            cookie, err = browser_cookies.load_browser_cookie_string("chrome")
+        self.assertIsNone(cookie or None)
+        self.assertIn("没有 douyin.com 的 cookie", err)
+
+    def test_unknown_browser_errors(self):
+        cookie, err = browser_cookies.load_browser_cookie_string("safari")
+        self.assertIn("不支持", err)
+
+    def test_import_failure_errors(self):
+        with mock.patch.dict(sys.modules, {"browser_cookie3": None}):
+            cookie, err = browser_cookies.load_browser_cookie_string("chrome")
+        self.assertIn("browser_cookie3 不可用", err)
+
+    def test_menu_has_three_import_buttons(self):
+        datas = [b.data for row in menu.cookie_menu_buttons() for b in row]
+        for browser in ("chrome", "edge", "firefox"):
+            self.assertIn(f"m:cookie_imp:{browser}".encode(), datas)
+
+    def test_cookie_imp_action_saves_and_replies(self):
+        cookie = "ttwid=IMP; sessionid=IMP"
+        with mock.patch.object(
+            browser_cookies, "load_browser_cookie_string",
+            return_value=(cookie, None),
+        ), \
+             mock.patch.object(config, "SECRETS_FILE", self.path):
+            text, _ = self._run(
+                bot.handle_menu_action("cookie_imp", "chrome", None)
+            )
+        self.assertIn("chrome 导入", text)
+        self.assertIn("实时生效", text)
+        self.assertEqual(config.DOUYIN_COOKIE, cookie)

@@ -338,7 +338,7 @@ MENU_ACTIONS = (
     "wl_del", "thread", "clean", "back",
     "queue", "queue_del", "retry", "retry_run", "retry_del",
     "cd2", "cd2_stop", "bak",
-    "cookie", "cookie_set", "cookie_clear",
+    "cookie", "cookie_set", "cookie_clear", "cookie_imp",
 )
 
 

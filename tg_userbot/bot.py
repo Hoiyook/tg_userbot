@@ -102,6 +102,29 @@ async def handle_menu_action(action, arg, event):
             "🗑 已清除（实时生效，抖音链接将走解析 bot 兜底）",
             menu.cookie_menu_buttons(),
         )
+    if action == "cookie_imp":
+        # 读浏览器 Cookie 库可能等钥匙串授权框，放线程池，不阻塞事件循环
+        from . import browser_cookies
+        browser = (arg or "").strip().lower()
+        cookie, err = await asyncio.get_event_loop().run_in_executor(
+            None, browser_cookies.load_browser_cookie_string, browser
+        )
+        if err:
+            return f"❌ {err}", menu.cookie_menu_buttons()
+        err = config.save_douyin_cookie(cookie)
+        if err:
+            return f"❌ {err}", menu.cookie_menu_buttons()
+        saved = config.DOUYIN_COOKIE
+        sess = "含登录态 sessionid ✅" if "sessionid=" in saved else (
+            "⚠️ 未检测到 sessionid（可能非登录态）"
+        )
+        return (
+            f"🌐 已从 {browser} 导入并实时生效\n\n"
+            f"长度：{len(saved)} 字符\n"
+            f"片段：{config.mask_douyin_cookie(saved)}\n"
+            f"{sess}",
+            menu.cookie_menu_buttons(),
+        )
     if action == "queue":
         return queue.format_queue_text(state.QUEUE), menu.queue_menu_buttons()
     if action == "queue_del":
@@ -257,6 +280,10 @@ async def bot_callback_handler(event):
             await event.edit(
                 text, buttons=buttons, link_preview=False
             )
+    except MessageNotModifiedError:
+        # 重复点击生成相同内容（如钥匙串拒绝后连点两次同一导入按钮）：
+        # Telegram 拒绝无变化编辑，属正常噪音，静默应答即可
+        logger.info("🤖 bot 菜单回调：内容无变化，忽略")
     except Exception as e:
         logger.exception(f"bot 菜单处理失败：{e}")
         try:
