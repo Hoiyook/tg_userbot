@@ -55,7 +55,10 @@ def _make_http_client(timeout):
     """
     import httpx
 
-    return httpx.AsyncClient(timeout=timeout)
+    # CDN 直链对 UA/Referer 敏感（裸请求 403），带抖音 Web 端标准头
+    return httpx.AsyncClient(
+        timeout=timeout, headers=config.DOUYIN_HEADERS
+    )
 
 
 async def _stream_url_to_file(client, url, temp_path, on_progress):

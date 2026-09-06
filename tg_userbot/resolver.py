@@ -53,16 +53,10 @@ def _douyin_kwargs() -> dict:
     DouyinCrawler 会取 kwargs["cookie"]（缺 KeyError）并合并进 headers；
     proxies 显式给「不走代理」的默认值（抖音是境内服务，直连）。
     """
+    headers = dict(getattr(config, "DOUYIN_HEADERS", {}))
     return {
         "cookie": getattr(config, "DOUYIN_COOKIE", "") or "",
-        "headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Referer": "https://www.douyin.com/",
-        },
+        "headers": headers,
         "proxies": {"http://": None, "https://": None},
         "timeout": 15,
         "max_retries": 2,

@@ -280,6 +280,18 @@ RESOLVER_TIMEOUT_SECONDS = 30
 # 缺省空串 → f2 请求大概率失败 → 自动降级 bot，不硬性要求配置。
 DOUYIN_COOKIE = _SECRET_CONFIG.get("douyin_cookie", "")
 
+# 抖音 Web 端通用请求头（f2 详情接口 + CDN 直链下载共用）。CDN 直链对
+# UA/Referer 敏感：裸请求（无 UA）会被 douyinvod 拒绝 403，下载必须带。
+DOUYIN_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+DOUYIN_HEADERS = {
+    "User-Agent": DOUYIN_UA,
+    "Referer": "https://www.douyin.com/",
+}
+
 # ============================================================
 # 下载并发
 # ============================================================

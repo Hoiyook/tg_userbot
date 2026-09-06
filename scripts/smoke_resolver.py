@@ -32,10 +32,32 @@ async def main(url: str):
     print(f"   直链    ：{result.direct_url[:120]}...")
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.head(result.direct_url, follow_redirects=True)
-        size = int(resp.headers.get("content-length") or 0)
-        print(f"   大小    ：{size / 1024 / 1024:.2f} MB（HEAD {resp.status_code}）")
+        # CDN 常拒绝裸 HEAD（403），用「带标准头的 Range GET」模拟真实
+        # 下载行为（下载分支同款 UA/Referer），并从 content-range 取总大小
+        async with httpx.AsyncClient(
+            timeout=15, headers=config.DOUYIN_HEADERS, follow_redirects=True
+        ) as client:
+            resp = await client.get(
+                result.direct_url, headers={"Range": "bytes=0-1023"}
+            )
+        total = None
+        cr = resp.headers.get("content-range") or ""
+        if "/" in cr:
+            try:
+                total = int(cr.rsplit("/", 1)[1])
+            except ValueError:
+                pass
+        if total is None and resp.headers.get("content-length"):
+            try:
+                total = int(resp.headers["content-length"])
+            except ValueError:
+                pass
+        if resp.status_code in (200, 206):
+            size_txt = f"{total / 1024 / 1024:.2f} MB" if total else "未知"
+            print(f"   大小    ：{size_txt}（Range GET {resp.status_code}，可下载 ✅）")
+        else:
+            print(f"   大小    ：验证请求 {resp.status_code}（解析已成功；"
+                  "若实际下载也 403 需要再调请求头）")
     except Exception as e:
         print(f"   大小    ：HEAD 校验失败（不影响解析）：{e}")
     return 0
