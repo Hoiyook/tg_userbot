@@ -263,6 +263,7 @@ async def _run_queued_task(record):
             message,
             record.get("source_override"),
             caption_override=record.get("album_caption"),
+            label_override=record.get("user_label"),
         )
     # 旧版平台链接任务（douyin/instagram）已随统一下载链路退役：落到这里的
     # 是历史 JSON 残留，按未知类型移除 + 记日志，不崩不卡队列。

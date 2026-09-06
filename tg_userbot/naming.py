@@ -216,19 +216,75 @@ def date_prefix(message) -> str:
     """原消息日期前缀，形如 '26-09-05 '（`%y-%m-%d `），供文件名开头排序/防重名。
 
     统一下载链路后抖音/IG 视频等都用通用命名落同来源目录，同名会撞出
-    (1)(2)；前缀消息日期可天然防撞并带时间序。message.date 缺失/异常时
-    返回空串（不强加前缀）。纯函数、无 I/O。
+    (1)(2)；前缀消息日期可天然防撞并带时间序。
+
+    转发副本取「最初日期」：优先 fwd_from.date（转发来源那条消息的发送日
+    期，如频道原帖日期），缺失才退回 message.date（转发时间）。Telegram 的
+    日期是 UTC 感知时间，按本地时区渲染（= 客户端里看到的日期），避免晚间
+    发布的内容差一天。日期缺失/异常时返回空串（不强加前缀）。纯函数、无 I/O。
     """
     try:
-        d = getattr(message, "date", None)
+        fwd = getattr(message, "fwd_from", None)
+        d = getattr(fwd, "date", None) if fwd is not None else None
+        if d is None:
+            d = getattr(message, "date", None)
         if d is None:
             return ""
+        if d.tzinfo is not None:
+            d = d.astimezone()
         return d.strftime("%y-%m-%d ")
     except Exception:
         return ""
 
 
-def compute_final_filename(message, caption=None) -> str:
+def _label_piece(label) -> str:
+    """把「手工转发标注」整理成带 # 前缀的标签段（无有效文本返回空串）。
+
+    代码统一加 '#' 作标注前缀，与后接的原 caption 空格分隔（如
+    '#自存 标题…'）。用户已自打 '#' 开头时去掉，避免 '##xx'；空串/只含
+    '#' 等清理后无字可用的都返回空串——不能交给 sanitize_filename，它把
+    空串兜成「未命名文件」，会让空标注误成 '#未命名文件'。
+    """
+    if label is None:
+        return ""
+    raw = str(label).strip()
+    if not raw:
+        return ""
+    piece = sanitize_filename(raw).lstrip("#")
+    return f"#{piece}" if piece else ""
+
+
+def _fit_text_parts(label_piece, caption, budget_bytes):
+    """把 label 段与 caption 段拼进 ≤ budget_bytes 的字节预算，返回文字段。
+
+    裁剪优先级：先保 #标注（用户手工打的、通常很短）→ 从 caption 尾部整字
+    裁（超长的是 douyin/IG 那一大段原说明）→ 标注自身也放不下时才最后裁标注。
+    budget_bytes ≤ 0 或两者皆无时返回空串。
+    """
+    if budget_bytes <= 0:
+        return ""
+    if not caption:
+        return _truncate_utf8_bytes(label_piece, budget_bytes)
+    head = f"{label_piece} " if label_piece else ""
+    if len(head.encode("utf-8")) + len(caption.encode("utf-8")) <= budget_bytes:
+        return head + caption
+    caption_budget = budget_bytes - len(head.encode("utf-8"))
+    if caption_budget > 0:
+        return head + _truncate_utf8_bytes(caption, caption_budget)
+    # 标注本身已超出剩余预算：最后才动标注（仍整字截）
+    return _truncate_utf8_bytes(label_piece, budget_bytes)
+
+
+def _truncate_utf8_bytes(text, max_bytes):
+    """把整段文本按 UTF-8 字节整字截短到 ≤ max_bytes（不丢半个字符）。"""
+    if not text or max_bytes <= 0:
+        return ""
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+    return text.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def compute_final_filename(message, caption=None, label=None, max_bytes=None) -> str:
     """根据消息计算最终落盘文件名（download_file 与队列展示共用）。
 
     规则：文件名开头加原消息日期前缀（'YY-MM-DD '，见 date_prefix）；有
@@ -236,27 +292,44 @@ def compute_final_filename(message, caption=None) -> str:
     媒体类型_时间戳 兜底；原名缺后缀时按 MIME 推断。唯一例外：纯兜底名
     媒体类型_时间戳 已含消息日期，不再前缀以免冗余。
 
+    label 参数：手工转发时在输入框里打的评论（见 app.py 的待关联标注），代码
+    加 '#' 前缀后与 caption 空格拼接，排在最前：'<date> #<label> <caption>…'。
+    通常很短；真超长时随预算一起被裁（见 max_bytes）。
+
     caption 参数：显式传入覆盖「消息自身文字」作为命名用说明（默认 None =
     取消息自带 caption）。相册的转发副本无法补 caption，调用方把从源 chat 读
     到的同组说明传进来，无文字图片即可沿用相册标题命名而非媒体类型_时间戳。
+
+    max_bytes 参数：非 None 时开启字节预算（download_file 传 MAX_FILENAME_BYTES），
+    拼出超限名时按用户约定的优先级裁剪——文件名/日期前缀最后才动、先裁原
+    caption、然后才裁 #标注。None（缺省，队列展示/单测用）不裁剪、照原样拼。
     """
     original_filename = sanitize_filename(get_original_filename(message))
     if caption is None:
         caption = get_caption(message)
     else:
-        caption = sanitize_filename(str(caption or "").strip()) if str(caption or "").strip() else ""
+        raw = str(caption or "").strip()
+        caption = sanitize_filename(raw) if raw else ""
+
+    label_piece = _label_piece(label)  # '#xxx' 或 ''
 
     extension = get_file_extension(message, original_filename)
     if extension and not os.path.splitext(original_filename)[1]:
         original_filename += extension
 
     prefix = date_prefix(message)
+    meaningful = not is_meaningless_filename(original_filename)
+    # 无意义文件名时的扩展名：原名带出的优先，否则按 MIME 推断的
+    m_ext = os.path.splitext(original_filename)[1] or extension or ""
 
-    if is_meaningless_filename(original_filename):
-        ext = os.path.splitext(original_filename)[1] or extension or ""
-        if caption:
-            return prefix + sanitize_filename(caption + ext)
+    if meaningful:
+        base = original_filename
 
+        def assemble(text_block):
+            if text_block:
+                return prefix + text_block + " - " + base
+            return prefix + base
+    else:
         if message.voice:
             kind = "voice"
         elif message.video:
@@ -267,9 +340,28 @@ def compute_final_filename(message, caption=None) -> str:
             kind = "audio"
         else:
             kind = "file"
-        # 兜底名已含 媒体类型_时间戳（同为消息日期），不再前缀
-        return generate_fallback_filename(message, kind) + ext
 
-    if caption:
-        return prefix + sanitize_filename(f"{caption} - {original_filename}")
-    return prefix + original_filename
+        def assemble(text_block):
+            if text_block:
+                return prefix + text_block + m_ext
+            # 兜底名已含 媒体类型_时间戳（同为消息日期），不再前缀
+            return generate_fallback_filename(message, kind) + m_ext
+
+    text_block = " ".join(p for p in (label_piece, caption) if p)
+    if max_bytes is None:
+        return assemble(text_block)
+
+    # ---- 字节预算版：先算「文字段」可用预算，保 日期前缀+文件名/后缀 ----
+    if meaningful:
+        overhead = len((prefix + " - " + base).encode("utf-8"))
+    else:
+        overhead = len((prefix + m_ext).encode("utf-8"))
+    allowed_text = max_bytes - overhead
+    if allowed_text > 0:
+        return assemble(_fit_text_parts(label_piece, caption, allowed_text))
+    # 文字段一点预算都分不到（极罕见：光原名就已超限）→ 退回无文字命名
+    name = assemble("")
+    if meaningful:
+        # 原名自身也可能超限 → 最后手段才截文件名（保扩展名）
+        return truncate_filename(name, max_bytes)
+    return name

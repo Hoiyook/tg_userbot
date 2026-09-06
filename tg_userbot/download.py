@@ -20,6 +20,7 @@ from .config import (
     DOWNLOAD_IDLE_TIMEOUT,
     DOWNLOAD_RETRIES,
     EXPORT_RACE_EXTRA_RETRIES,
+    MAX_FILENAME_BYTES,
     PROGRESS_STEP,
     SAVE_FOLDER,
 )
@@ -31,7 +32,6 @@ from .naming import (
     get_caption,
     get_original_filename,
     sanitize_filename,
-    truncate_filename,
 )
 from .sources import message_source_link, resolve_download_source
 
@@ -104,16 +104,25 @@ def unregister_download(did):
     state.ACTIVE_DOWNLOADS.pop(did, None)
 
 
-async def download_file(message, source_override=None, caption_override=None):
+async def download_file(message, source_override=None, caption_override=None,
+                        label_override=None):
     async with state.DOWNLOAD_SEMAPHORE:
         source = await resolve_download_source(message, source_override)
         # 命名用 caption：消息自带文字优先；否则用调用方继承的相册同组说明
         # （转发副本无 caption，图片名靠它避免落到 媒体类型_时间戳 兜底名）
         own_caption = get_caption(message)
         caption = own_caption or (caption_override or "")
-        # 超长标题/说明会拼出超 255 字节的文件名（Errno 63），按字节整字截短
-        final_filename = truncate_filename(
-            compute_final_filename(message, caption=caption or None)
+        # 最终名一次交给 compute_final_filename：label（手工转发评论，代码加 #）
+        # 与原 caption 一并拼入；超出字节上限时按用户约定的优先级裁剪——先裁原
+        # caption、其次才动 #标注、最后才截文件名（早年对整名一刀切的
+        # truncate_filename 会先截文件名一侧，恰与需求相反，已弃用）。
+        final_filename = str(
+            compute_final_filename(
+                message,
+                caption=caption or None,
+                label=label_override,
+                max_bytes=MAX_FILENAME_BYTES,
+            )
         )
         # 日志展示用（与 final_filename 的计算共用同一套规则）
         original_filename = sanitize_filename(get_original_filename(message))

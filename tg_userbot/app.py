@@ -12,6 +12,7 @@ new_message_handler 是唯一的用户事件入口：classify_message_chat 判�
 import asyncio
 import os
 import signal
+import time
 
 from telethon import TelegramClient, events
 from telethon.network.connection import ConnectionTcpFull, ConnectionTcpObfuscated
@@ -40,6 +41,8 @@ from .config import (
     LOG_FILE,
     LOGIN_RETRIES,
     LOGIN_TIMEOUT_SECONDS,
+    ME_LABEL_GRACE_SECONDS,
+    ME_LABEL_WINDOW_SECONDS,
     PROXY,
     QUEUE_FETCH_TIMEOUT,
     SAVE_FOLDER,
@@ -321,9 +324,24 @@ async def new_message_handler(event):
 
         # 判断是否是可下载媒体
         if not is_downloadable(message):
-            logger.info(
-                f"消息 ID={message.id} 没有检测到可下载媒体，忽略"
-            )
+            # Saved Messages 里的一条「纯用户评论」：转发带 caption 的媒体前在
+            # 输入框打的字（Telegram 把它发成评论消息、媒体紧跟其后，评论不进
+            # 转发副本的 caption）。记作待关联标注，让随后窗口内到达的媒体在
+            # 下载命名时拼上。排除命令/抖音链接（前面已早退）/程序消息（命令
+            # 回复、通知等由 is_cleanup_message 判定）——只有像样的人类短文本
+            # 才当作评论记录。
+            if (
+                is_me
+                and text
+                and not text.startswith("/")
+                and not cleanup.is_cleanup_message(message)
+            ):
+                _record_me_label(text)
+                logger.info(f"🏷 记录待关联转发评论：\"{text}\"")
+            else:
+                logger.info(
+                    f"消息 ID={message.id} 没有检测到可下载媒体，忽略"
+                )
             return
 
         logger.info(
@@ -349,12 +367,14 @@ async def new_message_handler(event):
 
 
 def _build_media_record(message, chat_id, source_override, source_link=None,
-                        album_caption=None):
+                        album_caption=None, user_label=None):
     """组装一条 media 队列任务记录（入队展示与实际下载命名共用同一规则）。
 
     album_caption：相册无自身文字的成员继承到的同组说明。转发副本本身没有
     caption，把它持久化进记录，下载/列表展示命名时无文字图片即可沿用相册标题
     （而非 photo_时间戳 兜底）。
+    user_label：手工转发评论（待关联标注，见 _record_me_label）。代码加 '#' 后
+    拼到命名最前，下载/展示与入队保持一致；持久化供重启后下载侧沿用。
     """
     text = (message.message or "").strip()
     file_name = None
@@ -370,7 +390,9 @@ def _build_media_record(message, chat_id, source_override, source_link=None,
         "source_override": source_override,
         "label": label,
         # 入队时算好最终文件名，列表展示与实际下载命名保持一致
-        "final_name": compute_final_filename(message, caption=album_caption),
+        "final_name": compute_final_filename(
+            message, caption=album_caption, label=user_label
+        ),
         # 转发消息链到原频道消息；否则用消息自身 chat 生成
         "source_link": (
             source_link if source_link is not None
@@ -379,27 +401,45 @@ def _build_media_record(message, chat_id, source_override, source_link=None,
     }
     if album_caption:
         record["album_caption"] = album_caption
+    if user_label:
+        record["user_label"] = user_label
     return record
 
 
 async def _enqueue_me(message):
-    """Saved Messages 原消息入队：相册无自身文字的成员先继承同组说明再入队。"""
+    """Saved Messages 原消息入队：相册无自身文字的成员先继承同组说明再入队。
+
+    手工转发评论（窗口内的待关联标注）一并继承为命名标注——Telegram 把它发成
+    「评论 + 紧跟媒体」；一条评论后连续转发的 N 条媒体都拿到同一条标注。
+    实测评论事件也可能落在媒体之后（同批更新的事件循环调度顺序不定），故到
+    达时无待关联标注就先等一小段宽限（ME_LABEL_GRACE_SECONDS）再取一次，给
+    尾随评论一个落地机会；已有标注时不等待、立即继承。
+    """
+    user_label = _take_me_label()
+    if user_label is None and ME_LABEL_GRACE_SECONDS > 0:
+        await asyncio.sleep(ME_LABEL_GRACE_SECONDS)
+        user_label = _take_me_label()
+    if user_label:
+        logger.info(f"🏷 媒体 {message.id} 继承转发评论标注：\"{user_label}\"")
     album_caption = await _maybe_album_caption(message)
     await enqueue_media(
-        message, state.MY_ID, None, album_caption=album_caption
+        message, state.MY_ID, None,
+        album_caption=album_caption, user_label=user_label,
     )
 
 
 async def enqueue_media(message, chat_id, source_override, source_link=None,
-                        album_caption=None):
+                        album_caption=None, user_label=None):
     """把一条媒体消息入队下载（持久化，重启不丢任务）。
 
     source_link 显式传入时覆盖默认的来源链接；album_caption 为相册无文字
-    成员继承到的同组说明（入队即随记录持久化，下载命名时使用）。
+    成员继承到的同组说明（入队即随记录持久化，下载命名时使用）；user_label
+    为手工转发评论标注（同样随记录持久化）。
     """
     await queue.enqueue_and_start(
         _build_media_record(
-            message, chat_id, source_override, source_link, album_caption
+            message, chat_id, source_override, source_link,
+            album_caption, user_label,
         )
     )
 
@@ -547,6 +587,38 @@ async def _maybe_album_caption(message):
     if cap:
         _ALBUM_CAPTIONS[grouped_id] = cap
     return cap or None
+
+
+# ============================================================
+# 手工转发「评论 + 紧跟媒体」的前置标注
+# ============================================================
+# 转发带 caption 的媒体到收藏夹时，若在输入框里打了一句话再转发，Telegram 并
+# 不会把这句话合并进转发副本的 caption——它变成「评论消息在前、媒体紧跟其后」
+# 的两条（多转发则是一条评论 + N 条媒体）。这里把这条评论记作待关联标注：
+# 窗口（ME_LABEL_WINDOW_SECONDS）内到达的媒体入队时都继承它，下载命名时代码加
+# '#' 拼到文件名最前（<date> #标注 原caption …）。窗口只随到达时间自然过期，
+# 取用不清空，一条评论后连续 N 条媒体都能拼上同一条标注。单线程事件循环内
+# 访问，无需加锁。
+_ME_PENDING_LABEL = None     # 最近一条待关联的用户评论文本
+_ME_PENDING_LABEL_AT = 0.0   # 记录时刻的 time.monotonic()
+
+
+def _record_me_label(text):
+    """记住一条用户纯文本评论，作为随后到达媒体的待关联标注。"""
+    global _ME_PENDING_LABEL, _ME_PENDING_LABEL_AT
+    _ME_PENDING_LABEL = text
+    _ME_PENDING_LABEL_AT = time.monotonic()
+
+
+def _take_me_label():
+    """取仍在新鲜窗口内的待关联标注；无/已过期返回 None。取用不清空。"""
+    global _ME_PENDING_LABEL
+    if not _ME_PENDING_LABEL:
+        return None
+    if time.monotonic() - _ME_PENDING_LABEL_AT > ME_LABEL_WINDOW_SECONDS:
+        _ME_PENDING_LABEL = None
+        return None
+    return _ME_PENDING_LABEL
 
 
 # ============================================================

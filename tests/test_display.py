@@ -6,7 +6,7 @@
 import os
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest import mock
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
@@ -110,6 +110,63 @@ class DatePrefixNamingTest(unittest.TestCase):
         self.assertEqual(naming.compute_final_filename(message), "标题 - a.mp4")
 
 
+class ForwardedOriginalDateTest(unittest.TestCase):
+    """date_prefix：转发副本的日期前缀取转发来源（fwd_from.date）的原始日期。
+
+    message.date 对转发副本是转发当天；用户要的是内容最初发布的日期，它只在
+    fwd_from.date 里。fwd_from 缺失/缺日期时退回 message.date（现状）。电报
+    日期是 UTC 感知时间，按本地时区渲染（= 客户端里看到的日期）。
+    """
+
+    def _msg(self, filename, caption="", msg_date=None, fwd_date=None):
+        m = fake_message(filename, caption=caption)
+        if msg_date is not None:
+            m.date = msg_date
+        if fwd_date is not None:
+            m.fwd_from = mock.Mock(date=fwd_date)
+        return m
+
+    def test_forwarded_copy_uses_original_date(self):
+        # 转发当天 09-06，原帖 09-01（UTC 感知时间）→ 前缀应为原帖本地日期
+        fwd_date = datetime(
+            2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc
+        )
+        message = self._msg(
+            "a.mp4", caption="标题",
+            msg_date=datetime(2026, 9, 6, 12, 0, 0),
+            fwd_date=fwd_date,
+        )
+        expected_prefix = fwd_date.astimezone().strftime("%y-%m-%d ")
+        self.assertEqual(
+            naming.compute_final_filename(message),
+            f"{expected_prefix}标题 - a.mp4",
+        )
+
+    def test_forward_without_fwd_from_keeps_message_date(self):
+        # 无转发头（如收藏夹自发送）→ 仍用消息自身日期
+        message = self._msg(
+            "a.mp4", caption="标题",
+            msg_date=datetime(2026, 9, 6, 12, 0, 0),
+        )
+        self.assertEqual(
+            naming.compute_final_filename(message), "26-09-06 标题 - a.mp4"
+        )
+
+    def test_aware_message_date_rendered_in_local_tz(self):
+        # UTC 感知的消息日期按本地时区渲染（+8 时区下 20:00 UTC 属次日）
+        message = self._msg(
+            "a.mp4", caption="标题",
+            msg_date=datetime(2026, 9, 5, 20, 0, 0, tzinfo=timezone.utc),
+        )
+        expected = datetime(
+            2026, 9, 5, 20, 0, 0, tzinfo=timezone.utc
+        ).astimezone().strftime("%y-%m-%d ")
+        self.assertEqual(
+            naming.compute_final_filename(message),
+            f"{expected}标题 - a.mp4",
+        )
+
+
 class CaptionOverrideNamingTest(unittest.TestCase):
     """compute_final_filename(message, caption=...)：相册继承说明用于命名。
 
@@ -151,6 +208,139 @@ class CaptionOverrideNamingTest(unittest.TestCase):
             naming.compute_final_filename(m, caption=None),
             "26-09-05 标题 - a.mp4",
         )
+
+
+class LabelNamingTest(unittest.TestCase):
+    """compute_final_filename(..., label=)：手工转发评论作 #标注拼到命名最前。"""
+
+    D = datetime(2026, 9, 6, 11, 30, 25)
+
+    def _msg(self, filename, caption="", **media_flags):
+        m = fake_message(filename, caption=caption, **media_flags)
+        m.date = self.D
+        return m
+
+    def test_label_prepends_hash_before_caption(self):
+        # 用户实测格式：<date> #自存 原caption - 原名
+        m = self._msg("a.mp4", caption="标题")
+        self.assertEqual(
+            naming.compute_final_filename(m, label="自存"),
+            "26-09-06 #自存 标题 - a.mp4",
+        )
+
+    def test_label_alone_with_no_caption(self):
+        m = self._msg("a.mp4")
+        self.assertEqual(
+            naming.compute_final_filename(m, label="自存"),
+            "26-09-06 #自存 - a.mp4",
+        )
+
+    def test_label_on_meaningless_uuid_caption(self):
+        # 抖音视频原名无意义(UUID)：原 caption 拼在 #标注后、不挂 UUID
+        m = self._msg("c80d0ff8-4fdb-4762-8b97-800612217e4c.mp4", caption="标题")
+        self.assertEqual(
+            naming.compute_final_filename(m, label="自存"),
+            "26-09-06 #自存 标题.mp4",
+        )
+
+    def test_label_rescues_meaningless_name_from_fallback(self):
+        # 无意义原名 + 无 caption + 有标注 → 用 #标注 兜底，不再落 媒体类型_时间戳
+        m = self._msg("c80d0ff8-4fdb-4762-8b97-800612217e4c.mp4")
+        self.assertEqual(
+            naming.compute_final_filename(m, label="自存"),
+            "26-09-06 #自存.mp4",
+        )
+
+    def test_label_user_pretyped_hash_not_doubled(self):
+        # 用户自己已打 '#' → 代码不再重复加，避免 '##自存'
+        m = self._msg("a.mp4", caption="标题")
+        self.assertEqual(
+            naming.compute_final_filename(m, label="#自存"),
+            "26-09-06 #自存 标题 - a.mp4",
+        )
+
+    def test_label_only_hash_is_ignored(self):
+        m = self._msg("a.mp4", caption="标题")
+        self.assertEqual(
+            naming.compute_final_filename(m, label="#"),
+            "26-09-06 标题 - a.mp4",
+        )
+
+    def test_label_none_unchanged(self):
+        # 无标注 = 缺省旧行为（caption 直接拼）
+        m = self._msg("a.mp4", caption="标题")
+        self.assertEqual(
+            naming.compute_final_filename(m, caption=None),
+            "26-09-06 标题 - a.mp4",
+        )
+
+
+class LabelBudgetTrimTest(unittest.TestCase):
+    """超长名：先裁原 caption、再动 #标注、最后才截文件名（download 用 max_bytes）。"""
+
+    D = datetime(2026, 9, 6, 11, 30, 25)
+
+    def test_trims_caption_first_keeps_filename(self):
+        # caption 240 字节超限：应裁 caption 保 原名 与 #标注，总体 ≤ 上限
+        m = fake_message("葉瞬光_Handjob_Uncensored_CC.mp4", caption="汉" * 80)
+        m.date = self.D
+        result = naming.compute_final_filename(
+            m, label="自存", max_bytes=config.MAX_FILENAME_BYTES
+        )
+        self.assertLessEqual(len(result.encode("utf-8")), config.MAX_FILENAME_BYTES)
+        self.assertTrue(result.endswith("葉瞬光_Handjob_Uncensored_CC.mp4"))
+        self.assertIn("#自存", result)  # 标注被保留
+        self.assertNotIn("汉" * 80, result)  # 原 caption 被裁短
+        result.encode("utf-8")  # 合法 UTF-8
+
+    def test_keeps_caption_and_label_when_within_budget(self):
+        m = fake_message("a.mp4", caption="标题")
+        m.date = self.D
+        result = naming.compute_final_filename(
+            m, label="自存", max_bytes=config.MAX_FILENAME_BYTES
+        )
+        self.assertEqual(result, "26-09-06 #自存 标题 - a.mp4")
+
+    def test_trims_caption_even_before_truncating_label_only_when_forced(self):
+        # 标注 + 极长 caption：标注整条保留，caption 被裁到放不下为止
+        m = fake_message("a.mp4", caption="汉" * 80)
+        m.date = self.D
+        result = naming.compute_final_filename(
+            m, label="自存", max_bytes=config.MAX_FILENAME_BYTES
+        )
+        self.assertLessEqual(len(result.encode("utf-8")), config.MAX_FILENAME_BYTES)
+        self.assertTrue(result.endswith("- a.mp4"))
+        self.assertTrue(result.startswith("26-09-06 #自存 "))
+        self.assertNotEqual(result, "26-09-06 #自存 " + "汉" * 80 + " - a.mp4")
+
+    def test_filename_truncated_only_as_last_resort(self):
+        # 原名本身就超限（预算小到连 prefix+原名 都放不下）→ 最后手段才截文件名
+        m = fake_message("汉" * 40 + ".mkv", caption="标题")
+        m.date = self.D
+        result = naming.compute_final_filename(
+            m, label="自存", max_bytes=100
+        )
+        self.assertLessEqual(len(result.encode("utf-8")), 100)
+        self.assertTrue(result.endswith(".mkv"))  # 扩展名保住
+        # caption/label 一点预算都分不到时整段被弃，只保留被截的原名部分
+        self.assertNotIn("标题", result)
+        self.assertNotIn("#自存", result)
+
+    def test_budget_none_keeps_full_uncut(self):
+        # max_bytes=None（队列展示/单测默认）不裁剪
+        m = fake_message("a.mp4", caption="汉" * 80)
+        m.date = self.D
+        result = naming.compute_final_filename(m, label="自存", max_bytes=None)
+        self.assertIn("汉" * 80, result)
+        self.assertTrue(result.startswith("26-09-06 #自存 "))
+
+    def test_label_piece_helper(self):
+        self.assertEqual(naming._label_piece(None), "")
+        self.assertEqual(naming._label_piece(""), "")
+        self.assertEqual(naming._label_piece("  "), "")
+        self.assertEqual(naming._label_piece("自存"), "#自存")
+        self.assertEqual(naming._label_piece("#自存"), "#自存")
+        self.assertEqual(naming._label_piece("#"), "")
 
 
 class PickGroupCaptionTextTest(unittest.TestCase):

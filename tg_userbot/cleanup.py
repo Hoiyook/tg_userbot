@@ -144,27 +144,72 @@ def is_cleanup_message(message) -> bool:
 
 
 async def _collect_messages(client, entity, limit):
-    """把 iter_messages 拉成列表（供 wait_for 超时包裹）。"""
+    """把 iter_messages 拉成列表（供 _shielded 在子任务上跑）。"""
     out = []
     async for m in client.iter_messages(entity, limit=limit):
         out.append(m)
     return out
 
 
-async def _fetch_for_cleanup(client, entity, limit):
-    """带超时地拉回待清理消息；超时（连接半死、无读超时）返回 None → 本轮跳过。
+async def _shielded(proc, timeout, what):
+    """在子任务上跑一个会产生网络请求的协程 proc()，返回其成功结果。
 
-    telethon 请求没有读超时，代理节点卡住时 iter_messages 会无限等待；
-    用 wait_for 兜住，不让清理周期被一条僵死连接永久卡住。
+    本模块所有网络请求（iter_messages / delete_messages）都经它收口。原因与
+    queue/download 对取消息、传字节的处理同源：telethon 断线会对 pending
+    请求 future 调 cancel()，py3.8+ 的 CancelledError 是 BaseException，会绕开
+    except Exception 一路冒上来。清理若把它当停服信号漏给 cleanup_loop，外层
+    except asyncio.CancelledError 会记「🛑 已停止」并 re-raise → 自动清理任务
+    永久退出，而进程照常重连下载（实测：主客户端中途掉线正撞上清理在拉消息，
+    清理当场被杀，此后数小时收藏夹的下载通知再无人清理）。这里把请求放进子
+    任务、结局一律经 result() 读取：子任务以 CancelledError 收场 = 网络层取消
+    → 返回 None（本轮跳过、下轮再试）；只有清理任务本身被真取消（停服）才在
+    此 await 处抛 CancelledError 原样上抛。返回值 None 一律表示「本轮没做成」。
     """
+    task = asyncio.ensure_future(proc())
     try:
-        return await asyncio.wait_for(
-            _collect_messages(client, entity, limit),
-            timeout=CLEANUP_FETCH_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("⏰ 拉取待清理消息超时，本轮清理跳过")
-        return None
+        try:
+            await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            raise
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            logger.warning(f"⏰ {what} 超时（{timeout}s），本轮跳过")
+            return None
+        try:
+            return task.result()
+        except asyncio.CancelledError:
+            logger.warning(
+                f"{what} 被底层连接取消（网络层 future.cancel()），本轮跳过"
+            )
+            return None
+        except Exception as e:
+            logger.warning(f"{what} 失败：{e}")
+            return None
+    except asyncio.CancelledError:
+        raise
+
+
+async def _fetch_for_cleanup(client, entity, limit):
+    """带超时地拉回待清理消息；取不到（超时/断线取消/异常）返回 None → 本轮跳过。
+
+    telethon 请求没有读超时，代理节点卡住时 iter_messages 会无限等待；经
+    _shielded 用超时兜住，不让清理周期被一条僵死连接永久卡住。
+    """
+    return await _shielded(
+        lambda: _collect_messages(client, entity, limit),
+        CLEANUP_FETCH_TIMEOUT,
+        "拉取待清理消息",
+    )
 
 
 async def cleanup_saved_messages_once():
@@ -200,13 +245,12 @@ async def cleanup_saved_messages_once():
                 delete_ids.append(message.id)
 
         if delete_ids:
-            try:
-                await asyncio.wait_for(
-                    cli.delete_messages("me", delete_ids),
-                    timeout=CLEANUP_DELETE_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("🧹 删除 Saved Messages 程序消息超时，下一轮再试")
+            result = await _shielded(
+                lambda: cli.delete_messages("me", delete_ids),
+                CLEANUP_DELETE_TIMEOUT,
+                "删除 Saved Messages 程序消息",
+            )
+            if result is None:
                 return
             logger.info(
                 f"🧹 自动清理 Saved Messages：删除 {len(delete_ids)} 条程序消息"
@@ -325,13 +369,12 @@ async def cleanup_bot_chat_once():
             )
         del_ids, _ = plan_bot_chat_cleanup(infos, CLEAN_MESSAGE_AGE_MINUTES)
         if del_ids:
-            try:
-                await asyncio.wait_for(
-                    cli.delete_messages(state.BOT_ID, del_ids),
-                    timeout=CLEANUP_DELETE_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("🧹 删除 bot 菜单对话消息超时，下一轮再试")
+            result = await _shielded(
+                lambda: cli.delete_messages(state.BOT_ID, del_ids),
+                CLEANUP_DELETE_TIMEOUT,
+                "删除 bot 菜单对话消息",
+            )
+            if result is None:
                 return
             logger.info(
                 f"🧹 自动清理 bot 菜单对话：删除 {len(del_ids)} 条消息"
