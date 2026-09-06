@@ -19,6 +19,8 @@ from . import thread
 from . import whitelist
 from . import platform
 from .config import (
+    CLEANUP_DELETE_TIMEOUT,
+    CLEANUP_FETCH_TIMEOUT,
     CLEAN_COMMANDS,
     CLEAN_MESSAGE_AGE_MINUTES,
     CLEAN_NOTIFICATION_PREFIXES,
@@ -141,9 +143,37 @@ def is_cleanup_message(message) -> bool:
         return False
 
 
+async def _collect_messages(client, entity, limit):
+    """把 iter_messages 拉成列表（供 wait_for 超时包裹）。"""
+    out = []
+    async for m in client.iter_messages(entity, limit=limit):
+        out.append(m)
+    return out
+
+
+async def _fetch_for_cleanup(client, entity, limit):
+    """带超时地拉回待清理消息；超时（连接半死、无读超时）返回 None → 本轮跳过。
+
+    telethon 请求没有读超时，代理节点卡住时 iter_messages 会无限等待；
+    用 wait_for 兜住，不让清理周期被一条僵死连接永久卡住。
+    """
+    try:
+        return await asyncio.wait_for(
+            _collect_messages(client, entity, limit),
+            timeout=CLEANUP_FETCH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("⏰ 拉取待清理消息超时，本轮清理跳过")
+        return None
+
+
 async def cleanup_saved_messages_once():
     """清理一段时间以前的程序指令和通知。"""
     if not state.MY_ID:
+        return
+    cli = state.client
+    if cli is None or not cli.is_connected():
+        logger.info("⏱ 主客户端未连接，跳过本轮 Saved Messages 清理")
         return
 
     try:
@@ -154,9 +184,11 @@ async def cleanup_saved_messages_once():
         )
 
         delete_ids = []
-
-        # Saved Messages 通常不会很多，逐页检查即可。
-        async for message in state.client.iter_messages("me", limit=300):
+        # Saved Messages 通常不会很多，逐条检查即可。
+        messages = await _fetch_for_cleanup(cli, "me", 300)
+        if messages is None:
+            return
+        for message in messages:
             if not is_cleanup_message(message):
                 continue
 
@@ -168,7 +200,14 @@ async def cleanup_saved_messages_once():
                 delete_ids.append(message.id)
 
         if delete_ids:
-            await state.client.delete_messages("me", delete_ids)
+            try:
+                await asyncio.wait_for(
+                    cli.delete_messages("me", delete_ids),
+                    timeout=CLEANUP_DELETE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("🧹 删除 Saved Messages 程序消息超时，下一轮再试")
+                return
             logger.info(
                 f"🧹 自动清理 Saved Messages：删除 {len(delete_ids)} 条程序消息"
             )
@@ -258,12 +297,19 @@ async def cleanup_bot_chat_once():
     """
     if not state.MY_ID or not state.bot_client or not state.BOT_ID:
         return
+    cli = state.client
+    if cli is None or not cli.is_connected():
+        logger.info("⏱ 主客户端未连接，跳过本轮 bot 菜单对话清理")
+        return
     try:
         from datetime import datetime, timezone
 
         now = datetime.now(timezone.utc)
         infos = []
-        async for m in state.client.iter_messages(state.BOT_ID, limit=300):
+        messages = await _fetch_for_cleanup(cli, state.BOT_ID, 300)
+        if messages is None:
+            return
+        for m in messages:
             if m.date:
                 if m.date.tzinfo is None:
                     m.date = m.date.replace(tzinfo=timezone.utc)
@@ -279,7 +325,14 @@ async def cleanup_bot_chat_once():
             )
         del_ids, _ = plan_bot_chat_cleanup(infos, CLEAN_MESSAGE_AGE_MINUTES)
         if del_ids:
-            await state.client.delete_messages(state.BOT_ID, del_ids)
+            try:
+                await asyncio.wait_for(
+                    cli.delete_messages(state.BOT_ID, del_ids),
+                    timeout=CLEANUP_DELETE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("🧹 删除 bot 菜单对话消息超时，下一轮再试")
+                return
             logger.info(
                 f"🧹 自动清理 bot 菜单对话：删除 {len(del_ids)} 条消息"
             )

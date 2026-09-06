@@ -11,6 +11,7 @@ new_message_handler 是唯一的用户事件入口：classify_message_chat 判�
 """
 import asyncio
 import os
+import signal
 
 from telethon import TelegramClient, events
 from telethon.network.connection import ConnectionTcpFull, ConnectionTcpObfuscated
@@ -28,6 +29,7 @@ from .config import (
     API_HASH,
     API_ID,
     AUTO_CLEAN_SAVED_MESSAGES,
+    BOT_KEEPALIVE_INTERVAL,
     BOT_SESSION_NAME,
     BOT_TOKEN,
     BOT_USERNAME,
@@ -43,6 +45,9 @@ from .config import (
     SAVE_FOLDER,
     SECRETS_FILE,
     SESSION_NAME,
+    SERVE_RECONNECT_BASE_DELAY,
+    SERVE_RECONNECT_MAX_DELAY,
+    TELEGRAM_AUTO_RECONNECT,
     AdjustableSemaphore,
 )
 from .log import logger
@@ -66,7 +71,7 @@ def create_client() -> TelegramClient:
         ),
         connection_retries=10,
         retry_delay=3,
-        auto_reconnect=True,
+        auto_reconnect=TELEGRAM_AUTO_RECONNECT,
         proxy=PROXY,
     )
 
@@ -84,7 +89,7 @@ def create_bot_client() -> TelegramClient:
         ),
         connection_retries=10,
         retry_delay=3,
-        auto_reconnect=True,
+        auto_reconnect=TELEGRAM_AUTO_RECONNECT,
         proxy=PROXY,
     )
 
@@ -126,6 +131,108 @@ async def start_with_retry(cli, bot_token=None):
                 await asyncio.sleep(5)
 
     raise last_error
+
+
+async def _main_serve():
+    """主客户端稳态守护：任何掉线都带指数退避自动重连，直到被取消退出。
+
+    依赖 create_client 关掉 telethon 内建自动重连（TELEGRAM_AUTO_RECONNECT=
+    False）：断线会及时让 run_until_disconnected 返回/抛错，由这里接管重连，
+    避免内建重连在「连上即再失败」（如代理持续回 HTTP 429）时的无界递归风暴
+    （曾叠上千层把事件循环拖死、进程退出）。异常一律兜住 → 本任务永不意外
+    return/退出，进程靠它保持存活；外部停止（SIGINT/SIGTERM 设 STOP_EVENT）
+    由 main 取消本任务（CancelledError 原样上抛）。run_until_disconnected 结束
+    时 telethon 会 disconnect，故每次循环都先确保已连接再挂起。
+    """
+    delay = SERVE_RECONNECT_BASE_DELAY
+    while True:
+        if not state.client.is_connected():
+            try:
+                await start_with_retry(state.client)
+                delay = SERVE_RECONNECT_BASE_DELAY
+                logger.info("🔁 主客户端连接已恢复")
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception as e:
+                logger.error(
+                    f"❌ 主客户端重连失败（{type(e).__name__}: {e}），"
+                    f"{delay} 秒后重试"
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, SERVE_RECONNECT_MAX_DELAY)
+                continue
+
+        try:
+            await state.client.run_until_disconnected()
+            logger.warning("⚠️ 主客户端连接已断开，稍后自动重连...")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            logger.warning(
+                f"⚠️ 主客户端连接异常中断（{type(e).__name__}: {e}），"
+                f"{delay} 秒后自动重连..."
+            )
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, SERVE_RECONNECT_MAX_DELAY)
+
+
+async def _bot_keepalive():
+    """bot 菜单连接守护：定期探活，掉线则用 bot_token 重新登录。
+
+    与主客户端一样不依赖 telethon 内建自动重连；bot 客户端没有常驻的
+    run_until_disconnected，故用周期探活代替。bot 启动失败/被置 None 时本任务
+    结束。被 main 取消（停止信号）时以 CancelledError 收尾。
+    """
+    while True:
+        await asyncio.sleep(BOT_KEEPALIVE_INTERVAL)
+        bot = state.bot_client
+        if bot is None:
+            return
+        if bot.is_connected():
+            continue
+        logger.warning("🤖 bot 菜单连接已断开，尝试重连...")
+        try:
+            await start_with_retry(bot, bot_token=BOT_TOKEN)
+            logger.info("🤖 bot 菜单已重新连接")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            logger.error(
+                f"🤖 bot 菜单重连失败（{type(e).__name__}: {e}），"
+                f"{BOT_KEEPALIVE_INTERVAL} 秒后重试"
+            )
+
+
+def _install_stop_handlers(stop_event):
+    """把 SIGINT/SIGTERM 转成「设 STOP_EVENT 优雅退出」，接管 telethon 对
+    KeyboardInterrupt 的吞并。
+
+    run_until_disconnected 内部有 except KeyboardInterrupt，若不加信号处理器，
+    Ctrl-C 会被它吞掉后当普通断开处理 → 稳态守护会立刻重连，Ctrl-C 就失效了。
+    这里把两个信号都转为设 STOP_EVENT，由 main 取消服务任务收尾；第二次信号
+    直接强制退出（os._exit，兜底进程已卡死的情况）。非 Unix 平台不支持则忽略。
+    """
+    loop = asyncio.get_running_loop()
+
+    def _on_signal(signame):
+        if stop_event.is_set():
+            logger.warning(
+                f"⚠️ 收到第二次 {signame}，强制退出"
+            )
+            os._exit(1)
+        logger.info(f"🛑 收到 {signame}，正在保存并退出...")
+        stop_event.set()
+
+    for sig, name in (
+        (signal.SIGINT, "Ctrl-C(SIGINT)"),
+        (signal.SIGTERM, "SIGTERM"),
+    ):
+        try:
+            loop.add_signal_handler(sig, _on_signal, name)
+        except (NotImplementedError, RuntimeError, ValueError):
+            # 非 Unix / 非主线程：保持默认（Ctrl-C 会以 KeyboardInterrupt 打断）
+            logger.warning(f"无法注册 {name} 信号处理器，改用默认行为")
+            continue
 
 
 async def new_message_handler(event):
@@ -760,9 +867,36 @@ async def main():
         await cleanup.cleanup_saved_messages_once()
         await cleanup.cleanup_bot_chat_once()
 
+    # ========================================================
+    # 稳态：主客户端 / bot 连接各自掉线自动重连，进程保持存活直到收到停止信号。
+    # SIGINT/SIGTERM → 设 STOP_EVENT → 取消服务任务 → 收尾退出（信号处理器在
+    # 稳态才开始注册，登录等启动阶段 Ctrl-C 仍以 KeyboardInterrupt 直接打断）。
+    # ========================================================
+    state.STOP_EVENT = asyncio.Event()
+    _install_stop_handlers(state.STOP_EVENT)
+
+    bot_keepalive_task = None
+    if BOT_TOKEN and state.bot_client is not None:
+        bot_keepalive_task = asyncio.create_task(_bot_keepalive())
+    main_serve_task = asyncio.create_task(_main_serve())
+
     try:
-        await state.client.run_until_disconnected()
+        await state.STOP_EVENT.wait()
+        logger.info("🛑 收到停止信号，正在收尾退出...")
     finally:
+        # 取消后台服务任务：主客户端挂在 run_until_disconnected，取消会触发其
+        # finally 里的 disconnect，随后以 CancelledError 收尾；bot 探活同理。
+        for t in (main_serve_task, bot_keepalive_task):
+            if t is not None:
+                t.cancel()
+        for t in (main_serve_task, bot_keepalive_task):
+            if t is not None:
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("后台服务任务清理出错")
         # 断开下载 worker 连接（尽力而为，不影响主客户端退出）
         try:
             await workers.shutdown()

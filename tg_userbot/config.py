@@ -392,6 +392,28 @@ LOGIN_TIMEOUT_SECONDS = 120
 LOGIN_RETRIES = 10
 
 
+# ------------------------------------------------------------
+# 稳态连接守护（app 的 _main_serve / _bot_keepalive）
+# ------------------------------------------------------------
+# telethon 内建自动重连：置 False，由 app.main 的稳态守护接管重连。内建重连在
+# 「连接成功后立刻再失败」（例如代理持续回 HTTP 429）时进入无界递归风暴
+# （get_me 验证失败又触发重连，曾叠上千层把事件循环拖死、进程退出）；关闭后
+# 断线会及时让 run_until_disconnected 返回/抛错，交给上层有界重连。
+TELEGRAM_AUTO_RECONNECT = False
+
+# 主客户端稳态守护：掉线自动重连，指数退避 5s → … → 120s 上限。
+SERVE_RECONNECT_BASE_DELAY = 5
+SERVE_RECONNECT_MAX_DELAY = 120
+
+# bot 菜单连接守护的探活间隔（秒）。
+BOT_KEEPALIVE_INTERVAL = 15
+
+# 清理周期拉取/删除消息的超时（秒）：连接半死（无读超时）时不能让清理周期
+# 无限卡住。拉取/删除都只记警告跳过本轮，清理本就是 best-effort。
+CLEANUP_FETCH_TIMEOUT = 90
+CLEANUP_DELETE_TIMEOUT = 30
+
+
 class AdjustableSemaphore:
     """并发上限可动态调整的信号量（asyncio.Semaphore 创建后不可改值）。
 

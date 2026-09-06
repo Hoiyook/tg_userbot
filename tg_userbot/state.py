@@ -46,6 +46,9 @@ _download_seq = 0
 CLEAR_INTERVAL_SECONDS = config.DEFAULT_CLEAR_INTERVAL_SECONDS
 CLEAR_TIME_CHANGED = None  # asyncio.Event，main() 里创建（事件循环规则）
 
+# 稳态停止事件：SIGINT/SIGTERM 信号处理器 set()，main() 挂起等它再收尾退出
+STOP_EVENT = None  # asyncio.Event，main() 里创建（事件循环规则）
+
 # 下载白名单 {chat_id(带符号): 标题}，main() 启动时 load_whitelist() 加载
 WHITELIST_CHATS = {}
 

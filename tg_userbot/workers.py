@@ -26,7 +26,13 @@ from telethon.network.connection import ConnectionTcpFull, ConnectionTcpObfuscat
 from telethon.sessions import MemorySession
 
 from . import state
-from .config import API_HASH, API_ID, CONNECTION_TYPE, PROXY
+from .config import (
+    API_HASH,
+    API_ID,
+    CONNECTION_TYPE,
+    PROXY,
+    TELEGRAM_AUTO_RECONNECT,
+)
 from .log import logger
 
 # 单条 worker connect() 的超时（秒）：代理节点卡住时不能拖住启动/扩容
@@ -83,7 +89,7 @@ async def _spawn_one(snapshot):
         connection=_connection_class(),
         connection_retries=10,
         retry_delay=3,
-        auto_reconnect=True,
+        auto_reconnect=TELEGRAM_AUTO_RECONNECT,
         proxy=PROXY,
         receive_updates=False,
     )
