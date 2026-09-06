@@ -28,6 +28,7 @@ from .log import logger
 from .history import append_history
 from .naming import (
     compute_final_filename,
+    compute_url_filename,
     format_size,
     get_caption,
     get_original_filename,
@@ -39,6 +40,221 @@ from .sources import message_source_link, resolve_download_source
 # 同 basename 的并发任务（如同一相册的多张同标题图片）共用一条 final_path，
 # 写完 finally 释放。与磁盘 os.path.exists 去重互补。
 _RESERVED_FINAL_PATHS = set()
+
+
+def _douyin_folder() -> str:
+    """本地解析的抖音视频落盘目录：SAVE_FOLDER/抖音。"""
+    return os.path.join(SAVE_FOLDER, "抖音")
+
+
+def _make_http_client(timeout):
+    """构造 httpx 异步客户端（工厂函数：测试可注入 MockTransport 客户端）。
+
+    httpx 是 f2 的依赖——f2 未安装时此处 ImportError，按普通失败转 retry，
+    不影响媒体下载流（这与 resolver 的「f2 可选」契约一致）。
+    """
+    import httpx
+
+    return httpx.AsyncClient(timeout=timeout)
+
+
+async def _stream_url_to_file(client, url, temp_path, on_progress):
+    """httpx 流式下载直链到临时文件（httpx 已随 f2 安装）。
+
+    按块写盘并回调进度；服务端无 Content-Length 时 total=0（进度按字节数记）。
+    任何 HTTP 层错误原样上抛，由调用方按普通失败重试。
+    """
+    async with client.stream("GET", url, follow_redirects=True) as resp:
+        resp.raise_for_status()
+        total = int(resp.headers.get("content-length") or 0)
+        current = 0
+        with open(temp_path, "wb") as f:
+            async for chunk in resp.aiter_bytes(64 * 1024):
+                f.write(chunk)
+                current += len(chunk)
+                on_progress(current, total)
+    return total
+
+
+async def download_url_media(record):
+    """本地解析链的 HTTP 直链下载（队列 kind=url 任务执行体）。
+
+    与 download_file 共享同一套纪律：DOWNLOAD_SEMAPHORE 并发闸、
+    .download 临时文件 + os.replace 原子落盘、无进度看门狗、失败转
+    retry（返回 False）、成功记历史 + 通知收藏夹。差异：没有 Telegram
+    消息/worker 池概念——直链、最终名、目录在入队时已定死在记录里。
+    """
+    import httpx  # f2 的依赖；f2 没装时队列任务按普通失败转 retry，不影响媒体流
+
+    url = record.get("direct_url") or record.get("url") or ""
+    final_filename = (
+        record.get("final_name")
+        or compute_url_filename(record.get("title"))
+    )
+    folder = _douyin_folder()
+    os.makedirs(folder, exist_ok=True)
+
+    async with state.DOWNLOAD_SEMAPHORE:
+        final_path = _reserve_final_path(folder, final_filename)
+        temp_path = final_path + ".download"
+        did = register_download("链接", os.path.basename(final_path), None)
+        try:
+            for attempt in count(1):
+                try:
+                    if os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+
+                    last_percent = -1
+                    last_activity = time.monotonic()
+
+                    def progress(current, total):
+                        nonlocal last_percent, last_activity
+                        last_activity = time.monotonic()
+                        update_download(did, current, total)
+                        if not total:
+                            return
+                        percent = min(int(current * 100 / total), 100)
+                        if percent >= last_percent + PROGRESS_STEP or percent == 100:
+                            last_percent = percent
+                            logger.info(
+                                f"⬇️ 下载进度：{percent}% "
+                                f"({format_size(current)}/{format_size(total)})"
+                                f" | {os.path.basename(final_path)}"
+                            )
+
+                    logger.info(
+                        f"⬇️ 直链下载尝试第 {attempt} 次"
+                        f" | {os.path.basename(final_path)}"
+                    )
+
+                    # 传字节包成子任务 + 无进度看门狗：CDN 卡死时既不报错
+                    # 也不出数据，超过 DOWNLOAD_IDLE_TIMEOUT 判僵死取消重试
+                    #（与 download_file 同一套纪律）。
+                    dl_task = asyncio.ensure_future(_stream_url_to_file(
+                        _make_http_client(DOWNLOAD_IDLE_TIMEOUT),
+                        url, temp_path, progress,
+                    ))
+                    try:
+                        while not dl_task.done():
+                            await asyncio.wait({dl_task}, timeout=1.0)
+                            if dl_task.done():
+                                break
+                            if time.monotonic() - last_activity > DOWNLOAD_IDLE_TIMEOUT:
+                                logger.warning(
+                                    f"⏰ 直链下载超过 {DOWNLOAD_IDLE_TIMEOUT}s 无进度，"
+                                    f"判定连接僵死，取消本次尝试（将重试）"
+                                )
+                                dl_task.cancel()
+                                try:
+                                    await dl_task
+                                except asyncio.CancelledError:
+                                    pass
+                                raise TimeoutError(
+                                    f"直链下载无进度超过 {DOWNLOAD_IDLE_TIMEOUT}s"
+                                )
+                        try:
+                            declared_size = dl_task.result()
+                        except asyncio.CancelledError as exc:
+                            # httpx 层取消按普通失败转 retry，不冒充真取消
+                            raise ConnectionError(
+                                "直链下载被底层取消"
+                            ) from exc
+                    finally:
+                        if not dl_task.done():
+                            dl_task.cancel()
+                            try:
+                                await dl_task
+                            except asyncio.CancelledError:
+                                pass
+
+                    if not os.path.exists(temp_path):
+                        raise RuntimeError("直链下载结束，但临时文件不存在")
+
+                    actual_size = os.path.getsize(temp_path)
+                    if actual_size <= 0:
+                        raise RuntimeError(f"下载的文件是空的（{actual_size} bytes）")
+
+                    # 大小一致性：声明大小存在且实际明显偏小 → 警告（CDN 截断）
+                    if declared_size and actual_size < declared_size * 0.98:
+                        logger.warning(
+                            f"⚠️ 实际大小（{format_size(actual_size)}）明显小于"
+                            f"Content-Length（{format_size(declared_size)}），"
+                            "可能被 CDN 截断"
+                        )
+
+                    os.replace(temp_path, final_path)
+
+                    append_history(
+                        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 抖音 | "
+                        f"{os.path.basename(final_path)} | {format_size(actual_size)}"
+                        f" | 来源：本地解析"
+                    )
+
+                    logger.info("✅ 直链下载完成")
+                    logger.info(f"文件：{final_path}")
+                    logger.info(f"实际大小：{format_size(actual_size)}")
+
+                    try:
+                        await state.client.send_message(
+                            "me",
+                            "✅ 下载完成\n\n"
+                            f"来源：抖音（本地解析）\n"
+                            f"文件：{os.path.basename(final_path)}\n"
+                            f"大小：{format_size(actual_size)}",
+                        )
+                    except Exception as e:
+                        logger.warning(f"发送完成通知失败：{e}")
+
+                    return True
+
+                except asyncio.CancelledError:
+                    # 真取消（进程退出）：原样放行，记录留在 tasks 重启恢复
+                    raise
+
+                except (ConnectionError, TimeoutError, OSError) as e:
+                    logger.exception(
+                        f"❌ 直链下载失败，尝试第 {attempt} 次"
+                        f"（上限 {DOWNLOAD_RETRIES}）：{e}"
+                    )
+                    if attempt >= DOWNLOAD_RETRIES:
+                        break
+                    logger.info("🔄 3 秒后重试直链下载...")
+                    await asyncio.sleep(3)
+
+                except Exception as e:
+                    logger.exception(
+                        f"❌ 直链下载出现未预期错误，尝试第 {attempt} 次"
+                        f"（上限 {DOWNLOAD_RETRIES}）：{e}"
+                    )
+                    if attempt >= DOWNLOAD_RETRIES:
+                        break
+                    logger.info("🔄 3 秒后重试直链下载...")
+                    await asyncio.sleep(3)
+
+            logger.error("❌ 已达到最大重试次数，直链下载失败")
+            try:
+                await state.client.send_message(
+                    "me",
+                    "❌ 直链下载失败\n\n"
+                    f"文件：{os.path.basename(final_path)}\n"
+                    f"请查看 download.log",
+                )
+            except Exception:
+                pass
+            return False
+
+        finally:
+            # 同 download_file：所有退出路径清理 .download 半成品
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+            unregister_download(did)
+            _RESERVED_FINAL_PATHS.discard(final_path)
 
 
 async def _sleep_and_reconnect(worker):

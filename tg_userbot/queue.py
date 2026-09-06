@@ -128,7 +128,8 @@ def queue_retry_failed(queue, record):
 
 def _queue_record_display(record):
     kind_label = QUEUE_KIND_LABELS.get(record.get("kind"), record.get("kind"))
-    if record.get("kind") == "media" and record.get("final_name"):
+    # media / url 都在入队时算好 final_name，展示与实际下载命名共用
+    if record.get("final_name"):
         label = record["final_name"]
     else:
         label = record.get("label") or record.get("url") or "(无)"
@@ -265,6 +266,10 @@ async def _run_queued_task(record):
             caption_override=record.get("album_caption"),
             label_override=record.get("user_label"),
         )
+    if kind == "url":
+        # 本地解析链的 HTTP 直链下载：没有 Telegram 消息概念，直链/标题/
+        # 最终名都在入队时定死在记录里，这里只负责执行 + 失败转 retry。
+        return await download.download_url_media(record)
     # 旧版平台链接任务（douyin/instagram）已随统一下载链路退役：落到这里的
     # 是历史 JSON 残留，按未知类型移除 + 记日志，不崩不卡队列。
     logger.warning(f"未知队列任务类型：{kind}，直接移除")

@@ -365,3 +365,48 @@ def compute_final_filename(message, caption=None, label=None, max_bytes=None) ->
         # 原名自身也可能超限 → 最后手段才截文件名（保扩展名）
         return truncate_filename(name, max_bytes)
     return name
+
+
+def compute_url_filename(title, created_at=None, label=None,
+                         max_bytes=MAX_FILENAME_BYTES) -> str:
+    """平台链接任务（本地解析链）的最终落盘文件名。
+
+    与 compute_final_filename 同一套视觉规则：'<日期前缀> [#标注] <标题>.mp4'。
+    差异：链接任务没有 Telegram 消息，没有「原始文件名」概念——
+      * 标题（解析元数据的 desc）就是 caption 源；为空时兜底 '视频_时间戳'；
+      * 日期前缀取任务创建时间（created_at，本地时区），非消息日期；
+      * 后缀固定 .mp4（当前解析链只下载抖音视频）。
+    max_bytes 字节预算语义一致：先裁标题、再裁 #标注、最后才动前缀/兜底名。
+    纯函数、无 I/O，入队展示与实际下载命名共用（final_name 在入队时算好）。
+    """
+    prefix = ""
+    if created_at is not None:
+        prefix = created_at.strftime("%y-%m-%d ")
+
+    raw = str(title or "").strip()
+    caption = sanitize_filename(raw) if raw else ""
+    label_piece = _label_piece(label)
+
+    if not caption:
+        # 兜底名：与媒体流的 媒体类型_时间戳 风格一致，已含时间不再前缀
+        stamp = (created_at or datetime.now()).strftime("%Y%m%d_%H%M%S")
+        return f"视频_{stamp}.mp4"
+
+    base = ".mp4"
+
+    def assemble(text_block):
+        if text_block:
+            return prefix + text_block + base
+        # 无文字段（极罕见）时去掉日期前缀的尾空格：'26-09-06.mp4'
+        return prefix.rstrip() + base
+
+    text_block = " ".join(p for p in (label_piece, caption) if p)
+    if max_bytes is None:
+        return assemble(text_block)
+
+    overhead = len((prefix + base).encode("utf-8"))
+    allowed_text = max_bytes - overhead
+    if allowed_text > 0:
+        return assemble(_fit_text_parts(label_piece, caption, allowed_text))
+    # 标题+标注一点预算都分不到（极罕见）→ 至少保留日期前缀，按预算截
+    return _truncate_utf8_bytes(assemble("").rstrip(), max_bytes)

@@ -1,4 +1,4 @@
-"""平台链接流（抖音 / Instagram）：链接识别 + 转发给解析 bot。
+"""平台链接流（抖音 / Instagram）：链接识别 + 本地解析优先 / 转发解析 bot。
 
 旧版「链接 → 平台对话 → 点按钮 → 平台自下」链路已删除：解析 bot 的私聊
 在下载白名单上，其回复的直发视频会由白名单转发流（app.relay_chat_media）
@@ -6,14 +6,22 @@
 Douyin/Instagram 子目录，也不再区分平台短命名）。本模块只负责：
 
   * 从消息文字提取抖音 / Instagram 链接（extract_*_urls，cleanup 与 app 复用）；
-  * 把链接原文发给解析 bot（relay_platform_links），之后等白名单流接手。
+  * 桌面端（config.RESOLVER_ENABLED）抖音链接先走 resolver 本地解析，
+    成功 → 入 kind=url 队列任务直接 HTTP 下载（不再依赖解析 bot 在线）；
+    失败/超时/未启用 → 链接原文发给解析 bot（_relay_kind_links），
+    之后等白名单流接手（原有路径原封不动，作为兜底永不丢）。
 
 不再有 queue ↔ platform 循环依赖；运行态一律走 state.*（client /
 PROCESSING_DOUYIN_IDS / WHITELIST_CHATS）。命名/历史等纯函数模块允许 from-import。
 """
+import re
+import uuid
+from datetime import datetime
+
 from telethon.utils import get_peer_id
 
 from . import state
+from . import config
 from .config import (
     DOUYIN_URL_PATTERN,
     INSTAGRAM_URL_PATTERN,
@@ -21,6 +29,7 @@ from .config import (
     PLATFORM_LINKS,
 )
 from .log import logger
+from .naming import compute_url_filename
 
 
 def extract_urls_by_pattern(text: str, pattern):
@@ -50,12 +59,57 @@ def extract_instagram_urls(text: str):
     return extract_urls_by_pattern(text, INSTAGRAM_URL_PATTERN)
 
 
-async def relay_platform_links(message, douyin_urls, instagram_urls):
-    """把一条 Saved Messages 消息中的抖音 / Instagram 链接原文发给解析 bot。
+def extract_link_comment(text, urls):
+    """从「评论 + 链接」混合消息里提取链接外的文字作为命名标注（纯函数）。
 
-    只负责投递链接与失败提示，不解析、不下载——解析 bot 回复的首条直发视频
-    因解析 bot 本身在下载白名单上，会被白名单转发流自动转发进收藏夹下载。
-    同一消息 id 通过 state.PROCESSING_DOUYIN_IDS 去重，防重复投递。
+    例：'自存 https://v.douyin.com/x' → '自存'。纯链接、命令（/ 开头）、
+    空文本 → None。与媒体转发的待关联标注窗口不同，链接的评论必须和链接
+    同一条消息（媒体是「前一条评论消息 + 后续媒体」两种事件）。
+    """
+    if not text:
+        return None
+    comment = text
+    for url in urls or []:
+        comment = comment.replace(url, " ")
+    comment = re.sub(r"\s+", " ", comment).strip()
+    if not comment or comment.startswith("/"):
+        return None
+    return comment
+
+
+def build_url_record(kind, url, result, user_label=None):
+    """组装一条 kind=url 队列任务记录（入队展示与下载命名共用 final_name）。
+
+    result：resolver.ResolveResult。final_name 在入队时算好并持久化，
+    与 download_url_media 实际落盘名保持一致（媒体任务的同一约定）。
+    """
+    created_at = datetime.now()
+    return {
+        "id": uuid.uuid4().hex,
+        "kind": "url",
+        "url": url,
+        "platform": kind,
+        "direct_url": result.direct_url,
+        "title": result.title,
+        "author": result.author,
+        "user_label": user_label,
+        "final_name": compute_url_filename(
+            result.title, created_at, label=user_label
+        ),
+        # 落盘目录：SAVE_FOLDER/抖音（见 download._douyin_folder）
+        "source": PLATFORM_LINKS.get(kind, {}).get("label", kind),
+        "source_link": None,
+        "created_at": created_at.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+async def relay_platform_links(message, douyin_urls, instagram_urls):
+    """处理一条 Saved Messages 消息中的抖音 / Instagram 链接。
+
+    桌面端抖音链接先试本地解析（resolver）：成功 → url 任务入队，bot 不再
+    参与该链接；失败/超时/未启用 → 链接原文发给解析 bot（原有路径兜底）。
+    Instagram 始终走 bot（匿名本地解析不可行）。同一消息 id 通过
+    state.PROCESSING_DOUYIN_IDS 去重，防重复触发。
     """
     if not douyin_urls and not instagram_urls:
         return
@@ -66,10 +120,48 @@ async def relay_platform_links(message, douyin_urls, instagram_urls):
     state.PROCESSING_DOUYIN_IDS.add(message.id)
 
     try:
-        await _relay_kind_links("douyin", douyin_urls)
+        await _handle_douyin_urls(message, douyin_urls)
         await _relay_kind_links("instagram", instagram_urls)
     finally:
         state.PROCESSING_DOUYIN_IDS.discard(message.id)
+
+
+async def _handle_douyin_urls(message, douyin_urls):
+    """抖音链接分流：本地解析优先（桌面端），失败/未启用降级 bot 中转。"""
+    if not douyin_urls:
+        return
+
+    if not config.RESOLVER_ENABLED:
+        await _relay_kind_links("douyin", douyin_urls)
+        return
+
+    # 函数内导入：隔离 f2 的 import 副作用（联网取 msToken），且避免
+    # platform → resolver → f2 在无关场景（TG_RESOLVER=off / Termux）被触发
+    from . import resolver
+    from . import queue
+
+    user_label = extract_link_comment(message.message or "", douyin_urls)
+    remaining = []
+    for url in douyin_urls:
+        result = await resolver.resolve_douyin(url)
+        if result is None:
+            remaining.append(url)
+            continue
+        record = build_url_record("douyin", url, result, user_label=user_label)
+        await queue.enqueue_and_start(record)
+        logger.info(f"🛠 抖音链接已本地解析并入队下载：{record['final_name']}")
+        try:
+            await state.client.send_message(
+                "me",
+                "🛠 本地解析成功，已入队下载\n\n"
+                f"文件：{record['final_name']}\n"
+                f"链接：{url}",
+            )
+        except Exception as e:
+            logger.warning(f"发送本地解析通知失败：{e}")
+
+    if remaining:
+        await _relay_kind_links("douyin", remaining)
 
 
 async def _relay_kind_links(kind: str, urls):

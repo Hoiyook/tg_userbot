@@ -259,6 +259,27 @@ INSTAGRAM_URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# ------------------------------------------------------------
+# 本地解析链（桌面端）：f2 库优先 + 解析 bot 兜底
+# ------------------------------------------------------------
+# 抖音链接默认先尝试 f2 本地解析（不依赖第三方解析 bot）；任何失败
+# （f2 未安装 / import 失败 / 签名过期 / 网络断 / 超时）都静默降级回
+# 原有 bot 中转路径，最坏情况 = 维持现状。Termux 上强制走 bot 路径
+# （f2 依赖较重，且手机端维持原行为）；TG_RESOLVER=off 可在桌面端
+# 强制关闭本地解析。
+RESOLVER_ENABLED = (
+    not IS_TERMUX
+    and os.environ.get("TG_RESOLVER", "").strip().lower() != "off"
+)
+
+# 本地解析整体超时：分享链接展开 + 作品详情接口请求共用一个预算。
+RESOLVER_TIMEOUT_SECONDS = 30
+
+# 抖音 Web cookie：f2 调作品详情接口必需（游客 cookie 大概率也能用，
+# 但登录 cookie 更稳）。从 tg_secrets.json 的 douyin_cookie 字段读取，
+# 缺省空串 → f2 请求大概率失败 → 自动降级 bot，不硬性要求配置。
+DOUYIN_COOKIE = _SECRET_CONFIG.get("douyin_cookie", "")
+
 # ============================================================
 # 下载并发
 # ============================================================
@@ -313,7 +334,12 @@ QUEUE_FILE = os.path.join(RUNTIME_DIR, "download_queue.json")
 # 把信号量槽位占满、整条队列堵死。取消息步骤必须加外部超时。
 QUEUE_FETCH_TIMEOUT = 30
 
-QUEUE_KIND_LABELS = {"media": "媒体", "douyin": "抖音", "instagram": "Instagram"}
+QUEUE_KIND_LABELS = {
+    "media": "媒体",
+    "url": "链接",
+    "douyin": "抖音",
+    "instagram": "Instagram",
+}
 
 # ------------------------------------------------------------
 # Saved Messages 消息清理
