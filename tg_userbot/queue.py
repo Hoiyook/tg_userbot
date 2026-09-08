@@ -83,11 +83,24 @@ async def queue_del_task(index=None, record_id=None):
     if record is None:
         return False, None, False
 
-    cancelled = False
-    if record["id"] in state.EXECUTING:
-        cancelled = cancel_running(record["id"])
+    # 在途判定交给 cancel_running 自身（_RUNNING_TASKS 句柄在 spawn 时同步
+    # 登记，比 EXECUTING 更早更准）：EXECUTING 要到协程首段运行才写入，以它
+    # 作前置会把「已 spawn 未登记」窗口里的在途任务误判成未在途而放行下载。
+    cancelled = cancel_running(record["id"])
 
     async with state.QUEUE_LOCK:
+        # 两段锁之间任务可能已收尾（executor 成功移除 / 失败转 retry）：
+        # 此时删除并未发生——照旧记「移除」会让台账假账、误导用户。按
+        # 「已不存在」返回（记录躺在 retry 的可经 /retry 看到/再删）。
+        still_there = any(
+            r.get("id") == record["id"] for r in state.QUEUE["tasks"]
+        )
+        if not still_there:
+            logger.info(
+                f"ℹ️ 任务在移除前已不在队列（刚结束或已转待重试）："
+                f"{record.get('label') or '(无)'}"
+            )
+            return False, None, False
         state.QUEUE["tasks"] = [
             r for r in state.QUEUE["tasks"] if r.get("id") != record["id"]
         ]

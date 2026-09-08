@@ -486,6 +486,88 @@ class QueueCancelRunningTest(unittest.IsolatedAsyncioTestCase):
         msgs = [c.args[0] for c in mlog.info.call_args_list if c.args]
         self.assertTrue(any("手动移除队列任务" in m for m in msgs))
 
+    async def test_queue_del_task_skips_when_task_failed_in_between(self):
+        """del 两段锁之间任务恰好收尾（失败转 retry）：不得记「移除」假账。
+
+        竞态：del 在锁①找到记录后出锁，executor 恰在此间隙完成收尾把记录
+        挪进 retry；del 的锁②必须发现记录已不在 tasks、按「已不存在」返回，
+        绝不能照记「🗑 手动移除队列任务」——否则台账「移除」桶假账 +1，
+        而记录其实躺在 retry 里。用打桩 cancel_running 在同步窗口内注入
+        收尾，确定性复现该交错。
+        """
+        rec = queue.queue_enqueue(state.QUEUE, media_record(label="竞态.mp4"))
+        state.EXECUTING.add(rec["id"])
+
+        def finish_concurrently(record_id):
+            # 模拟 executor 在 del 两段锁之间收尾：失败 → 挪进 retry
+            for i, r in enumerate(state.QUEUE["tasks"]):
+                if r.get("id") == record_id:
+                    moved = state.QUEUE["tasks"].pop(i)
+                    moved["attempts"] = moved.get("attempts", 0) + 1
+                    state.QUEUE["retry"].append(moved)
+                    break
+            return False
+
+        with mock.patch.object(queue, "cancel_running",
+                               side_effect=finish_concurrently), \
+                mock.patch.object(queue, "logger") as mlog:
+            ok, removed, cancelled = await queue.queue_del_task(index=1)
+
+        self.assertFalse(ok)  # 删除并没有发生
+        self.assertIsNone(removed)
+        self.assertFalse(cancelled)
+        self.assertEqual(state.QUEUE["tasks"], [])
+        self.assertEqual([r["id"] for r in state.QUEUE["retry"]], [rec["id"]])
+        msgs = [c.args[0] for c in mlog.info.call_args_list if c.args]
+        self.assertFalse(any("手动移除队列任务" in m for m in msgs))
+
+    async def test_queue_del_task_skips_when_task_succeeded_in_between(self):
+        """同上竞态的成功变体：任务在间隙内下载完成被 executor 移除，
+        del 不得报「已移除」（文件其实已落盘，台账「成功+移除」双计）。"""
+        rec = queue.queue_enqueue(state.QUEUE, media_record(label="竞成.mp4"))
+        state.EXECUTING.add(rec["id"])
+
+        def finish_concurrently(record_id):
+            # 模拟 executor 收尾：成功 → 从 tasks 移除
+            state.QUEUE["tasks"] = [
+                r for r in state.QUEUE["tasks"] if r.get("id") != record_id
+            ]
+            return False
+
+        with mock.patch.object(queue, "cancel_running",
+                               side_effect=finish_concurrently), \
+                mock.patch.object(queue, "logger") as mlog:
+            ok, removed, _ = await queue.queue_del_task(index=1)
+
+        self.assertFalse(ok)
+        self.assertIsNone(removed)
+        self.assertEqual(state.QUEUE["tasks"], [])
+        msgs = [c.args[0] for c in mlog.info.call_args_list if c.args]
+        self.assertFalse(any("手动移除队列任务" in m for m in msgs))
+
+    async def test_queue_del_task_cancels_spawned_but_unregistered(self):
+        """「已 spawn 未登记 EXECUTING」窗口：del 仍须能取消在途任务。
+
+        EXECUTING 要到 execute_queued_task 协程首段运行才登记，spawn 到
+        首段之间有个调度窗口；窗口内 del 只看 EXECUTING 会把在途任务误判
+        成「未在途」而不取消，随后协程照常下载（记录却已被移除，失败也
+        不再转 retry）。_RUNNING_TASKS 句柄在 spawn 时同步登记，在途判定
+        交给 cancel_running 以句柄为准即关掉该窗口。假执行体不写
+        EXECUTING（见 _spawn_hanging_task），正是窗口内 del 看到的状态。
+        """
+        rec = queue.queue_enqueue(state.QUEUE, media_record(label="窗口.mp4"))
+        task = await self._spawn_hanging_task(rec)
+        # 不补 EXECUTING —— 复现「句柄已登记、EXECUTING 未登记」的窗口状态
+
+        ok, removed, cancelled = await queue.queue_del_task(index=1)
+
+        self.assertTrue(ok)
+        self.assertTrue(cancelled)  # 窗口内的在途任务也必须被取消
+        self.assertEqual(state.QUEUE["tasks"], [])
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertNotIn(rec["id"], queue._RUNNING_TASKS)
+
 
 class RetryAllTest(unittest.IsolatedAsyncioTestCase):
     """/retry all：重放待重试列表全部任务（执行中的跳过）。"""
