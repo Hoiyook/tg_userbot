@@ -214,11 +214,30 @@ async def borrow():
     返回 None 时调用方照旧用 state.client；返回客户端时用它做 download_media。
     由「信号量先于 borrow」的次序保证不饿死：可并行下载数（≤ 并发数 target）
     恒不大于存活 worker 数，借出必有着落。
+
+    借出前验活：池没有自动重连守护，空闲停靠期间的网络抖动会把连接静默杀死
+    （实测 2026-09-07：04:00 代理断连把 20 条 worker 全数陈尸池中，此后每个
+    下载任务的第 1 次尝试都 0 秒败在「Cannot send requests while disconnected」，
+    白烧 1 次重试预算，个别任务耗尽重试永久失败）。所以借出时发现连接已死就
+    地重连（带超时，防代理黑洞把借出挂死）；重连失败（网络仍断）也照常借出
+    —— 扣下/换走会把池抽干饿死借方，交给下载自身的重试路径兜底不劣于旧版。
     """
     q = state.DOWNLOAD_WORKER_QUEUE
     if q is None:
         return None
-    return await q.get()
+    client = await q.get()
+    if not client.is_connected():
+        try:
+            await asyncio.wait_for(
+                client.connect(), timeout=_WORKER_CONNECT_TIMEOUT
+            )
+            logger.info("🧵 下载 worker 借出时已断开，已重新连接")
+        except Exception as e:
+            logger.warning(
+                f"下载 worker 借出时重连失败（{type(e).__name__}: {e}），"
+                "照常借出，由下载重试兜底"
+            )
+    return client
 
 
 async def release(client):

@@ -13,8 +13,11 @@ from . import state
 from . import text
 from . import queue
 from . import thread
+from . import dedup
 from . import whitelist
 from . import cleanup
+from . import stats
+from . import finder
 from .config import (
     BOT_USERNAME,
     DONE_DEFAULT_LINES,
@@ -22,6 +25,7 @@ from .config import (
     DOWNLOAD_CONCURRENCY_MAX,
     DOWNLOAD_CONCURRENCY_MIN,
     LOG_FILE,
+    LOG_RETENTION_DAYS,
     SAVE_FOLDER,
 )
 from .log import logger
@@ -89,6 +93,17 @@ async def handle_command(event, cmd_text):
         ok, msg = thread.apply_thread_limit(parts[1])
         await event.reply(msg)
         logger.info(f"执行命令：/thread {parts[1]} 成功={ok}")
+        return True
+
+    if dedup.is_dedup_command(cmd_text):
+        parts = cmd_text.split(maxsplit=1)
+        if len(parts) == 1:
+            await event.reply(dedup.status_text())
+            logger.info("执行命令：/dedup（查询）")
+            return True
+        arg = parts[1].strip().lower()
+        await event.reply(dedup.set_enabled(arg == "on"))
+        logger.info(f"执行命令：/dedup {arg}")
         return True
 
     parsed_wl = whitelist.parse_wl_command(cmd_text)
@@ -169,14 +184,12 @@ async def handle_command(event, cmd_text):
             except (IndexError, ValueError):
                 await event.reply("❌ /queue del 用法：/queue del <序号>")
                 return True
-            async with state.QUEUE_LOCK:
-                ok, removed = queue.queue_remove(state.QUEUE, "tasks", idx)
-                if ok:
-                    queue.save_queue(state.QUEUE)
+            # 执行中的任务先真正取消在途下载（task.cancel → 清半成品、归还
+            # worker），再把记录移除；排队中的直接移除。
+            ok, removed, cancelled = await queue.queue_del_task(index=idx)
             if ok:
-                await event.reply(
-                    f"✅ 已从队列移除：{removed.get('label', '')}"
-                )
+                verb = "🛑 已取消下载并移除" if cancelled else "✅ 已从队列移除"
+                await event.reply(f"{verb}：{removed.get('label', '')}")
             else:
                 await event.reply("❌ /queue：序号无效，用 /queue 查看列表")
         else:
@@ -190,6 +203,14 @@ async def handle_command(event, cmd_text):
             await event.reply(
                 queue.format_retry_text(state.QUEUE), link_preview=False
             )
+        elif parts[1].strip().lower() == "all":
+            n = queue.retry_all()
+            await event.reply(
+                f"🔁 已重放全部待重试任务：{n} 条" if n
+                else "🔁 待重试列表为空（或都在执行中）"
+            )
+            logger.info(f"执行命令：/retry all | 触发 {n} 条")
+            return True
         elif parts[1].startswith("del "):
             try:
                 idx = int(parts[1].split(None, 1)[1])
@@ -213,7 +234,7 @@ async def handle_command(event, cmd_text):
                 idx = int(parts[1])
             except ValueError:
                 await event.reply(
-                    "❌ 用法：/retry | /retry <序号> | /retry del <序号>"
+                    "❌ 用法：/retry | /retry all | /retry <序号> | /retry del <序号>"
                 )
                 return True
             async with state.QUEUE_LOCK:
@@ -232,6 +253,31 @@ async def handle_command(event, cmd_text):
         logger.info(f"执行命令：/retry {parts[1] if len(parts) > 1 else ''}")
         return True
 
+    if stats.is_stats_command(cmd_text):
+        parts = cmd_text.split()
+        days = 1
+        if len(parts) > 1:
+            try:
+                days = int(parts[1])
+            except ValueError:
+                await event.reply(
+                    f"❌ /stats：参数须为天数（1-{LOG_RETENTION_DAYS}），"
+                    "如 /stats 3"
+                )
+                return True
+        days = max(1, min(days, LOG_RETENTION_DAYS))
+        logger.info(f"执行命令：/stats {days if days > 1 else ''}".rstrip())
+        await event.reply(stats.stats_text(days), link_preview=False)
+        return True
+
+    if finder.is_find_command(cmd_text):
+        # 媒体下落查询：完整字段子串匹配（列表视图截尾 48 字符是它存在的理由）
+        parts = cmd_text.split(maxsplit=1)
+        keyword = parts[1].strip() if len(parts) > 1 else ""
+        logger.info(f"执行命令：/find {keyword}")
+        await event.reply(finder.find_media(keyword), link_preview=False)
+        return True
+
     if cmd_text == "/help":
         await event.reply(
             "📖 TG Userbot 命令\n\n"
@@ -243,10 +289,13 @@ async def handle_command(event, cmd_text):
             "/done 关键词 - 模糊匹配下载记录\n"
             "/done 20 关键词 - 最近 20 条中模糊匹配\n"
             "/progress - 查看进行中下载的进度\n"
+            "/stats - 查看台账：今日转发/解析/成功/失败汇总\n"
+            "/stats 3 - 查看最近 3 天的台账\n"
             "/thread - 查看当前并发下载数\n"
             f"/thread 5 - 设置并行下载路数为 5"
             f"（{DOWNLOAD_CONCURRENCY_MIN}-{DOWNLOAD_CONCURRENCY_MAX}，每条各占一条独立连接）\n"
-            "/wl - 查看下载白名单\n"
+            "/dedup - 查看重复媒体去重状态\n"
+            "/dedup off - 关闭去重（重新下载已删文件时用）\n"            "/wl - 查看下载白名单\n"
             "/wl add @用户名 - 加入白名单（也可回复转发消息后 /wl add）\n"
             "/wl del ID或序号 - 移出白名单\n"
             "/queue - 查看下载队列\n"

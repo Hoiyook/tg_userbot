@@ -304,6 +304,273 @@ class QueueTaskCancellationRegressionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.QUEUE["tasks"][0]["attempts"], 0)
 
 
+class QueueDelegatedUrlTaskTest(unittest.IsolatedAsyncioTestCase):
+    """kind=url 任务返回 "delegated"（直链失效已降级转交解析 bot）时的簿记。
+
+    download_url_media 的直链过期防护在「刷新无效 → 链接已转解析 bot」时
+    返回 truthy 字符串 "delegated"：任务必须按成功移除（不进 retry、不重放
+    死链，bot 回复的视频走白名单流另入队）。本测试钉住 execute_queued_task
+    的 truthiness 契约——防止将来把 `if success:` 收紧成 `if success is True:`
+    时悄悄弄坏降级路径。characterization 测试（现有行为守卫，非新增行为）。
+    """
+
+    async def asyncSetUp(self):
+        self.old_queue = state.QUEUE
+        self.old_lock = state.QUEUE_LOCK
+        self.old_exec = state.EXECUTING
+        self.old_save = queue.save_queue
+        state.QUEUE_LOCK = asyncio.Lock()
+        state.QUEUE = {"tasks": [], "retry": []}
+        state.EXECUTING = set()
+        queue.save_queue = mock.MagicMock()
+
+    def tearDown(self):
+        state.QUEUE = self.old_queue
+        state.QUEUE_LOCK = self.old_lock
+        state.EXECUTING = self.old_exec
+        queue.save_queue = self.old_save
+
+    async def test_delegated_task_removed_from_tasks(self):
+        rec = queue.queue_enqueue(state.QUEUE, {
+            "kind": "url", "url": "https://v.douyin.com/x/", "label": "x",
+        })
+
+        async def delegated(record):
+            return "delegated"
+
+        with mock.patch.object(queue, "_run_queued_task", side_effect=delegated):
+            await queue.execute_queued_task(rec)
+
+        self.assertNotIn(rec["id"], [r["id"] for r in state.QUEUE["tasks"]])
+        self.assertNotIn(rec["id"], [r["id"] for r in state.QUEUE["retry"]])
+
+    async def test_delegated_task_removed_from_retry(self):
+        """手动 /retry 重放的降级任务同样从 retry 列表移除（不再反复重放死链）。"""
+        rec = queue.queue_enqueue(state.QUEUE, {
+            "kind": "url", "url": "https://v.douyin.com/x/", "label": "x",
+        })
+        queue.queue_fail_to_retry(state.QUEUE, rec)
+
+        async def delegated(record):
+            return "delegated"
+
+        with mock.patch.object(queue, "_run_queued_task", side_effect=delegated):
+            await queue.execute_queued_task(rec)
+
+        self.assertEqual(
+            [r["id"] for r in state.QUEUE["retry"]],
+            [],
+        )
+
+
+class QueueCancelRunningTest(unittest.IsolatedAsyncioTestCase):
+    """在途任务取消：/queue del 命中执行中的任务时必须能真正中断下载。
+
+    旧行为：/queue del 只删记录，字节继续跑完（白下几个 GB）。现在
+    spawn_execute 按记录 id 登记任务句柄，cancel_running 定点 cancel；
+    真取消沿 download_file/execute_queued_task 的既有链路收尾（清
+    .download 半成品、归还 worker、记录原位），queue_del_task 再把记录
+    从 tasks 移除。
+    """
+
+    async def asyncSetUp(self):
+        self.old = (state.QUEUE, state.QUEUE_LOCK, state.EXECUTING)
+        state.QUEUE = {"tasks": [], "retry": []}
+        state.QUEUE_LOCK = asyncio.Lock()
+        state.EXECUTING = set()
+        queue._RUNNING_TASKS.clear()
+        queue._SPAWNED_TASKS.clear()
+
+    async def asyncTearDown(self):
+        # 收尾：取消可能还挂着的假任务，恢复全局
+        for t in list(queue._SPAWNED_TASKS):
+            t.cancel()
+        state.QUEUE, state.QUEUE_LOCK, state.EXECUTING = self.old
+        queue._RUNNING_TASKS.clear()
+
+    async def _spawn_hanging_task(self, rec):
+        started = asyncio.Event()
+
+        async def hang(record):
+            started.set()
+            await asyncio.sleep(3600)
+
+        with mock.patch.object(queue, "execute_queued_task", side_effect=hang):
+            task = queue.spawn_execute(rec)
+        await started.wait()
+        return task
+
+    async def test_cancel_running_cancels_and_cleans_registry(self):
+        rec = queue.queue_enqueue(state.QUEUE, media_record(label="x.mp4"))
+        task = await self._spawn_hanging_task(rec)
+        self.assertIn(rec["id"], queue._RUNNING_TASKS)
+
+        self.assertTrue(queue.cancel_running(rec["id"]))
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertNotIn(rec["id"], queue._RUNNING_TASKS)  # done 回调清簿
+
+    async def test_cancel_running_unknown_or_done_returns_false(self):
+        self.assertFalse(queue.cancel_running("no-such-id"))
+
+        rec = queue.queue_enqueue(state.QUEUE, media_record())
+        done = asyncio.Event()
+
+        async def instant(record):
+            done.set()
+
+        with mock.patch.object(queue, "execute_queued_task",
+                               side_effect=instant):
+            queue.spawn_execute(rec)
+        await done.wait()
+        await asyncio.sleep(0)  # 让 done 回调跑完
+        self.assertFalse(queue.cancel_running(rec["id"]))  # 已结束不可取消
+
+    async def test_queue_del_task_cancels_executing_and_removes(self):
+        rec = queue.queue_enqueue(state.QUEUE, media_record(label="大文件.mp4"))
+        task = await self._spawn_hanging_task(rec)
+        # 假执行体不写 EXECUTING（真身才写），手动补上「执行中」语义
+        state.EXECUTING.add(rec["id"])
+
+        ok, removed, cancelled = await queue.queue_del_task(index=1)
+
+        self.assertTrue(ok)
+        self.assertEqual(removed["id"], rec["id"])
+        self.assertTrue(cancelled)
+        self.assertEqual(state.QUEUE["tasks"], [])  # 记录已移除
+        # 取消是异步收尾：等任务真正结束后再断言句柄簿记已清
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertNotIn(rec["id"], queue._RUNNING_TASKS)
+
+    async def test_queue_del_task_idle_just_removes(self):
+        rec = queue.queue_enqueue(state.QUEUE, media_record(label="排队中.mp4"))
+
+        ok, removed, cancelled = await queue.queue_del_task(index=1)
+
+        self.assertTrue(ok)
+        self.assertFalse(cancelled)  # 没在执行，无取消发生
+        self.assertEqual(state.QUEUE["tasks"], [])
+
+    async def test_queue_del_task_by_record_id(self):
+        rec = queue.queue_enqueue(state.QUEUE, media_record())
+        ok, removed, cancelled = await queue.queue_del_task(record_id=rec["id"])
+        self.assertTrue(ok)
+        self.assertFalse(cancelled)
+        self.assertEqual(state.QUEUE["tasks"], [])
+
+    async def test_queue_del_task_bad_index_fails(self):
+        ok, removed, cancelled = await queue.queue_del_task(index=9)
+        self.assertFalse(ok)
+        self.assertIsNone(removed)
+        self.assertFalse(cancelled)
+
+    async def test_queue_del_task_logs_removal(self):
+        """手动删除必须落日志：台账勾稽靠它计「移除」桶（此前完全无痕，
+        收到的媒体被删后成功/待重试都数不到，台账永远差一口）。"""
+        rec = queue.queue_enqueue(
+            state.QUEUE, media_record(label="黑窟窿.mp4")
+        )
+        with mock.patch.object(queue, "logger") as mlog:
+            await queue.queue_del_task(index=1)
+        msgs = [c.args[0] for c in mlog.info.call_args_list if c.args]
+        self.assertTrue(any("手动移除队列任务" in m for m in msgs))
+        self.assertTrue(any("黑窟窿.mp4" in m for m in msgs))
+
+        # 未在途（纯排队中）的删除同样落日志
+        rec2 = queue.queue_enqueue(
+            state.QUEUE, media_record(label="排队中.mp4")
+        )
+        with mock.patch.object(queue, "logger") as mlog:
+            await queue.queue_del_task(record_id=rec2["id"])
+        msgs = [c.args[0] for c in mlog.info.call_args_list if c.args]
+        self.assertTrue(any("手动移除队列任务" in m for m in msgs))
+
+
+class RetryAllTest(unittest.IsolatedAsyncioTestCase):
+    """/retry all：重放待重试列表全部任务（执行中的跳过）。"""
+
+    async def asyncSetUp(self):
+        self.old = (state.QUEUE, state.QUEUE_LOCK, state.EXECUTING)
+        state.QUEUE = {"tasks": [], "retry": []}
+        state.QUEUE_LOCK = asyncio.Lock()
+        state.EXECUTING = set()
+        queue._SPAWNED_TASKS.clear()
+
+    async def asyncTearDown(self):
+        for t in list(queue._SPAWNED_TASKS):
+            t.cancel()
+        state.QUEUE, state.QUEUE_LOCK, state.EXECUTING = self.old
+        queue._SPAWNED_TASKS.clear()
+
+    async def test_retry_all_spawns_all_not_executing(self):
+        spawned = []
+
+        def fake_spawn(record):
+            spawned.append(record)
+
+        for i in range(3):
+            rec = queue.queue_enqueue(
+                state.QUEUE, media_record(label=f"r{i}.mp4")
+            )
+            queue.queue_fail_to_retry(state.QUEUE, rec)  # 内部自行 pop
+        # 第 2 条假装在执行 → 跳过
+        state.EXECUTING.add(state.QUEUE["retry"][1]["id"])
+
+        with mock.patch.object(queue, "spawn_execute", fake_spawn):
+            n = queue.retry_all()
+
+        self.assertEqual(n, 2)
+        self.assertEqual(len(spawned), 2)
+        # 重放不改列表归属（成功/失败仍由 execute_queued_task 收尾处理）
+        self.assertEqual(len(state.QUEUE["retry"]), 3)
+
+    async def test_retry_all_empty_returns_zero(self):
+        self.assertEqual(queue.retry_all(), 0)
+
+
+class QueuePaginationTest(unittest.TestCase):
+    """重试/队列列表分页：60 条会超 Telegram 4096 上限导致回复发不出
+    （「点重试列表没数据返回」的根因），按页渲染 + 页头统计。序号保持
+    全局（第 2 页从 11 起），/retry <n> 的序号语义不变。"""
+
+    def _q(self, n, key="retry"):
+        q = empty_queue()
+        for i in range(n):
+            q[key].append(media_record(label=f"任务{i}.mp4"))
+        return q
+
+    def test_retry_text_paginated_with_stats_header(self):
+        text = queue.format_retry_text(self._q(12), page=1)
+        self.assertIn("共 12 条", text)
+        self.assertIn("第 1/2 页", text)
+        self.assertIn("\n1. ", text)
+        self.assertIn("\n10. ", text)
+        self.assertNotIn("\n11. ", text)  # 只渲染本页
+        self.assertLess(len(text), 4096)
+
+    def test_retry_text_page2_global_numbering(self):
+        text = queue.format_retry_text(self._q(12), page=2)
+        self.assertIn("第 2/2 页", text)
+        self.assertIn("\n11. ", text)
+        self.assertIn("\n12. ", text)
+        self.assertNotIn("\n1. ", text)  # "1. " 是 "11. " 的子串，须带行首
+
+    def test_retry_text_page_clamped(self):
+        text = queue.format_retry_text(self._q(12), page=99)
+        self.assertIn("第 2/2 页", text)
+
+    def test_retry_text_empty_unchanged(self):
+        self.assertIn("空", queue.format_retry_text(empty_queue()))
+
+    def test_queue_text_paginated_too(self):
+        """队列列表同样分页（39 条大队列时同样会撞 4096）。"""
+        text = queue.format_queue_text(self._q(25, key="tasks"), page=1)
+        self.assertIn("共 25 条", text)
+        self.assertIn("第 1/3 页", text)
+        self.assertLess(len(text), 4096)
+
+
 class QueueFormatTest(unittest.TestCase):
     """队列/待重试列表文本格式化。"""
 
@@ -331,6 +598,37 @@ class QueueFormatTest(unittest.TestCase):
 
     def test_retry_text_empty(self):
         self.assertIn("空", queue.format_retry_text(empty_queue()))
+
+    def test_long_final_name_truncated_to_tail(self):
+        """超长 final_name（相册长 caption 名）截到 48 字符、保留尾部——
+        区分性最强的原文件名在后半段；约 27 条 250 字符长名就会撞 Telegram
+        4096 字符上限（2026-09-07 实测 20 条 ≈ 3041 字符），截断后列表
+        恒在限内且更易读。"""
+        long_name = ("26-07-08 作者：#腿玩年_期数：bl208_角色：#达妮娅 "
+                     "文件大小：1297M_i站视频预览地址_布料【 https___www 】"
+                     " - bl208布料4k【达妮娅】可愛くてごめん.mp4")
+        self.assertGreater(len(long_name), 48)
+        q = empty_queue()
+        queue.queue_enqueue(q, {
+            "kind": "media", "chat_id": 987654321, "msg_id": 1,
+            "final_name": long_name, "label": long_name,
+        })
+        text = queue.format_queue_text(q)
+        self.assertNotIn(long_name, text)          # 全名不再出现
+        self.assertIn("…", text)                    # 有省略号标记
+        self.assertIn("可愛くてごめん.mp4", text)    # 尾部（原文件名）保留
+        self.assertLess(len(text), 4096)            # 单条也远在限内
+
+    def test_short_final_name_untouched(self):
+        """守卫：短名不截断、不加省略号。"""
+        q = empty_queue()
+        queue.queue_enqueue(q, {
+            "kind": "media", "chat_id": 987654321, "msg_id": 1,
+            "final_name": "a.mp4", "label": "a.mp4",
+        })
+        text = queue.format_queue_text(q)
+        self.assertIn("a.mp4", text)
+        self.assertNotIn("…", text)
 
 
 if __name__ == "__main__":

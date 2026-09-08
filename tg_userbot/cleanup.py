@@ -16,8 +16,11 @@ import asyncio
 from . import state
 from . import queue
 from . import thread
+from . import dedup
 from . import whitelist
 from . import platform
+from . import stats
+from . import finder
 from .config import (
     CLEANUP_DELETE_TIMEOUT,
     CLEANUP_FETCH_TIMEOUT,
@@ -123,12 +126,24 @@ def is_cleanup_message(message) -> bool:
         if thread.is_thread_command(text):
             return True
 
+        # /dedup 指令（/dedup、/dedup on、/dedup off）
+        if dedup.is_dedup_command(text):
+            return True
+
         # /wl 指令（/wl、/wl add @xxx、/wl del 123 ...）
         if whitelist.is_wl_command(text):
             return True
 
         # /queue、/retry 指令（含子命令）
         if queue.is_queue_command(text) or queue.is_retry_command(text):
+            return True
+
+        # /stats 指令（台账，含天数参数）
+        if stats.is_stats_command(text):
+            return True
+
+        # /find 指令（媒体下落查询，含关键字）
+        if finder.is_find_command(text):
             return True
 
         # 程序自己发送/产生的链接指令：

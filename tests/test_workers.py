@@ -7,6 +7,8 @@
    live 恒不低于 target（borrow 不饿死）。
 3. download_file 借到 worker 时把字节走 worker.download_media(message, ...)，
    而不是 message.download_media —— 这是「多 socket 并行」的关键分流。
+4. borrow 借出前验活：空闲期被网络抖动杀死的 worker 就地重连再借出（重连
+   失败仍借出，交下载重试兜底）；健康连接不多发起 connect。
 
 不联网：spawn 的建 client 用假 client 顶替；download 路径沿用
 test_queue 死锁回归的假消息配方（真实 download_file 全链路，无网络）。
@@ -31,16 +33,31 @@ from tg_userbot import download  # noqa: E402
 
 
 class _FakeWorker:
-    """假 worker：记录 download_media 调用；disconnect 无操作。"""
+    """假 worker：记录 download_media/connect 调用；disconnect 即失联。
+
+    is_connected/connect 与真实 TelegramClient 同接口（borrow 借出前验活、
+    重连都要走它们）。
+    """
 
     def __init__(self, name, calls=None):
         self.name = name
         self.calls = calls if calls is not None else []
         self.disconnected = False
+        self.connected = True
+        self.connect_calls = 0
         self.session = types.SimpleNamespace(server_address="fake-host")
+
+    def is_connected(self):
+        return self.connected
+
+    async def connect(self):
+        self.connect_calls += 1
+        self.connected = True
+        return True
 
     async def disconnect(self):
         self.disconnected = True
+        self.connected = False
 
     async def download_media(self, message, *, file=None, progress_callback=None):
         self.calls.append(("worker", file))
@@ -147,6 +164,57 @@ class PoolLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.DOWNLOAD_WORKER_TARGET, 5)
 
 
+class BorrowLivenessTest(unittest.IsolatedAsyncioTestCase):
+    """borrow 借出前验活：空闲期被网络抖动杀死的 worker 就地重连再借出。
+
+    背景（2026-09-07 线上）：04:00 代理断连把全部 20 条 worker 杀死在池中，
+    池无守护、借出不验活 → 每个任务第 1 次尝试 0 秒败在「Cannot send
+    requests while disconnected」，白烧 1 次重试预算；3 个任务再被网络杀两次
+    就耗尽重试、永久进 retry 列表。修复 = 借出前 is_connected() + 就地重连
+    （带超时）；重连失败仍借出，交给下载自身的重试兜底，不劣于旧版。
+    """
+
+    async def asyncSetUp(self):
+        self.old = (state.DOWNLOAD_WORKERS, state.DOWNLOAD_WORKER_QUEUE,
+                    state.DOWNLOAD_WORKER_TARGET)
+        _disabled_pool()
+        self.worker = _FakeWorker("w")
+        state.DOWNLOAD_WORKERS = [self.worker]
+        state.DOWNLOAD_WORKER_QUEUE = asyncio.Queue()
+        state.DOWNLOAD_WORKER_QUEUE.put_nowait(self.worker)
+        state.DOWNLOAD_WORKER_TARGET = 1
+
+    async def asyncTearDown(self):
+        state.DOWNLOAD_WORKERS, state.DOWNLOAD_WORKER_QUEUE, \
+            state.DOWNLOAD_WORKER_TARGET = self.old
+
+    async def test_borrow_revives_dead_worker(self):
+        self.worker.connected = False  # 空闲期被网络抖动杀死
+        got = await workers.borrow()
+        self.assertIs(got, self.worker)
+        self.assertEqual(self.worker.connect_calls, 1)
+        self.assertTrue(self.worker.is_connected())
+
+    async def test_borrow_returns_dead_worker_when_reconnect_fails(self):
+        """网络仍断（重连失败）时也要照常借出：borrow 若换走/扣下 worker 会
+        把池抽干、借方饿死；借出后由下载重试路径（_sleep_and_reconnect）
+        继续尝试复活，与旧行为兼容。"""
+        self.worker.connected = False
+
+        async def dead_network():
+            raise OSError("网络不可达")
+
+        self.worker.connect = dead_network
+        got = await workers.borrow()
+        self.assertIs(got, self.worker)
+
+    async def test_borrow_does_not_touch_healthy_worker(self):
+        """守卫：健康连接借出时不发起多余 connect。"""
+        got = await workers.borrow()
+        self.assertIs(got, self.worker)
+        self.assertEqual(self.worker.connect_calls, 0)
+
+
 class DownloadWorkerRoutingTest(unittest.IsolatedAsyncioTestCase):
     """download_file 借到 worker 时字节走 worker.download_media（多 socket 分流）。
 
@@ -223,6 +291,33 @@ class DownloadWorkerRoutingTest(unittest.IsolatedAsyncioTestCase):
         # 完成后 worker 归还空闲队列
         self.assertEqual(state.DOWNLOAD_WORKER_QUEUE.qsize(), 1)
         self.assertEqual(len(state.DOWNLOAD_WORKERS), 1)
+
+    async def test_success_remembers_dedup_key(self):
+        """成功落盘后把 tg:<file_unique_id> 记入去重索引（文件 + 内存）——
+        同一媒体再次转发/重发时由入队前判重拦截。"""
+        from tg_userbot import dedup
+
+        self.fake_message.file.id = "TG-UID-9"
+        old_index = state.DEDUP_INDEX
+        state.DEDUP_INDEX = {}
+        idx_file = os.path.join(_TMP, "dedup_index_workerstest.txt")
+        if os.path.exists(idx_file):
+            os.remove(idx_file)
+        try:
+            with mock.patch.object(dedup, "DEDUP_INDEX_FILE", idx_file):
+                ok = await asyncio.wait_for(
+                    download.download_file(self.fake_message, "测试来源"),
+                    timeout=10,
+                )
+                self.assertTrue(ok)
+                # mock 消息算出的最终名不可控，只断言键与落盘行为
+                self.assertIn("tg:TG-UID-9", state.DEDUP_INDEX)
+                with open(idx_file, "r", encoding="utf-8") as f:
+                    self.assertIn("tg:TG-UID-9", f.read())
+        finally:
+            state.DEDUP_INDEX = old_index
+            if os.path.exists(idx_file):
+                os.remove(idx_file)
 
     async def test_network_cancel_retried_not_propagated(self):
         """回归：download_media 抛网络层 CancelledError（telethon 断线时对 pending

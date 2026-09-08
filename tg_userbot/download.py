@@ -7,6 +7,7 @@
 无环依赖：download 只引用叶子模块（naming/sources/history/config/log/state）。
 """
 import os
+import re
 import time
 import asyncio
 from datetime import datetime
@@ -17,7 +18,9 @@ from telethon.errors import AuthBytesInvalidError, RPCError
 from . import state
 from . import workers
 from . import config
+from . import dedup
 from .config import (
+    DIRECT_URL_REFRESH_MARGIN_SECONDS,
     DOWNLOAD_IDLE_TIMEOUT,
     DOWNLOAD_RETRIES,
     EXPORT_RACE_EXTRA_RETRIES,
@@ -80,6 +83,112 @@ async def _stream_url_to_file(client, url, temp_path, on_progress):
     return total
 
 
+# ------------------------------------------------------------
+# 直链过期防护：douyinvod 直链签名只活 ~3 小时（实测 = 解析时刻 +3h），
+# 深队列里排队太久会拿着过期直链开下。开下前解码内嵌过期戳提前刷新；
+# 万一仍被 CDN 拒（403/410）再补一次刷新，刷新无效则降级解析 bot 兜底。
+# ------------------------------------------------------------
+
+# douyinvod 签名格式：https://<host>/<32hex md5>/<hex 过期 unix 戳>/video/...
+_DIRECT_URL_EXPIRY_RE = re.compile(
+    r"^https?://[^/]+/[0-9a-f]{32}/([0-9a-f]+)/", re.IGNORECASE
+)
+
+# CDN 对失效直链的拒绝码：触发「补刷新 → 刷新无效转交解析 bot」。
+# 其它 HTTP 错误（5xx 等）与解析 bot 无关，仍按普通失败重试。
+_DIRECT_LINK_GONE_STATUS = frozenset({403, 410})
+
+
+def direct_url_expiry(url):
+    """从 douyinvod 直链里解码签名过期 unix 时间戳（浮点秒）；认不出返回 None。"""
+    m = _DIRECT_URL_EXPIRY_RE.match(url or "")
+    if not m:
+        return None
+    try:
+        return float(int(m.group(1), 16))
+    except ValueError:
+        return None
+
+
+def direct_url_needs_refresh(url, now=None):
+    """直链临近过期（含已过期）→ True；签名认不出 → False（不盲刷，等 403 兜底）。"""
+    expiry = direct_url_expiry(url)
+    if expiry is None:
+        return False
+    if now is None:
+        now = time.time()
+    return now >= expiry - DIRECT_URL_REFRESH_MARGIN_SECONDS
+
+
+async def _refresh_direct_url(record):
+    """用记录里的原始分享链接重新解析，拿一条新直链。
+
+    成功：原地更新 record["direct_url"] 并返回新直链（记录对象与队列里的是
+    同一份，任务收尾时 execute_queued_task 的 save_queue 顺带把新直链落盘，
+    此后转 retry / 重启重放用的都是新直链）。失败：返回 None，记录不动，
+    调用方回退旧直链。resolver 调用走函数内 import（f2 的 import 有联网
+    副作用，与 platform 的隔离纪律一致）。
+    """
+    share_url = record.get("url") or ""
+    if not share_url:
+        return None
+    try:
+        from . import resolver
+
+        result = await resolver.resolve_douyin(share_url)
+    except Exception as e:
+        # resolve_douyin 理论上不抛（内部已全捕获），防御性兜底
+        logger.warning(f"⚠️ 直链重新解析异常：{type(e).__name__}: {e}")
+        return None
+    if not result or not result.direct_url:
+        logger.warning(
+            "⚠️ 直链重新解析失败（cookie 可能失效或作品不可见），拿不到新直链"
+        )
+        return None
+    record["direct_url"] = result.direct_url
+    logger.info(f"🔄 直链已重新解析刷新 | {result.direct_url[:80]}...")
+    return result.direct_url
+
+
+async def _delegate_url_task_to_bot(record, display_name):
+    """直链确认无法下载且刷新无效：把原始链接转交解析 bot 兜底。
+
+    bot 在自己服务端解析、不依赖本地 cookie，这条兜底永远可用；bot 回复的
+    视频由白名单转发流自动进收藏夹下载。返回 "delegated"（truthy）→ 队列
+    按成功移除本任务（bot 那条路会送来新的媒体，重放旧记录只会双下载）；
+    转交本身失败（网络断等）返回 False → 照常转 retry，链接不丢。
+    """
+    share_url = record.get("url") or ""
+    logger.warning(f"⚠️ 直链已失效且刷新无效，转交解析 bot 兜底：{display_name}")
+    try:
+        from . import platform
+
+        await platform.relay_links_to_parse_bot("douyin", [share_url])
+    except Exception as e:
+        logger.exception(f"转交解析 bot 失败：{e}")
+        try:
+            await state.client.send_message(
+                "me",
+                "❌ 直链下载失败，且转交解析 bot 失败\n\n"
+                f"文件：{display_name}\n"
+                f"链接：{share_url}\n"
+                "任务已转待重试，可 /retry 重放或手动重新发送链接",
+            )
+        except Exception:
+            pass
+        return False
+    try:
+        await state.client.send_message(
+            "me",
+            "⚠️ 直链已过期且重新解析无效（cookie 可能失效），"
+            "已把原始链接转给解析 bot 兜底，回复视频将自动下载\n\n"
+            f"文件：{display_name}",
+        )
+    except Exception:
+        pass
+    return "delegated"
+
+
 async def download_url_media(record):
     """本地解析链的 HTTP 直链下载（队列 kind=url 任务执行体）。
 
@@ -87,6 +196,11 @@ async def download_url_media(record):
     .download 临时文件 + os.replace 原子落盘、无进度看门狗、失败转
     retry（返回 False）、成功记历史 + 通知收藏夹。差异：没有 Telegram
     消息/worker 池概念——直链、最终名、目录在入队时已定死在记录里。
+    另有直链过期防护（douyinvod 签名只活 ~3 小时，深队列会等超它）：
+    开下前临近过期先重新解析刷新；仍被 CDN 拒（403/410）则补刷新一次，
+    再无效就把原始链接降级转交解析 bot（返回 "delegated"，队列按成功
+    移除）。占信号量前做刷新——解析最长 RESOLVER_TIMEOUT_SECONDS，
+    别占着并发槽等它。
     """
     import httpx  # f2 的依赖；f2 没装时队列任务按普通失败转 retry，不影响媒体流
 
@@ -97,6 +211,15 @@ async def download_url_media(record):
     )
     folder = _douyin_folder()
     os.makedirs(folder, exist_ok=True)
+
+    # 开下前先看直链签名寿命：临近/已过期就刷新，别让第一轮尝试烧在
+    # 过期直链上。refreshed 标记「本执行已试过刷新」——之后 403 时不再
+    # 重复解析（刚试过仍失败，多半是 cookie 失效，几秒后再试也一样）。
+    refreshed = False
+    if direct_url_needs_refresh(url):
+        refreshed = True
+        logger.info("⏰ 直链签名临近过期/已过期，先重新解析刷新再下载")
+        url = await _refresh_direct_url(record) or url
 
     async with state.DOWNLOAD_SEMAPHORE:
         final_path = _reserve_final_path(folder, final_filename)
@@ -197,6 +320,14 @@ async def download_url_media(record):
                         f" | 来源：本地解析"
                     )
 
+                    # 记入去重索引（dedup_key 入队时随记录持久化）：同一视频
+                    # 换口令重发时由入队前判重拦截
+                    dedup.remember(
+                        record.get("dedup_key"),
+                        os.path.basename(final_path),
+                        actual_size,
+                    )
+
                     logger.info("✅ 直链下载完成")
                     logger.info(f"文件：{final_path}")
                     logger.info(f"实际大小：{format_size(actual_size)}")
@@ -217,6 +348,38 @@ async def download_url_media(record):
                 except asyncio.CancelledError:
                     # 真取消（进程退出）：原样放行，记录留在 tasks 重启恢复
                     raise
+
+                except httpx.HTTPStatusError as e:
+                    status = (
+                        e.response.status_code
+                        if e.response is not None else None
+                    )
+                    if status in _DIRECT_LINK_GONE_STATUS:
+                        # CDN 拒链 = 直链失效（签名过期/作品不可见）。这不是
+                        # 网络抖动，原样烧满 DOWNLOAD_RETRIES 次毫无意义：
+                        # 没刷新过就补一次刷新换新直链立刻重下；刷新过仍被拒
+                        # （或刷新拿不到新链）说明重新解析已无效 → 降级解析
+                        # bot 兜底（不依赖本地 cookie），本任务按 "delegated"
+                        # 移除，不进 retry。
+                        if refreshed:
+                            return await _delegate_url_task_to_bot(
+                                record, os.path.basename(final_path)
+                            )
+                        refreshed = True
+                        logger.warning(
+                            f"⚠️ 直链被 CDN 拒绝（HTTP {status}），"
+                            "重新解析刷新直链"
+                        )
+                        url = await _refresh_direct_url(record) or url
+                        continue
+                    logger.exception(
+                        f"❌ 直链下载失败（HTTP {status}），尝试第 {attempt} 次"
+                        f"（上限 {DOWNLOAD_RETRIES}）：{e}"
+                    )
+                    if attempt >= DOWNLOAD_RETRIES:
+                        break
+                    logger.info("🔄 3 秒后重试直链下载...")
+                    await asyncio.sleep(3)
 
                 except (ConnectionError, TimeoutError, OSError) as e:
                     logger.exception(
@@ -525,6 +688,14 @@ async def download_file(message, source_override=None, caption_override=None,
                         f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 普通 | "
                         f"{os.path.basename(final_path)} | {format_size(actual_size)}"
                         f" | 来源：{source}"
+                    )
+
+                    # 记入去重索引：tg:<file_unique_id> 跨转发稳定，同一媒体
+                    # 再转发/重发时由入队前判重拦截（file 拿不到就 no-op）
+                    dedup.remember(
+                        dedup.media_key(message),
+                        os.path.basename(final_path),
+                        actual_size,
                     )
 
                     logger.info("✅ 下载完成")

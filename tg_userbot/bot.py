@@ -12,21 +12,58 @@ import asyncio
 import time
 
 from telethon import Button
+from telethon.tl.functions.bots import SetBotCommandsRequest
+from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from telethon.utils import get_peer_id
 
 from . import state
 from . import text
 from . import menu
 from . import queue
+from . import dedup
 from . import thread
 from . import whitelist
 from . import cleanup
 from . import cd2
+from . import stats
+from . import finder
+from . import commands
 from . import config
 from .config import DONE_DEFAULT_LINES
 from .log import logger
 from .naming import sanitize_filename
 from .sources import entity_display_name
+
+# bot 原生命令面板：注册后 owner 在 bot 对话点输入框 "/" 即见带说明的命令
+# 菜单（此前从未注册，命令全靠记）。这些命令在 bot 对话同样执行
+# （bot_message_handler 分发到 commands.handle_command），未识别的回落主菜单。
+BOT_COMMANDS = (
+    ("stats", "台账：今日转发/解析/成功/失败汇总"),
+    ("find", "按关键字查一条媒体的下落"),
+    ("progress", "查看进行中下载的实时进度"),
+    ("queue", "查看下载队列"),
+    ("retry", "查看待重试列表"),
+    ("done", "查看最近下载记录"),
+    ("thread", "查看/设置并行下载路数"),
+    ("dedup", "查看/设置重复媒体去重"),
+    ("wl", "查看下载白名单"),
+    ("clean", "清理 .download 临时文件"),
+    ("clearmsg", "清理程序产生的消息"),
+    ("help", "查看全部命令"),
+)
+
+
+async def register_bot_commands(client):
+    """注册命令面板（启动时一次，服务端持久，重连无需重注）。"""
+    await client(SetBotCommandsRequest(
+        scope=BotCommandScopeDefault(),
+        lang_code="",
+        commands=[
+            BotCommand(command=name, description=desc)
+            for name, desc in BOT_COMMANDS
+        ],
+    ))
+    logger.info(f"🤖 bot 命令面板已注册：{len(BOT_COMMANDS)} 个命令")
 
 
 async def handle_menu_action(action, arg, event):
@@ -36,7 +73,10 @@ async def handle_menu_action(action, arg, event):
     if action == "status":
         return text.status_text(), menu.back_home_buttons()
     if action == "progress":
-        return text.progress_text(), menu.back_home_buttons()
+        return text.progress_text(), [
+            [Button.inline("🔄 刷新", menu.encode_menu_data("progress")),
+             Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
+        ]
     if action == "done":
         return text.done_reply_text(DONE_DEFAULT_LINES), menu.back_home_buttons()
     if action == "wl":
@@ -81,6 +121,27 @@ async def handle_menu_action(action, arg, event):
         return await cd2.cd2_stop_or_status(), menu.back_home_buttons()
     if action == "bak":
         return cd2.backup_records_text(), menu.back_home_buttons()
+    if action == "stats":
+        # 窗口天数随按钮参数（m:stats:<n>），非法/缺省回落今日；
+        # 上限即日志保留天数（更早无数据）。
+        try:
+            days = int(arg) if arg else 1
+        except ValueError:
+            days = 1
+        days = max(1, min(days, config.LOG_RETENTION_DAYS))
+        return stats.stats_text(days), menu.stats_menu_buttons(days)
+    if action == "find":
+        # 查询按钮没法打字：进入输入窗口（同 cookie 模式），下一条普通文本
+        # 即关键字；/ 开头视为命令退出窗口。
+        state.FIND_INPUT_UNTIL = (
+            time.monotonic() + config.FIND_INPUT_WINDOW_SECONDS
+        )
+        return (
+            "🔍 请直接发送要查询的关键字（发到本对话）。\n\n"
+            f"{config.FIND_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "超时请重新点【🔍 查询】。发送 / 开头的命令可取消。",
+            menu.back_home_buttons(),
+        )
     if action == "cookie":
         return menu.cookie_status_text(), menu.cookie_menu_buttons()
     if action == "cookie_set":
@@ -128,20 +189,33 @@ async def handle_menu_action(action, arg, event):
     if action == "queue":
         return queue.format_queue_text(state.QUEUE), menu.queue_menu_buttons()
     if action == "queue_del":
-        async with state.QUEUE_LOCK:
-            before = len(state.QUEUE["tasks"])
-            state.QUEUE["tasks"] = [
-                r for r in state.QUEUE["tasks"] if r.get("id") != arg
-            ]
-            removed_any = len(state.QUEUE["tasks"]) != before
-            if removed_any:
-                queue.save_queue(state.QUEUE)
-        return (
-            ("✅ 已从队列移除" if removed_any else "❌ 任务已不存在"),
-            menu.back_home_buttons(),
-        )
+        # 与 /queue del 同路：执行中的任务先真正取消在途下载再移除记录
+        ok, removed, cancelled = await queue.queue_del_task(record_id=arg)
+        if not ok:
+            return "❌ 任务已不存在", menu.back_home_buttons()
+        verb = "🛑 已取消下载并移除" if cancelled else "✅ 已从队列移除"
+        return f"{verb}：{removed.get('label', '')}", menu.back_home_buttons()
+    if action == "dedup":
+        return dedup.status_text(), menu.dedup_menu_buttons()
+    if action == "dedup_toggle":
+        msg = dedup.set_enabled(not state.DEDUP_ENABLED)
+        return msg, menu.dedup_menu_buttons()
     if action == "retry":
-        return queue.format_retry_text(state.QUEUE), menu.retry_menu_buttons()
+        try:
+            page = int(arg) if arg else 1
+        except ValueError:
+            page = 1
+        return (
+            queue.format_retry_text(state.QUEUE, page),
+            menu.retry_menu_buttons(page),
+        )
+    if action == "retry_all":
+        n = queue.retry_all()
+        return (
+            (f"🔁 已重放全部待重试任务：{n} 条" if n
+             else "🔁 待重试列表为空（或都在执行中）"),
+            menu.retry_menu_buttons(1),
+        )
     if action == "retry_run":
         async with state.QUEUE_LOCK:
             record = next(
@@ -192,6 +266,14 @@ async def bot_message_handler(event):
             return
         state.COOKIE_INPUT_UNTIL = 0.0
 
+    # 查询等待窗口：普通文本当作 /find 的关键字，执行后窗口即关。
+    if state.FIND_INPUT_UNTIL and time.monotonic() < state.FIND_INPUT_UNTIL:
+        if not text.startswith("/"):
+            state.FIND_INPUT_UNTIL = 0.0
+            await _handle_find_input(event, text)
+            return
+        state.FIND_INPUT_UNTIL = 0.0
+
     if from_id:
         chat_id, title = await whitelist.resolve_wl_target(
             state.bot_client, None, fwd
@@ -223,12 +305,33 @@ async def bot_message_handler(event):
             )
         return
 
+    # 注册过的 / 命令在 bot 对话同样执行（命令面板点出来的命令落在本对话）；
+    # 未识别的 / 命令（含 /start）回落主菜单，语义与旧行为一致。
+    if text.startswith("/"):
+        if await commands.handle_command(event, text):
+            return
+
     # 任意文本（含 /start）→ 主菜单
     logger.info(f"🤖 bot 菜单：owner 发送 {text[:30]!r}，显示主菜单")
     await state.bot_client.send_message(
         state.MY_ID,
         menu.build_main_menu_text(),
         buttons=menu.main_menu_buttons(),
+    )
+
+
+async def _handle_find_input(event, text):
+    """处理查询等待窗口内发来的关键字：执行 /find 同款查询并回复。"""
+    if len(text.strip()) < 2:
+        await state.bot_client.send_message(
+            state.MY_ID,
+            f"🔍 关键字太短（≥2 字符）。请重新点【🔍 查询】再发，"
+            f"或直接发 /find <关键字>",
+        )
+        return
+    logger.info(f"🤖 bot 菜单查询：{text.strip()!r}")
+    await state.bot_client.send_message(
+        state.MY_ID, finder.find_media(text), link_preview=False
     )
 
 

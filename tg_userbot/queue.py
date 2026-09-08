@@ -35,13 +35,70 @@ from .sources import message_link
 # 回收，仍按最佳实践持有，兼为未来 Python 版本兜底）。done 回调里自我移除。
 _SPAWNED_TASKS = set()
 
+# 执行中任务句柄 {record_id: Task}：/queue del 取消在途下载用（任务结束自清）。
+_RUNNING_TASKS = {}
+
 
 def spawn_execute(record):
     """后台执行一个队列任务并持有强引用（入队/启动恢复/手动重试共用）。"""
     task = asyncio.create_task(execute_queued_task(record))
     _SPAWNED_TASKS.add(task)
+    _RUNNING_TASKS[record["id"]] = task
     task.add_done_callback(_SPAWNED_TASKS.discard)
+    task.add_done_callback(
+        lambda _t, rid=record["id"]: _RUNNING_TASKS.pop(rid, None)
+    )
     return task
+
+
+def cancel_running(record_id):
+    """取消一个执行中的队列任务（task.cancel() → 真取消链路收尾）。
+
+    任务不存在/已结束返回 False。取消后 CancelledError 沿既有链路传播：
+    download_file 的 finally 清 .download 半成品、归还 worker；记录留在
+    原位，由调用方（queue_del_task）负责移除。
+    """
+    task = _RUNNING_TASKS.get(record_id)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    return True
+
+
+async def queue_del_task(index=None, record_id=None):
+    """删除一个队列任务；正在执行则先取消在途下载。
+
+    index（1 起始）或 record_id 二选一定位 tasks 里的记录。返回
+    (是否删除, 被删记录, 是否取消了在途下载)。
+    """
+    async with state.QUEUE_LOCK:
+        if index is not None:
+            lst = state.QUEUE["tasks"]
+            record = lst[index - 1] if 1 <= index <= len(lst) else None
+        else:
+            record = next(
+                (r for r in state.QUEUE["tasks"] if r.get("id") == record_id),
+                None,
+            )
+    if record is None:
+        return False, None, False
+
+    cancelled = False
+    if record["id"] in state.EXECUTING:
+        cancelled = cancel_running(record["id"])
+
+    async with state.QUEUE_LOCK:
+        state.QUEUE["tasks"] = [
+            r for r in state.QUEUE["tasks"] if r.get("id") != record["id"]
+        ]
+        save_queue(state.QUEUE)
+    # 删除必须落日志：台账勾稽靠这行计「移除」桶（此前删除完全无痕，
+    # 收到的媒体被手动删掉后成功/待重试都数不到，/stats 永远差一口）。
+    logger.info(
+        f"🗑 手动移除队列任务（{'在途已取消' if cancelled else '未在途'}）："
+        f"{record.get('label') or '(无)'}"
+    )
+    return True, record, cancelled
 
 
 def is_queue_command(text):
@@ -126,11 +183,21 @@ def queue_retry_failed(queue, record):
             return
 
 
+def _truncate_tail(label, limit=48):
+    """超长名截到 limit 字符、保留尾部（原文件名在后半段），省略号打头。"""
+    if len(label) <= limit:
+        return label
+    return "…" + label[-(limit - 1):]
+
+
 def _queue_record_display(record):
     kind_label = QUEUE_KIND_LABELS.get(record.get("kind"), record.get("kind"))
-    # media / url 都在入队时算好 final_name，展示与实际下载命名共用
+    # media / url 都在入队时算好 final_name，展示与实际下载命名共用；
+    # 相册长 caption 名可达 250+ 字符，列表视图截到尾部 48 字符——区分性
+    # 最强的原文件名在后半段。不截的话 ~27 条就撞 Telegram 4096 字符上限，
+    # 列表编辑直接报错（2026-09-07 实测 20 条 ≈ 3041 字符）。
     if record.get("final_name"):
-        label = record["final_name"]
+        label = _truncate_tail(record["final_name"])
     else:
         label = record.get("label") or record.get("url") or "(无)"
     lines = [f"[{kind_label}] {label}"]
@@ -152,28 +219,66 @@ def _queue_record_source(record):
     return ""
 
 
-def format_queue_text(queue):
-    """活跃队列列表文本。"""
+# 列表分页大小：60+ 条任务的全量渲染会超 Telegram 4096 字符上限，回复/编辑
+# 直接失败（「点重试列表没数据返回」的根因）。每页 10 条 + 页头统计。
+LIST_PAGE_SIZE = 10
+
+
+def _paged_lines(header, records, page, render):
+    """列表分页通用渲染：页头统计 + 本页条目，序号保持全局（跨页连续）。"""
+    total = len(records)
+    total_pages = max(1, (total + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
+    page = min(max(1, page), total_pages)
+    start = (page - 1) * LIST_PAGE_SIZE
+    lines = [
+        f"{header}（共 {total} 条，第 {page}/{total_pages} 页，"
+        f"序号为全局序号）：",
+        "",
+    ]
+    for i, r in enumerate(records[start:start + LIST_PAGE_SIZE],
+                          start=start + 1):
+        lines.append(render(i, r))
+    return "\n".join(lines)
+
+
+def format_queue_text(queue, page=1):
+    """活跃队列列表文本（分页，序号全局）。"""
     tasks = queue.get("tasks", [])
     if not tasks:
         return "📥 下载队列：空"
-    lines = [
-        f"{i}. {_queue_record_display(r)}"
-        for i, r in enumerate(tasks, start=1)
-    ]
-    return f"📥 下载队列（等待中 {len(tasks)} 条）：\n\n" + "\n".join(lines)
+    return _paged_lines(
+        "📥 下载队列", tasks, page,
+        lambda i, r: f"{i}. {_queue_record_display(r)}",
+    )
 
 
-def format_retry_text(queue):
-    """待重试列表文本。"""
+def format_retry_text(queue, page=1):
+    """待重试列表文本（分页，序号全局——/retry <序号> 语义不变）。"""
     retry = queue.get("retry", [])
     if not retry:
         return "🔁 待重试列表：空"
-    lines = [
-        f"{i}. {_queue_record_display(r)}（已尝试 {r.get('attempts', 0)} 次）"
-        for i, r in enumerate(retry, start=1)
-    ]
-    return f"🔁 待重试列表（{len(retry)} 条）：\n\n" + "\n".join(lines)
+    return _paged_lines(
+        "🔁 待重试列表", retry, page,
+        lambda i, r: (
+            f"{i}. {_queue_record_display(r)}"
+            f"（已尝试 {r.get('attempts', 0)} 次）"
+        ),
+    )
+
+
+def retry_all():
+    """重放待重试列表的全部任务；正在执行中的跳过。返回触发条数。
+
+    重放不改列表归属：记录留在 retry，成功/失败由 execute_queued_task
+    收尾时按 in_retry 更新（与单条手动重试同一套簿记）。
+    """
+    triggered = 0
+    for record in list(state.QUEUE["retry"]):
+        if record.get("id") in state.EXECUTING:
+            continue
+        spawn_execute(record)
+        triggered += 1
+    return triggered
 
 
 # ------------------------------------------------------------

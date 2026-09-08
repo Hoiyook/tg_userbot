@@ -19,6 +19,7 @@ from telethon.network.connection import ConnectionTcpFull, ConnectionTcpObfuscat
 
 from . import state
 from . import commands
+from . import dedup
 from . import queue
 from . import thread
 from . import whitelist
@@ -435,13 +436,28 @@ async def enqueue_media(message, chat_id, source_override, source_link=None,
     source_link 显式传入时覆盖默认的来源链接；album_caption 为相册无文字
     成员继承到的同组说明（入队即随记录持久化，下载命名时使用）；user_label
     为手工转发评论标注（同样随记录持久化）。
+    入队前先过重复媒体判重（tg:<file_unique_id> 两级：已下载索引 + 在途
+    队列）：命中只拦下载不拦转发（白名单转发的「转发自」副本照旧留在收藏
+    夹当书签），并通知；键拿不到或 /dedup off 时照常入队。
     """
-    await queue.enqueue_and_start(
-        _build_media_record(
-            message, chat_id, source_override, source_link,
-            album_caption, user_label,
-        )
+    key = dedup.media_key(message)
+    if key:
+        logger.info(f"🛡 判重键 tg:{key.split(':', 1)[1]}（消息 {message.id}）")
+    skip, notice = dedup.should_skip(key)
+    if skip:
+        logger.info(f"⏭️ 重复媒体跳过入队（消息 {message.id}）")
+        try:
+            await state.client.send_message("me", notice)
+        except Exception as e:
+            logger.warning(f"发送重复媒体通知失败：{e}")
+        return
+    record = _build_media_record(
+        message, chat_id, source_override, source_link,
+        album_caption, user_label,
     )
+    if key:
+        record["dedup_key"] = key
+    await queue.enqueue_and_start(record)
 
 
 async def relay_chat_media(message, origin_chat_id, source_override):
@@ -827,6 +843,9 @@ async def main():
     state.client = create_client()
     state.bot_client = None
     thread.load_thread_config()
+    dedup.load_dedup_config()
+    loaded = dedup.load_index()
+    logger.info(f"🛡 去重索引已载入：{loaded} 条")
     state.WHITELIST_CHATS = whitelist.load_whitelist()
     state.DOWNLOAD_SEMAPHORE = AdjustableSemaphore(state.DOWNLOAD_CONCURRENCY)
     state.QUEUE_LOCK = asyncio.Lock()
@@ -906,6 +925,10 @@ async def main():
                 bot.bot_callback_handler, events.CallbackQuery()
             )
             logger.info(f"✅ bot 菜单已启用：{BOT_USERNAME}（ID={state.BOT_ID}）")
+            try:
+                await bot.register_bot_commands(state.bot_client)
+            except Exception as e:
+                logger.warning(f"注册 bot 命令面板失败（不影响菜单）：{e}")
         except Exception as e:
             logger.error(f"❌ bot 菜单启动失败（不影响主功能）：{e}")
             state.bot_client = None

@@ -202,6 +202,12 @@ PROGRESS_STEP = 5
 # 进度），只在代理节点彻底断流时才触发；误判顶多浪费一次尝试、重下即可。
 DOWNLOAD_IDLE_TIMEOUT = 120
 
+# 抖音直链签名寿命的「提前刷新」边际（秒）：douyinvod 直链内嵌过期 unix 戳，
+# 实测 = 解析时刻 +3 小时。本地解析链入队的 url 任务在深队列里排队太久会拿
+# 着过期直链开下（403 白烧重试、任务救不回）。download_url_media 开下前解码
+# 该戳，剩余寿命低于此边际就先用原始分享链接重新解析拿新直链。
+DIRECT_URL_REFRESH_MARGIN_SECONDS = 15 * 60
+
 # 文件名按 UTF-8 字节上限截断。macOS(APFS/HFS+) 与 Android(ext4) 的单文件名
 # 上限都是 255 字节；这里留出 ".download" 临时后缀与重名 " (n)" 的余量。
 # 只影响超限的罕见超长标题/说明，正常文件名原样保留。
@@ -212,6 +218,14 @@ MAX_FILENAME_BYTES = 200
 # 文件名最前，见 naming 的 label 参数）。窗口不消费、不因取用而清空——一条
 # 评论后连续转发 N 条媒体都拼上同一条标注，靠时间自然过期。
 ME_LABEL_WINDOW_SECONDS = 5
+
+# 重复媒体去重（2026-09-07）：判重索引 append-only 追加（runtime/dedup_index.txt，
+# 一行一条「键\t日期\t文件名」，与 download_history.txt 同款单行原子纪律，
+# 永不全量重写），启动时载入内存并只在启动裁剪到 DEDUP_MAX_ENTRIES 条
+# （保尾部，超限原子重写一次）。键：tg:<file_unique_id> / dyc:<aweme_id>。
+DEDUP_INDEX_FILE = os.path.join(RUNTIME_DIR, "dedup_index.txt")
+DEDUP_CONFIG_FILE = os.path.join(RUNTIME_DIR, "dedup_config.json")
+DEDUP_MAX_ENTRIES = 10000
 
 # 「文本在后」宽限（秒）：实测转发+评论时评论的事件可能落在媒体之后（事件循环
 # 调度顺序不定），媒体到达时若还没有待关联标注，先等这么多秒再取一次，给尾部
@@ -295,6 +309,8 @@ DOUYIN_HEADERS = {
 # bot 菜单更新 cookie 的等待输入窗口（秒）：超时后 bot 对话里的普通文本
 # 不再当作 cookie 内容，需重新点【✏️ 更新】
 COOKIE_INPUT_WINDOW_SECONDS = 120
+# 【🔍 查询】按钮的等待输入窗口（按下后发关键字，同 cookie 模式）
+FIND_INPUT_WINDOW_SECONDS = 120
 
 # ============================================================
 # 下载并发
@@ -336,9 +352,11 @@ BOT_SESSION_NAME = SESSION_NAME + "_bot"
 MENU_ACTIONS = (
     "home", "status", "progress", "done", "wl", "wl_add",
     "wl_del", "thread", "clean", "back",
-    "queue", "queue_del", "retry", "retry_run", "retry_del",
-    "cd2", "cd2_stop", "bak",
+    "queue", "queue_del", "retry", "retry_run", "retry_del", "retry_all",
+    "cd2", "cd2_stop", "bak", "stats",
     "cookie", "cookie_set", "cookie_clear", "cookie_imp",
+    "dedup", "dedup_toggle",
+    "find",
 )
 
 
@@ -464,9 +482,16 @@ CLEAN_NOTIFICATION_PREFIXES = (
     # /progress 的回复
     "📊 当前没有进行中的下载",
     "📊 当前下载进度",
+    # /stats（台账）的回复
+    "📊 台账",
+    # /find（媒体下落查询）的命令与回复
+    "🔍 查询",
     # /thread 的回复
     "🧵 当前并发下载数",
     "✅ 并发下载数已设置为",
+    # 去重命中的跳过通知
+    "⏭️ 重复媒体已跳过下载",
+    "⏭️ 相同媒体已在下载队列",
     # /wl 的回复
     "📋 下载白名单",
     "✅ 已加入白名单",

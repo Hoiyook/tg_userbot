@@ -38,6 +38,7 @@ PROCESSING_DOUYIN_IDS = set()
 
 # bot 菜单「🍪 抖音Cookie」的等待输入标记：monotonic 时间戳，超过即窗口关闭
 COOKIE_INPUT_UNTIL = 0.0
+FIND_INPUT_UNTIL = 0.0
 
 MY_ID = None  # 本人（owner）用户 id，登录后填充
 
@@ -54,6 +55,12 @@ STOP_EVENT = None  # asyncio.Event，main() 里创建（事件循环规则）
 
 # 下载白名单 {chat_id(带符号): 标题}，main() 启动时 load_whitelist() 加载
 WHITELIST_CHATS = {}
+
+# 重复媒体去重：{判重键: {"date":…, "filename":…}}，main() 启动时
+# dedup.load_index() 载入（尾部 ≤ DEDUP_MAX_ENTRIES 条）；DEDUP_ENABLED 由
+# dedup.load_dedup_config() 从 dedup_config.json 还原（/dedup off|on 切换）
+DEDUP_INDEX = {}
+DEDUP_ENABLED = True
 
 # CD2 进程句柄（仅防 GC 回收后台进程，无人读取）
 _CD2_PROC = None

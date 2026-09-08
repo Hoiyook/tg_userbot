@@ -90,3 +90,14 @@ class CleanupTextMessageTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CleanupFindTest(unittest.TestCase):
+    """/find 命令与「🔍 查询」回复纳入自动清理白名单（2026-09-08）。"""
+
+    def test_find_command_cleaned(self):
+        self.assertTrue(cleanup.is_cleanup_message(make_msg(text="/find bl44")))
+
+    def test_find_reply_prefix_cleaned(self):
+        msg = make_msg(text="🔍 查询「bl44」匹配 3 处\n\n1. 🔁 待重试 | …")
+        self.assertTrue(cleanup.is_cleanup_message(msg))

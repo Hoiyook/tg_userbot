@@ -13,7 +13,7 @@ _TMP = tempfile.mkdtemp(prefix="tg_userbot_menu_test_")
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import state, config  # noqa: E402
-from tg_userbot import menu, text, thread, cleanup, cd2, whitelist  # noqa: E402
+from tg_userbot import menu, text, thread, cleanup, cd2, whitelist, bot  # noqa: E402
 
 
 class MenuDataCodecTest(unittest.TestCase):
@@ -64,6 +64,54 @@ class MenuTextTest(unittest.TestCase):
                       "🖥 启动CD2", "🛑 停止CD2", "🗂 备份记录"):
             self.assertIn(label, texts)
 
+    def test_main_menu_has_dedup_entry(self):
+        texts = [b.text for row in menu.main_menu_buttons() for b in row]
+        self.assertIn("🛡 去重", texts)
+
+    def test_dedup_menu_buttons(self):
+        rows = menu.dedup_menu_buttons()
+        pairs = [menu.parse_menu_data(b.data) for row in rows for b in row]
+        actions = [a for a, _arg in pairs]
+        self.assertIn("dedup_toggle", actions)
+        self.assertIn("home", actions)
+
+    def test_dedup_menu_actions_registered(self):
+        from tg_userbot import config
+        for a in ("dedup", "dedup_toggle"):
+            self.assertIn(a, config.MENU_ACTIONS)
+
+    def test_retry_menu_buttons_paginated(self):
+        from tg_userbot import state as _state
+        old_q = _state.QUEUE
+        _state.QUEUE = {"tasks": [], "retry": []}
+        try:
+            for i in range(12):
+                _state.QUEUE["retry"].append({
+                    "id": f"r{i}", "label": f"任务{i}.mp4", "attempts": 1,
+                })
+            rows = menu.retry_menu_buttons(1)
+            flat = [(b.text, menu.parse_menu_data(b.data))
+                    for row in rows for b in row]
+            texts = [t for t, _ in flat]
+            actions = [a for _, (a, _arg) in flat]
+            run_items = [t for t, (a, _arg) in flat if a == "retry_run"]
+            self.assertEqual(len(run_items), 10)  # 只渲染本页条目
+            self.assertIn("▶️ 下一页", texts)
+            self.assertNotIn("◀️ 上一页", texts)  # 第 1 页没有上一页
+            self.assertIn(("▶️ 下一页", ("retry", "2")),
+                          [(t, p) for t, p in flat])
+            # 第 2 页：有上一页、无下一页，序号从 11 起
+            rows2 = menu.retry_menu_buttons(2)
+            texts2 = [b.text for row in rows2 for b in row]
+            self.assertIn("◀️ 上一页", texts2)
+            self.assertNotIn("▶️ 下一页", texts2)
+            self.assertIn("▶️ 11", texts2)
+            # 全部重放入口
+            self.assertIn("♻️ 全部重放", texts)
+            self.assertIn("retry_all", actions)
+        finally:
+            _state.QUEUE = old_q
+
     def test_main_menu_text_non_empty(self):
         text = menu.build_main_menu_text()
         self.assertTrue(text.strip())
@@ -98,6 +146,88 @@ class MenuTextTest(unittest.TestCase):
         self.assertIn("a.mp4", body)
         self.assertIn("42.0%", body)
         state.ACTIVE_DOWNLOADS.clear()
+
+
+class LiveMenuHeaderTest(unittest.TestCase):
+    """主菜单头部实时状态：打开菜单即见 在途/待处理/待重试/今日成功。"""
+
+    def setUp(self):
+        self.old = (state.ACTIVE_DOWNLOADS, state.QUEUE)
+        state.ACTIVE_DOWNLOADS = {}
+        state.QUEUE = {"tasks": [], "retry": []}
+
+    def tearDown(self):
+        state.ACTIVE_DOWNLOADS, state.QUEUE = self.old
+
+    def test_idle_menu(self):
+        """全空（且今日无成功）时显示空闲。"""
+        self.assertIn("空闲", menu.build_main_menu_text())
+
+    def test_busy_menu_shows_counts(self):
+        state.ACTIVE_DOWNLOADS = {1: {}, 2: {}}
+        state.QUEUE = {
+            "tasks": [{"id": "a"}, {"id": "b"}, {"id": "c"}],
+            "retry": [{"id": "d"}],
+        }
+        t = menu.build_main_menu_text()
+        self.assertIn("在途 2", t)
+        self.assertIn("待处理 3", t)
+        self.assertIn("待重试 1", t)
+        # 测试环境的临时目录无日志/历史 → 今日成功为 0，仍应展示（可预期的格式）
+        self.assertIn("今日 0 个", t)
+        self.assertNotIn("空闲", t)
+
+
+class RefreshButtonsTest(unittest.TestCase):
+    """队列/待重试视图的「🔄 刷新」按钮：原地重渲染，免走主菜单。"""
+
+    def test_queue_menu_has_refresh(self):
+        state.QUEUE = {"tasks": [], "retry": []}
+        rows = menu.queue_menu_buttons()
+        actions = [
+            menu.parse_menu_data(b.data)
+            for row in rows for b in row
+        ]
+        self.assertIn(("queue", None), actions)
+
+    def test_retry_menu_has_refresh(self):
+        state.QUEUE = {"tasks": [], "retry": []}
+        rows = menu.retry_menu_buttons()
+        actions = [
+            menu.parse_menu_data(b.data)
+            for row in rows for b in row
+        ]
+        # 刷新按钮带当前页参（🔄 1/1 → m:retry:1）
+        self.assertIn(("retry", "1"), actions)
+
+    def test_main_menu_has_ledger_entry(self):
+        texts = [b.text for row in menu.main_menu_buttons() for b in row]
+        self.assertIn("📊 台账", texts)
+
+
+class BotCommandsRegistryTest(unittest.IsolatedAsyncioTestCase):
+    """bot 命令面板：BOT_COMMANDS 表合法，注册时发 SetBotCommandsRequest。"""
+
+    def test_bot_commands_well_formed(self):
+        for name, desc in bot.BOT_COMMANDS:
+            self.assertRegex(name, r"^[a-z0-9_]{1,32}$")
+            self.assertTrue(desc.strip())
+        names = [n for n, _ in bot.BOT_COMMANDS]
+        self.assertIn("stats", names)
+        self.assertEqual(len(names), len(set(names)), "命令不应重复")
+
+    async def test_register_sends_request(self):
+        calls = []
+
+        class FakeClient:
+            async def __call__(self, request):
+                calls.append(request)
+
+        await bot.register_bot_commands(FakeClient())
+        self.assertEqual(len(calls), 1)
+        names = [c.command for c in calls[0].commands]
+        self.assertIn("stats", names)
+        self.assertEqual(calls[0].lang_code, "")
 
 
 class ThreadLimitTest(unittest.TestCase):
@@ -326,3 +456,15 @@ class BotCleanupPlanTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FindMenuEntryTest(unittest.TestCase):
+    """主菜单带【🔍 查询】按钮，动作注册为 find（2026-09-08 媒体查询）。"""
+
+    def test_main_menu_has_find_entry(self):
+        rows = menu.main_menu_buttons()
+        texts = [b.text for row in rows for b in row]
+        self.assertTrue(any("查询" in t for t in texts))
+        actions = [menu.parse_menu_data(b.data)[0]
+                   for row in rows for b in row]
+        self.assertIn("find", actions)

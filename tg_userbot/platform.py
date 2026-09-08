@@ -22,6 +22,7 @@ from telethon.utils import get_peer_id
 
 from . import state
 from . import config
+from . import dedup
 from .config import (
     DOUYIN_URL_PATTERN,
     INSTAGRAM_URL_PATTERN,
@@ -97,7 +98,7 @@ def build_url_record(kind, url, result, user_label=None):
     与 download_url_media 实际落盘名保持一致（媒体任务的同一约定）。
     """
     created_at = datetime.now()
-    return {
+    record = {
         "id": uuid.uuid4().hex,
         "kind": "url",
         "url": url,
@@ -114,6 +115,10 @@ def build_url_record(kind, url, result, user_label=None):
         "source_link": None,
         "created_at": created_at.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    dedup_key = dedup.douyin_key(getattr(result, "aweme_id", None))
+    if dedup_key:
+        record["dedup_key"] = dedup_key  # 在途判重 + 成功后 remember 复用
+    return record
 
 
 async def relay_platform_links(message, douyin_urls, instagram_urls):
@@ -168,6 +173,18 @@ async def _handle_douyin_urls(message, douyin_urls):
         if result is None:
             remaining.append(url)
             continue
+        # 入队前判重（dyc:<aweme_id> 两级：已下载索引 + 在途队列）：同一视频
+        # 换个分享口令重发也判得住；命中只跳过入队、不再降级 bot（已下载过，
+        # 再中转一份就是白下）。键拿不到（aweme_id 缺失）照常入队。
+        key = dedup.douyin_key(getattr(result, "aweme_id", None))
+        skip, notice = dedup.should_skip(key)
+        if skip:
+            logger.info(f"⏭️ 抖音重复视频跳过入队：{url}")
+            try:
+                await state.client.send_message("me", notice)
+            except Exception as e:
+                logger.warning(f"发送重复视频通知失败：{e}")
+            continue
         try:
             record = build_url_record("douyin", url, result, user_label=user_label)
             await queue.enqueue_and_start(record)
@@ -191,6 +208,15 @@ async def _handle_douyin_urls(message, douyin_urls):
 
     if remaining:
         await _relay_kind_links("douyin", remaining)
+
+
+async def relay_links_to_parse_bot(kind: str, urls):
+    """把链接原文发给解析 bot 的公开入口（与 _relay_kind_links 同路径）。
+
+    download 的直链失效降级（_delegate_url_task_to_bot）用它把原始分享
+    链接兜底转给解析 bot——bot 在自己服务端解析、不依赖本地 cookie。
+    """
+    await _relay_kind_links(kind, urls)
 
 
 async def _relay_kind_links(kind: str, urls):

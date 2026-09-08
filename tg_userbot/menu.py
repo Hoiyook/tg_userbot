@@ -9,7 +9,7 @@ from telethon import Button
 
 from . import state
 from . import config
-from .config import DOWNLOAD_CONCURRENCY_MAX, MENU_ACTIONS
+from .config import DOWNLOAD_CONCURRENCY_MAX, LOG_RETENTION_DAYS, MENU_ACTIONS
 
 
 def encode_menu_data(action, arg=None):
@@ -36,11 +36,32 @@ def parse_menu_data(data):
 
 
 def build_main_menu_text():
-    return (
-        "🤖菜单\n\n"
-        "点击按钮操作，结果会更新在这条消息里。\n"
-        "【我的收藏】 里的命令照常可用。"
-    )
+    """主菜单文本；头部拼一行实时状态，打开菜单即所见、0 次额外点击。"""
+    from .stats import collect_stats  # 函数内引用：查台账要读日志/历史文件
+    from .naming import format_size
+
+    in_flight = len(state.ACTIVE_DOWNLOADS) if state.ACTIVE_DOWNLOADS else 0
+    pending = len(state.QUEUE.get("tasks", [])) if state.QUEUE else 0
+    to_retry = len(state.QUEUE.get("retry", [])) if state.QUEUE else 0
+    today = collect_stats(1)
+
+    lines = ["🤖菜单", ""]
+    if not (in_flight or pending or to_retry or today["success_count"]):
+        lines.append("✅ 空闲：暂无在途与排队任务")
+    else:
+        lines.append(
+            f"⏳ 在途 {in_flight} | 📥 待处理 {pending} | 🔁 待重试 {to_retry}"
+        )
+        lines.append(
+            f"✅ 今日 {today['success_count']} 个 / "
+            f"{format_size(today['success_bytes'])}"
+        )
+    lines += [
+        "",
+        "点击按钮操作，结果会更新在这条消息里。",
+        "【我的收藏】 里的命令照常可用。",
+    ]
+    return "\n".join(lines)
 
 
 def main_menu_buttons():
@@ -53,10 +74,39 @@ def main_menu_buttons():
          Button.inline("🔁 待重试", encode_menu_data("retry"))],
         [Button.inline("🧵 并发", encode_menu_data("thread")),
          Button.inline("🧹 清理", encode_menu_data("clean"))],
-        [Button.inline("🍪 抖音Cookie", encode_menu_data("cookie"))],
+        [Button.inline("🛡 去重", encode_menu_data("dedup")),
+         Button.inline("🍪 抖音Cookie", encode_menu_data("cookie"))],
         [Button.inline("🖥 启动CD2", encode_menu_data("cd2")),
          Button.inline("🛑 停止CD2", encode_menu_data("cd2_stop"))],
-        [Button.inline("🗂 备份记录", encode_menu_data("bak"))],
+        [Button.inline("🗂 备份记录", encode_menu_data("bak")),
+         Button.inline("📊 台账", encode_menu_data("stats"))],
+        [Button.inline("🔍 查询", encode_menu_data("find"))],
+    ]
+
+
+def stats_menu_buttons(days=1):
+    """台账视图的窗口切换按钮：今日 / 3 天 / 7 天，当前窗口打 ✅。"""
+    def _btn(n):
+        label = "今日" if n == 1 else f"{n} 天"
+        mark = "✅ " if n == days else ""
+        return Button.inline(
+            f"{mark}{label}", encode_menu_data("stats", str(n))
+        )
+
+    return [
+        [_btn(1), _btn(3), _btn(LOG_RETENTION_DAYS)],
+        [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
+    ]
+
+
+def dedup_menu_buttons():
+    """去重视图按钮：开/关切换 + 回填扫描 + 返回主菜单。"""
+    from . import dedup  # 函数内导入：menu 为叶子模块，避免环
+
+    toggle_label = "⏸ 关闭去重" if dedup.state.DEDUP_ENABLED else "▶️ 开启去重"
+    return [
+        [Button.inline(toggle_label, encode_menu_data("dedup_toggle"))],
+        [Button.inline("🏠 返回主菜单", encode_menu_data("home"))],
     ]
 
 
@@ -69,13 +119,25 @@ def queue_menu_buttons():
                 f"❌ {i} {label}", encode_menu_data("queue_del", r["id"])
             )]
         )
-    rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
+    rows.append([
+        Button.inline("🔄 刷新", encode_menu_data("queue")),
+        Button.inline("🔙 返回主菜单", encode_menu_data("home")),
+    ])
     return rows
 
 
-def retry_menu_buttons():
+def retry_menu_buttons(page=1):
+    """待重试视图：本页条目按钮 + 翻页/刷新 + 全部重放 + 返回。序号全局。"""
+    from .queue import LIST_PAGE_SIZE  # 函数内导入，避免 menu → queue 环
+
+    records = state.QUEUE.get("retry", []) if state.QUEUE else []
+    total = len(records)
+    total_pages = max(1, (total + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
+    page = min(max(1, page), total_pages)
+    start = (page - 1) * LIST_PAGE_SIZE
     rows = []
-    for i, r in enumerate(state.QUEUE["retry"], start=1):
+    for i, r in enumerate(records[start:start + LIST_PAGE_SIZE],
+                          start=start + 1):
         label = (r.get("label") or "(无)")[:14]
         rows.append(
             [
@@ -87,7 +149,20 @@ def retry_menu_buttons():
                 ),
             ]
         )
-    rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
+    nav = []
+    if page > 1:
+        nav.append(Button.inline("◀️ 上一页",
+                                 encode_menu_data("retry", str(page - 1))))
+    nav.append(Button.inline(f"🔄 {page}/{total_pages}",
+                             encode_menu_data("retry", str(page))))
+    if page < total_pages:
+        nav.append(Button.inline("▶️ 下一页",
+                                 encode_menu_data("retry", str(page + 1))))
+    rows.append(nav)
+    rows.append([
+        Button.inline("♻️ 全部重放", encode_menu_data("retry_all")),
+        Button.inline("🔙 返回主菜单", encode_menu_data("home")),
+    ])
     return rows
 
 
