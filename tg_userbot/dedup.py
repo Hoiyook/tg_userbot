@@ -1,19 +1,21 @@
 """重复媒体去重：append-only 判重索引 + 入队前检查 + /dedup 开关。
 
 同一频道帖子转发两次 / 同一抖音视频换口令重发会原样再下载一遍（几个 GB
-白吃）。判重键用跨转发稳定的元数据：
+白吃）。判重键按「防线层级」分四类：
 
-  * Telegram 媒体  → ``tg:<file_unique_id>``（同一媒体文件在任意聊天/
-    转发副本里 unique_id 相同，正是「同一频道帖子转两次」的判据）；
-  * 抖音本地解析  → ``dyc:<aweme_id>``（不同分享口令指向同一视频也能判）。
-
-局限（已知且接受）：解析 bot 中转回的视频是 bot 每次重新上传的，
-file_unique_id 每次都不同，判不了——那部分靠 dyc 键那条腿覆盖。
+  * 元数据级 ``tg:<file.id>`` —— Telegram document/photo 的服务端文件 ID，
+    跨转发稳定，判「同一频道帖子转两次」；
+  * 元数据级 ``dyc:<aweme_id>`` —— 抖音本地解析，不同分享口令指向同一
+    视频也能判；
+  * 文件级 ``f:<原始文件名>:<字节大小>`` —— 判「bot 重传」：解析 bot 每次
+    重新上传 file.id 都变，但生成的文件名与字节大小不变；
+  * 内容级 ``c:<sha256>`` —— 下载完成后、落盘前读回临时文件算哈希查询，
+    字节相同即拦，是前两层全漏掉时的最终兜底（带宽已花，省磁盘与 115）。
 
 纪律：索引文件 append-only 单行追加（与 download_history.txt 同款——
 事件循环内单行 ``"a"`` 写原子，永不全量重写），启动时载入内存并裁剪到
 DEDUP_MAX_ENTRIES 条（保尾部，超限只在启动原子重写一次）。判重不确定的
-（file 缺失 / aweme_id 拿不到）一律放行——不确定性永不拦下载。
+（file 缺失 / aweme_id 拿不到 / 哈希算不出）一律放行——不确定性永不拦下载。
 """
 import os
 import re
@@ -27,6 +29,7 @@ from .config import (
     DEDUP_MAX_ENTRIES,
 )
 from .log import logger
+from .naming import get_original_filename, is_meaningless_filename
 
 
 def media_key(message):
@@ -45,9 +48,47 @@ def media_key(message):
     return f"tg:{uid}" if uid else None
 
 
+def file_key(message):
+    """文件级判重键 f:<原始文件名>:<字节大小>；拿不全 → None（放行）。
+
+    判「bot 重传」：解析 bot 每次重新上传，file.id 每次都变（tg: 键判
+    不了），但 bot 生成的文件名与字节大小不变。原名无意义（未命名/UUID，
+    含没有文件名的照片）不参与——不同文件可能恰好同大小，会误伤。
+    """
+    try:
+        f = getattr(message, "file", None)
+        size = getattr(f, "size", None) if f is not None else None
+        if not size:
+            return None
+        name = get_original_filename(message)
+        if not name or is_meaningless_filename(name):
+            return None
+        return f"f:{name}:{size}"
+    except Exception:
+        return None
+
+
+def media_keys(message):
+    """媒体判重键列表 [tg:…, f:…]（拿不到的层自动缺席，不炸不拦）。
+
+    消息既过 tg:（同一媒体转多次）也过 f:（bot 重传）两道；任一层键
+    拿不到只影响自己那条腿。
+    """
+    keys = []
+    for k in (media_key(message), file_key(message)):
+        if k:
+            keys.append(k)
+    return keys
+
+
 def douyin_key(aweme_id):
     """抖音视频的判重键 dyc:<aweme_id>；拿不到 → None（放行）。"""
     return f"dyc:{aweme_id}" if aweme_id else None
+
+
+def content_key(digest):
+    """内容级判重键 c:<sha256 十六进制>；哈希缺失 → None（放行）。"""
+    return f"c:{digest}" if digest else None
 
 
 def seen(key):
@@ -58,57 +99,91 @@ def seen(key):
 
 
 def find_in_queue(key):
-    """在途判重：state.QUEUE 的 tasks/retry 里是否已有同键任务。"""
+    """在途判重：state.QUEUE 的 tasks/retry 里是否已有同键任务。
+
+    记录侧兼容两种字段：新 ``dedup_keys`` 列表（媒体任务，多防线）与旧
+    ``dedup_key`` 单字段（抖音 url 任务 + 升级前的存量 JSON）。
+    """
     if not key or state.QUEUE is None:
         return False
     for section in ("tasks", "retry"):
         for record in state.QUEUE.get(section) or []:
-            if record.get("dedup_key") == key:
+            record_keys = record.get("dedup_keys")
+            if record_keys is not None:
+                if key in record_keys:
+                    return True
+            elif record.get("dedup_key") == key:
                 return True
     return False
 
 
-def should_skip(key):
-    """入队前两级判重总入口。返回 (是否跳过, 通知文本)。
+def should_skip(keys):
+    """入队前判重总入口（元数据级 tg:/dyc: + 文件级 f:）。返回 (是否跳过, 通知)。
 
-    开关关闭或键为 None → 永远 (False, None)；索引命中（已下载过）→ 拦并
-    带原下载信息；队列在途（排队/待重试）→ 拦并提示等它下完。
+    keys 可为单键字符串（抖音 dyc 路径兼容）或键列表——列表里任一键命中
+    即拦。索引命中（已下载过）→ 拦并带原下载信息；队列在途（排队/待重试）
+    → 拦并提示等它下完。开关关闭或键全缺 → 永远 (False, None)。
     """
-    if not state.DEDUP_ENABLED or not key:
+    if not state.DEDUP_ENABLED or not keys:
         return False, None
-    prior = seen(key)
-    if prior:
-        return True, (
-            "⏭️ 重复媒体已跳过下载\n\n"
-            f"文件：{prior.get('filename') or '(未知)'}\n"
-            f"原下载：{prior.get('date') or '(未知)'}\n\n"
-            "（/dedup off 可临时关闭去重后重新下载）"
-        )
-    if find_in_queue(key):
-        return True, (
-            "⏭️ 相同媒体已在下载队列中，跳过重复入队\n\n"
-            "（/dedup off 可临时关闭去重）"
-        )
+    if isinstance(keys, str):
+        keys = [keys]
+    for key in keys:
+        prior = seen(key)
+        if prior:
+            head = (
+                "⏭️ 相同文件已跳过下载（文件名与大小一致）"
+                if key.startswith("f:")
+                else "⏭️ 重复媒体已跳过下载"
+            )
+            return True, (
+                f"{head}\n\n"
+                f"文件：{prior.get('filename') or '(未知)'}\n"
+                f"原下载：{prior.get('date') or '(未知)'}\n\n"
+                "（/dedup off 可临时关闭去重后重新下载）"
+            )
+        if find_in_queue(key):
+            return True, (
+                "⏭️ 相同媒体已在下载队列中，跳过重复入队\n\n"
+                "（/dedup off 可临时关闭去重）"
+            )
     return False, None
 
 
-def remember(key, filename, size=None, now=None):
-    """成功下载后记入索引：追加一行进文件 + 更新内存 dict。
+def content_seen(digest):
+    """内容级查询：开关关 / 哈希缺失 → None；索引命中 → 先前条目。
 
-    lockless 同步单行 append（与 history.append_history 同一纪律）。键为
-    None（判重不了）时是 no-op；文件名里的制表/换行就地压成空格防拆行。
+    在下载完成后、落盘（os.replace）前调用——命中说明刚下载的字节与已有
+    文件完全相同，调用方应丢弃临时文件而不是落盘。
     """
-    if not key:
+    if not state.DEDUP_ENABLED or not digest:
+        return None
+    return state.DEDUP_INDEX.get(content_key(digest))
+
+
+def remember(keys, filename, size=None, now=None):
+    """成功下载后记入索引：每个键追加一行进文件 + 更新内存 dict。
+
+    keys 可为单键字符串（抖音路径兼容）或列表（媒体三键 tg:/f:/c: 一并
+    记）；None 项跳过。lockless 同步单行 append（与 history.append_history
+    同一纪律）；文件名里的制表/换行就地压成空格防拆行。
+    """
+    if isinstance(keys, str):
+        keys = [keys]
+    if not keys:
         return
     ts = (now or datetime.now()).strftime("%y-%m-%d %H:%M")
     safe_name = str(filename or "(未知)").replace("\t", " ").replace("\n", " ")
-    line = f"{key}\t{ts}\t{safe_name}\n"
-    try:
-        with open(DEDUP_INDEX_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
-    except Exception as e:
-        logger.warning(f"写去重索引失败（不影响下载）：{e}")
-    state.DEDUP_INDEX[key] = {"date": ts, "filename": safe_name}
+    for key in keys:
+        if not key:
+            continue
+        line = f"{key}\t{ts}\t{safe_name}\n"
+        try:
+            with open(DEDUP_INDEX_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception as e:
+            logger.warning(f"写去重索引失败（不影响下载）：{e}")
+        state.DEDUP_INDEX[key] = {"date": ts, "filename": safe_name}
 
 
 def load_index():

@@ -13,7 +13,8 @@ LOG_RETENTION_DAYS 天）与 download_history.txt（永久）里，查询时按�
 - 失败            = `失败，尝试第`（重试过程）/ `已达到最大重试次数`（最终）。
 - 移除            = `手动移除队列任务`（/queue del 与菜单删除，queue_del_task 落
   日志）+ `队列任务原消息已被删除`（来源消息被删，任务终结移除）。
-- 去重跳过        = `⏭️ 重复媒体跳过入队`（收了但不入队）。
+- 去重跳过        = `⏭️ 重复媒体跳过入队`（收了但不入队）+ `⏭️ 内容重复已
+  拦截落盘`（下载后落盘前内容级判重命中，无成功行也不转 retry）。
 - 在途/待处理/待重试 = state.ACTIVE_DOWNLOADS / state.QUEUE（实时快照）。
 
 勾稽恒等式：收到 = 成功 + 待重试 + 移除 + 去重 + 在途/待处理。在途/待处理/
@@ -132,7 +133,8 @@ def collect_stats(days=1, today=None, log_path=None, history_path=None):
         # 勾稽出口桶：收到媒体除「成功/待重试」外的下落，凑齐恒等式
         "manual_del": _count(lines, "手动移除队列任务"),
         "msg_deleted": _count(lines, "队列任务原消息已被删除"),
-        "dedup_skip": _count(lines, "重复媒体跳过入队"),
+        "dedup_skip": (_count(lines, "重复媒体跳过入队")
+                       + _count(lines, "内容重复已拦截")),
     }
 
 

@@ -460,5 +460,155 @@ class DownloadWorkerRoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(leftovers, [])
 
 
+class ContentDedupHitTest(unittest.IsolatedAsyncioTestCase):
+    """download_file 落盘前内容级判重（download.py 的内容检查挂钩）。
+
+    下载完成、os.replace 之前读回 .download 临时文件算 sha256 查索引：
+    命中 → 丢弃临时文件不落盘（.download 扩展名不在 CD2 备份白名单，
+    重复内容进不了 115）、通知、把 tg:/f: 元数据键补记进索引（下次连
+    元数据层都能拦）；未命中 → 照常落盘并把 c: 键一并 remember。
+    """
+
+    CONTENT = b"DUPLICATE-BYTES"
+
+    async def asyncSetUp(self):
+        import hashlib
+        from tg_userbot import dedup
+        self.dedup = dedup
+        self.digest = hashlib.sha256(self.CONTENT).hexdigest()
+
+        self.old = {
+            "sem": state.DOWNLOAD_SEMAPHORE,
+            "client": state.client,
+            "ww": state.DOWNLOAD_WORKERS,
+            "wq": state.DOWNLOAD_WORKER_QUEUE,
+            "wt": state.DOWNLOAD_WORKER_TARGET,
+            "idx": state.DEDUP_INDEX,
+            "enabled": state.DEDUP_ENABLED,
+        }
+        state.DOWNLOAD_SEMAPHORE = config.AdjustableSemaphore(1)
+        _disabled_pool()
+        state.DEDUP_INDEX = {}
+        state.DEDUP_ENABLED = True
+        self.idx_file = os.path.join(_TMP, "dedup_index_content_hit.txt")
+        if os.path.exists(self.idx_file):
+            os.remove(self.idx_file)
+
+        # 一个 worker，写已知字节（内容级判重的判定依据）
+        self.notified = []
+
+        async def write_known(message, *, file=None, progress_callback=None):
+            with open(file, "wb") as f:
+                f.write(self.CONTENT)
+            return file
+
+        self.worker = _FakeWorker("w")
+        self.worker.download_media = write_known
+        state.DOWNLOAD_WORKERS = [self.worker]
+        state.DOWNLOAD_WORKER_QUEUE = asyncio.Queue()
+        state.DOWNLOAD_WORKER_QUEUE.put_nowait(self.worker)
+        state.DOWNLOAD_WORKER_TARGET = 1
+
+        fake_client = mock.MagicMock()
+        fake_client.is_connected = lambda: True
+
+        async def fake_send_message(*args, **kwargs):
+            if len(args) > 1:
+                self.notified.append(args[1])
+
+        fake_client.send_message = fake_send_message
+        state.client = fake_client
+
+        self.fake_message = mock.MagicMock()
+        fake_file = mock.MagicMock()
+        fake_file.name = "video.mp4"
+        fake_file.size = 2048
+        fake_file.id = "TG-C1"
+        self.fake_message.id = 1
+        self.fake_message.file = fake_file
+        self.fake_message.fwd_from = None
+        self.fake_message.message = ""
+        self.fake_message.media = None
+        self.fake_message.photo = None
+        self.fake_message.video = None
+        self.fake_message.audio = None
+        self.fake_message.voice = None
+        self.fake_message.document = None
+
+        self.source_dir = os.path.join(config.SAVE_FOLDER, "内容判重来源")
+        # 目录级隔离：三个测试共用落盘目录，先清掉上一个测试的落盘文件。
+        # 路径必须用 config.SAVE_FOLDER（进程级共享、首个 import 的测试模块
+        # 定下的那个临时目录），不能用本模块的 _TMP 拼——全量跑时两者不同。
+        import shutil
+        if os.path.isdir(self.source_dir):
+            shutil.rmtree(self.source_dir)
+
+    async def asyncTearDown(self):
+        for w in list(state.DOWNLOAD_WORKERS):
+            await w.disconnect()
+        for key in ("sem", "client", "ww", "wq", "wt", "idx", "enabled"):
+            setattr(state, {"sem": "DOWNLOAD_SEMAPHORE", "client": "client",
+                            "ww": "DOWNLOAD_WORKERS",
+                            "wq": "DOWNLOAD_WORKER_QUEUE",
+                            "wt": "DOWNLOAD_WORKER_TARGET",
+                            "idx": "DEDUP_INDEX",
+                            "enabled": "DEDUP_ENABLED"}[key], self.old[key])
+        if os.path.exists(self.idx_file):
+            os.remove(self.idx_file)
+
+    def _landed(self):
+        return (os.listdir(self.source_dir)
+                if os.path.isdir(self.source_dir) else [])
+
+    async def _run(self):
+        with mock.patch.object(self.dedup, "DEDUP_INDEX_FILE", self.idx_file):
+            return await asyncio.wait_for(
+                download.download_file(self.fake_message, "内容判重来源"),
+                timeout=10,
+            )
+
+    async def test_content_hit_blocks_before_land(self):
+        """索引里已有同内容 c: 键：临时文件被丢弃、不落盘、元数据键补记。"""
+        state.DEDUP_INDEX[self.dedup.content_key(self.digest)] = {
+            "date": "26-09-08 10:00", "filename": "原文件.mp4",
+        }
+
+        ok = await self._run()
+
+        self.assertTrue(ok)  # 队列按成功移除（重复内容不需要重试）
+        self.assertEqual(self._landed(), [])  # 没有任何文件落盘
+        # 元数据键补记：下次同媒体连 tg:/f: 层都能拦
+        self.assertIn("tg:TG-C1", state.DEDUP_INDEX)
+        self.assertIn("f:video.mp4:2048", state.DEDUP_INDEX)
+        self.assertTrue(any("内容重复" in n for n in self.notified))
+        # worker 归还空闲队列（finally 链路照常收尾）
+        self.assertEqual(state.DOWNLOAD_WORKER_QUEUE.qsize(), 1)
+
+    async def test_content_miss_lands_and_remembers(self):
+        """新内容：照常落盘，c: 键随 tg:/f: 一并入索引。"""
+        ok = await self._run()
+
+        self.assertTrue(ok)
+        self.assertEqual(len(self._landed()), 1)
+        self.assertIn("tg:TG-C1", state.DEDUP_INDEX)
+        self.assertIn("f:video.mp4:2048", state.DEDUP_INDEX)
+        self.assertIn(self.dedup.content_key(self.digest), state.DEDUP_INDEX)
+
+    async def test_content_check_disabled_still_lands(self):
+        """/dedup off：内容命中不拦截照常落盘；下载的文件仍记入索引
+        （off 期间下载的内容也该挡住未来的重复）。"""
+        state.DEDUP_INDEX[self.dedup.content_key(self.digest)] = {
+            "date": "26-09-08 10:00", "filename": "原文件.mp4",
+        }
+        state.DEDUP_ENABLED = False
+
+        ok = await self._run()
+
+        self.assertTrue(ok)
+        self.assertEqual(len(self._landed()), 1)  # 命中但没拦
+        self.assertFalse(any("内容重复" in n for n in self.notified))
+        self.assertIn(self.dedup.content_key(self.digest), state.DEDUP_INDEX)
+
+
 if __name__ == "__main__":
     unittest.main()

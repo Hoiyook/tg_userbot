@@ -264,5 +264,212 @@ class DedupToggleTest(unittest.TestCase):
         self.assertFalse(dedup.is_dedup_command("/dedup now"))
         self.assertFalse(dedup.is_dedup_command("/queue"))
 
+
+class FileKeyTest(unittest.TestCase):
+    """文件级键 f:<原始文件名>:<字节大小>：判「bot 重传」——解析 bot 每次
+    重新上传 file.id 都变（tg: 键判不了），但生成的文件名与字节大小不变。
+    拿不全/原名无意义 → None（放行，判重不确定性永不拦下载）。"""
+
+    def test_file_key_uses_name_and_size(self):
+        msg = SimpleNamespace(
+            file=SimpleNamespace(id="A", name="video.mp4", size=1024)
+        )
+        self.assertEqual(dedup.file_key(msg), "f:video.mp4:1024")
+
+    def test_file_key_none_when_incomplete(self):
+        self.assertIsNone(dedup.file_key(SimpleNamespace(file=None)))
+        self.assertIsNone(dedup.file_key(SimpleNamespace(
+            file=SimpleNamespace(id="A", name="v.mp4", size=None))))
+        self.assertIsNone(dedup.file_key(SimpleNamespace(
+            file=SimpleNamespace(id="A", name="", size=5))))
+
+    def test_file_key_none_when_name_meaningless(self):
+        """无意义原名（未命名/UUID）不参与文件级判重：不同文件可能恰好
+        同大小，键会误伤（相册照片就没有文件名）。"""
+        self.assertIsNone(dedup.file_key(SimpleNamespace(
+            file=SimpleNamespace(id="A", name="未命名文件", size=5))))
+        self.assertIsNone(dedup.file_key(SimpleNamespace(
+            file=SimpleNamespace(
+                id="A", name="3f2a" * 8 + ".mp4", size=5))))
+
+    def test_file_key_none_on_error(self):
+        class _Boom:
+            @property
+            def size(self):
+                raise RuntimeError("boom")
+        self.assertIsNone(dedup.file_key(SimpleNamespace(file=_Boom())))
+
+    def test_media_keys_tg_then_file(self):
+        self.assertEqual(
+            dedup.media_keys(_media_message()),
+            ["tg:VID-123", "f:a.mp4:123"],
+        )
+
+    def test_media_keys_drops_missing_keys(self):
+        msg = SimpleNamespace(file=SimpleNamespace(id="A", name=None, size=None))
+        self.assertEqual(dedup.media_keys(msg), ["tg:A"])
+        self.assertEqual(dedup.media_keys(SimpleNamespace(file=None)), [])
+
+
+class MultiKeyShouldSkipTest(unittest.IsolatedAsyncioTestCase):
+    """should_skip 多键版：列表任一键命中即拦；单字符串仍兼容（抖音路径）；
+    队列在途匹配新 dedup_keys 列表字段 + 旧 dedup_key 单字段。"""
+
+    async def asyncSetUp(self):
+        self.old = (state.DEDUP_INDEX, state.DEDUP_ENABLED,
+                    state.QUEUE, state.QUEUE_LOCK)
+        state.DEDUP_INDEX = {}
+        state.DEDUP_ENABLED = True
+        state.QUEUE = {"tasks": [], "retry": []}
+        state.QUEUE_LOCK = None
+
+    async def asyncTearDown(self):
+        state.DEDUP_INDEX, state.DEDUP_ENABLED, state.QUEUE, \
+            state.QUEUE_LOCK = self.old
+
+    async def test_any_key_index_hit_blocks(self):
+        state.DEDUP_INDEX["f:a.mp4:123"] = {
+            "date": "26-09-08 10:00", "filename": "旧文件.mp4",
+        }
+        skip, notice = dedup.should_skip(["tg:BRAND-NEW", "f:a.mp4:123"])
+        self.assertTrue(skip)
+        self.assertIn("旧文件.mp4", notice)
+
+    async def test_file_layer_hit_notice_says_same_file(self):
+        state.DEDUP_INDEX["f:a.mp4:123"] = {
+            "date": "26-09-08 10:00", "filename": "旧文件.mp4",
+        }
+        _, notice = dedup.should_skip(["tg:BRAND-NEW", "f:a.mp4:123"])
+        self.assertIn("相同文件", notice)
+
+    async def test_single_string_key_still_accepted(self):
+        """抖音 dyc 路径传单键字符串：签名兼容，行为不变。"""
+        state.DEDUP_INDEX["dyc:9"] = {
+            "date": "26-09-08", "filename": "旧视频.mp4",
+        }
+        skip, _ = dedup.should_skip("dyc:9")
+        self.assertTrue(skip)
+
+    async def test_queue_matches_dedup_keys_list_field(self):
+        state.QUEUE["tasks"] = [
+            {"dedup_keys": ["tg:X", "f:a.mp4:123"], "label": "x"},
+        ]
+        skip, notice = dedup.should_skip(["tg:Y", "f:a.mp4:123"])
+        self.assertTrue(skip)
+        self.assertIn("队列", notice)
+
+    async def test_queue_old_single_field_still_matches(self):
+        """旧队列 JSON 里的 dedup_key 单字段（升级前的存量记录）照样判。"""
+        state.QUEUE["retry"] = [{"dedup_key": "tg:abc"}]
+        skip, _ = dedup.should_skip(["tg:abc"])
+        self.assertTrue(skip)
+
+    async def test_empty_list_passes(self):
+        self.assertEqual(dedup.should_skip([]), (False, None))
+
+
+class ContentDedupTest(unittest.TestCase):
+    """内容级键 c:<sha256>：下载完成后、落盘前查——字节相同即拦，
+    是元数据/文件两层全漏掉时的最终兜底。"""
+
+    def setUp(self):
+        self.old = (state.DEDUP_INDEX, state.DEDUP_ENABLED)
+        state.DEDUP_INDEX = {}
+        state.DEDUP_ENABLED = True
+        self.idx_file = os.path.join(_TMP, "dedup_index_content_test.txt")
+        if os.path.exists(self.idx_file):
+            os.remove(self.idx_file)
+
+    def tearDown(self):
+        state.DEDUP_INDEX, state.DEDUP_ENABLED = self.old
+        if os.path.exists(self.idx_file):
+            os.remove(self.idx_file)
+
+    def test_content_key_prefixes_digest(self):
+        digest = "ab" * 32
+        self.assertEqual(dedup.content_key(digest), f"c:{digest}")
+        self.assertIsNone(dedup.content_key(None))
+        self.assertIsNone(dedup.content_key(""))
+
+    def test_content_seen_hit_miss_off_empty(self):
+        state.DEDUP_INDEX[dedup.content_key("h1")] = {
+            "date": "26-09-08 10:00", "filename": "原文件.mp4",
+        }
+        self.assertEqual(
+            dedup.content_seen("h1"), state.DEDUP_INDEX["c:h1"]
+        )
+        self.assertIsNone(dedup.content_seen("no-such-digest"))
+        state.DEDUP_ENABLED = False
+        self.assertIsNone(dedup.content_seen("h1"))  # 开关关 → 全放行
+        state.DEDUP_ENABLED = True
+        self.assertIsNone(dedup.content_seen(None))  # 哈希拿不到 → 放行
+
+    def test_remember_list_writes_one_line_per_key(self):
+        with mock.patch.object(dedup, "DEDUP_INDEX_FILE", self.idx_file):
+            dedup.remember(["tg:A", "c:" + "ab" * 32], "文件.mp4")
+        self.assertIn("tg:A", state.DEDUP_INDEX)
+        self.assertIn("c:" + "ab" * 32, state.DEDUP_INDEX)
+        with open(self.idx_file, "r", encoding="utf-8") as f:
+            self.assertEqual(len(f.read().strip().splitlines()), 2)
+
+    def test_remember_list_drops_none_and_accepts_single_string(self):
+        with mock.patch.object(dedup, "DEDUP_INDEX_FILE", self.idx_file):
+            dedup.remember(["tg:A", None], "x")
+            self.assertEqual(list(state.DEDUP_INDEX), ["tg:A"])
+            dedup.remember("tg:B", "x")
+        self.assertIn("tg:B", state.DEDUP_INDEX)
+
+
+class EnqueueMediaKeysTest(unittest.IsolatedAsyncioTestCase):
+    """enqueue_media 接线：媒体任务入队记录带 dedup_keys 列表（tg: + f:），
+    任一键命中（索引或在途）即不入队。"""
+
+    async def asyncSetUp(self):
+        self.old = (state.DEDUP_INDEX, state.DEDUP_ENABLED,
+                    state.QUEUE, state.QUEUE_LOCK, state.client)
+        state.DEDUP_INDEX = {}
+        state.DEDUP_ENABLED = True
+        state.QUEUE = {"tasks": [], "retry": []}
+        state.QUEUE_LOCK = None
+        state.client = mock.MagicMock()
+
+    async def asyncTearDown(self):
+        (state.DEDUP_INDEX, state.DEDUP_ENABLED,
+         state.QUEUE, state.QUEUE_LOCK, state.client) = self.old
+
+    async def test_record_carries_dedup_keys_list(self):
+        captured = []
+
+        async def fake_enqueue(record):
+            captured.append(record)
+
+        with mock.patch.object(app.queue, "enqueue_and_start", fake_enqueue):
+            await app.enqueue_media(_media_message(), 111, "测试来源")
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(
+            captured[0]["dedup_keys"], ["tg:VID-123", "f:a.mp4:123"]
+        )
+
+    async def test_file_key_index_hit_skips_enqueue(self):
+        """文件级键命中（bot 重传场景：file.id 变、名+大小不变）→ 不入队。"""
+        state.DEDUP_INDEX["f:a.mp4:123"] = {
+            "date": "26-09-08", "filename": "旧.mp4",
+        }
+        captured = []
+
+        async def fake_enqueue(record):
+            captured.append(record)
+
+        async def fake_send(*a, **k):
+            return None
+
+        state.client.send_message = fake_send
+        with mock.patch.object(app.queue, "enqueue_and_start", fake_enqueue):
+            await app.enqueue_media(_media_message(), 111, "测试来源")
+
+        self.assertEqual(captured, [])
+
+
 if __name__ == "__main__":
     unittest.main()

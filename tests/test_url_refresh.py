@@ -119,6 +119,11 @@ class DownloadUrlMediaTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.old_sem = state.DOWNLOAD_SEMAPHORE
         self.old_client = state.client
+        # 内容级判重上线后 download_url_media 会读写共享判重索引——每个测试
+        # 独立洁净室，防同字节下载跨测试「内容重复」（前后测试互不感知）
+        self.old_dedup = (state.DEDUP_INDEX, state.DEDUP_ENABLED)
+        state.DEDUP_INDEX = {}
+        state.DEDUP_ENABLED = True
         state.DOWNLOAD_SEMAPHORE = config.AdjustableSemaphore(1)
 
         fake_client = mock.MagicMock()
@@ -147,6 +152,7 @@ class DownloadUrlMediaTest(unittest.IsolatedAsyncioTestCase):
         self._p_history.stop()
         state.DOWNLOAD_SEMAPHORE = self.old_sem
         state.client = self.old_client
+        state.DEDUP_INDEX, state.DEDUP_ENABLED = self.old_dedup
 
     def _use_transport(self, routes):
         self.transport = _TransportRecorder(routes)
@@ -320,6 +326,80 @@ class DownloadUrlMediaTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(temp_index["dyc:999"]["filename"], "入索引.mp4")
         with open(idx_file, "r", encoding="utf-8") as f:
             self.assertIn("dyc:999", f.read())
+
+    async def test_content_hit_blocks_url_task(self):
+        """内容级命中（字节与已有文件相同）：丢弃临时文件不落盘，dyc 键
+        补记进索引——下次同一视频连元数据层都能拦。"""
+        import hashlib
+        from tg_userbot import state as _state
+
+        digest = hashlib.sha256(b"video-bytes").hexdigest()
+        url = _make_direct_url(int(time.time()) + 2 * 60 * 60)
+        self._use_transport({url: 200})
+        record = _record_with_name(url, "内容重复.mp4")
+        record["dedup_key"] = "dyc:999"
+
+        old_index = _state.DEDUP_INDEX
+        old_enabled = _state.DEDUP_ENABLED
+        temp_index = {
+            f"c:{digest}": {"date": "26-09-08", "filename": "原视频.mp4"},
+        }
+        _state.DEDUP_INDEX = temp_index
+        _state.DEDUP_ENABLED = True
+        idx_file = os.path.join(_TMP, "dedup_index_url_content_hit.txt")
+        if os.path.exists(idx_file):
+            os.remove(idx_file)
+        try:
+            with mock.patch.object(download.dedup, "DEDUP_INDEX_FILE",
+                                   idx_file):
+                ok = await self._run(record)
+        finally:
+            _state.DEDUP_INDEX = old_index
+            _state.DEDUP_ENABLED = old_enabled
+            if os.path.exists(idx_file):
+                os.remove(idx_file)
+
+        self.assertTrue(ok)
+        self.assertFalse(os.path.exists(
+            os.path.join(SAVE_FOLDER, "抖音", "内容重复.mp4")
+        ))
+        self.assertIn("dyc:999", temp_index)  # 元数据键补记
+
+    async def test_content_miss_lands_and_remembers(self):
+        """新内容：照常落盘，dyc 与 c: 两键一并入索引。"""
+        import hashlib
+        from tg_userbot import state as _state
+
+        digest = hashlib.sha256(b"video-bytes").hexdigest()
+        url = _make_direct_url(int(time.time()) + 2 * 60 * 60)
+        self._use_transport({url: 200})
+        record = _record_with_name(url, "内容新增.mp4")
+        record["dedup_key"] = "dyc:888"
+
+        old_index = _state.DEDUP_INDEX
+        old_enabled = _state.DEDUP_ENABLED
+        temp_index = {}
+        _state.DEDUP_INDEX = temp_index
+        _state.DEDUP_ENABLED = True
+        idx_file = os.path.join(_TMP, "dedup_index_url_content_miss.txt")
+        if os.path.exists(idx_file):
+            os.remove(idx_file)
+        try:
+            with mock.patch.object(download.dedup, "DEDUP_INDEX_FILE",
+                                   idx_file):
+                ok = await self._run(record)
+        finally:
+            _state.DEDUP_INDEX = old_index
+            _state.DEDUP_ENABLED = old_enabled
+            if os.path.exists(idx_file):
+                os.remove(idx_file)
+
+        self.assertTrue(ok)
+        self.assertTrue(os.path.exists(
+            os.path.join(SAVE_FOLDER, "抖音", "内容新增.mp4")
+        ))
+        self.assertIn("dyc:888", temp_index)
+        self.assertIn(f"c:{digest}", temp_index)
 
     async def test_failure_does_not_remember(self):
         """失败/降级路径绝不记索引——没下成的文件下次还要能下。"""

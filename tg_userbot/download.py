@@ -10,6 +10,7 @@ import os
 import re
 import time
 import asyncio
+import hashlib
 from datetime import datetime
 from itertools import count
 
@@ -65,10 +66,11 @@ def _make_http_client(timeout):
     )
 
 
-async def _stream_url_to_file(client, url, temp_path, on_progress):
+async def _stream_url_to_file(client, url, temp_path, on_progress, hasher=None):
     """httpx 流式下载直链到临时文件（httpx 已随 f2 安装）。
 
     按块写盘并回调进度；服务端无 Content-Length 时 total=0（进度按字节数记）。
+    传入 hasher（hashlib 对象）时逐块喂哈希——内容级判重的零额外 I/O 路径。
     任何 HTTP 层错误原样上抛，由调用方按普通失败重试。
     """
     async with client.stream("GET", url, follow_redirects=True) as resp:
@@ -78,9 +80,64 @@ async def _stream_url_to_file(client, url, temp_path, on_progress):
         with open(temp_path, "wb") as f:
             async for chunk in resp.aiter_bytes(64 * 1024):
                 f.write(chunk)
+                if hasher is not None:
+                    hasher.update(chunk)
                 current += len(chunk)
                 on_progress(current, total)
     return total
+
+
+def _hash_file(path, chunk_bytes=1024 * 1024):
+    """分块读回文件算 sha256；任何失败返回 None（判重不确定 → 放行）。"""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_bytes)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception as e:
+        logger.warning(f"计算文件哈希失败（跳过内容级判重）：{e}")
+        return None
+
+
+async def _content_dedupe_check(temp_path, metadata_keys, display_name,
+                                digest=None):
+    """落盘（os.replace）前的内容级判重。返回 (是否拦截, digest)。
+
+    命中（字节与索引里已有文件完全相同）→ 删临时文件、通知「me」、把
+    元数据键（tg:/f:/dyc:）补记进索引（下次同内容连元数据层都能拦），
+    返回 (True, None) —— 调用方必须直接按成功收尾、不得再落盘。未命中
+    返回 (False, digest) 供 remember；哈希拿不到（读盘失败/digest=None）
+    照常放行落盘——判重不确定性永不拦下载。调用前在 .download 临时文件
+    阶段完成，CD2 备份按扩展名白名单看不见 .download，重复内容进不了 115。
+    """
+    if digest is None:
+        digest = _hash_file(temp_path)
+    prior = dedup.content_seen(digest)
+    if prior is None:
+        return False, digest
+    try:
+        os.remove(temp_path)
+    except Exception as e:
+        logger.warning(f"删除内容重复的临时文件失败：{e}")
+    prior_name = prior.get("filename") or display_name
+    # 台账「去重」桶按「内容重复」子串计数——措辞改动会漏计，勾稽会差
+    logger.info(f"⏭️ 内容重复已拦截落盘（与已下载文件字节相同）：{display_name}")
+    dedup.remember(list(metadata_keys or []), prior_name)
+    try:
+        await state.client.send_message(
+            "me",
+            "⏭️ 内容重复已拦截\n\n"
+            f"文件：{display_name}\n"
+            f"与已下载的「{prior_name}」字节相同\n\n"
+            "（/dedup off 可临时关闭去重）",
+        )
+    except Exception as e:
+        logger.warning(f"发送内容重复通知失败：{e}")
+    return True, None
 
 
 # ------------------------------------------------------------
@@ -259,10 +316,12 @@ async def download_url_media(record):
 
                     # 传字节包成子任务 + 无进度看门狗：CDN 卡死时既不报错
                     # 也不出数据，超过 DOWNLOAD_IDLE_TIMEOUT 判僵死取消重试
-                    #（与 download_file 同一套纪律）。
+                    #（与 download_file 同一套纪律）。逐块喂 sha256——内容级
+                    # 判重的零额外 I/O 路径（媒体路径是事后读回临时文件）。
+                    hasher = hashlib.sha256()
                     dl_task = asyncio.ensure_future(_stream_url_to_file(
                         _make_http_client(DOWNLOAD_IDLE_TIMEOUT),
-                        url, temp_path, progress,
+                        url, temp_path, progress, hasher=hasher,
                     ))
                     try:
                         while not dl_task.done():
@@ -312,6 +371,17 @@ async def download_url_media(record):
                             "可能被 CDN 截断"
                         )
 
+                    # 内容级判重（下载完、落盘前，与 download_file 对称）：
+                    # 哈希已在流式循环里逐块算好，命中 → 丢弃临时文件不落盘
+                    dyc_key = record.get("dedup_key")
+                    blocked, digest = await _content_dedupe_check(
+                        temp_path, [dyc_key] if dyc_key else [],
+                        os.path.basename(final_path),
+                        digest=hasher.hexdigest(),
+                    )
+                    if blocked:
+                        return True
+
                     os.replace(temp_path, final_path)
 
                     append_history(
@@ -320,10 +390,12 @@ async def download_url_media(record):
                         f" | 来源：本地解析"
                     )
 
-                    # 记入去重索引（dedup_key 入队时随记录持久化）：同一视频
-                    # 换口令重发时由入队前判重拦截
+                    # 记入去重索引（dedup_key 入队时随记录持久化 + c: 内容键）：
+                    # 同一视频换口令重发时由入队前判重拦截，字节相同的重传由
+                    # 落盘前内容判重拦截
                     dedup.remember(
-                        record.get("dedup_key"),
+                        ([dyc_key] if dyc_key else [])
+                        + ([dedup.content_key(digest)] if digest else []),
                         os.path.basename(final_path),
                         actual_size,
                     )
@@ -681,6 +753,15 @@ async def download_file(message, source_override=None, caption_override=None,
                             "存储的是转码后的文件"
                         )
 
+                    # 内容级判重（下载完、落盘前）：字节与已有文件相同 →
+                    # 丢弃临时文件不落盘，按成功收尾（重复内容无需重试）。
+                    media_keys = dedup.media_keys(message)
+                    blocked, digest = await _content_dedupe_check(
+                        temp_path, media_keys, os.path.basename(final_path),
+                    )
+                    if blocked:
+                        return True
+
                     os.replace(temp_path, final_path)
 
                     # 记录下载历史（每行一条）
@@ -690,10 +771,12 @@ async def download_file(message, source_override=None, caption_override=None,
                         f" | 来源：{source}"
                     )
 
-                    # 记入去重索引：tg:<file_unique_id> 跨转发稳定，同一媒体
-                    # 再转发/重发时由入队前判重拦截（file 拿不到就 no-op）
+                    # 记入去重索引：tg:/f: 元数据键（file 拿不到的层自动缺席）
+                    # + c: 内容键，同一媒体再转发/重发/被 bot 重传时由入队前
+                    # 判重或落盘前内容判重拦截
                     dedup.remember(
-                        dedup.media_key(message),
+                        media_keys + ([dedup.content_key(digest)]
+                                      if digest else []),
                         os.path.basename(final_path),
                         actual_size,
                     )

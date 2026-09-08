@@ -126,6 +126,32 @@ class CollectStatsTest(unittest.TestCase):
         self.assertEqual(s["success_bytes"], 1024 ** 3 + 512 * 1024 * 1024 + 1024)
         self.assertEqual(s["manual_del"], 2)       # 今天 + 昨天各一条
 
+    def test_content_level_hit_counts_into_dedup_bucket(self):
+        """内容级拦截（下载后、落盘前）也进「去重」桶：该出口的任务既无
+        成功 history 行也不转 retry，不计数则勾稽恒等式破。"""
+        log_path = os.path.join(_TMP, "stats_content.log")
+        lines = [
+            f"{TODAY} 10:00:00 | INFO | 📨 Saved Messages 收到消息 | ID=9 "
+            "| media=Video | grouped=None | file=dup.mp4",
+            f"{TODAY} 10:00:01 | INFO | 📦 检测到可下载媒体 | 类型=Video "
+            "| 文件=dup.mp4",
+            f"{TODAY} 10:00:05 | INFO | ⏭️ 内容重复已拦截落盘"
+            "（与已下载文件字节相同）：dup.mp4",
+        ]
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        # 空 history：隔离 setUp 夹具里的今日成功行，只看内容拦截这一个出口
+        history_path = os.path.join(_TMP, "stats_content_history.txt")
+        with open(history_path, "w", encoding="utf-8") as f:
+            f.write("")
+        s = stats.collect_stats(
+            1, today=TODAY, log_path=log_path,
+            history_path=history_path,
+        )
+        self.assertEqual(s["media_total"], 1)
+        self.assertEqual(s["success_count"], 0)    # 没落盘 → 无 history 行
+        self.assertEqual(s["dedup_skip"], 1)       # 计入去重桶，勾稽才平
+
 
 class StatsTextTest(unittest.TestCase):
     """stats_text：渲染出台账文本；在途/待处理/待重试读 state。"""

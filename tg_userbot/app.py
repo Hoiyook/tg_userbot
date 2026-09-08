@@ -440,10 +440,10 @@ async def enqueue_media(message, chat_id, source_override, source_link=None,
     队列）：命中只拦下载不拦转发（白名单转发的「转发自」副本照旧留在收藏
     夹当书签），并通知；键拿不到或 /dedup off 时照常入队。
     """
-    key = dedup.media_key(message)
-    if key:
-        logger.info(f"🛡 判重键 tg:{key.split(':', 1)[1]}（消息 {message.id}）")
-    skip, notice = dedup.should_skip(key)
+    keys = dedup.media_keys(message)
+    if keys:
+        logger.info(f"🛡 判重键 {' '.join(keys)}（消息 {message.id}）")
+    skip, notice = dedup.should_skip(keys)
     if skip:
         logger.info(f"⏭️ 重复媒体跳过入队（消息 {message.id}）")
         try:
@@ -455,8 +455,8 @@ async def enqueue_media(message, chat_id, source_override, source_link=None,
         message, chat_id, source_override, source_link,
         album_caption, user_label,
     )
-    if key:
-        record["dedup_key"] = key
+    if keys:
+        record["dedup_keys"] = keys  # 在途判重 + 成功后 remember 复用
     await queue.enqueue_and_start(record)
 
 
