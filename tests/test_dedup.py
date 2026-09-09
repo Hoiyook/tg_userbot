@@ -470,6 +470,73 @@ class EnqueueMediaKeysTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured, [])
 
+    async def test_dedup_hit_emits_skipped_event_not_task(self):
+        """去重跳过是「收到但未产生下载任务」：只发 DEDUP_SKIPPED 事件，
+        绝无 RECEIVED/QUEUED（任务数不被污染）。"""
+        from tg_userbot import stats as stats_mod
+
+        state.DEDUP_INDEX["f:a.mp4:123"] = {
+            "date": "26-09-08", "filename": "旧.mp4",
+        }
+        ev_file = os.path.join(_TMP, "task_events_dedup_skip.jsonl")
+        if os.path.exists(ev_file):
+            os.remove(ev_file)
+
+        async def fake_enqueue(record):
+            raise AssertionError("去重命中不应入队")
+
+        async def fake_send(*a, **k):
+            return None
+
+        state.client.send_message = fake_send
+        try:
+            with mock.patch.object(app.queue, "enqueue_and_start",
+                                   fake_enqueue), \
+                    mock.patch.object(stats_mod, "TASK_EVENTS_FILE", ev_file):
+                await app.enqueue_media(_media_message(), 111, "测试来源")
+            events = stats_mod.load_events(ev_file)
+            self.assertEqual([e["ev"] for e in events], ["DEDUP_SKIPPED"])
+            self.assertNotIn("id", events[0])  # 没有任务，无 task_id
+        finally:
+            if os.path.exists(ev_file):
+                os.remove(ev_file)
+
+    async def test_douyin_url_dedup_hit_emits_skipped_event(self):
+        """抖音 url 判重命中同样发 DEDUP_SKIPPED（输入侧事件，无任务）。"""
+        from tg_userbot import stats as stats_mod
+
+        ev_file = os.path.join(_TMP, "task_events_dyc_skip.jsonl")
+        if os.path.exists(ev_file):
+            os.remove(ev_file)
+        message = mock.MagicMock()
+        message.message = "看看这个 https://v.douyin.com/abc/"
+
+        async def fake_send(*a, **k):
+            return None
+
+        state.client.send_message = fake_send
+
+        async def fake_resolve(url):
+            return SimpleNamespace(aweme_id="777", direct_url="https://x",
+                                   title="t", author="a")
+
+        try:
+            with mock.patch.object(stats_mod, "TASK_EVENTS_FILE", ev_file), \
+                    mock.patch.object(dedup, "should_skip",
+                                      return_value=(True, "重复")), \
+                    mock.patch.object(resolver, "resolve_douyin",
+                                      side_effect=fake_resolve), \
+                    mock.patch.object(queue_mod, "enqueue_and_start",
+                                      side_effect=AssertionError("不应入队")):
+                await platform._handle_douyin_urls(
+                    message, ["https://v.douyin.com/abc/"]
+                )
+            events = stats_mod.load_events(ev_file)
+            self.assertEqual([e["ev"] for e in events], ["DEDUP_SKIPPED"])
+        finally:
+            if os.path.exists(ev_file):
+                os.remove(ev_file)
+
 
 if __name__ == "__main__":
     unittest.main()

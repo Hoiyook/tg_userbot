@@ -22,6 +22,7 @@ import asyncio
 
 from . import state
 from . import download
+from . import stats
 from .config import (
     QUEUE_FETCH_TIMEOUT,
     QUEUE_FILE,
@@ -105,6 +106,12 @@ async def queue_del_task(index=None, record_id=None):
             r for r in state.QUEUE["tasks"] if r.get("id") != record["id"]
         ]
         save_queue(state.QUEUE)
+    # 台账事件：取消在途 → CANCELLED；删排队中的 → REMOVED(manual)
+    stats.emit_event(
+        "CANCELLED" if cancelled else "REMOVED",
+        task_id=record["id"], label=record.get("label"),
+        **({} if cancelled else {"why": "manual"}),
+    )
     # 删除必须落日志：台账勾稽靠这行计「移除」桶（此前删除完全无痕，
     # 收到的媒体被手动删掉后成功/待重试都数不到，/stats 永远差一口）。
     logger.info(
@@ -305,6 +312,17 @@ async def enqueue_and_start(record):
         # 否则 execute_queued_task 按 id 收尾时对不上队列里的记录。
         record = queue_enqueue(state.QUEUE, record)
         save_queue(state.QUEUE)
+    # 台账事件：这里是媒体与 url 任务唯一的入队咽喉——白名单中转的
+    # 「源消息→转发副本」也只在这里入队一次，天然保证一个逻辑任务一个
+    # task_id（RECEIVED 仅媒体任务有，src 区分 收藏/中转 供输入侧拆分）。
+    kind = record.get("kind")
+    if kind == "media":
+        stats.emit_event(
+            "RECEIVED", task_id=record["id"], label=record.get("label"),
+            src="me" if record.get("chat_id") == state.MY_ID else "wl",
+        )
+    stats.emit_event("QUEUED", task_id=record["id"],
+                     label=record.get("label"), kind=kind)
     spawn_execute(record)
 
 
@@ -370,6 +388,8 @@ async def _run_queued_task(record):
         if not message:
             label = record.get("label") or ""
             logger.warning(f"队列任务原消息已被删除：{label}")
+            stats.emit_event("REMOVED", task_id=record.get("id"), label=label,
+                             why="source_deleted")
             try:
                 await state.client.send_message(
                     "me",
@@ -383,6 +403,7 @@ async def _run_queued_task(record):
             record.get("source_override"),
             caption_override=record.get("album_caption"),
             label_override=record.get("user_label"),
+            task_id=record.get("id"),
         )
     if kind == "url":
         # 本地解析链的 HTTP 直链下载：没有 Telegram 消息概念，直链/标题/
@@ -391,6 +412,7 @@ async def _run_queued_task(record):
     # 旧版平台链接任务（douyin/instagram）已随统一下载链路退役：落到这里的
     # 是历史 JSON 残留，按未知类型移除 + 记日志，不崩不卡队列。
     logger.warning(f"未知队列任务类型：{kind}，直接移除")
+    stats.emit_event("REMOVED", task_id=record.get("id"), why="unknown_kind")
     return True
 
 
@@ -403,6 +425,8 @@ async def execute_queued_task(record):
     # 每个任务一个独立 context，互不串扰；finally 里清除。
     set_trace(record["id"][:8])
     state.EXECUTING.add(record["id"])
+    stats.emit_event("RUNNING", task_id=record["id"],
+                     label=record.get("label"))
     logger.info(
         f"▶️ 队列任务开始：{record.get('label') or record.get('url') or '(无)'}"
     )
@@ -441,6 +465,12 @@ async def execute_queued_task(record):
                     queue_retry_failed(state.QUEUE, record)
                 else:
                     queue_fail_to_retry(state.QUEUE, record)
+                # 失败尝试单独计次：SUCCESS/REMOVED/CANCELLED 由各自发点发，
+                # 这里只发 RETRY（次数）+ FAILED（任务停在待重试的终态）
+                stats.emit_event("RETRY", task_id=record["id"],
+                                 attempts=record.get("attempts", 0))
+                stats.emit_event("FAILED", task_id=record["id"],
+                                 label=record.get("label"))
             save_queue(state.QUEUE)
     finally:
         state.EXECUTING.discard(record["id"])

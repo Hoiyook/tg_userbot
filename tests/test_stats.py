@@ -1,7 +1,9 @@
-"""台账/对账（stats.py）的单元测试：日志+历史文件的窗口统计与文本渲染。
+"""台账/对账（stats.py）的单元测试：任务事件层 + task_id 生命周期重建 + 渲染。
 
-stats 的契约：查询时解析 download.log（7 天轮转）与 download_history.txt，
-不新增任何持久化；日期窗口以「注入的 today」为基准（测试可定死日期），
+stats 的契约：窗口内有任务事件（runtime/task_events.jsonl）→ 按 task_id
+严格重建（rebuild_stats：任务集按窗口内最后终态分区，对账恒等式恒成立）；
+窗口内无事件（功能上线前的老日子）→ 回落 download.log/download_history.txt
+关键词口径并注明估算。日期窗口以「注入的 today」为基准（测试可定死日期），
 days=1 只看 today 当天，days=N 看 today 起往前的 N 个自然日。
 
 运行方式（项目根目录）：
@@ -11,6 +13,7 @@ import os
 import tempfile
 import unittest
 from datetime import date
+from unittest import mock
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_stats_test_")
@@ -246,6 +249,274 @@ class IsStatsCommandTest(unittest.TestCase):
         self.assertFalse(stats.is_stats_command("/statsx"))
         self.assertFalse(stats.is_stats_command("/status"))
         self.assertFalse(stats.is_stats_command("看看台账"))
+
+
+def _ev(day, hhmmss, ev, task_id=None, **extra):
+    """造一条合成事件（day: 6=昨天 7=今天，对应 YESTERDAY/TODAY）。"""
+    rec = {"ts": f"2026-09-{day:02d} {hhmmss}", "ev": ev}
+    if task_id:
+        rec["id"] = task_id
+    rec.update(extra)
+    return rec
+
+
+class RebuildStatsTest(unittest.TestCase):
+    """按 task_id 重建统计：一个任务一条生命线，retry 不产生新任务，
+    白名单转发只有一个任务，去重跳过不产生任务，bytes 精确累计。"""
+
+    def _rebuild(self, events, days=1):
+        return stats.rebuild_stats(events, days=days, today=TODAY)
+
+    def test_retry_three_times_then_success(self):
+        t = "a" * 32
+        events = [
+            _ev(7, "10:00:00", "RECEIVED", t, src="me"),
+            _ev(7, "10:00:01", "QUEUED", t, kind="media", label="x.mp4"),
+            _ev(7, "10:00:02", "RUNNING", t),
+            _ev(7, "10:00:03", "RETRY", t, attempts=1),
+            _ev(7, "10:00:03", "FAILED", t),
+            _ev(7, "10:01:00", "RUNNING", t),
+            _ev(7, "10:01:01", "RETRY", t, attempts=2),
+            _ev(7, "10:01:01", "FAILED", t),
+            _ev(7, "10:02:00", "RUNNING", t),
+            _ev(7, "10:02:01", "RETRY", t, attempts=3),
+            _ev(7, "10:02:01", "FAILED", t),
+            _ev(7, "10:03:00", "RUNNING", t),
+            _ev(7, "10:03:01", "SUCCESS", t, bytes=1000),
+        ]
+        s = self._rebuild(events)
+        self.assertEqual(s["received"], 1)
+        self.assertEqual(s["queued_new"], 1)
+        self.assertEqual(s["success"], 1)          # 一个 task 只算一次成功
+        self.assertEqual(s["failed_final"], 0)     # 最终成功了就不算失败
+        self.assertEqual(s["retries"], 3)          # 失败尝试单独计次
+        self.assertEqual(s["success_bytes"], 1000)
+
+    def test_fail_twice_parks_as_final_fail(self):
+        t = "b" * 32
+        events = [
+            _ev(7, "10:00:00", "RECEIVED", t),
+            _ev(7, "10:00:01", "QUEUED", t, kind="media"),
+            _ev(7, "10:00:02", "RUNNING", t),
+            _ev(7, "10:00:03", "RETRY", t, attempts=1),
+            _ev(7, "10:00:03", "FAILED", t),
+            _ev(7, "10:01:00", "RUNNING", t),      # 手动重放
+            _ev(7, "10:01:03", "RETRY", t, attempts=2),
+            _ev(7, "10:01:03", "FAILED", t),       # 停在 retry 列表
+        ]
+        s = self._rebuild(events)
+        self.assertEqual(s["queued_new"], 1)
+        self.assertEqual(s["success"], 0)
+        self.assertEqual(s["failed_final"], 1)     # 一个任务最终失败一次
+        self.assertEqual(s["retries"], 2)
+        self.assertEqual(s["active"], 0)           # FAILED 是终态（暂时的）
+
+    def test_removed_manual_source_deleted_and_cancelled(self):
+        t1, t2, t3 = "c" * 32, "d" * 32, "e" * 32
+        events = [
+            _ev(7, "10:00:00", "QUEUED", t1, kind="media"),
+            _ev(7, "10:00:01", "RUNNING", t1),
+            _ev(7, "10:00:02", "REMOVED", t1, why="manual"),
+            _ev(7, "10:01:00", "QUEUED", t2, kind="media"),
+            _ev(7, "10:01:01", "RUNNING", t2),
+            _ev(7, "10:01:02", "REMOVED", t2, why="source_deleted"),
+            _ev(7, "10:02:00", "QUEUED", t3, kind="media"),
+            _ev(7, "10:02:01", "RUNNING", t3),
+            _ev(7, "10:02:02", "CANCELLED", t3),
+        ]
+        s = self._rebuild(events)
+        self.assertEqual(s["queued_new"], 3)
+        self.assertEqual(s["removed"], 3)          # 移除桶含取消
+        self.assertEqual(s["removed_manual"], 1)
+        self.assertEqual(s["removed_source"], 1)
+        self.assertEqual(s["cancelled"], 1)
+        self.assertEqual(s["active"], 0)
+
+    def test_dedup_skip_produces_no_task(self):
+        events = [
+            _ev(7, "10:00:00", "DEDUP_SKIPPED"),
+            _ev(7, "10:00:01", "DEDUP_SKIPPED"),
+            _ev(7, "10:00:02", "RECEIVED", "f" * 32),
+            _ev(7, "10:00:03", "QUEUED", "f" * 32, kind="media"),
+        ]
+        s = self._rebuild(events)
+        self.assertEqual(s["dedup_skipped"], 2)    # 收到但未成任务
+        self.assertEqual(s["queued_new"], 1)
+        self.assertEqual(s["task_total"], 1)       # 任务集只有一个
+
+    def test_content_hit_is_its_own_terminal(self):
+        t = "1" * 32
+        events = [
+            _ev(7, "10:00:00", "QUEUED", t, kind="media"),
+            _ev(7, "10:00:01", "RUNNING", t),
+            _ev(7, "10:00:02", "DEDUP_HIT", t),
+        ]
+        s = self._rebuild(events)
+        self.assertEqual(s["dedup_hit"], 1)
+        self.assertEqual(s["success"], 0)          # 没落盘不算成功
+        self.assertEqual(s["failed_final"], 0)
+
+    def test_cross_day_task(self):
+        t = "2" * 32
+        events = [
+            _ev(6, "23:59:00", "RECEIVED", t),
+            _ev(6, "23:59:01", "QUEUED", t, kind="media"),
+            _ev(7, "00:00:30", "RUNNING", t),
+            _ev(7, "00:01:00", "SUCCESS", t, bytes=555),
+        ]
+        today_only = self._rebuild(events, days=1)
+        self.assertEqual(today_only["queued_new"], 0)   # 新建在昨天
+        self.assertEqual(today_only["success"], 1)      # 终态在今天
+        self.assertEqual(today_only["success_bytes"], 555)
+        two_days = self._rebuild(events, days=2)
+        self.assertEqual(two_days["queued_new"], 1)
+        self.assertEqual(two_days["success"], 1)
+        self.assertEqual(two_days["task_total"], 1)     # 跨日仍是一个任务
+
+    def test_bytes_accumulated_exactly(self):
+        events = [
+            _ev(7, "10:00:00", "QUEUED", "3" * 32, kind="media"),
+            _ev(7, "10:00:01", "SUCCESS", "3" * 32, bytes=1234567891),
+            _ev(7, "10:01:00", "QUEUED", "4" * 32, kind="url"),
+            _ev(7, "10:01:01", "SUCCESS", "4" * 32, bytes=2),
+        ]
+        s = self._rebuild(events)
+        self.assertEqual(s["success_bytes"], 1234567891 + 2)  # 无舍入
+
+    def test_running_task_without_terminal_is_active(self):
+        t = "5" * 32
+        events = [
+            _ev(7, "10:00:00", "QUEUED", t, kind="media"),
+            _ev(7, "10:00:01", "RUNNING", t),
+        ]
+        s = self._rebuild(events)
+        self.assertEqual(s["active"], 1)
+        self.assertEqual(s["task_total"], 1)
+
+
+class StatsTextEventModeTest(unittest.TestCase):
+    """事件模式下 stats_text 的分节渲染（用户约定格式）。"""
+
+    def setUp(self):
+        self.ev_file = os.path.join(_TMP, "task_events_render.jsonl")
+        if os.path.exists(self.ev_file):
+            os.remove(self.ev_file)
+        self.old = {"queue": state.QUEUE, "active": state.ACTIVE_DOWNLOADS}
+        state.QUEUE = {"tasks": [], "retry": []}
+        state.ACTIVE_DOWNLOADS = {}
+
+    def tearDown(self):
+        state.QUEUE = self.old["queue"]
+        state.ACTIVE_DOWNLOADS = self.old["active"]
+        if os.path.exists(self.ev_file):
+            os.remove(self.ev_file)
+
+    def _write_events(self, events):
+        import json as _json
+        with open(self.ev_file, "w", encoding="utf-8") as f:
+            for e in events:
+                f.write(_json.dumps(e, ensure_ascii=False) + "\n")
+
+    def test_renders_task_lifecycle_sections(self):
+        self._write_events([
+            _ev(7, "10:00:00", "RECEIVED", "a" * 32, src="me"),
+            _ev(7, "10:00:01", "DEDUP_SKIPPED"),
+            _ev(7, "10:00:02", "QUEUED", "a" * 32, kind="media"),
+            _ev(7, "10:00:03", "RUNNING", "a" * 32),
+            _ev(7, "10:00:04", "RETRY", "a" * 32, attempts=1),
+            _ev(7, "10:00:05", "FAILED", "a" * 32),
+            _ev(7, "10:01:00", "RUNNING", "a" * 32),
+            _ev(7, "10:01:01", "SUCCESS", "a" * 32, bytes=1234),
+        ])
+        text = stats.stats_text(
+            1, today=TODAY, log_path=os.path.join(_TMP, "nope.log"),
+            history_path=os.path.join(_TMP, "nope_history.txt"),
+            events_path=self.ev_file,
+        )
+        self.assertIn("📥 输入事件", text)
+        self.assertIn("收到媒体：1 条", text)
+        self.assertIn("去重跳过：1 条", text)
+        self.assertIn("📦 下载任务", text)
+        self.assertIn("新建任务：1", text)
+        self.assertIn("成功任务：1", text)
+        self.assertIn("最终失败任务：0", text)
+        self.assertIn("移除任务：0", text)
+        self.assertIn("🔄 执行情况", text)
+        self.assertIn("重试次数：1", text)
+        self.assertIn("⏳ 当前存量", text)
+        self.assertIn("下载中 0", text)
+        self.assertIn("💾 成功容量", text)
+        self.assertIn("1234 bytes", text)          # 精确 bytes 展示
+        self.assertIn("🧮 对账", text)
+        self.assertIn("✓", text)                   # 严格分区恒等
+
+    def test_legacy_fallback_when_no_events_in_window(self):
+        """窗口内无事件（功能上线前的老日子）→ 回落关键词口径并注明。"""
+        log_path, history_path = _write(None)
+        text = stats.stats_text(
+            1, today=TODAY, log_path=log_path,
+            history_path=history_path,
+            events_path=self.ev_file,              # 空事件文件
+        )
+        self.assertIn("关键词估算", text)
+        self.assertIn("媒体：2 条", text)           # 旧口径内容仍在
+
+
+class EventLogTest(unittest.TestCase):
+    """任务事件日志（task_events.jsonl）：JSONL append-only 单行追加，
+    与 dedup 索引/history 同款纪律——写失败仅告警、绝不影响下载。"""
+
+    def setUp(self):
+        self.ev_file = os.path.join(_TMP, "task_events_test.jsonl")
+        if os.path.exists(self.ev_file):
+            os.remove(self.ev_file)
+
+    def tearDown(self):
+        if os.path.exists(self.ev_file):
+            os.remove(self.ev_file)
+
+    def test_emit_appends_readable_json_line(self):
+        with mock.patch.object(stats, "TASK_EVENTS_FILE", self.ev_file):
+            stats.emit_event("QUEUED", task_id="a" * 32, label="视频.mp4")
+        events = stats.load_events(self.ev_file)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["ev"], "QUEUED")
+        self.assertEqual(events[0]["id"], "a" * 32)
+        self.assertEqual(events[0]["label"], "视频.mp4")
+        self.assertEqual(events[0]["ts"][:2], "20")  # 有时间戳
+
+    def test_emit_extra_fields_and_label_sanitized(self):
+        with mock.patch.object(stats, "TASK_EVENTS_FILE", self.ev_file):
+            stats.emit_event("SUCCESS", task_id="b", bytes=123,
+                             label="a\tb\nc")
+        ev = stats.load_events(self.ev_file)[0]
+        self.assertEqual(ev["bytes"], 123)
+        self.assertEqual(ev["label"], "a b c")  # 制表/换行压空格防拆行
+
+    def test_emit_failure_never_raises(self):
+        # 目标路径是目录 → open 必炸；emit 必须吞掉（台账绝不影响下载）
+        with mock.patch.object(stats, "TASK_EVENTS_FILE", _TMP):
+            stats.emit_event("QUEUED", task_id="x")  # 不应抛
+
+    def test_load_missing_or_bad_lines(self):
+        self.assertEqual(stats.load_events(self.ev_file), [])
+        with open(self.ev_file, "w", encoding="utf-8") as f:
+            f.write("not-json\n")
+            f.write('{"ev": "QUEUED", "ts": "2026-09-09 10:00:00"}\n')
+            f.write("[1, 2]\n")  # JSON 但不是 dict
+            f.write("\n")
+        events = stats.load_events(self.ev_file)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["ev"], "QUEUED")
+
+    def test_trim_keeps_tail_atomically(self):
+        with mock.patch.object(stats, "TASK_EVENTS_FILE", self.ev_file):
+            for i in range(5):
+                stats.emit_event("QUEUED", task_id=str(i))
+            stats.trim_event_file(self.ev_file, max_events=3)
+        events = stats.load_events(self.ev_file)
+        self.assertEqual([e["id"] for e in events], ["2", "3", "4"])
+        self.assertFalse(os.path.exists(self.ev_file + ".tmp"))
 
 
 if __name__ == "__main__":

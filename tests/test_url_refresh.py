@@ -338,6 +338,7 @@ class DownloadUrlMediaTest(unittest.IsolatedAsyncioTestCase):
         self._use_transport({url: 200})
         record = _record_with_name(url, "内容重复.mp4")
         record["dedup_key"] = "dyc:999"
+        record["id"] = "u" * 32
 
         old_index = _state.DEDUP_INDEX
         old_enabled = _state.DEDUP_ENABLED
@@ -347,23 +348,63 @@ class DownloadUrlMediaTest(unittest.IsolatedAsyncioTestCase):
         _state.DEDUP_INDEX = temp_index
         _state.DEDUP_ENABLED = True
         idx_file = os.path.join(_TMP, "dedup_index_url_content_hit.txt")
-        if os.path.exists(idx_file):
-            os.remove(idx_file)
+        ev_file = os.path.join(_TMP, "task_events_url_hit.jsonl")
+        for p in (idx_file, ev_file):
+            if os.path.exists(p):
+                os.remove(p)
         try:
             with mock.patch.object(download.dedup, "DEDUP_INDEX_FILE",
-                                   idx_file):
+                                   idx_file), \
+                    mock.patch.object(download.stats, "TASK_EVENTS_FILE",
+                                      ev_file):
                 ok = await self._run(record)
+                # 事件文件在 finally 里会删，先读后删
+                hit_names = [e["ev"] for e in download.stats.load_events(ev_file)]
         finally:
             _state.DEDUP_INDEX = old_index
             _state.DEDUP_ENABLED = old_enabled
-            if os.path.exists(idx_file):
-                os.remove(idx_file)
+            for p in (idx_file, ev_file):
+                if os.path.exists(p):
+                    os.remove(p)
 
         self.assertTrue(ok)
         self.assertFalse(os.path.exists(
             os.path.join(SAVE_FOLDER, "抖音", "内容重复.mp4")
         ))
         self.assertIn("dyc:999", temp_index)  # 元数据键补记
+
+        # 台账事件：DEDUP_HIT 终态（下载层发的），绝不是 SUCCESS
+        self.assertEqual(hit_names.count("DEDUP_HIT"), 1)
+        self.assertEqual(hit_names.count("SUCCESS"), 0)
+
+    async def test_url_success_emits_event_with_exact_bytes(self):
+        """url 任务成功：SUCCESS 事件带精确 bytes 与 record id。"""
+        from tg_userbot import stats as stats_mod
+        from tg_userbot import state as _state
+
+        url = _make_direct_url(int(time.time()) + 2 * 60 * 60)
+        self._use_transport({url: 200})
+        record = _record_with_name(url, "事件.mp4")
+        record["id"] = "v" * 32
+
+        ev_file = os.path.join(_TMP, "task_events_url_success.jsonl")
+        if os.path.exists(ev_file):
+            os.remove(ev_file)
+        try:
+            with mock.patch.object(download.stats, "TASK_EVENTS_FILE",
+                                   ev_file):
+                ok = await self._run(record)
+                # 事件文件在 finally 里会删，先读后删
+                events = download.stats.load_events(ev_file)
+        finally:
+            if os.path.exists(ev_file):
+                os.remove(ev_file)
+
+        self.assertTrue(ok)
+        success = [e for e in events if e["ev"] == "SUCCESS"]
+        self.assertEqual(len(success), 1)
+        self.assertEqual(success[0]["id"], "v" * 32)
+        self.assertEqual(success[0]["bytes"], len(b"video-bytes"))
 
     async def test_content_miss_lands_and_remembers(self):
         """新内容：照常落盘，dyc 与 c: 两键一并入索引。"""

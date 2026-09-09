@@ -227,6 +227,14 @@ DEDUP_INDEX_FILE = os.path.join(RUNTIME_DIR, "dedup_index.txt")
 DEDUP_CONFIG_FILE = os.path.join(RUNTIME_DIR, "dedup_config.json")
 DEDUP_MAX_ENTRIES = 10000
 
+# 任务生命周期事件日志（JSONL，append-only 单行追加，写失败仅告警）：
+# 台账按 task_id 重建统计的数据源。每行一个事件
+# {"ts","ev","id","label",...}，ev ∈ RECEIVED/QUEUED/RUNNING/RETRY/FAILED/
+# SUCCESS/CANCELLED/REMOVED/DEDUP_SKIPPED/DEDUP_HIT。只在启动裁剪到
+# TASK_EVENTS_MAX_EVENTS 条（保尾部，超限原子重写一次）。
+TASK_EVENTS_FILE = os.path.join(RUNTIME_DIR, "task_events.jsonl")
+TASK_EVENTS_MAX_EVENTS = 30000
+
 # 「文本在后」宽限（秒）：实测转发+评论时评论的事件可能落在媒体之后（事件循环
 # 调度顺序不定），媒体到达时若还没有待关联标注，先等这么多秒再取一次，给尾部
 # 评论一个落地机会。已有待关联标注时不等待、立即继承。0 = 关闭宽限。

@@ -20,6 +20,7 @@ from . import state
 from . import workers
 from . import config
 from . import dedup
+from . import stats
 from .config import (
     DIRECT_URL_REFRESH_MARGIN_SECONDS,
     DOWNLOAD_IDLE_TIMEOUT,
@@ -104,15 +105,16 @@ def _hash_file(path, chunk_bytes=1024 * 1024):
 
 
 async def _content_dedupe_check(temp_path, metadata_keys, display_name,
-                                digest=None):
+                                digest=None, task_id=None):
     """落盘（os.replace）前的内容级判重。返回 (是否拦截, digest)。
 
     命中（字节与索引里已有文件完全相同）→ 删临时文件、通知「me」、把
     元数据键（tg:/f:/dyc:）补记进索引（下次同内容连元数据层都能拦），
-    返回 (True, None) —— 调用方必须直接按成功收尾、不得再落盘。未命中
-    返回 (False, digest) 供 remember；哈希拿不到（读盘失败/digest=None）
-    照常放行落盘——判重不确定性永不拦下载。调用前在 .download 临时文件
-    阶段完成，CD2 备份按扩展名白名单看不见 .download，重复内容进不了 115。
+    发 DEDUP_HIT 台账事件，返回 (True, None) —— 调用方必须直接按成功
+    收尾、不得再落盘。未命中返回 (False, digest) 供 remember；哈希拿不到
+    （读盘失败/digest=None）照常放行落盘——判重不确定性永不拦下载。
+    调用前在 .download 临时文件阶段完成，CD2 备份按扩展名白名单看不见
+    .download，重复内容进不了 115。
     """
     if digest is None:
         digest = _hash_file(temp_path)
@@ -126,6 +128,7 @@ async def _content_dedupe_check(temp_path, metadata_keys, display_name,
     prior_name = prior.get("filename") or display_name
     # 台账「去重」桶按「内容重复」子串计数——措辞改动会漏计，勾稽会差
     logger.info(f"⏭️ 内容重复已拦截落盘（与已下载文件字节相同）：{display_name}")
+    stats.emit_event("DEDUP_HIT", task_id=task_id, label=display_name)
     dedup.remember(list(metadata_keys or []), prior_name)
     try:
         await state.client.send_message(
@@ -378,11 +381,19 @@ async def download_url_media(record):
                         temp_path, [dyc_key] if dyc_key else [],
                         os.path.basename(final_path),
                         digest=hasher.hexdigest(),
+                        task_id=record.get("id"),
                     )
                     if blocked:
                         return True
 
                     os.replace(temp_path, final_path)
+                    # 台账事件：SUCCESS 带精确字节数（记录入队时即有 id）
+                    if record.get("id"):
+                        stats.emit_event(
+                            "SUCCESS", task_id=record["id"],
+                            bytes=actual_size,
+                            label=os.path.basename(final_path),
+                        )
 
                     append_history(
                         f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 抖音 | "
@@ -560,7 +571,7 @@ def unregister_download(did):
 
 
 async def download_file(message, source_override=None, caption_override=None,
-                        label_override=None):
+                        label_override=None, task_id=None):
     async with state.DOWNLOAD_SEMAPHORE:
         source = await resolve_download_source(message, source_override)
         # 命名用 caption：消息自带文字优先；否则用调用方继承的相册同组说明
@@ -758,11 +769,19 @@ async def download_file(message, source_override=None, caption_override=None,
                     media_keys = dedup.media_keys(message)
                     blocked, digest = await _content_dedupe_check(
                         temp_path, media_keys, os.path.basename(final_path),
+                        task_id=task_id,
                     )
                     if blocked:
                         return True
 
                     os.replace(temp_path, final_path)
+                    # 台账事件：SUCCESS 带精确字节数（容量不再靠 format_size
+                    # 反解）；task_id 缺省（非队列路径）时不发
+                    if task_id:
+                        stats.emit_event(
+                            "SUCCESS", task_id=task_id, bytes=actual_size,
+                            label=os.path.basename(final_path),
+                        )
 
                     # 记录下载历史（每行一条）
                     append_history(

@@ -609,6 +609,60 @@ class ContentDedupHitTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("内容重复" in n for n in self.notified))
         self.assertIn(self.dedup.content_key(self.digest), state.DEDUP_INDEX)
 
+    async def test_success_emits_event_with_exact_bytes(self):
+        """下载层在成功点发 SUCCESS 事件，bytes 为精确字节数（台账容量
+        不再靠 format_size 反解）；带 task_id 时才发（默认 None 不发）。"""
+        from tg_userbot import stats as stats_mod
+        ev_file = os.path.join(_TMP, "task_events_dl_success.jsonl")
+        if os.path.exists(ev_file):
+            os.remove(ev_file)
+        try:
+            with mock.patch.object(stats_mod, "TASK_EVENTS_FILE", ev_file):
+                ok = await asyncio.wait_for(
+                    download.download_file(
+                        self.fake_message, "内容判重来源",
+                        task_id="d" * 32,
+                    ),
+                    timeout=10,
+                )
+            self.assertTrue(ok)
+            events = stats_mod.load_events(ev_file)
+            success = [e for e in events if e["ev"] == "SUCCESS"]
+            self.assertEqual(len(success), 1)
+            self.assertEqual(success[0]["id"], "d" * 32)
+            # 精确字节：worker 写入的已知内容长度，不经 format_size 反解
+            self.assertEqual(success[0]["bytes"], len(self.CONTENT))
+        finally:
+            if os.path.exists(ev_file):
+                os.remove(ev_file)
+
+    async def test_content_hit_emits_dedup_hit_not_success(self):
+        """内容级拦截发 DEDUP_HIT 终态（不是 SUCCESS——没落盘不算成功，
+        台账对账才有独立出口桶）。"""
+        from tg_userbot import stats as stats_mod
+        state.DEDUP_INDEX[self.dedup.content_key(self.digest)] = {
+            "date": "26-09-08 10:00", "filename": "原文件.mp4",
+        }
+        ev_file = os.path.join(_TMP, "task_events_dl_hit.jsonl")
+        if os.path.exists(ev_file):
+            os.remove(ev_file)
+        try:
+            with mock.patch.object(stats_mod, "TASK_EVENTS_FILE", ev_file):
+                ok = await asyncio.wait_for(
+                    download.download_file(
+                        self.fake_message, "内容判重来源",
+                        task_id="e" * 32,
+                    ),
+                    timeout=10,
+                )
+            self.assertTrue(ok)
+            names = [e["ev"] for e in stats_mod.load_events(ev_file)]
+            self.assertEqual(names.count("DEDUP_HIT"), 1)
+            self.assertEqual(names.count("SUCCESS"), 0)
+        finally:
+            if os.path.exists(ev_file):
+                os.remove(ev_file)
+
 
 if __name__ == "__main__":
     unittest.main()

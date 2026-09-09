@@ -15,6 +15,7 @@ _TMP = tempfile.mkdtemp(prefix="tg_userbot_queue_test_")
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import state, config, queue  # noqa: E402
+from tg_userbot import stats as stats_mod  # noqa: E402
 
 
 def empty_queue():
@@ -711,6 +712,153 @@ class QueueFormatTest(unittest.TestCase):
         text = queue.format_queue_text(q)
         self.assertIn("a.mp4", text)
         self.assertNotIn("…", text)
+
+
+class TaskEventEmissionTest(unittest.IsolatedAsyncioTestCase):
+    """台账事件发点：队列层在生命周期转换处发事件，同一 task 全程同 id。
+
+    一个逻辑下载任务有且只有一个 task_id（= record id）；retry 重放、
+    手动重试都沿用原 id；白名单媒体只在入队咽喉处产生一次 QUEUED。
+    """
+
+    async def asyncSetUp(self):
+        self.old = (state.QUEUE, state.QUEUE_LOCK, state.EXECUTING,
+                    state.client, state.MY_ID)
+        state.QUEUE = {"tasks": [], "retry": []}
+        state.QUEUE_LOCK = asyncio.Lock()
+        state.EXECUTING = set()
+        state.MY_ID = 111
+        state.QUEUE = {"tasks": [], "retry": []}
+
+        self.notified = []
+
+        async def fake_send(*args, **kwargs):
+            self.notified.append(args)
+
+        fake_client = mock.MagicMock()
+        fake_client.send_message = fake_send
+        state.client = fake_client
+
+        queue._RUNNING_TASKS.clear()
+        queue._SPAWNED_TASKS.clear()
+        self.ev_file = os.path.join(_TMP, "task_events_queue_test.jsonl")
+        if os.path.exists(self.ev_file):
+            os.remove(self.ev_file)
+
+    async def asyncTearDown(self):
+        for t in list(queue._SPAWNED_TASKS):
+            t.cancel()
+        (state.QUEUE, state.QUEUE_LOCK, state.EXECUTING,
+         state.client, state.MY_ID) = self.old
+        queue._RUNNING_TASKS.clear()
+        if os.path.exists(self.ev_file):
+            os.remove(self.ev_file)
+
+    def _events(self):
+        return stats_mod.load_events(self.ev_file)
+
+    async def test_enqueue_emits_received_and_queued_once(self):
+        rec = media_record(chat_id=111, label="收藏.mp4")
+        with mock.patch.object(stats_mod, "TASK_EVENTS_FILE", self.ev_file):
+            await queue.enqueue_and_start(rec)
+            await asyncio.sleep(0)  # 让执行任务首段跑完（RUNNING）
+        events = self._events()
+        names = [e["ev"] for e in events]
+        # 收藏夹直发：RECEIVED+QUEUED 各一次（白名单中转同样只入队一次）
+        self.assertEqual(names.count("RECEIVED"), 1)
+        self.assertEqual(names.count("QUEUED"), 1)
+        self.assertEqual(names[1], "QUEUED")
+        self.assertEqual(events[1].get("kind"), "media")
+        self.assertEqual(events[0].get("src"), "me")
+        # 全部事件同一个 task_id
+        ids = {e.get("id") for e in events}
+        self.assertEqual(len(ids), 1)
+
+    async def test_whitelist_enqueue_marks_wl_source(self):
+        rec = media_record(chat_id=222, label="中转.mp4")
+        with mock.patch.object(stats_mod, "TASK_EVENTS_FILE", self.ev_file):
+            await queue.enqueue_and_start(rec)
+            await asyncio.sleep(0)
+        self.assertEqual(self._events()[0].get("src"), "wl")
+
+    async def test_retry_failures_keep_same_task_id(self):
+        rec = media_record(chat_id=111, label="重试.mp4")
+        calls = {"n": 0}
+
+        async def flaky(record):
+            calls["n"] += 1
+            return calls["n"] >= 3  # 前两次失败，第三次成功
+
+        with mock.patch.object(stats_mod, "TASK_EVENTS_FILE", self.ev_file), \
+                mock.patch.object(queue, "_run_queued_task", side_effect=flaky):
+            await queue.enqueue_and_start(rec)
+            while calls["n"] < 1:
+                await asyncio.sleep(0.01)
+            # 失败转入 retry 列表；/retry <n> / 菜单 ▶️ 手动重放同一记录
+            retried = state.QUEUE["retry"][0]
+            queue.spawn_execute(retried)
+            while calls["n"] < 2:
+                await asyncio.sleep(0.01)
+            queue.spawn_execute(state.QUEUE["retry"][0])
+            while calls["n"] < 3:
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+
+        events = self._events()
+        names = [e["ev"] for e in events]
+        # RUNNING×3 → (RETRY+FAILED)*2；SUCCESS 由下载层发（假执行体没有）
+        self.assertEqual(names.count("RUNNING"), 3)
+        self.assertEqual(names.count("RETRY"), 2)
+        self.assertEqual(names.count("FAILED"), 2)
+        # retry 重放全程同一个 task_id，没有被统计成新任务
+        self.assertEqual(len({e.get("id") for e in events}), 1)
+        retries = [e for e in events if e["ev"] == "RETRY"]
+        self.assertEqual(retries[-1].get("attempts"), 2)
+        # 成功收尾：记录已从 retry 列表移除
+        self.assertEqual(state.QUEUE["retry"], [])
+
+    async def test_del_emits_cancelled_or_removed(self):
+        started = asyncio.Event()
+
+        async def hang(record):
+            started.set()
+            await asyncio.sleep(3600)
+
+        rec = media_record(chat_id=111, label="取消.mp4")
+        with mock.patch.object(stats_mod, "TASK_EVENTS_FILE", self.ev_file), \
+                mock.patch.object(queue, "execute_queued_task", side_effect=hang):
+            # 真实路径：入队咽喉分配 id 副本后再 spawn
+            queue.spawn_execute(queue.queue_enqueue(state.QUEUE, rec))
+            await started.wait()
+            ok, _, cancelled = await queue.queue_del_task(index=1)
+        self.assertTrue(ok)
+        self.assertTrue(cancelled)
+        self.assertIn(("CANCELLED" in [e["ev"] for e in self._events()]), [True])
+
+        # 未在途删除 → REMOVED(manual)
+        rec2 = media_record(chat_id=111, label="手动删.mp4")
+        with mock.patch.object(stats_mod, "TASK_EVENTS_FILE", self.ev_file):
+            queue.queue_enqueue(state.QUEUE, rec2)
+            ok2, _, cancelled2 = await queue.queue_del_task(index=1)
+        self.assertTrue(ok2)
+        self.assertFalse(cancelled2)
+        removed = [e for e in self._events() if e["ev"] == "REMOVED"]
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0].get("why"), "manual")
+
+    async def test_source_message_deleted_emits_removed(self):
+        rec = media_record(chat_id=111, label="没源.mp4")
+
+        async def fake_get_messages(*args, **kwargs):
+            return None
+
+        state.client.get_messages = fake_get_messages
+        with mock.patch.object(stats_mod, "TASK_EVENTS_FILE", self.ev_file):
+            ok = await queue._run_queued_task(rec)
+        self.assertTrue(ok)
+        removed = [e for e in self._events() if e["ev"] == "REMOVED"]
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0].get("why"), "source_deleted")
 
 
 if __name__ == "__main__":

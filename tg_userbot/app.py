@@ -21,6 +21,7 @@ from . import state
 from . import commands
 from . import dedup
 from . import queue
+from . import stats
 from . import thread
 from . import whitelist
 from . import platform
@@ -446,6 +447,8 @@ async def enqueue_media(message, chat_id, source_override, source_link=None,
     skip, notice = dedup.should_skip(keys)
     if skip:
         logger.info(f"⏭️ 重复媒体跳过入队（消息 {message.id}）")
+        # 台账输入侧事件：收到但未产生下载任务（无 task_id，不进任务集）
+        stats.emit_event("DEDUP_SKIPPED")
         try:
             await state.client.send_message("me", notice)
         except Exception as e:
@@ -910,6 +913,9 @@ async def main():
         queue.recover_queue_tasks()
     if state.QUEUE["retry"]:
         logger.info(f"🔁 待重试列表：{len(state.QUEUE['retry'])} 个任务（手动重试）")
+
+    # 任务事件日志裁剪（台账按 task_id 重建的数据源，保尾部控制体积）
+    stats.trim_event_file()
 
     # bot 按钮菜单：登录失败只影响菜单，不影响主功能
     if BOT_TOKEN:

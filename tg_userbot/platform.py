@@ -23,6 +23,7 @@ from telethon.utils import get_peer_id
 from . import state
 from . import config
 from . import dedup
+from . import stats
 from .config import (
     DOUYIN_URL_PATTERN,
     INSTAGRAM_URL_PATTERN,
@@ -180,6 +181,8 @@ async def _handle_douyin_urls(message, douyin_urls):
         skip, notice = dedup.should_skip(key)
         if skip:
             logger.info(f"⏭️ 抖音重复视频跳过入队：{url}")
+            # 台账输入侧事件：收到但未产生下载任务
+            stats.emit_event("DEDUP_SKIPPED")
             try:
                 await state.client.send_message("me", notice)
             except Exception as e:
