@@ -689,6 +689,20 @@ CHROME_TASKS_FILE = os.path.join(RUNTIME_DIR, "chrome_tasks.json")
 CHROME_REQUESTS_FILE = os.path.join(RUNTIME_DIR, "chrome_requests.json")
 CHROME_AGENT_PID_FILE = os.path.join(RUNTIME_DIR, "chrome_agent.pid")
 
+# Chrome Agent V2 Recovery constants
+# 健康检查间隔（秒）：Agent 向 User Bot 报告状态
+CHROME_HEALTH_CHECK_INTERVAL = 5.0
+# 恢复超时（秒）：User Bot 等待 Agent 响应的最长时间
+CHROME_RECOVERY_TIMEOUT = 30.0
+# 任务备份保留数量：Agent 保留的成功/失败任务历史记录数
+CHROME_BACKUP_COUNT = 3
+# GUID 有效期（秒）：下载 GUID 在 Agent 内存中的有效时间
+CHROME_GUID_VALIDITY_SECONDS = 300
+# GUID 最大存活时间（秒）：从下载开始到记录被回收的最长时间
+CHROME_MAX_GUID_AGE = 1800
+# 最小进度更新间隔（秒）：Agent 向 User Bot 报告进度的时间间隔
+CHROME_MIN_PROGRESS_INTERVAL = 30
+
 os.makedirs(RUNTIME_DIR, exist_ok=True)
 _migrated_runtime_files = _migrate_runtime_files()
 log.configure(LOG_FILE, LOG_RETENTION_DAYS)

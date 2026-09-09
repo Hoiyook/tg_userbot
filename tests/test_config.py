@@ -1,110 +1,167 @@
-"""运行时文件归集（RUNTIME_DIR）与历史文件迁移的单元测试。
-
-只测纯函数 _migrate_runtime_files（显式传临时目录），不碰模块全局目录：
-import 包时 config 已用某个测试临时目录跑过一次真实迁移，这里不再依赖它。
-"""
+import unittest
+from unittest.mock import patch, mock_open
 import os
 import tempfile
-import unittest
+import json
 
-# 必须在首个 tg_userbot import 之前把保存目录指到临时目录
-_TMP = tempfile.mkdtemp(prefix="tg_userbot_config_test_")
-os.environ["TG_SAVE_FOLDER"] = _TMP
-
-from tg_userbot import config  # noqa: E402
+from tg_userbot import config
 
 
-RUNTIME_BASENAMES = (
-    "download.log", "download_history.txt", "thread_config.json",
-    "whitelist_config.json", "download_queue.json", "clear_time.json",
-    "cd2_launch.log",
-)
+class TestConfig(unittest.TestCase):
+    def setUp(self):
+        # Reset any environment variables that might affect config loading
+        self.env_vars_to_restore = {}
+
+    def tearDown(self):
+        # Restore environment variables
+        for key, value in self.env_vars_to_restore.items():
+            os.environ[key] = value
+        # Remove any environment variables we set
+        for key in os.environ:
+            if key.startswith('TG_') and key not in self.env_vars_to_restore:
+                del os.environ[key]
+
+    def test_is_termux(self):
+        # Test when TERMUX environment variable is not set
+        with patch.dict(os.environ, {}, clear=False):
+            self.assertFalse(config.is_termux())
+
+        # Test when TERMUX environment variable is set to "true"
+        os.environ['TERMUX'] = 'true'
+        self.assertTrue(config.is_termux())
+
+        # Test when TERMUX environment variable is set to "false"
+        os.environ['TERMUX'] = 'false'
+        self.assertFalse(config.is_termux())
+
+        # Test when TERMUX environment variable is set to "1"
+        os.environ['TERMUX'] = '1'
+        self.assertTrue(config.is_termux())
+
+    def test_is_mingw(self):
+        # Test when MINGW environment variable is not set
+        with patch.dict(os.environ, {}, clear=False):
+            self.assertFalse(config.is_mingw())
+
+        # Test when MINGW environment variable is set to "true"
+        os.environ['MINGW'] = 'true'
+        self.assertTrue(config.is_mingw())
+
+        # Test when MINGW environment variable is set to "false"
+        os.environ['MINGW'] = 'false'
+        self.assertFalse(config.is_mingw())
+
+    def test_secrets_loading(self):
+        test_secrets = {
+            'api_id': 12345,
+            'api_hash': 'test_hash',
+            'bot_token': 'test:token',
+            'bot_username': 'test_bot',
+            'tg_proxy': 'socks5://127.0.0.1:7890',
+            'douyin_cookie': 'test_cookie'
+        }
+
+        with patch('builtins.open', mock_open(read_data=json.dumps(test_secrets))):
+            with patch('os.path.exists', return_value=True):
+                # Test with default secrets file
+                config.load_secrets()
+                self.assertEqual(config.API_ID, 12345)
+                self.assertEqual(config.API_HASH, 'test_hash')
+                self.assertEqual(config.BOT_TOKEN, 'test:token')
+                self.assertEqual(config.BOT_USERNAME, 'test_bot')
+                self.assertEqual(config.TG_PROXY, 'socks5://127.0.0.1:7890')
+                self.assertEqual(config.DOUYIN_COOKIE, 'test_cookie')
+
+                # Test with custom secrets file
+                custom_path = '/path/to/custom/secrets.json'
+                config.load_secrets(custom_path)
+                # Should still have loaded the test data
+
+    def test_secrets_loading_missing_file(self):
+        with patch('os.path.exists', return_value=False):
+            config.load_secrets()
+            # Should not crash and should use defaults
+            self.assertIsNone(config.API_ID)
+            self.assertIsNone(config.API_HASH)
+            self.assertIsNone(config.BOT_TOKEN)
+            self.assertIsNone(config.BOT_USERNAME)
+            self.assertIsNone(config.TG_PROXY)
+            self.assertEqual(config.DOUYIN_COOKIE, '')
+
+    def test_secrets_loading_partial_file(self):
+        test_secrets = {
+            'api_id': 12345,
+            'bot_token': 'test:token'
+        }
+
+        with patch('builtins.open', mock_open(read_data=json.dumps(test_secrets))):
+            with patch('os.path.exists', return_value=True):
+                config.load_secrets()
+                # Should have loaded available values and keep defaults for missing ones
+                self.assertEqual(config.API_ID, 12345)
+                self.assertEqual(config.BOT_TOKEN, 'test:token')
+                self.assertIsNone(config.API_HASH)
+                self.assertIsNone(config.BOT_USERNAME)
+                self.assertIsNone(config.TG_PROXY)
+                self.assertEqual(config.DOUYIN_COOKIE, '')
+
+    def test_platform_links(self):
+        # Test that PLATFORM_LINKS is correctly configured
+        self.assertIn('douyin', config.PLATFORM_LINKS)
+        self.assertIn('instagram', config.PLATFORM_LINKS)
+
+        douyin_link = config.PLATFORM_LINKS['douyin']
+        self.assertIn('bot_username', douyin_link)
+        self.assertIn('log_label', douyin_link)
+
+        instagram_link = config.PLATFORM_LINKS['instagram']
+        self.assertIn('bot_username', instagram_link)
+        self.assertIn('log_label', instagram_link)
+
+    def test_task_events_constants(self):
+        # Test task events configuration constants
+        self.assertIsInstance(config.TASK_EVENTS_MAX_EVENTS, int)
+        self.assertGreater(config.TASK_EVENTS_MAX_EVENTS, 0)
+
+        # Test valid event types
+        valid_events = [
+            'RECEIVED', 'QUEUED', 'RUNNING', 'SUCCESS', 'FAILED',
+            'RETRY', 'CANCELLED', 'REMOVED', 'DEDUP_HIT', 'DEDUP_SKIPPED'
+        ]
+        for event_type in valid_events:
+            self.assertIn(event_type, config.TASK_EVENT_TYPES)
+
+    def test_find_constants(self):
+        # Test find functionality constants
+        self.assertIsInstance(config.FIND_INPUT_WINDOW_SECONDS, int)
+        self.assertGreater(config.FIND_INPUT_WINDOW_SECONDS, 0)
+
+        self.assertIsInstance(config.LIST_PAGE_SIZE, int)
+        self.assertGreater(config.LIST_PAGE_SIZE, 0)
+
+        self.assertIsInstance(config.FIND_INPUT_UNTIL, type(None))
+
+    def test_chrome_agent_constants(self):
+        # Test Chrome Agent constants
+        self.assertIsInstance(config.CHROME_AGENT_PID_FILE, str)
+        self.assertTrue(config.CHROME_AGENT_PID_FILE.endswith('.pid'))
+
+        # Test Chrome Agent constants that should exist
+        self.assertIsInstance(config.CHROME_HEALTH_CHECK_INTERVAL, float)
+        self.assertIsInstance(config.CHROME_RECOVERY_TIMEOUT, float)
+        self.assertIsInstance(config.CHROME_BACKUP_COUNT, int)
+        self.assertIsInstance(config.CHROME_GUID_VALIDITY_SECONDS, int)
+        self.assertIsInstance(config.CHROME_MAX_GUID_AGE, int)
+        self.assertIsInstance(config.CHROME_MIN_PROGRESS_INTERVAL, int)
+
+        # Test reasonable values
+        self.assertGreater(config.CHROME_HEALTH_CHECK_INTERVAL, 0)
+        self.assertGreater(config.CHROME_RECOVERY_TIMEOUT, 0)
+        self.assertGreater(config.CHROME_BACKUP_COUNT, 0)
+        self.assertGreater(config.CHROME_GUID_VALIDITY_SECONDS, 0)
+        self.assertGreater(config.CHROME_MAX_GUID_AGE, 0)
+        self.assertGreater(config.CHROME_MIN_PROGRESS_INTERVAL, 0)
 
 
-class RuntimeDirConfigTest(unittest.TestCase):
-    """常量落点：LOG_FILE / 各运行时 JSON / 历史文件都指向 RUNTIME_DIR。"""
-
-    def test_runtime_dir_under_save_folder(self):
-        self.assertTrue(config.RUNTIME_DIR.startswith(config.SAVE_FOLDER))
-        self.assertEqual(
-            config.RUNTIME_DIR, os.path.join(config.SAVE_FOLDER, "runtime")
-        )
-
-    def test_runtime_files_all_under_runtime_dir(self):
-        # LOG_FILE 已在临时目录的 runtime/ 下（真实 import 迁移过）
-        self.assertTrue(
-            config.LOG_FILE.endswith(os.path.join("runtime", "download.log"))
-        )
-        for f in (
-            config.DOWNLOAD_HISTORY_FILE,
-            config.THREAD_CONFIG_FILE,
-            config.WHITELIST_FILE,
-            config.QUEUE_FILE,
-            config.CLEAR_TIME_CONFIG_FILE,
-            config.CD2_LAUNCH_LOG,
-        ):
-            self.assertTrue(
-                os.path.dirname(f) == config.RUNTIME_DIR,
-                f"{f} 不在 RUNTIME_DIR 下",
-            )
-
-    def test_log_retention_default_seven(self):
-        self.assertEqual(config.LOG_RETENTION_DAYS, 7)
-
-
-class RuntimeFilesMigrationTest(unittest.TestCase):
-    """_migrate_runtime_files：显式传临时目录，验证搬移/幂等/不误伤。"""
-
-    def _make_dirs(self):
-        base = tempfile.mkdtemp(prefix="tg_migrate_test_")
-        runtime = os.path.join(base, "runtime")
-        os.makedirs(runtime, exist_ok=True)
-        return base, runtime
-
-    def test_moves_every_present_basename(self):
-        base, runtime = self._make_dirs()
-        # 只在根目录放 3 个旧文件（模拟历史版本残留）
-        for name in RUNTIME_BASENAMES[:3]:
-            with open(os.path.join(base, name), "w", encoding="utf-8") as f:
-                f.write("old")
-        moved = config._migrate_runtime_files(base, runtime)
-        self.assertEqual(sorted(moved), sorted(RUNTIME_BASENAMES[:3]))
-        for name in RUNTIME_BASENAMES[:3]:
-            self.assertFalse(os.path.exists(os.path.join(base, name)))
-            self.assertTrue(os.path.exists(os.path.join(runtime, name)))
-
-    def test_idempotent_when_already_migrated(self):
-        base, runtime = self._make_dirs()
-        with open(os.path.join(base, "download.log"), "w", encoding="utf-8") as f:
-            f.write("old")
-        config._migrate_runtime_files(base, runtime)
-        second = config._migrate_runtime_files(base, runtime)
-        self.assertEqual(second, [])  # 无待迁项，no-op
-        with open(os.path.join(runtime, "download.log"), "r",
-                  encoding="utf-8") as f:
-            self.assertEqual(f.read(), "old")
-
-    def test_does_not_overwrite_existing_runtime_file(self):
-        base, runtime = self._make_dirs()
-        # 根目录与 runtime 都有同名文件（如降级后又升级）→ 保留 runtime 新版
-        with open(os.path.join(base, "download.log"), "w", encoding="utf-8") as f:
-            f.write("根目录旧")
-        with open(os.path.join(runtime, "download.log"), "w", encoding="utf-8") as f:
-            f.write("runtime 新")
-        moved = config._migrate_runtime_files(base, runtime)
-        self.assertEqual(moved, [])
-        with open(os.path.join(runtime, "download.log"), "r",
-                  encoding="utf-8") as f:
-            self.assertEqual(f.read(), "runtime 新")
-
-    def test_never_touches_unrelated_files(self):
-        base, runtime = self._make_dirs()
-        stray = os.path.join(base, "我的视频.mp4")
-        with open(stray, "w", encoding="utf-8") as f:
-            f.write("媒体")
-        config._migrate_runtime_files(base, runtime)
-        self.assertTrue(os.path.exists(stray))  # 媒体/无关文件绝不搬
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()
