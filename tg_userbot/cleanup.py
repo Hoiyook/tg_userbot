@@ -21,12 +21,14 @@ from . import whitelist
 from . import platform
 from . import stats
 from . import finder
+from . import chrome_client
 from .config import (
     CLEANUP_DELETE_TIMEOUT,
     CLEANUP_FETCH_TIMEOUT,
     CLEAN_COMMANDS,
     CLEAN_MESSAGE_AGE_MINUTES,
     CLEAN_NOTIFICATION_PREFIXES,
+    PERSISTENT_NOTIFICATION_PREFIXES,
     CLEAR_TIME_CONFIG_FILE,
     DEFAULT_CLEAR_INTERVAL_SECONDS,
     SAVE_FOLDER,
@@ -99,7 +101,19 @@ def is_setcleartime_command(text):
     ))
 
 
-def is_cleanup_message(message) -> bool:
+def is_cleanup_message(message, include_persistent=False) -> bool:
+    """判断 Saved Messages 中的消息是否属于程序指令/通知。
+
+    真实媒体（含白名单转发进收藏夹待下载/已下载的副本）一律保留，即使
+    caption 里含抖音 URL 或通知前缀——副本是用户明言要留的记录/收藏。
+    纯文本命令/通知/抖音链接指令消息才清理（is_downloadable 对纯 WebPage
+    预览返回 False，带链接的纯文本指令照旧清理）。
+
+    include_persistent=True（仅 /clearmsg 手动批量清理使用）时，持久保留
+    的程序通知（PERSISTENT_NOTIFICATION_PREFIXES，如 Chrome 下载结果报告）
+    也算清理对象；自动清理循环用默认 False——结果报告用户可能晚些才看，
+    瞬态清理会让人错过（2026-09-09 验收实测）。
+    """
     """判断 Saved Messages 中的消息是否属于程序指令/通知。
 
     真实媒体（含白名单转发进收藏夹待下载/已下载的副本）一律保留，即使
@@ -146,13 +160,20 @@ def is_cleanup_message(message) -> bool:
         if finder.is_find_command(text):
             return True
 
+        # /chrome* 指令（Chrome Agent，含 URL 参数）
+        if chrome_client.is_chrome_dispatch(text):
+            return True
+
         # 程序自己发送/产生的链接指令：
         # 只要消息中包含抖音 / Instagram URL，就视为下载指令，纳入定时清理。
         if platform.extract_douyin_urls(text) or platform.extract_instagram_urls(text):
             return True
 
+        prefixes = CLEAN_NOTIFICATION_PREFIXES
+        if include_persistent:
+            prefixes = tuple(prefixes) + tuple(PERSISTENT_NOTIFICATION_PREFIXES)
         return any(
-            text.startswith(prefix) for prefix in CLEAN_NOTIFICATION_PREFIXES
+            text.startswith(prefix) for prefix in prefixes
         )
     except Exception:
         return False

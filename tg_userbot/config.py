@@ -462,11 +462,13 @@ CLEAN_COMMANDS = {
 
 # 程序通知回复的前缀（以此开头的消息会被自动清理）
 CLEAN_NOTIFICATION_PREFIXES = (
+    "🤖 Chrome",
     "🟢 TG Userbot 状态正常",
     "📁 保存目录：",
     "📋 日志文件：",
     "📖 TG Userbot 命令",
     "🧹 清理完成，共删除",
+    "🧹 正在扫描收藏夹程序消息",
     "📥 开始下载",
     "✅ 下载完成",
     "❌ 文件下载失败",
@@ -523,6 +525,14 @@ CLEAN_NOTIFICATION_PREFIXES = (
     "📸 Instagram视频下载完成",
     "❌ Instagram视频下载失败",
     "❌ Instagram链接处理失败",
+)
+
+# 持久保留的程序通知（豁免自动清理，/clearmsg 的 include_persistent=True
+# 才批量清理）：下载「结果报告」用户可能晚些才看，瞬态清理会让人错过
+#（2026-09-09 验收实测：结果通知 85 秒后被自动清理删除，用户以为没收到）。
+PERSISTENT_NOTIFICATION_PREFIXES = (
+    "✅ Chrome 下载完成",
+    "❌ Chrome 下载失败",
 )
 
 # ------------------------------------------------------------
@@ -643,6 +653,42 @@ def _migrate_runtime_files(save_folder=None, runtime_dir=None):
 # import 期一次性副作用（保持单文件时的时机：先建目录、再配日志）
 # ============================================================
 os.makedirs(SAVE_FOLDER, exist_ok=True)
+# ------------------------------------------------------------
+# Chrome Agent V1（专用 Profile + CDP，2026-09-09 用户允许新建 Profile）。
+# Chrome ≥136 禁止在默认 user-data-dir 上开 remote debugging，专用 Profile
+# 是唯一合法形态；该实例由 Agent 独占，与用户正常 Chrome 并行、互不触碰。
+# ------------------------------------------------------------
+
+# CDP 只监听本机回环，禁 0.0.0.0（规格 6）
+CHROME_CDP_HOST = "127.0.0.1"
+CHROME_CDP_PORT = 9222
+# 专用 Chrome 实例的代理（--proxy-server）：缺省沿用 TG_PROXY（同机网络环境
+# 一致——本机直连被墙时专用实例同样需要代理才能下载外网资源）。格式与
+# Chrome 一致：socks5://host:port 或 http://host:port。空 = 直连。
+CHROME_PROXY_SERVER = os.environ.get(
+    "CHROME_PROXY", os.environ.get("TG_PROXY", "")).strip() or None
+# 下载落 <SAVE_FOLDER>/TG Chrome Download/（规格 21），随 TG_SAVE_FOLDER 变化
+CHROME_DOWNLOAD_DIR = os.path.join(SAVE_FOLDER, "TG Chrome Download")
+# Agent 专用 Profile（持久复用；绝不指向正常 Chrome 的 User Data）
+CHROME_PROFILE_DIR = os.path.expanduser("~/tg_chrome_agent_profile")
+# 允许使用 /chrome* 命令的 owner（tg_secrets.json chrome_agent.owner_id 可
+# 覆盖；缺省 None = 运行时回落主账号 MY_ID——单用户部署即本人）
+CHROME_AGENT_OWNER_ID = (_SECRET_CONFIG.get("chrome_agent") or {}).get(
+    "owner_id")
+# 单任务最大尝试次数与单次尝试超时（秒）（规格 29/30）
+CHROME_DOWNLOAD_RETRIES = 3
+CHROME_DOWNLOAD_TIMEOUT = 1800
+# RETRY_WAIT 到下次执行的等待秒数
+CHROME_RETRY_WAIT_SECONDS = 30
+# 等待 CDP 端口就绪的超时秒数（拉起专用 Chrome 后轮询 /json/version）
+CHROME_CDP_CONNECT_TIMEOUT = 60
+# Agent 轮询周期（秒）：认领请求、监视下载目录
+CHROME_POLL_SECONDS = 1.0
+# 持久化文件（规格 24：两进程各写各的，temp+os.replace 原子写）
+CHROME_TASKS_FILE = os.path.join(RUNTIME_DIR, "chrome_tasks.json")
+CHROME_REQUESTS_FILE = os.path.join(RUNTIME_DIR, "chrome_requests.json")
+CHROME_AGENT_PID_FILE = os.path.join(RUNTIME_DIR, "chrome_agent.pid")
+
 os.makedirs(RUNTIME_DIR, exist_ok=True)
 _migrated_runtime_files = _migrate_runtime_files()
 log.configure(LOG_FILE, LOG_RETENTION_DAYS)

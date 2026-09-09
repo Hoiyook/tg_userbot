@@ -101,3 +101,30 @@ class CleanupFindTest(unittest.TestCase):
     def test_find_reply_prefix_cleaned(self):
         msg = make_msg(text="🔍 查询「bl44」匹配 3 处\n\n1. 🔁 待重试 | …")
         self.assertTrue(cleanup.is_cleanup_message(msg))
+
+
+class ChromeResultNotificationTest(unittest.TestCase):
+    """Chrome 下载结果通知持久保留（2026-09-09 验收反馈：通知 85 秒后就被
+    自动清理删掉，用户没看到）。结果类通知豁免自动清理（include_persistent
+    默认 False 不命中），/clearmsg 显式带 include_persistent=True 才清理。"""
+
+    def test_success_result_not_auto_cleaned(self):
+        msg = make_msg(text="✅ Chrome 下载完成\n\n任务 ID：abc\n状态：SUCCESS")
+        self.assertFalse(cleanup.is_cleanup_message(msg))
+
+    def test_failed_result_not_auto_cleaned(self):
+        msg = make_msg(text="❌ Chrome 下载失败\n\n任务 ID：abc\n状态：FAILED")
+        self.assertFalse(cleanup.is_cleanup_message(msg))
+
+    def test_results_cleaned_by_clearmsg_mode(self):
+        """/clearmsg 的 include_persistent=True 模式：结果通知仍可批量清理。"""
+        msg = make_msg(text="✅ Chrome 下载完成\n\n任务 ID：abc")
+        self.assertTrue(cleanup.is_cleanup_message(msg,
+                                                   include_persistent=True))
+
+    def test_transient_chrome_replies_still_auto_cleaned(self):
+        """瞬态回复（🤖 Chrome 开头的提交/状态报告）照旧自动清理。"""
+        msg = make_msg(text="🤖 Chrome 下载任务已提交\n\n任务 ID：abc")
+        self.assertTrue(cleanup.is_cleanup_message(msg))
+        self.assertTrue(cleanup.is_cleanup_message(msg,
+                                                   include_persistent=True))

@@ -10,6 +10,7 @@ CLEAR_INTERVAL_SECONDS / CLEAR_TIME_CHANGED）一律读 state.*；跨模块函�
 import asyncio
 
 from . import state
+from . import chrome_client
 from . import text
 from . import queue
 from . import thread
@@ -253,6 +254,12 @@ async def handle_command(event, cmd_text):
         logger.info(f"执行命令：/retry {parts[1] if len(parts) > 1 else ''}")
         return True
 
+    if chrome_client.is_chrome_dispatch(cmd_text):
+        await chrome_client.handle_chrome_command(
+            event, cmd_text,
+            owner_id=chrome_client.resolve_owner_id(state.MY_ID))
+        return True
+
     if stats.is_stats_command(cmd_text):
         parts = cmd_text.split()
         days = 1
@@ -351,33 +358,44 @@ async def handle_command(event, cmd_text):
     if cmd_text == "/clearmsg":
         logger.info("执行命令：/clearmsg")
         try:
-            # 先统计并删除其它程序消息；当前 /clearmsg 留到最后删除。
-            delete_ids = []
+            # 双入口甄别：bot 对话与收藏夹的消息 id 是两个空间。只有收藏夹
+            # 路径（event.client 即主客户端）才有「本命令消息」要跳过/删除；
+            # bot 路径若按 bot 对话 id 操作收藏夹，会按同数字 id 盲删用户
+            # 保留的内容（2026-09-09 验收发现）。扫描大收藏夹约需 1 分钟，
+            # 先回执再干活的避免「以为无效」。
+            from_saved = getattr(event, "client", None) is state.client
 
+            await event.reply(
+                "🧹 正在扫描收藏夹程序消息（最多 3000 条，约需 1 分钟）…\n"
+                "完成后会再回复结果。"
+            )
+
+            delete_ids = []
             async for message in state.client.iter_messages("me", limit=3000):
-                if message.id == event.message.id:
+                if from_saved and message.id == event.message.id:
                     continue
 
-                if cleanup.is_cleanup_message(message):
+                if cleanup.is_cleanup_message(message,
+                                           include_persistent=True):
                     delete_ids.append(message.id)
 
-            count = len(delete_ids) + 1
+            count = len(delete_ids) + (1 if from_saved else 0)
 
-            # 先反馈结果，避免当前 /clearmsg 被删除后无法回复。
             await event.reply(
                 f"🧹 清理完成，共删除 {count} 条程序相关消息\n\n"
                 "已清理：抖音/IG 链接指令、程序通知、程序命令、/clearmsg 指令\n"
                 "收藏的媒体副本与普通收藏内容会保留。"
             )
 
-            # 删除其它消息 + 当前 /clearmsg 指令。
+            # 删除其它程序消息；收藏夹路径最后删除当前 /clearmsg 指令。
             if delete_ids:
                 await state.client.delete_messages("me", delete_ids)
-
-            await state.client.delete_messages("me", [event.message.id])
+            if from_saved:
+                await state.client.delete_messages("me", [event.message.id])
 
             logger.info(
                 f"执行命令：/clearmsg | 删除 {count} 条程序相关消息"
+                f"{'（收藏夹入口）' if from_saved else '（bot 对话入口）'}"
             )
 
         except Exception as e:

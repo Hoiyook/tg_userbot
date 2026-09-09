@@ -48,6 +48,10 @@ BOT_COMMANDS = (
     ("dedup", "查看/设置重复媒体去重"),
     ("wl", "查看下载白名单"),
     ("clean", "清理 .download 临时文件"),
+    ("chrome_start", "启动 Chrome 下载 Agent"),
+    ("chrome_stop", "停止 Chrome 下载 Agent"),
+    ("chrome_status", "查看 Chrome Agent 状态"),
+    ("chrome", "用 Chrome 下载：/chrome <URL>"),
     ("clearmsg", "清理程序产生的消息"),
     ("help", "查看全部命令"),
 )

@@ -12,6 +12,7 @@ import asyncio
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_commands_test_")
@@ -165,3 +166,88 @@ class FindCommandTest(unittest.TestCase):
         ok = asyncio.run(commands.handle_command(ev, "/find 无此关键字zz"))
         self.assertTrue(ok)
         self.assertIn("无匹配", ev.replies[0])
+
+
+class ClearmsgEntryTest(unittest.IsolatedAsyncioTestCase):
+    """/clearmsg 双入口：bot 对话与收藏夹的消息 id 是两个空间。
+
+    bot 路径曾按 bot 对话消息 id 去盲删收藏夹消息（2026-09-09 发现，
+    可能误删用户保留的内容）；收藏夹路径要跳过并最后删除命令自身。
+    """
+
+    def _msg(self, mid, text):
+        from types import SimpleNamespace
+        return SimpleNamespace(id=mid, message=text, file=None,
+                               document=None, video=None, photo=None,
+                               audio=None, voice=None, media=None)
+
+    class _FakeClient:
+        def __init__(self, msgs, deleted):
+            self._msgs = msgs
+            self.deleted = deleted
+
+        async def iter_messages(self, peer, limit=None):
+            for m in self._msgs:
+                yield m
+
+        async def delete_messages(self, peer, ids):
+            self.deleted.append(list(ids))
+
+    async def asyncSetUp(self):
+        self.old = (commands.state.client, commands.state.MY_ID)
+        commands.state.MY_ID = 545
+        self.deleted = []
+        self.msgs = [
+            self._msg(100, "/status"),
+            self._msg(500, "普通收藏内容，用户自己存的"),
+            self._msg(501, "🤖 Chrome 下载任务已提交"),
+        ]
+        self.fake_client = self._FakeClient(self.msgs, self.deleted)
+        commands.state.client = self.fake_client
+        self.bot_client_sentinel = object()  # ≠ state.client
+
+    async def asyncTearDown(self):
+        commands.state.client, commands.state.MY_ID = self.old
+
+    def _event(self, client, msg_id):
+        replies = []
+        owner_client = client
+
+        class _Ev:
+            client = owner_client  # handle_command 以 event.client is state.client 甄别入口
+            chat_id = 545
+            message = SimpleNamespace(id=msg_id)
+
+            async def reply(self, text, **kwargs):
+                replies.append(text)
+
+        return _Ev(), replies
+
+    def _flat_deleted(self):
+        return [i for batch in self.deleted for i in batch]
+
+    async def test_bot_path_never_touches_me_id_500(self):
+        ev, replies = self._event(self.bot_client_sentinel, 500)
+        handled = await commands.handle_command(ev, "/clearmsg")
+        self.assertTrue(handled)
+        flat = self._flat_deleted()
+        self.assertIn(100, flat)
+        self.assertIn(501, flat)
+        self.assertNotIn(500, flat)  # 500 是 bot 对话 id，收藏夹同 id 不得动
+        self.assertTrue(any("正在扫描" in r for r in replies))
+        self.assertTrue(any("清理完成" in r for r in replies))
+
+    async def test_saved_path_skips_then_deletes_own_command(self):
+        ev, _ = self._event(self.fake_client, 500)
+        handled = await commands.handle_command(ev, "/clearmsg")
+        self.assertTrue(handled)
+        flat = self._flat_deleted()
+        self.assertIn(100, flat)
+        self.assertIn(501, flat)
+        self.assertIn(500, flat)  # 收藏夹路径：最后删除命令自身
+        # 自身命令必须是最后一个删除批次
+        self.assertEqual(self.deleted[-1], [500])
+
+
+if __name__ == "__main__":
+    unittest.main()

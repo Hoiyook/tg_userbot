@@ -19,6 +19,7 @@ from telethon.network.connection import ConnectionTcpFull, ConnectionTcpObfuscat
 
 from . import state
 from . import commands
+from . import chrome_client
 from . import dedup
 from . import queue
 from . import stats
@@ -916,6 +917,9 @@ async def main():
 
     # 任务事件日志裁剪（台账按 task_id 重建的数据源，保尾部控制体积）
     stats.trim_event_file()
+
+    # Chrome Agent 结果通知轮询（读 chrome_tasks.json 终态 → 通知收藏夹）
+    asyncio.create_task(chrome_client.notify_loop())
 
     # bot 按钮菜单：登录失败只影响菜单，不影响主功能
     if BOT_TOKEN:
