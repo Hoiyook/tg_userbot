@@ -703,6 +703,12 @@ CHROME_MAX_GUID_AGE = 1800
 # 最小进度更新间隔（秒）：Agent 向 User Bot 报告进度的时间间隔
 CHROME_MIN_PROGRESS_INTERVAL = 30
 
+# Chrome Events constants
+# 事件分发器默认 GUID 超时时间（秒）
+CHROME_EVENTS_DEFAULT_GUID_TIMEOUT = 300
+# 最大事件处理器数量限制
+CHROME_EVENTS_MAX_HANDLERS = 100
+
 os.makedirs(RUNTIME_DIR, exist_ok=True)
 _migrated_runtime_files = _migrate_runtime_files()
 log.configure(LOG_FILE, LOG_RETENTION_DAYS)
