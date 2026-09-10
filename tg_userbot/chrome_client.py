@@ -64,16 +64,6 @@ def download_dir():
     return CHROME_DOWNLOAD_DIR
 
 
-def is_chrome_command(text):
-    """严格形态（用于命令面板/白名单判定）：/chrome 必须带合法 URL。"""
-    match = _CHROME_CMD_RE.fullmatch((text or "").strip())
-    if not match:
-        return False
-    if match.group(1).lower() == "chrome":
-        return chrome_agent.validate_chrome_url(chrome_url_token(match))
-    return True
-
-
 def _split_subdir_label(token):
     """把 `/chrome` 的头 token 拆成 (download_subdir, label)。
 
@@ -107,8 +97,9 @@ def parse_chrome_submit(match):
     命令的 URL 恒为最后一个 token；它前面的那个 token（若有）是「目录+标注」。
     例外：头 token 自身就是合法 http(s) URL 时维持旧行为（把它当 URL）——
     否则 `/chrome <URL1> <URL2>` 会把 URL1 降级成目录，凭空建出名叫
-    `https:` 的目录。`is_chrome_command` 与 `handle_chrome_command` 共用
-    本函数，保证判定与执行用的是同一套规则。
+    `https:` 的目录。
+
+    这是 `/chrome` 唯一的解析入口：命令被分发之后由它定 URL/目录/标注。
     """
     first, second = match.group(2), match.group(3)
     if second is None:
@@ -119,15 +110,13 @@ def parse_chrome_submit(match):
     return second.strip(), label, subdir
 
 
-def chrome_url_token(match):
-    """/chrome 的 URL token（判定用）；解析规则与 handle_chrome_command 共用。"""
-    return parse_chrome_submit(match)[0]
-
-
 def is_chrome_dispatch(text):
-    """分发谓词（比 is_chrome_command 宽）：凡 /chrome* 都交给
-    handle_chrome_command，由它对非法形态回用法提示（/chrome 无参、
-    /chrome abc 非法 URL 等）。"""
+    """分发谓词（唯一入口）：凡 /chrome* 都交给 handle_chrome_command，由它
+    对非法形态回用法提示（/chrome 无参、/chrome abc 非法 URL 等）。
+
+    刻意"宽"：判定不校验 URL，非法形态也要落到 handler 里回一句人话，而不是
+    掉进普通下载逻辑里悄无声息。
+    """
     text = (text or "").strip()
     return text == "/chrome" or text.startswith("/chrome ") \
         or text.startswith("/chrome_")

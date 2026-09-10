@@ -830,6 +830,14 @@ CHROME_REQUESTS_FILE = os.path.join(RUNTIME_DIR, "chrome_requests.json")
 # 取消请求：User Bot 独占写、Agent 只读（与 chrome_requests.json 同款单向通道）
 CHROME_CANCEL_REQUESTS_FILE = os.path.join(
     RUNTIME_DIR, "chrome_cancel_requests.json")
+# 取消请求到达时 downloadWillBegin 还没来：在这段时间内继续等它，等到就能按
+# guid 真正中止下载；等不到说明下载还没开始，靠关标签页兜底。太短会错过
+# 「点开链接后隔几秒才开始下载」的站点（取消变成只改状态、文件照样落地），
+# 所以留 5s —— 代价只是这类取消多等几秒，换取真的把下载摁住。
+CHROME_CANCEL_GUID_GRACE_SECONDS = 5.0
+# chrome_tasks.json 里保留的终态任务条数上限（成功/失败/取消）：只裁最老的，
+# 刚终结的任务必须留着——chrome_client 的 notify_loop 每 5s 才轮询一次通知。
+CHROME_TASKS_KEEP_TERMINAL = 200
 CHROME_AGENT_PID_FILE = os.path.join(RUNTIME_DIR, "chrome_agent.pid")
 
 # Chrome Agent V2 Recovery constants

@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 from .config import (
     CHROME_AGENT_LOG_FILE,
     CHROME_AGENT_PID_FILE,
+    CHROME_CANCEL_GUID_GRACE_SECONDS,
     CHROME_CANCEL_REQUESTS_FILE,
     CHROME_CDP_CONNECT_TIMEOUT,
     CHROME_CDP_HOST,
@@ -37,6 +38,7 @@ from .config import (
     CHROME_REQUESTS_FILE,
     CHROME_RETRY_WAIT_SECONDS,
     CHROME_TASKS_FILE,
+    CHROME_TASKS_KEEP_TERMINAL,
     LOG_RETENTION_DAYS,
 )
 
@@ -47,10 +49,10 @@ TERMINAL_STATUSES = ("SUCCESS", "FAILED", "CANCELLED")
 # Agent 读取消请求文件的轮询间隔。文件 IPC 只能轮询（规格 §9 禁止引入
 # socket/队列服务）；这是唯一的轮询点，下载本身仍是 CDP 事件驱动。
 CANCEL_POLL_SECONDS = 1.0
-# 取消请求到达时 guid 还没产生的宽限窗口（§11）：在这段时间里继续等
-# downloadWillBegin，等到就按 guid 真正取消；等不到说明下载还没开始，
-# 由 run_download_attempt 收尾时的 close_tab 兜底。
-CANCEL_GUID_GRACE_SECONDS = 2.0
+# 取消请求到达时 guid 还没产生的宽限窗口（§11）：继续等 downloadWillBegin，
+# 等到就按 guid 真正取消；等不到说明下载还没开始，由收尾的 close_tab 兜底。
+# 取值见 config.CHROME_CANCEL_GUID_GRACE_SECONDS。
+CANCEL_GUID_GRACE_SECONDS = CHROME_CANCEL_GUID_GRACE_SECONDS
 # 「取消先到」的内部哨兵（与 None=无事件区分开）
 _CANCEL_SENTINEL = object()
 # 启动清扫孤儿 .crdownload 的最小「没人动过」时长（秒）。见 sweep_orphan_partials：
@@ -195,6 +197,29 @@ def save_tasks(tasks, path):
 
 def get_task(tasks, task_id):
     return next((t for t in tasks if t.get("task_id") == task_id), None)
+
+
+def trim_terminal_tasks(tasks, keep):
+    """只保留最近的 keep 条终态任务（就地裁剪），返回被裁掉的记录。
+
+    终态任务（SUCCESS / FAILED / CANCELLED）只用于展示与统计，但会一直堆在
+    chrome_tasks.json 里，而 chrome_client 的 notify_loop 每 5s 全表扫一遍、
+    /chrome_status 也全表算。这里只裁**最老的**——刚终结的必须留着：通知是
+    轮询发的，裁太早用户就收不到那条结果了。
+
+    非终态任务一条都不动（它们还要被认领/重试）。列表是原地改的，调用方的
+    引用与文件顺序都保持不变。
+    """
+    terminal_idx = [i for i, t in enumerate(tasks)
+                    if t.get("status") in TERMINAL_STATUSES]
+    excess = len(terminal_idx) - int(keep)
+    if excess <= 0:
+        return []
+    drop = set(terminal_idx[:excess])
+    removed = [t for i, t in enumerate(tasks) if i in drop]
+    tasks[:] = [t for i, t in enumerate(tasks) if i not in drop]
+    logger.info(f"🧹 清理历史终态任务 {len(removed)} 条（保留最近 {keep} 条）")
+    return removed
 
 
 # ------------------------------------------------------------
@@ -420,20 +445,20 @@ def sweep_orphan_partials(download_dir, tasks,
     return removed
 
 
-async def _next_event_or_cancel(cdp, timeout, cancel_event):
+async def _next_event_or_cancel(cdp, timeout, cancel_task):
     """等下一个 CDP 事件；取消请求到达则返回 `_CANCEL_SENTINEL`（§13）。
 
-    用 asyncio 的任务等待，不做 sleep 轮询：next_event 与 cancel_event.wait()
-    同时挂在事件循环上、谁先完成用谁。取消时把没完成的那一边取消掉——
+    用 asyncio 的任务等待，不做 sleep 轮询：next_event 与取消等待同时挂在事件
+    循环上、谁先完成用谁。`cancel_task` 由调用方在**整个尝试期间**持有一个
+    （每次事件都现建一个纯属浪费），这里只收掉没赢的 event_task——
     `Queue.get()` 被取消不会消费队列，所以 downloadWillBegin /
     downloadProgress 一个都不会丢。
 
     两边同一拍完成时**优先采纳事件**（§14：完成先被确认就保留完成）。
     """
     event_task = asyncio.ensure_future(cdp.next_event(timeout=timeout))
-    if cancel_event is None:
+    if cancel_task is None:
         return await event_task
-    cancel_task = asyncio.ensure_future(cancel_event.wait())
     try:
         await asyncio.wait({event_task, cancel_task},
                            return_when=asyncio.FIRST_COMPLETED)
@@ -444,10 +469,9 @@ async def _next_event_or_cancel(cdp, timeout, cancel_event):
             return event_task.result()
         return _CANCEL_SENTINEL
     finally:
-        for fut in (event_task, cancel_task):
-            if not fut.done():
-                fut.cancel()
-        await asyncio.gather(event_task, cancel_task, return_exceptions=True)
+        if not event_task.done():
+            event_task.cancel()
+        await asyncio.gather(event_task, return_exceptions=True)
 
 
 async def _wait_begin_within_grace(cdp, deadline):
@@ -508,6 +532,9 @@ async def run_download_attempt(cdp, url, download_dir, timeout,
     deadline = loop.time() + float(timeout)
     filename = None
     guid = None
+    # 整个尝试期只挂一个取消等待任务（每次事件现建一个会白白churn任务对象）
+    cancel_task = (asyncio.ensure_future(cancel_event.wait())
+                   if cancel_event is not None else None)
     try:
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -518,7 +545,7 @@ async def run_download_attempt(cdp, url, download_dir, timeout,
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return False, filename, None, "下载超时（超时内无终态事件）"
-            event = await _next_event_or_cancel(cdp, remaining, cancel_event)
+            event = await _next_event_or_cancel(cdp, remaining, cancel_task)
             if event is _CANCEL_SENTINEL:
                 continue  # 取消处理只在循环顶部一处（此刻 cancel_event 已置位）
             if event is None:
@@ -543,6 +570,8 @@ async def run_download_attempt(cdp, url, download_dir, timeout,
                 if state == "canceled":
                     return False, filename, None, "浏览器取消下载"
     finally:
+        if cancel_task is not None and not cancel_task.done():
+            cancel_task.cancel()
         try:
             await cdp.close_tab(target_id)
         except Exception:
@@ -939,6 +968,8 @@ async def agent_main():
                 cancel_path=CHROME_CANCEL_REQUESTS_FILE)
             if stop.is_set():
                 break
+            if trim_terminal_tasks(tasks, CHROME_TASKS_KEEP_TERMINAL):
+                save_tasks(tasks, CHROME_TASKS_FILE)
             await asyncio.sleep(CHROME_POLL_SECONDS)
     finally:
         await client.close()
