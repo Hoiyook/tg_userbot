@@ -29,7 +29,7 @@ from . import stats
 from . import finder
 from . import commands
 from . import config
-from .config import DONE_DEFAULT_LINES
+from .config import DONE_DEFAULT_LINES, REPORT_STATUS_PREFIX
 from .log import logger
 from .naming import sanitize_filename
 from .sources import entity_display_name
@@ -258,6 +258,14 @@ async def bot_message_handler(event):
         return
     message = event.message
     text = (message.message or "").strip()
+
+    # Runtime Reporter 的汇报发到这个对话（面板 + 启动/关闭/异常通知），但它们
+    # 不是「给我的指令」。这行必须排在下面两个等待窗口**之前**：cookie 与
+    # /find 窗口期内任何非 "/" 开头的文本都会被当成输入内容——面板正文要是
+    # 正好落在那 120 秒里，会被当成抖音 cookie 存下来。
+    if text.startswith(REPORT_STATUS_PREFIX):
+        return
+
     fwd = getattr(message, "fwd_from", None)
     from_id = getattr(fwd, "from_id", None) if fwd else None
 

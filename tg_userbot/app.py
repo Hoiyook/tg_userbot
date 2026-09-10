@@ -22,6 +22,7 @@ from . import commands
 from . import chrome_client
 from . import dedup
 from . import queue
+from . import reporter
 from . import stats
 from . import thread
 from . import whitelist
@@ -49,6 +50,9 @@ from .config import (
     ME_LABEL_WINDOW_SECONDS,
     PROXY,
     QUEUE_FETCH_TIMEOUT,
+    REPORT_ENABLED,
+    REPORT_INTERVAL_SECONDS,
+    REPORT_PROGRESS_INTERVAL_SECONDS,
     SAVE_FOLDER,
     SECRETS_FILE,
     SESSION_NAME,
@@ -208,6 +212,29 @@ async def _bot_keepalive():
                 f"🤖 bot 菜单重连失败（{type(e).__name__}: {e}），"
                 f"{BOT_KEEPALIVE_INTERVAL} 秒后重试"
             )
+
+
+async def _start_reporter():
+    """构造并启动 Runtime Reporter，返回 (实例, 任务)。
+
+    REPORT_ENABLED 关闭时返回 (None, None)。启动通知（start）在此发出——
+    此时客户端与 worker 池都已就绪。start 自身失败只记日志：Reporter 是
+    观察者，它起不来绝不能拖垮主程序。
+    """
+    if not REPORT_ENABLED:
+        return None, None
+    instance = reporter.Reporter()
+    try:
+        await instance.start()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        raise
+    except Exception:
+        logger.exception("🤖 Reporter 启动失败（不影响核心系统）")
+    logger.info(
+        f"🤖 Runtime Reporter 已启动（状态面板每 "
+        f"{REPORT_INTERVAL_SECONDS}s 刷新，下载中 {REPORT_PROGRESS_INTERVAL_SECONDS}s）"
+    )
+    return instance, asyncio.create_task(instance.run())
 
 
 async def _retry_sweeper():
@@ -1008,18 +1035,31 @@ async def main():
         bot_keepalive_task = asyncio.create_task(_bot_keepalive())
     main_serve_task = asyncio.create_task(_main_serve())
     retry_sweeper_task = asyncio.create_task(_retry_sweeper())
+    # Runtime Reporter（只读观察者）：发启动通知 + 后台刷新状态面板
+    reporter_instance, reporter_task = await _start_reporter()
 
     try:
         await state.STOP_EVENT.wait()
         logger.info("🛑 收到停止信号，正在收尾退出...")
     finally:
+        # Reporter 的关闭通知必须赶在客户端被拆掉之前发；stop() 内部带超时，
+        # Telegram 不可用时也只是多等一会儿，绝不阻塞退出（规格 §28）。
+        if reporter_instance is not None:
+            try:
+                await reporter_instance.stop()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("🤖 Reporter 关闭通知失败（不影响退出）")
         # 取消后台服务任务：主客户端挂在 run_until_disconnected，取消会触发其
         # finally 里的 disconnect，随后以 CancelledError 收尾；bot 探活/重放
-        # 扫描同理。
-        for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task):
+        # 扫描/Reporter 主循环同理。
+        for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
+                  reporter_task):
             if t is not None:
                 t.cancel()
-        for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task):
+        for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
+                  reporter_task):
             if t is not None:
                 try:
                     await t

@@ -3,8 +3,10 @@
 运行方式（在项目根目录）：
     .venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
 """
+import asyncio
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -422,11 +424,12 @@ class WhitelistCommitTest(unittest.TestCase):
 class BotCleanupPlanTest(unittest.TestCase):
     """plan_bot_chat_cleanup：bot 对话清理决策（纯函数）。"""
 
-    def _msg(self, mid, age_minutes, has_buttons):
+    def _msg(self, mid, age_minutes, has_buttons, is_panel=False):
         return {
             "id": mid,
             "age_minutes": age_minutes,
             "has_buttons": has_buttons,
+            "is_panel": is_panel,
         }
 
     def test_keeps_newest_menu_always(self):
@@ -438,6 +441,20 @@ class BotCleanupPlanTest(unittest.TestCase):
         to_delete, to_keep = cleanup.plan_bot_chat_cleanup(messages, age_limit=1)
         self.assertEqual(to_keep, {2})
         self.assertEqual(set(to_delete), {1, 3})
+
+    def test_keeps_newest_status_panel(self):
+        """Runtime Reporter 面板也要留：它靠 edit_message 原地刷新，
+        被删掉后下一轮会重建 → 每两分钟多一条面板、永远刷屏。"""
+        # 注意顺序：生产里 iter_messages 返回的是「最新在前」（age 递增）
+        messages = [
+            self._msg(4, age_minutes=5, has_buttons=False, is_panel=True),    # 最新面板
+            self._msg(3, age_minutes=10, has_buttons=True),                   # 最新菜单
+            self._msg(2, age_minutes=20, has_buttons=False, is_panel=True),   # 旧面板
+            self._msg(1, age_minutes=30, has_buttons=False),                  # 旧通知
+        ]
+        to_delete, to_keep = cleanup.plan_bot_chat_cleanup(messages, age_limit=1)
+        self.assertEqual(to_keep, {3, 4}, "最新菜单 + 最新面板都要保留")
+        self.assertEqual(set(to_delete), {1, 2}, "旧面板与旧通知照删")
 
     def test_deletes_only_old_messages(self):
         messages = [
@@ -468,3 +485,52 @@ class FindMenuEntryTest(unittest.TestCase):
         actions = [menu.parse_menu_data(b.data)[0]
                    for row in rows for b in row]
         self.assertIn("find", actions)
+
+
+class BotHandlerIgnoresReporterTest(unittest.IsolatedAsyncioTestCase):
+    """Runtime Reporter 的汇报发到 bot 对话时，不得被当成「给 bot 的指令」。
+
+    关键回归点：短路判断必须排在 cookie / find 等待窗口**之前**——那两个窗口
+    期内任何非 "/" 开头的文本都会被当作输入内容，面板正文要是正好落在窗口里，
+    会被当成抖音 cookie 直接存进 tg_secrets.json。
+    """
+
+    async def asyncSetUp(self):
+        self.old = (state.MY_ID, state.COOKIE_INPUT_UNTIL,
+                    state.FIND_INPUT_UNTIL)
+        state.MY_ID = 5452449426
+        state.COOKIE_INPUT_UNTIL = 0.0
+        state.FIND_INPUT_UNTIL = 0.0
+
+    async def asyncTearDown(self):
+        (state.MY_ID, state.COOKIE_INPUT_UNTIL,
+         state.FIND_INPUT_UNTIL) = self.old
+
+    def _event(self, text):
+        msg = mock.MagicMock()
+        msg.message = text
+        msg.fwd_from = None
+        ev = mock.MagicMock()
+        ev.out = False
+        ev.chat_id = state.MY_ID
+        ev.message = msg
+        return ev
+
+    async def test_panel_text_not_eaten_by_cookie_window(self):
+        state.COOKIE_INPUT_UNTIL = time.monotonic() + 60
+        cookie = mock.AsyncMock()
+        with mock.patch.object(bot, "_handle_cookie_input", cookie):
+            await bot.bot_message_handler(
+                self._event(f"{config.REPORT_STATUS_PREFIX}\n\n🟢 RUNNING"))
+        cookie.assert_not_awaited()
+        self.assertGreater(state.COOKIE_INPUT_UNTIL, 0,
+                           "面板不该把 cookie 等待窗口关掉")
+
+    async def test_plain_text_still_eaten_by_cookie_window(self):
+        """对照组：证明上一条不是因为 cookie 路径本来就进不去。"""
+        state.COOKIE_INPUT_UNTIL = time.monotonic() + 60
+        cookie = mock.AsyncMock()
+        with mock.patch.object(bot, "_handle_cookie_input", cookie):
+            await bot.bot_message_handler(
+                self._event("sessionid=abc; ttwid=xyz"))
+        cookie.assert_awaited_once()

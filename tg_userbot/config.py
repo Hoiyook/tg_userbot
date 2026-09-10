@@ -546,6 +546,13 @@ CLEAN_NOTIFICATION_PREFIXES = (
     "📸 Instagram视频下载完成",
     "❌ Instagram视频下载失败",
     "❌ Instagram链接处理失败",
+    # Runtime Reporter 的事件通知（Status Panel 刻意不入此表——它要长期存活，
+    # 靠 edit_message 原地刷新而不是反复重建）
+    "🚀 Userbot 已启动",
+    "🛑 Userbot 正在关闭",
+    "⚠️ Userbot 异常",
+    "✅ 已恢复",
+    "♻️ 自动重放",
 )
 
 # 持久保留的程序通知（豁免自动清理，/clearmsg 的 include_persistent=True
@@ -555,6 +562,68 @@ PERSISTENT_NOTIFICATION_PREFIXES = (
     "✅ Chrome 下载完成",
     "❌ Chrome 下载失败",
 )
+
+# ------------------------------------------------------------
+# Runtime Reporter（主动运行状态汇报，2026-09-10）
+# ------------------------------------------------------------
+# Reporter 是**只读观察者**：只读 state.* 与 stats 事件流，不参与任何调度。
+# 两类输出——① Status Panel：收藏夹里的一条消息，首发 send_message、之后原地
+# edit_message 刷新；② Event Notification：重要事件发独立消息。
+# 它自己的任何异常都被兜住，绝不拖垮下载/队列/worker。
+REPORT_ENABLED = True
+
+# Status Panel 常规刷新间隔（秒）。下载进行中另有更快的进度节奏。
+REPORT_INTERVAL_SECONDS = 300
+# 有下载在跑时，面板按此间隔刷新（只在这些时候加密，空闲时回到常规间隔）
+REPORT_PROGRESS_ENABLED = True
+REPORT_PROGRESS_INTERVAL_SECONDS = 15
+
+# 事件流轮询间隔（秒）：增量读 task_events.jsonl 的新行 → 派发事件通知。
+# 这是「立即通知」的代价上限——事件最迟这么久被汇报出去。
+REPORT_EVENT_POLL_SECONDS = 15
+
+# 事件通知开关。startup/shutdown/error/recovery/auto_replay 都是现有体系**没有**
+# 的信息（尤其自动重放与手动 /retry 以前无从分辨），故默认开。
+REPORT_STARTUP = True
+REPORT_SHUTDOWN = True
+REPORT_ERROR = True
+REPORT_RECOVERY = True
+REPORT_AUTO_REPLAY = True
+
+# 下载类通知默认**关**：download.py 已经在收藏夹发「📥 开始下载 / ✅ 下载完成 /
+# ❌ 文件下载失败」，Reporter 再发一遍就是每条双份刷屏。想要更详细的版本
+#（含耗时/worker）把它们打开即可。
+REPORT_DOWNLOAD_START = False
+REPORT_DOWNLOAD_SUCCESS = False
+REPORT_DOWNLOAD_FAILED = False
+REPORT_RETRY = False
+
+# 面板「当前下载」区块最多列几条，其余折叠为「还有 X 个下载任务……」。
+# 这个值是**上限**：渲染时若总长度仍超 REPORT_MAX_MESSAGE_CHARS 会自动再减。
+REPORT_MAX_DOWNLOADS_SHOWN = 5
+# 面板「Workers」区块最多列几条异常明细（正常 worker 只计数，不逐条列）。
+REPORT_MAX_WORKER_ALERTS_SHOWN = 5
+
+# 单条汇报的硬上限（字符）：Telegram 上限 4096，留余量。超了就自动裁剪——
+# 宁可少显示，也绝不能因为超长让消息发不出去（失败还会被静默吞成"没反应"）。
+REPORT_MAX_MESSAGE_CHARS = 4000
+# 下载文件名在面板里的最大长度（保尾：区分性最强的原名在尾部）。
+REPORT_MAX_FILENAME_CHARS = 52
+
+# 统计缓存时长（秒）：事件流没新增时直接复用上次算好的统计，避免每次刷新
+# 都全量扫描 task_events.jsonl（实测 3 万行封顶时一次 load+rebuild 约 116ms
+# 同步阻塞事件循环，而下载中面板每 15s 刷一次）。
+REPORT_STATS_CACHE_SECONDS = 300
+
+# 汇报目标：True=发到 bot 私聊（控制/状态频道，自带清理），False=发收藏夹。
+# bot 未就绪（BOT_ID 为空）时自动回落收藏夹，绝不发丢。
+REPORT_TO_BOT_CHAT = True
+# 回落目标（收藏夹）。
+REPORT_FALLBACK_TARGET = "me"
+
+# Status Panel 首行前缀。**刻意不进 CLEAN_NOTIFICATION_PREFIXES**：面板要长期
+# 存活、靠原地编辑刷新；若被自动清理删掉，下一轮会重建（MessageIdInvalid 路径）。
+REPORT_STATUS_PREFIX = "🤖 Userbot Runtime"
 
 # ------------------------------------------------------------
 # 登录看门狗（start_with_retry 的超时与重试）

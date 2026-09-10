@@ -31,6 +31,7 @@ from .config import (
     PERSISTENT_NOTIFICATION_PREFIXES,
     CLEAR_TIME_CONFIG_FILE,
     DEFAULT_CLEAR_INTERVAL_SECONDS,
+    REPORT_STATUS_PREFIX,
     SAVE_FOLDER,
 )
 from .history import is_done_command
@@ -352,16 +353,28 @@ def clean_temp_files(root=None):
 
 
 def plan_bot_chat_cleanup(messages, age_limit):
-    """bot 菜单对话清理决策：删除超过时限的消息，但始终保留最新一条带按钮的菜单。
+    """bot 菜单对话清理决策：删除超过时限的消息，但始终保留两条「活消息」——
+    最新一条带按钮的菜单，以及最新一条 Runtime Reporter 状态面板。
 
-    messages: 按时间从新到旧排列的 [{"id", "age_minutes", "has_buttons"}, ...]
+    面板也必须留（2026-09-10 起汇报发到这个对话）：它靠 edit_message 原地刷新，
+    被删掉后下一轮会 MessageIdInvalid → 重建，于是每两分钟多一条面板、永远刷屏。
+
+    messages: 按时间从新到旧排列
+        [{"id", "age_minutes", "has_buttons", "is_panel"}, ...]
     返回 (要删除的 id 列表, 要保留的 id 集合)
     """
     keep = set()
     delete = []
+    kept_menu = False
+    kept_panel = False
     for m in messages:
-        if m["has_buttons"] and not keep:
+        if m.get("has_buttons") and not kept_menu:
             keep.add(m["id"])
+            kept_menu = True
+            continue
+        if m.get("is_panel") and not kept_panel:
+            keep.add(m["id"])
+            kept_panel = True
             continue
         if m["age_minutes"] > age_limit:
             delete.append(m["id"])
@@ -401,6 +414,11 @@ async def cleanup_bot_chat_once():
                     "id": m.id,
                     "age_minutes": age,
                     "has_buttons": bool(m.buttons),
+                    # Runtime Reporter 面板：要长期保留（见 plan_bot_chat_cleanup）
+                    "is_panel": bool(
+                        m.buttons is None
+                        and (m.message or "").startswith(REPORT_STATUS_PREFIX)
+                    ),
                 }
             )
         del_ids, _ = plan_bot_chat_cleanup(infos, CLEAN_MESSAGE_AGE_MINUTES)
