@@ -6,6 +6,7 @@
     .venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
 """
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -749,6 +750,181 @@ class AgentLogIsolationTest(unittest.TestCase):
         self.assertEqual(rc, 1)  # 无 Chrome 可执行文件 → 快速退出
         self.assertEqual(
             logmod.current_log_path(), config.CHROME_AGENT_LOG_FILE)
+
+
+class ChromeSubdirTest(unittest.TestCase):
+    """下载子目录：safe_subdir / get_task_download_dir / 字段透传。"""
+
+    def test_safe_subdir_normalizes(self):
+        f = chrome_agent.safe_subdir
+        self.assertEqual(f("A"), "A")
+        self.assertEqual(f("A/B"), "A/B")
+        self.assertEqual(f("A//B"), "A/B")
+        self.assertEqual(f(" A / B "), "A/B")
+        self.assertEqual(f("A/B/"), "A/B")
+        self.assertIsNone(f(None))
+        self.assertIsNone(f(""))
+        self.assertIsNone(f("   "))
+
+    def test_safe_subdir_rejects_traversal(self):
+        """子目录直接来自用户输入，必须挡住上跳/绝对/反斜杠——
+        否则 `A/../../..` 会把文件写到 TG Chrome Download 之外。"""
+        f = chrome_agent.safe_subdir
+        self.assertIsNone(f(".."))
+        self.assertIsNone(f("A/../B"))
+        self.assertIsNone(f("A/.."))
+        self.assertIsNone(f("../../etc"))
+        self.assertIsNone(f("A/./B"))
+        self.assertIsNone(f("a\\b"))
+
+    def test_get_task_download_dir(self):
+        root = "/root/TG Chrome Download"
+        self.assertEqual(
+            chrome_agent.get_task_download_dir(root, {}), root)
+        self.assertEqual(
+            chrome_agent.get_task_download_dir(root, {"download_subdir": None}),
+            root)
+        self.assertEqual(
+            chrome_agent.get_task_download_dir(
+                root, {"download_subdir": "A/B"}),
+            os.path.join(root, "A", "B"))
+
+    def test_get_task_download_dir_falls_back_on_illegal(self):
+        """非法子目录退回根目录（不报错、不越界），绝不写出根之外。"""
+        root = "/root/TG Chrome Download"
+        got = chrome_agent.get_task_download_dir(
+            root, {"download_subdir": "../outside"})
+        self.assertEqual(got, root)
+
+    def test_create_task_stores_subdir_only_when_present(self):
+        with_sub = chrome_agent.create_task(
+            "https://a.com/1.zip", "t1", download_subdir="A/B")
+        self.assertEqual(with_sub["download_subdir"], "A/B")
+        without = chrome_agent.create_task("https://a.com/2.zip", "t2")
+        self.assertNotIn("download_subdir", without)
+
+    def test_claim_new_requests_propagates_subdir(self):
+        path = os.path.join(_TMP, "chrome_req_subdir.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"requests": [{
+                "task_id": "t1", "url": "https://a.com/1.zip",
+                "label": "#标", "download_subdir": "A/B",
+            }]}, f)
+        tasks = []
+        claimed = chrome_agent.claim_new_requests(tasks, path)
+        os.remove(path)
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0]["download_subdir"], "A/B")
+        self.assertEqual(claimed[0]["label"], "#标")
+
+
+class ChromeSubdirRecoveryTest(unittest.TestCase):
+    """Recovery 必须按任务自己的目录找成品（否则重启后会重下已完成的）。"""
+
+    def setUp(self):
+        self.root = os.path.join(_TMP, "chrome_subdir_recover")
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_recover_finds_file_in_subdir(self):
+        sub = os.path.join(self.root, "A", "B")
+        os.makedirs(sub, exist_ok=True)
+        with open(os.path.join(sub, "done.zip"), "wb") as f:
+            f.write(b"z" * 10)
+        task = chrome_agent.create_task(
+            "https://a.com/done.zip", "r1", download_subdir="A/B")
+        chrome_agent.start_attempt(task)
+        task["filename"] = "done.zip"
+
+        chrome_agent.recover_tasks([task], self.root)
+        self.assertEqual(task["status"], "SUCCESS",
+                         "子目录里的成品没被认出来 → 会重复下载")
+
+    def test_recover_still_pending_when_file_absent(self):
+        task = chrome_agent.create_task(
+            "https://a.com/miss.zip", "r2", download_subdir="A/B")
+        chrome_agent.start_attempt(task)
+        task["filename"] = "miss.zip"
+        chrome_agent.recover_tasks([task], self.root)
+        self.assertEqual(task["status"], "PENDING")
+
+
+class _WritingCDP(FakeCDP):
+    """在 setup_download 时把成品写进「浏览器将要下载到的」那个目录。
+
+    既证明传给 CDP 的目录确实变了（记录在 commands 里），又满足 completed
+    之后 run_download_attempt 对成品文件的校验。
+    """
+
+    def __init__(self, events, filename):
+        super().__init__(events)
+        self.filename = filename
+
+    async def setup_download(self, download_path):
+        await super().setup_download(download_path)
+        os.makedirs(download_path, exist_ok=True)
+        with open(os.path.join(download_path, self.filename), "wb") as f:
+            f.write(b"z" * 7)
+
+
+class ChromeSubdirDownloadTest(unittest.IsolatedAsyncioTestCase):
+    """带 download_subdir 的任务真的落到子目录（建目录 + CDP 落点 + 改名）。"""
+
+    def setUp(self):
+        self.root = os.path.join(_TMP, "chrome_subdir_dl")
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+        self.tasks_path = os.path.join(_TMP, "chrome_tasks_subdir.json")
+        if os.path.exists(self.tasks_path):
+            os.remove(self.tasks_path)
+
+    def _events(self):
+        return [
+            {"method": "Browser.downloadWillBegin",
+             "params": {"guid": "g", "suggestedFilename": "x.zip"}},
+            {"method": "Browser.downloadProgress",
+             "params": {"guid": "g", "state": "completed"}},
+        ]
+
+    async def test_download_lands_in_subdir(self):
+        cdp = _WritingCDP(self._events(), "x.zip")
+        task = chrome_agent.create_task(
+            "https://a.com/x.zip", "s1", download_subdir="A/B")
+        await chrome_agent.process_pending_tasks(
+            cdp, [task], self.tasks_path, self.root,
+            timeout=5, retries=3, wait_seconds=0)
+        self.assertEqual(task["status"], "SUCCESS")
+        # CDP 的下载落点必须是子目录，不是根目录
+        self.assertIn(
+            ("setup_download", os.path.join(self.root, "A", "B")),
+            cdp.commands)
+        self.assertTrue(
+            os.path.isfile(os.path.join(self.root, "A", "B", "x.zip")))
+
+    async def test_label_rename_happens_inside_subdir(self):
+        cdp = _WritingCDP(self._events(), "x.zip")
+        task = chrome_agent.create_task(
+            "https://a.com/x.zip", "s2", download_subdir="A/B")
+        task["label"] = "#标"
+        await chrome_agent.process_pending_tasks(
+            cdp, [task], self.tasks_path, self.root,
+            timeout=5, retries=3, wait_seconds=0)
+        self.assertEqual(task["status"], "SUCCESS")
+        self.assertEqual(task["filename"], "#标 x.zip")
+        self.assertTrue(
+            os.path.isfile(os.path.join(self.root, "A", "B", "#标 x.zip")))
+        # 根目录不该出现任何东西
+        self.assertFalse(os.path.exists(os.path.join(self.root, "x.zip")))
+
+    async def test_no_subdir_still_lands_in_root(self):
+        """回归：不带子目录的任务行为不变（还是落在根目录）。"""
+        cdp = _WritingCDP(self._events(), "x.zip")
+        task = chrome_agent.create_task("https://a.com/x.zip", "s3")
+        await chrome_agent.process_pending_tasks(
+            cdp, [task], self.tasks_path, self.root,
+            timeout=5, retries=3, wait_seconds=0)
+        self.assertIn(("setup_download", self.root), cdp.commands)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, "x.zip")))
 
 
 if __name__ == "__main__":

@@ -59,11 +59,54 @@ def is_chrome_command(text):
     return True
 
 
+def _split_subdir_label(token):
+    """把 `/chrome` 的头 token 拆成 (download_subdir, label)。
+
+    规则（任务书 §1）：**最后一个 `/` 之后的 `#xxx` 是文件名标注，前面的
+    全部内容才是目录路径**；不带 `#` 的头 token 整个就是目录。
+
+        "#标注"      → (None, "#标注")
+        "A/#标注"    → ("A", "#标注")
+        "A/B/#标注"  → ("A/B", "#标注")
+        "A"          → ("A", None)
+        "A/B"        → ("A/B", None)
+
+    空 token 返回 (None, None)。
+    """
+    token = (token or "").strip()
+    if not token:
+        return None, None
+    if "/" in token:
+        head, _, tail = token.rpartition("/")
+        if tail.startswith("#"):
+            return (head.strip("/") or None), tail
+        return token.strip("/") or None, None
+    if token.startswith("#"):
+        return None, token
+    return token, None
+
+
+def parse_chrome_submit(match):
+    """解析 `/chrome [目录/][#标注] <URL>`，返回 (url, label, download_subdir)。
+
+    命令的 URL 恒为最后一个 token；它前面的那个 token（若有）是「目录+标注」。
+    例外：头 token 自身就是合法 http(s) URL 时维持旧行为（把它当 URL）——
+    否则 `/chrome <URL1> <URL2>` 会把 URL1 降级成目录，凭空建出名叫
+    `https:` 的目录。`is_chrome_command` 与 `handle_chrome_command` 共用
+    本函数，保证判定与执行用的是同一套规则。
+    """
+    first, second = match.group(2), match.group(3)
+    if second is None:
+        return (first or "").strip(), None, None
+    if chrome_agent.validate_chrome_url(first):
+        return (first or "").strip(), None, None
+    subdir, label = _split_subdir_label(first)
+    return second.strip(), label, subdir
+
+
 def chrome_url_token(match):
-    """/chrome 的 URL token：带 #标注 时是第三个 token，否则第二个。"""
-    if match.group(2) and match.group(2).startswith("#"):
-        return match.group(3)
-    return match.group(2)
+    """/chrome 的 URL token（判定用）；解析规则与 handle_chrome_command 共用。"""
+    return parse_chrome_submit(match)[0]
 
 
 def is_chrome_dispatch(text):
@@ -85,12 +128,15 @@ def resolve_owner_id(my_id):
 # 文本构建（纯函数）
 # ------------------------------------------------------------
 
-def submit_text(task_id, url, label=None):
+def submit_text(task_id, url, label=None, download_subdir=None):
     label_line = f"标注：{label}\n" if label else ""
+    subdir = chrome_agent.safe_subdir(download_subdir)
+    dir_line = f"子目录：{subdir}\n" if subdir else ""
     return (
         f"{CHROME_TEXT_PREFIX} 下载任务已提交\n\n"
         f"任务 ID：{task_id[:8]}\n"
         f"{label_line}"
+        f"{dir_line}"
         f"URL：{url}\n\n"
         "完成后会在此通知结果。"
     )
@@ -203,7 +249,7 @@ def result_text(task):
             f"URL：{task.get('url')}\n"
             f"文件：{task.get('filename')}\n"
             f"{size_line}\n"
-            f"目录：\n{download_dir()}"
+            f"目录：\n{chrome_agent.get_task_download_dir(download_dir(), task)}"
         )
     attempts = task.get("attempts", 0)
     return (
@@ -357,7 +403,12 @@ def save_requests(reqs, path=None):
 
 
 def add_request(task_id, url, user_id, chat_id, message_id, path=None,
-                now=None, label=None):
+                now=None, label=None, download_subdir=None):
+    """登记一条下载请求。
+
+    download_subdir：可选的下载子目录（`/chrome A/B/#标注 URL`）。只在非空且
+    合法时写入——没有子目录的请求保持原有数据结构不变。
+    """
     reqs = load_requests(path)
     ts = (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     record = {
@@ -370,6 +421,9 @@ def add_request(task_id, url, user_id, chat_id, message_id, path=None,
     }
     if label:
         record["label"] = label
+    subdir = chrome_agent.safe_subdir(download_subdir)
+    if subdir:
+        record["download_subdir"] = subdir
     reqs.append(record)
     save_requests(reqs, path)
 
@@ -465,14 +519,9 @@ async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
         logger.info("执行命令：/chrome_status")
         return True
 
-    # sub == "chrome"：[#标注] <URL> 提交下载（规格 15：Agent 未运行不自动启动）
-    # 带 # 开头的第一个 token 视为文件名标注（结果文件重命名为「#标注 原名」）
-    label = None
-    url_token = arg
-    if url_token and url_token.startswith("#"):
-        label = url_token
-        url_token = match.group(3)
-    url = (url_token or "").strip()
+    # sub == "chrome"：[目录/][#标注] <URL> 提交下载（规格 15：Agent 未运行不自动启动）
+    # 最后一个 "/" 之后的 #xxx 是文件名标注，前面的是下载子目录
+    url, label, download_subdir = parse_chrome_submit(match)
     if not chrome_agent.validate_chrome_url(url):
         await event.reply(invalid_url_text(url))
         return True
@@ -484,11 +533,12 @@ async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
                 user_id=sender if sender is not None else owner_id,
                 chat_id=owner_id,  # Saved Messages：通知发回收藏夹
                 message_id=getattr(event, "id", 0) or 0,
-                label=label)
-    await event.reply(submit_text(task_id, url, label))
+                label=label, download_subdir=download_subdir)
+    await event.reply(submit_text(task_id, url, label, download_subdir))
     logger.info(
         f"执行命令：/chrome {url}（task {task_id[:8]}"
-        f"{'，标注 ' + label if label else ''}）")
+        f"{'，标注 ' + label if label else ''}"
+        f"{'，子目录 ' + download_subdir if download_subdir else ''}）")
     return True
 
 

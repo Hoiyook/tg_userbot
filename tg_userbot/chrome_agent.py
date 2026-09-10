@@ -70,15 +70,45 @@ def validate_chrome_url(url):
     return parts.scheme in ("http", "https") and bool(parts.netloc)
 
 
+def safe_subdir(subdir):
+    """校验并规范化下载子目录，非法返回 None（调用方退回根目录）。
+
+    子目录直接来自用户在 Telegram 里敲的命令，必须挡住越界写法——
+    `A/../../..` 或绝对路径会让文件落到 TG Chrome Download 之外。只做
+    底线校验（拒绝上跳 / 当前目录 / 反斜杠，去掉首尾与重复的 "/"），
+    不引入任何新语法。合法时返回用 "/" 分隔的相对路径。
+    """
+    if not subdir:
+        return None
+    text = str(subdir).strip().strip("/")
+    if not text:
+        return None
+    parts = []
+    for part in text.split("/"):
+        part = part.strip()
+        if not part:
+            continue
+        if part in (".", ".."):
+            return None
+        if "\\" in part:
+            return None
+        parts.append(part)
+    return "/".join(parts) if parts else None
+
+
 def new_task_id():
     """任务唯一 id（uuid hex，与队列记录同款；展示取前 8 位）。"""
     return uuid.uuid4().hex
 
 
-def create_task(url, task_id, now=None):
-    """新建任务记录（规格 25 的完整字段，PENDING 起点）。"""
+def create_task(url, task_id, now=None, download_subdir=None):
+    """新建任务记录（规格 25 的完整字段，PENDING 起点）。
+
+    download_subdir：可选的下载子目录（`/chrome A/B/#标注 URL`）。只在非空
+    时写入——没有子目录的任务保持原有数据结构不变。
+    """
     ts = (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
-    return {
+    task = {
         "task_id": task_id,
         "url": url,
         "status": "PENDING",
@@ -92,6 +122,22 @@ def create_task(url, task_id, now=None):
         "error": None,
         "guid": None,
     }
+    subdir = safe_subdir(download_subdir)
+    if subdir:
+        task["download_subdir"] = subdir
+    return task
+
+
+def get_task_download_dir(root_dir, task):
+    """任务的实际下载目录 = 根目录 + task 的 download_subdir（无则根目录）。
+
+    这里是越界的最后一道闸：即便 task 里的 download_subdir 是历史脏数据，
+    非法值也只会退回根目录，绝不会把文件写出 root_dir 之外。
+    """
+    subdir = safe_subdir((task or {}).get("download_subdir"))
+    if not subdir:
+        return root_dir
+    return os.path.join(root_dir, *subdir.split("/"))
 
 
 # ------------------------------------------------------------
@@ -216,7 +262,10 @@ def recover_tasks(tasks, download_dir, now=None):
         if task.get("status") != "RUNNING":
             continue
         filename = task.get("filename")
-        final_path = os.path.join(download_dir, filename) if filename else None
+        # 成品要按**任务自己的**目录找：带子目录的任务文件在 A/B 下，
+        # 拿根目录去找会认不出来 → 重启后重复下载已完成的文件
+        task_dir = get_task_download_dir(download_dir, task)
+        final_path = os.path.join(task_dir, filename) if filename else None
         if (final_path and os.path.isfile(final_path)
                 and not os.path.exists(final_path + ".crdownload")):
             try:
@@ -461,7 +510,8 @@ def claim_new_requests(tasks, path):
         url = req.get("url")
         if not task_id or task_id in known or not validate_chrome_url(url):
             continue
-        task = create_task(url, task_id)
+        task = create_task(url, task_id,
+                           download_subdir=req.get("download_subdir"))
         if req.get("label"):
             task["label"] = str(req["label"])
         tasks.append(task)
@@ -520,15 +570,22 @@ async def process_pending_tasks(cdp, tasks, tasks_path, download_dir,
         while not (stop_event and stop_event.is_set()):
             start_attempt(task)
             save_tasks(tasks, tasks_path)
+            # 每个任务用自己的目录（带 download_subdir 的落到子目录里）；
+            # 目录按需创建——子目录是第一次下载时才出现的
+            task_dir = get_task_download_dir(download_dir, task)
+            try:
+                os.makedirs(task_dir, exist_ok=True)
+            except OSError as e:
+                logger.warning(f"[T={trace}] 创建下载子目录失败：{e}")
             logger.info(f"[T={trace}] ▶️ 下载开始（第 {task['attempts']} 次）"
                         f" {task['url']}")
             ok, filename, size, error = await run_download_attempt(
-                cdp, task["url"], download_dir, timeout)
+                cdp, task["url"], task_dir, timeout)
             if stop_event and stop_event.is_set():
                 return processed  # RUNNING 原样保留 → 重启恢复
             if ok:
                 finish_success(task, filename, size)
-                apply_label_rename(download_dir, task)
+                apply_label_rename(task_dir, task)
                 save_tasks(tasks, tasks_path)
                 logger.info(f"[T={trace}] ✅ 下载成功 {filename} "
                             f"({size} bytes)")

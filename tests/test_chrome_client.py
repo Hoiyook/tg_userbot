@@ -577,3 +577,160 @@ class StatusUnclaimedFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("待入队", status)
         self.assertIn("2.zip", status)
         self.assertNotIn("1.zip", status.split("待入队")[1].split("\n")[0])
+
+
+class ChromeSubdirParseTest(unittest.TestCase):
+    """`/chrome [目录/][#标注] URL` 的解析规则。
+
+    核心规则（任务书 §1）：**最后一个 `/` 之后的 `#xxx` 是文件名标注，
+    前面的全部内容才是目录路径**。
+    """
+
+    def _parse(self, text):
+        m = chrome_client._CHROME_CMD_RE.fullmatch(text.strip())
+        self.assertIsNotNone(m, f"现有正则应当能接受：{text}")
+        return chrome_client.parse_chrome_submit(m)
+
+    def test_url_only(self):
+        self.assertEqual(self._parse("/chrome https://a.com/t.zip"),
+                         ("https://a.com/t.zip", None, None))
+
+    def test_label_only(self):
+        self.assertEqual(self._parse("/chrome #标 https://a.com/t.zip"),
+                         ("https://a.com/t.zip", "#标", None))
+
+    def test_one_level_subdir(self):
+        self.assertEqual(self._parse("/chrome A/#标 https://a.com/t.zip"),
+                         ("https://a.com/t.zip", "#标", "A"))
+
+    def test_two_level_subdir(self):
+        self.assertEqual(self._parse("/chrome A/B/#标 https://a.com/t.zip"),
+                         ("https://a.com/t.zip", "#标", "A/B"))
+
+    def test_three_level_subdir(self):
+        self.assertEqual(self._parse("/chrome A/B/C/#标 https://a.com/t.zip"),
+                         ("https://a.com/t.zip", "#标", "A/B/C"))
+
+    def test_single_level_dir_without_label(self):
+        """「只有目录、没有 #标注」：头 token 是目录，URL 仍是最后一个 token。"""
+        self.assertEqual(self._parse("/chrome A https://a.com/t.zip"),
+                         ("https://a.com/t.zip", None, "A"))
+
+    def test_two_level_dir_without_label(self):
+        """2026-09-10 实测回归：`/chrome Hyuk/250630 <URL>` 曾被当成
+        「URL 无效：Hyuk/250630」——目录形态不要求最后一段带 #。"""
+        self.assertEqual(
+            self._parse("/chrome Hyuk/250630 https://a.com/t.zip"),
+            ("https://a.com/t.zip", None, "Hyuk/250630"))
+
+    def test_head_token_that_is_itself_a_url_keeps_old_behaviour(self):
+        """头 token 本身就是合法 http(s) URL 时仍按 URL 解析（旧行为），
+        绝不把它降级成目录——否则会凭空建出名叫 `https:` 的目录。"""
+        url, label, subdir = self._parse(
+            "/chrome https://a.com/1.zip https://b.com/2.zip")
+        self.assertEqual(url, "https://a.com/1.zip")
+        self.assertIsNone(label)
+        self.assertIsNone(subdir)
+
+    def test_is_chrome_command_accepts_subdir_form(self):
+        """命令面板/清理白名单判定必须与 handler 用同一套解析——
+        否则带子目录的命令会被判成「不是 chrome 命令」。"""
+        self.assertTrue(chrome_client.is_chrome_command(
+            "/chrome A/B/#标 https://a.com/t.zip"))
+        self.assertTrue(chrome_client.is_chrome_command(
+            "/chrome A/B https://a.com/t.zip"))
+        self.assertTrue(chrome_client.is_chrome_command(
+            "/chrome https://a.com/t.zip"))
+        self.assertFalse(chrome_client.is_chrome_command(
+            "/chrome A/B/#标 not-a-url"))
+        self.assertFalse(chrome_client.is_chrome_command(
+            "/chrome A/B not-a-url"))
+
+
+class ChromeSubdirCommandFlowTest(unittest.IsolatedAsyncioTestCase):
+    """/chrome 带子目录时的提交链路：request 落盘 + 回执文案。"""
+
+    def setUp(self):
+        self.requests_path = os.path.join(_TMP, "chrome_requests_subdir.json")
+        if os.path.exists(self.requests_path):
+            os.remove(self.requests_path)
+        self.replies = []
+
+        class _Event:
+            sender_id = 545
+
+            async def reply(self, text, **kw):
+                self_out.replies.append(text)
+
+        self_out = self
+        self.event = _Event()
+
+    def tearDown(self):
+        if os.path.exists(self.requests_path):
+            os.remove(self.requests_path)
+
+    def _run(self, cmd_text):
+        return chrome_client.handle_chrome_command(
+            self.event, cmd_text, owner_id=545)
+
+    async def test_subdir_and_label_stored_in_request(self):
+        with mock.patch.object(chrome_client, "CHROME_REQUESTS_FILE",
+                               self.requests_path), \
+                mock.patch.object(chrome_client, "agent_running",
+                                  lambda: True):
+            await self._run("/chrome A/B/#标 https://example.com/a.zip")
+        reqs = chrome_client.load_requests(self.requests_path)
+        self.assertEqual(reqs[0]["url"], "https://example.com/a.zip")
+        self.assertEqual(reqs[0]["label"], "#标")
+        self.assertEqual(reqs[0]["download_subdir"], "A/B")
+
+    async def test_plain_url_has_no_subdir_key(self):
+        with mock.patch.object(chrome_client, "CHROME_REQUESTS_FILE",
+                               self.requests_path), \
+                mock.patch.object(chrome_client, "agent_running",
+                                  lambda: True):
+            await self._run("/chrome https://example.com/a.zip")
+        reqs = chrome_client.load_requests(self.requests_path)
+        self.assertIsNone(reqs[0].get("download_subdir"))
+
+    async def test_label_only_form_unchanged(self):
+        with mock.patch.object(chrome_client, "CHROME_REQUESTS_FILE",
+                               self.requests_path), \
+                mock.patch.object(chrome_client, "agent_running",
+                                  lambda: True):
+            await self._run("/chrome #标 https://example.com/a.zip")
+        reqs = chrome_client.load_requests(self.requests_path)
+        self.assertEqual(reqs[0]["label"], "#标")
+        self.assertIsNone(reqs[0].get("download_subdir"))
+
+    async def test_dir_only_stored_without_label(self):
+        """只有目录时 request 也要带 download_subdir（label 为空）。"""
+        with mock.patch.object(chrome_client, "CHROME_REQUESTS_FILE",
+                               self.requests_path), \
+                mock.patch.object(chrome_client, "agent_running",
+                                  lambda: True):
+            await self._run("/chrome Hyuk/250630 https://example.com/a.zip")
+        reqs = chrome_client.load_requests(self.requests_path)
+        self.assertEqual(reqs[0]["url"], "https://example.com/a.zip")
+        self.assertEqual(reqs[0]["download_subdir"], "Hyuk/250630")
+        self.assertIsNone(reqs[0].get("label"))
+
+    async def test_submit_reply_shows_target_dir(self):
+        with mock.patch.object(chrome_client, "CHROME_REQUESTS_FILE",
+                               self.requests_path), \
+                mock.patch.object(chrome_client, "agent_running",
+                                  lambda: True):
+            await self._run("/chrome A/B/#标 https://example.com/a.zip")
+        self.assertTrue(any("A/B" in r for r in self.replies),
+                        "回执应显示实际下载目录")
+
+    def test_result_text_shows_task_dir_not_global(self):
+        """成功通知的目录必须是**该任务的**目录（带子目录时不再是根目录）。"""
+        task = {
+            "task_id": "abcdef1234567890", "status": "SUCCESS",
+            "url": "https://a.com/x.zip", "filename": "#标 x.zip",
+            "size_bytes": 100, "download_subdir": "A/B",
+        }
+        body = chrome_client.result_text(task)
+        self.assertIn("A/B", body)
+        self.assertNotIn(f"\n{chrome_client.download_dir()}\n", body)
