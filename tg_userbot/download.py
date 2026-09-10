@@ -517,7 +517,10 @@ async def _sleep_and_reconnect(worker):
             logger.info("🔌 Telegram 连接已断开，正在重新连接...")
             await transfer.connect()
             logger.info("✅ Telegram 重新连接成功")
+            workers.mark_healthy(worker)
     except Exception as e:
+        # 纯观察：把这个 worker 记为不健康供 Reporter 展示（不改变重试行为）。
+        workers.mark_unhealthy(worker, f"{type(e).__name__}: {e}")
         logger.exception(f"重新连接 Telegram 失败：{e}")
 
 
@@ -539,7 +542,11 @@ def _reserve_final_path(folder, filename):
 
 
 def register_download(label, filename, total, link=None):
-    """登记一个开始下载的任务，返回下载 ID。link 为来源消息链接（可选）。"""
+    """登记一个开始下载的任务，返回下载 ID。link 为来源消息链接（可选）。
+
+    `started_at`（单调时钟）与 `worker`（借到后才填）是 Runtime Reporter
+    展示「耗时」「Worker #N」的数据源；池禁用时 worker 恒为 None → 展示 `--`。
+    """
     state._download_seq += 1
     did = state._download_seq
     state.ACTIVE_DOWNLOADS[did] = {
@@ -549,8 +556,23 @@ def register_download(label, filename, total, link=None):
         "downloaded": 0,
         "percent": 0,
         "link": link,
+        "started_at": time.monotonic(),
+        "worker": None,
     }
     return did
+
+
+def attach_download_worker(did, worker):
+    """把本任务实际使用的 worker 编号补进进行中登记（展示用，纯观察）。
+
+    借到 worker 后调用；池禁用（worker 为 None）或对象不在池里时不写假编号。
+    """
+    info = state.ACTIVE_DOWNLOADS.get(did)
+    if info is None:
+        return
+    label = workers.worker_label(worker)
+    if label:
+        info["worker"] = label
 
 
 def update_download(did, current, total):
@@ -624,6 +646,7 @@ async def download_file(message, source_override=None, caption_override=None,
             # 并发下载数恒不大于存活 worker 数 → 不会饿死；None = 池禁用，
             # 照旧走主客户端单连接（原行为）。
             worker = await workers.borrow()
+            attach_download_worker(did, worker)
             logger.info("=" * 60)
             logger.info("📥 开始下载")
             logger.info(f"消息 ID：{message.id}")

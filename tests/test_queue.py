@@ -733,6 +733,49 @@ class AutoReplayDueTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(n, 1)
         self.assertEqual(len(self.spawned), 1)
 
+    # ---------- 自动重放事件（供 Reporter 与用户区分「自动」与「手动」）----------
+
+    def _ev_file(self):
+        path = os.path.join(_TMP, "task_events_autoreplay_test.jsonl")
+        if os.path.exists(path):
+            os.remove(path)
+        return path
+
+    def test_replay_due_emits_auto_replay_event_per_task(self):
+        """自动放行必须留事件痕：否则事件流里分不清「自动重放」和「手动 /retry」，
+        面板与通知都只能显示 --。"""
+        self._set_idle_workers(5)
+        r1 = self._to_retry("a.mp4", attempts=1, due=500.0)
+        r2 = self._to_retry("b.mp4", attempts=1, due=500.0)
+        path = self._ev_file()
+        try:
+            with mock.patch.object(stats_mod, "TASK_EVENTS_FILE", path):
+                n = self._replay(now=1000.0)
+            auto = [e for e in stats_mod.load_events(path)
+                    if e.get("ev") == "AUTO_REPLAY"]
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+        self.assertEqual(n, 2)
+        self.assertEqual({e["id"] for e in auto}, {r1["id"], r2["id"]})
+        self.assertTrue(all(e.get("label") for e in auto))
+
+    def test_manual_retry_all_emits_no_auto_replay_event(self):
+        """手动路径不得打上自动重放标记（否则统计与通知会把人工重放算成自动）。"""
+        self._to_retry("a.mp4", attempts=1, due=9e9)
+        path = self._ev_file()
+        try:
+            with mock.patch.object(stats_mod, "TASK_EVENTS_FILE", path), \
+                    mock.patch.object(queue, "spawn_execute",
+                                      lambda r: self.spawned.append(r)):
+                queue.retry_all()
+            auto = [e for e in stats_mod.load_events(path)
+                    if e.get("ev") == "AUTO_REPLAY"]
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+        self.assertEqual(auto, [])
+
     # ---------- 空闲 worker 预算 ----------
 
     def test_round_capped_by_idle_worker_count(self):

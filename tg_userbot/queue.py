@@ -355,6 +355,11 @@ def replay_due(now=None):
         due = record.get("next_retry_at")
         if due is not None and now < due:
             continue
+        # 事件痕：事件流里区分「自动重放」与「手动 /retry」（两者都走
+        # spawn_execute，没有这条就无从分辨）。纯追加，不影响控制流。
+        stats.emit_event("AUTO_REPLAY", task_id=record.get("id"),
+                         label=record.get("label"),
+                         attempts=record.get("attempts", 0))
         spawn_execute(record)
         triggered += 1
     return triggered

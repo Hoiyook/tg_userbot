@@ -215,6 +215,159 @@ class BorrowLivenessTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.worker.connect_calls, 0)
 
 
+class WorkerObservationTest(unittest.IsolatedAsyncioTestCase):
+    """worker 可观测性：稳定编号 / BUSY-IDLE / 健康标记。
+
+    这些是纯观察数据（Runtime Reporter 的 Worker 区块数据源），不参与任何
+    调度决策 —— 池的借还语义由 PoolLifecycleTest / Borrow* 守护。
+    """
+
+    async def asyncSetUp(self):
+        self.old = (state.DOWNLOAD_WORKERS, state.DOWNLOAD_WORKER_QUEUE,
+                    state.DOWNLOAD_WORKER_TARGET)
+        _disabled_pool()
+        workers._clear_observation()
+        self.created = []
+
+        async def fake_spawn(snapshot):
+            w = _FakeWorker(f"w{len(self.created) + 1}")
+            self.created.append(w)
+            return w
+
+        self._p_snapshot = mock.patch.object(
+            workers, "read_live_session",
+            return_value={"dc_id": 2, "server_address": "1.2.3.4",
+                          "port": 443, "auth_key": object()},
+        )
+        self._p_spawn = mock.patch.object(workers, "_spawn_one", fake_spawn)
+        self._p_snapshot.start()
+        self._p_spawn.start()
+
+    async def asyncTearDown(self):
+        for w in list(state.DOWNLOAD_WORKERS):
+            await w.disconnect()
+        self._p_snapshot.stop()
+        self._p_spawn.stop()
+        workers._clear_observation()
+        state.DOWNLOAD_WORKERS, state.DOWNLOAD_WORKER_QUEUE, \
+            state.DOWNLOAD_WORKER_TARGET = self.old
+
+    async def test_labels_assigned_in_spawn_order(self):
+        await workers.spawn_pool(3)
+        self.assertEqual(
+            [workers.worker_label(w) for w in state.DOWNLOAD_WORKERS],
+            ["#1", "#2", "#3"],
+        )
+
+    async def test_label_none_for_unknown_client(self):
+        """不认识的对象（含池禁用时的 None）不得被编号，也不能抛。"""
+        self.assertIsNone(workers.worker_label(None))
+        self.assertIsNone(workers.worker_label(object()))
+
+    async def test_snapshot_tracks_busy_and_idle(self):
+        await workers.spawn_pool(3)
+        self.assertEqual(
+            [w["state"] for w in workers.worker_snapshot()],
+            ["IDLE", "IDLE", "IDLE"],
+        )
+        borrowed = await workers.borrow()
+        snap = workers.worker_snapshot()
+        self.assertEqual(
+            [w["state"] for w in snap], ["BUSY", "IDLE", "IDLE"])
+        self.assertEqual(snap[0]["label"], workers.worker_label(borrowed))
+        await workers.release(borrowed)
+        self.assertEqual(
+            [w["state"] for w in workers.worker_snapshot()],
+            ["IDLE", "IDLE", "IDLE"],
+        )
+
+    async def test_snapshot_reports_unhealthy_after_failed_reconnect(self):
+        """借出时连接已死且重连失败 → 标记 UNHEALTHY 并带原因（面板要显示）。"""
+        await workers.spawn_pool(1)
+        w = state.DOWNLOAD_WORKERS[0]
+        w.connected = False
+
+        async def dead_network():
+            raise OSError("网络不可达")
+
+        w.connect = dead_network
+        await workers.borrow()          # 照旧借出（不改变池语义）
+        snap = workers.worker_snapshot()
+        self.assertEqual(snap[0]["health"], "UNHEALTHY")
+        self.assertIn("网络不可达", snap[0]["reason"])
+
+    async def test_healthy_again_after_successful_reconnect(self):
+        await workers.spawn_pool(1)
+        w = state.DOWNLOAD_WORKERS[0]
+        workers.mark_unhealthy(w, "下载中途连接被取消")
+        self.assertEqual(workers.worker_snapshot()[0]["health"], "UNHEALTHY")
+        w.connected = False             # 借出时重连成功 → 恢复
+        await workers.borrow()
+        self.assertEqual(workers.worker_snapshot()[0]["health"], "HEALTHY")
+        self.assertIsNone(workers.worker_snapshot()[0]["reason"])
+
+    async def test_mark_helpers_ignore_unknown_client(self):
+        """对不在池里的对象打标记必须静默 no-op（下载降级路径可能传 None）。"""
+        workers.mark_unhealthy(None, "x")
+        workers.mark_healthy(None)
+        self.assertEqual(workers.worker_snapshot(), [])
+
+    async def test_reset_pool_clears_observation(self):
+        """拆池（_reset_pool）必须连观察数据一起清：
+        否则 id() 被后续对象复用会把陈标记安到新 worker 头上。"""
+        await workers.spawn_pool(2)
+        workers._reset_pool()
+        self.assertEqual(workers.worker_snapshot(), [])
+
+    async def test_unregistered_worker_shows_dash(self):
+        """池里有连接但没有观察记录时如实出 `--` 行（监控不隐藏池的真实规模）。"""
+        await workers.spawn_pool(1)
+        workers._clear_observation()
+        snap = workers.worker_snapshot()
+        self.assertEqual(len(snap), 1)
+        self.assertEqual(snap[0]["label"], "--")
+
+
+class DownloadRegistryObservationTest(unittest.TestCase):
+    """进行中下载登记（ACTIVE_DOWNLOADS）的可观测字段：开始时刻 + worker 编号。
+
+    这两项是 Runtime Reporter 展示「耗时」「Worker #N」的唯一数据源——
+    以前只有 label/filename/total/downloaded/percent/link，既无开始时间也无
+    worker 身份，面板只能显示 `--`。
+    """
+
+    def setUp(self):
+        self.old = state.ACTIVE_DOWNLOADS
+        state.ACTIVE_DOWNLOADS = {}
+        workers._clear_observation()
+
+    def tearDown(self):
+        state.ACTIVE_DOWNLOADS = self.old
+        workers._clear_observation()
+
+    def test_register_download_stamps_start_time_and_worker_slot(self):
+        did = download.register_download("普通", "a.mp4", 100)
+        entry = state.ACTIVE_DOWNLOADS[did]
+        self.assertEqual(entry["downloaded"], 0)
+        self.assertIsInstance(entry["started_at"], float)
+        self.assertIsNone(entry["worker"], "池未启用时应为 None（展示 --）")
+
+    def test_attach_download_worker_records_label(self):
+        did = download.register_download("普通", "a.mp4", 100)
+        client = _FakeWorker("w1")
+        workers._register_worker(client)
+        download.attach_download_worker(did, client)
+        self.assertEqual(state.ACTIVE_DOWNLOADS[did]["worker"], "#1")
+
+    def test_attach_with_unknown_or_none_is_noop(self):
+        """池禁用（None）或陌生对象时不得抛，也不得写入假编号。"""
+        did = download.register_download("普通", "a.mp4", 100)
+        download.attach_download_worker(did, None)
+        download.attach_download_worker(did, object())
+        self.assertIsNone(state.ACTIVE_DOWNLOADS[did]["worker"])
+        download.attach_download_worker(999999, None)  # 不存在的 did 也不抛
+
+
 class DownloadWorkerRoutingTest(unittest.IsolatedAsyncioTestCase):
     """download_file 借到 worker 时字节走 worker.download_media（多 socket 分流）。
 
@@ -231,6 +384,7 @@ class DownloadWorkerRoutingTest(unittest.IsolatedAsyncioTestCase):
         }
         state.DOWNLOAD_SEMAPHORE = config.AdjustableSemaphore(1)
         _disabled_pool()
+        workers._clear_observation()   # 编号计数器是模块级全局，先归零
 
         # 一个 worker 入池：download_file 应借到它、走它的 download_media
         self.calls = []
@@ -291,6 +445,24 @@ class DownloadWorkerRoutingTest(unittest.IsolatedAsyncioTestCase):
         # 完成后 worker 归还空闲队列
         self.assertEqual(state.DOWNLOAD_WORKER_QUEUE.qsize(), 1)
         self.assertEqual(len(state.DOWNLOAD_WORKERS), 1)
+
+    async def test_download_records_worker_label_and_start_time(self):
+        """真实下载链路里，借到的 worker 编号必须落进进行中登记。"""
+        captured = {}
+        real_unregister = download.unregister_download
+
+        def spy(did):
+            captured.update(state.ACTIVE_DOWNLOADS.get(did) or {})
+            real_unregister(did)
+
+        with mock.patch.object(download, "unregister_download", spy):
+            ok = await asyncio.wait_for(
+                download.download_file(self.fake_message, "测试来源"),
+                timeout=10,
+            )
+        self.assertTrue(ok)
+        self.assertEqual(captured.get("worker"), "#1")
+        self.assertIsInstance(captured.get("started_at"), float)
 
     async def test_success_remembers_dedup_key(self):
         """成功落盘后把 tg:<file_unique_id> 记入去重索引（文件 + 内存）——

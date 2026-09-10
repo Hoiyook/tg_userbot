@@ -267,6 +267,19 @@ class RebuildStatsTest(unittest.TestCase):
     def _rebuild(self, events, days=1):
         return stats.rebuild_stats(events, days=days, today=TODAY)
 
+    def test_auto_replay_event_does_not_perturb_reconciliation(self):
+        """新增的 AUTO_REPLAY 事件（队列自动放行时发）不得改变任何统计口径：
+        它既不是终态、也不产生新任务，只给已有 task 的生命线多一条痕。"""
+        t = "a" * 32
+        base = [
+            _ev(7, "10:00:00", "QUEUED", t, kind="media", label="x.mp4"),
+            _ev(7, "10:00:01", "RUNNING", t),
+            _ev(7, "10:00:02", "SUCCESS", t, bytes=1000),
+        ]
+        with_auto = base + [_ev(7, "09:00:00", "AUTO_REPLAY", t,
+                                label="x.mp4", attempts=3)]
+        self.assertEqual(self._rebuild(with_auto), self._rebuild(base))
+
     def test_retry_three_times_then_success(self):
         t = "a" * 32
         events = [

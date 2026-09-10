@@ -38,6 +38,82 @@ from .log import logger
 # 单条 worker connect() 的超时（秒）：代理节点卡住时不能拖住启动/扩容
 _WORKER_CONNECT_TIMEOUT = 45
 
+# ------------------------------------------------------------
+# 只读观察数据（Runtime Reporter 的 Worker 区块数据源）
+# ------------------------------------------------------------
+# 池本身**不依赖**这些字典做任何调度决策——它们只被写入、被读取展示。
+# worker 是裸 TelegramClient、没有持久标识，而 asyncio.Queue 也无法按客户端
+# 反查归属，故这里以 id(client) 为键另记：编号 / BUSY-IDLE / 健康。
+# _clear_observation() 必须随池的建立与拆除成对调用，否则 id() 会被后续
+# 对象复用、把陈标记安到新 worker 头上。
+_WORKER_LABELS = {}    # id(client) -> "#N"（按建池顺序，跨扩容递增）
+_WORKER_STATE = {}     # id(client) -> "IDLE" / "BUSY"
+_WORKER_HEALTH = {}    # id(client) -> (健康字符串, 原因字符串或 None)
+_WORKER_SEQ = 0
+
+_HEALTHY = "HEALTHY"
+_UNHEALTHY = "UNHEALTHY"
+
+
+def _clear_observation():
+    """清空观察数据（建池失败/拆池时调用；同时重置编号计数器）。"""
+    global _WORKER_SEQ
+    _WORKER_LABELS.clear()
+    _WORKER_STATE.clear()
+    _WORKER_HEALTH.clear()
+    _WORKER_SEQ = 0
+
+
+def _register_worker(client):
+    """给新加入池的 worker 编号并置为 IDLE/HEALTHY（仅观察用）。"""
+    global _WORKER_SEQ
+    _WORKER_SEQ += 1
+    _WORKER_LABELS[id(client)] = f"#{_WORKER_SEQ}"
+    _WORKER_STATE[id(client)] = "IDLE"
+    _WORKER_HEALTH[id(client)] = (_HEALTHY, None)
+
+
+def worker_label(client):
+    """worker 的稳定编号（"#3"）；不认识的对象/None 返回 None（展示为 --）。"""
+    if client is None:
+        return None
+    return _WORKER_LABELS.get(id(client))
+
+
+def mark_unhealthy(client, reason):
+    """把 worker 标记为不健康并记下原因（借出重连失败、下载中途连接被取消等）。
+
+    纯观察：不改变借还/调度行为。不在池里的对象静默忽略。
+    """
+    if client is not None and id(client) in _WORKER_LABELS:
+        _WORKER_HEALTH[id(client)] = (_UNHEALTHY, str(reason))
+
+
+def mark_healthy(client):
+    """清除 worker 的不健康标记（重连成功、下载成功）。"""
+    if client is not None and id(client) in _WORKER_LABELS:
+        _WORKER_HEALTH[id(client)] = (_HEALTHY, None)
+
+
+def worker_snapshot():
+    """池的只读快照，按编号排序：[{label, state, health, reason}, ...]。
+
+    state 由借还簿记给出（borrow→BUSY、release→IDLE），不读 asyncio.Queue 的
+    内部结构。池禁用时返回空列表——Reporter 据此显示 Workers 区块为 --。
+    """
+    out = []
+    for client in state.DOWNLOAD_WORKERS:
+        cid = id(client)
+        health, reason = _WORKER_HEALTH.get(cid, (_HEALTHY, None))
+        out.append({
+            "label": _WORKER_LABELS.get(cid, "--"),
+            "state": _WORKER_STATE.get(cid, "IDLE"),
+            "health": health,
+            "reason": reason,
+        })
+    out.sort(key=lambda w: (len(w["label"]), w["label"]))
+    return out
+
 
 def _connection_class():
     return (
@@ -99,11 +175,19 @@ async def _spawn_one(snapshot):
     return client
 
 
+def _forget_worker(client):
+    """把已移出池的 worker 从观察数据里摘掉（防止 id() 复用导致张冠李戴）。"""
+    _WORKER_LABELS.pop(id(client), None)
+    _WORKER_STATE.pop(id(client), None)
+    _WORKER_HEALTH.pop(id(client), None)
+
+
 def _reset_pool():
     """把池状态清成「禁用」：borrow() 一律返回 None，下载回退 state.client。"""
     state.DOWNLOAD_WORKERS = []
     state.DOWNLOAD_WORKER_QUEUE = None
     state.DOWNLOAD_WORKER_TARGET = 0
+    _clear_observation()
 
 
 async def spawn_pool(n):
@@ -131,6 +215,7 @@ async def spawn_pool(n):
             )
             break
         workers.append(client)
+        _register_worker(client)
         logger.info(
             f"✅ 下载 worker #{i} 已连接 "
             f"（{client.session.server_address}）"
@@ -181,6 +266,7 @@ async def sync_pool_to_target():
                 )
                 break
             state.DOWNLOAD_WORKERS.append(client)
+            _register_worker(client)
             q.put_nowait(client)
             logger.info(
                 f"🧵 下载 worker 扩容：现有 {len(state.DOWNLOAD_WORKERS)} 条"
@@ -197,6 +283,7 @@ async def sync_pool_to_target():
             except asyncio.QueueEmpty:
                 break
             state.DOWNLOAD_WORKERS.remove(client)
+            _forget_worker(client)
             try:
                 await client.disconnect()
                 logger.info("🧵 下载 worker 缩容：断开一条空闲连接")
@@ -226,13 +313,18 @@ async def borrow():
     if q is None:
         return None
     client = await q.get()
+    if id(client) not in _WORKER_LABELS:   # 自愈：池若在 spawn 之外被组装也能编号
+        _register_worker(client)
+    _WORKER_STATE[id(client)] = "BUSY"
     if not client.is_connected():
         try:
             await asyncio.wait_for(
                 client.connect(), timeout=_WORKER_CONNECT_TIMEOUT
             )
+            mark_healthy(client)
             logger.info("🧵 下载 worker 借出时已断开，已重新连接")
         except Exception as e:
+            mark_unhealthy(client, f"{type(e).__name__}: {e}")
             logger.warning(
                 f"下载 worker 借出时重连失败（{type(e).__name__}: {e}），"
                 "照常借出，由下载重试兜底"
@@ -249,11 +341,13 @@ async def release(client):
     """
     q = state.DOWNLOAD_WORKER_QUEUE
     if q is None:
+        _forget_worker(client)
         try:
             await client.disconnect()
         except Exception:
             pass
         return
+    _WORKER_STATE[id(client)] = "IDLE"
     q.put_nowait(client)
     target = state.DOWNLOAD_WORKER_TARGET
     if q.qsize() > target and len(state.DOWNLOAD_WORKERS) > target:
@@ -262,6 +356,7 @@ async def release(client):
         except asyncio.QueueEmpty:
             return
         state.DOWNLOAD_WORKERS.remove(extra)
+        _forget_worker(extra)
         try:
             await extra.disconnect()
             logger.info("🧵 下载 worker 收敛：断开一条超额空闲连接")
@@ -275,6 +370,7 @@ async def shutdown():
     state.DOWNLOAD_WORKERS = []
     state.DOWNLOAD_WORKER_QUEUE = None
     state.DOWNLOAD_WORKER_TARGET = 0
+    _clear_observation()
     for client in workers:
         try:
             await client.disconnect()
