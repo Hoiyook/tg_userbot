@@ -5,6 +5,7 @@
 运行方式（项目根目录）：
     .venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
 """
+import asyncio
 import os
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import config  # noqa: E402
 from tg_userbot import chrome_agent  # noqa: E402
+from tg_userbot import log as logmod  # noqa: E402
 
 
 class ChromeConfigTest(unittest.TestCase):
@@ -676,6 +678,77 @@ class ChromeLabelRenameTest(unittest.IsolatedAsyncioTestCase):
         # 旧文件不被覆盖
         with open(os.path.join(self.dl_dir, "#标 a.zip"), "rb") as f:
             self.assertEqual(f.read(), b"old")
+
+
+class AgentLogIsolationTest(unittest.TestCase):
+    """Agent 进程必须写自己的日志文件，绝不与主 userbot 共用 download.log。
+
+    两个进程各持一个 TimedRotatingFileHandler 写同一文件时，午夜各自轮转，
+    POSIX rename 静默替换 → 后轮转者覆盖先归档者的内容，且先轮转者的句柄仍
+    绑在已被改名的 inode 上、此后持续写进归档名文件。2026-09-10 实测：
+    9/9 全天日志被覆盖丢失，主进程日志此后全灌进 download.log.2026-09-09
+    （见 issues/001）。此测试钉死「Agent 用自己的文件」这一隔离契约。
+    """
+
+    def setUp(self):
+        self._probe = "🤖 agent 日志隔离探针"
+        # download.log 在 import config 时已被 handler 创建，取其当下内容作基线
+        self._main_before = self._read(config.LOG_FILE)
+
+    def tearDown(self):
+        # 本测试改了共享 logger 的 handler（会干扰同进程其它测试模块），恢复之
+        for h in list(logmod.logger.handlers):
+            logmod.logger.removeHandler(h)
+            h.close()
+        logmod.configure(config.LOG_FILE, config.LOG_RETENTION_DAYS)
+
+    @staticmethod
+    def _read(path):
+        if not os.path.exists(path):
+            return ""
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            return f.read()
+
+    def _log_probe_and_flush(self):
+        logmod.logger.info(self._probe)
+        for h in logmod.logger.handlers:
+            h.flush()
+
+    def test_agent_log_file_is_distinct_from_main_log(self):
+        """两个路径必须不同，且 Agent 日志同样落在 runtime/ 目录里。"""
+        self.assertNotEqual(config.CHROME_AGENT_LOG_FILE, config.LOG_FILE)
+        self.assertEqual(
+            os.path.dirname(config.CHROME_AGENT_LOG_FILE), config.RUNTIME_DIR)
+
+    def test_configure_agent_logging_points_away_from_download_log(self):
+        chrome_agent.configure_agent_logging()
+        self.assertEqual(
+            logmod.current_log_path(), config.CHROME_AGENT_LOG_FILE)
+
+    def test_agent_holds_no_handler_on_download_log(self):
+        """重定向后不能还握着 download.log 的句柄（旧 handler 必须被关掉）。"""
+        chrome_agent.configure_agent_logging()
+        targets = {getattr(h, "baseFilename", None)
+                   for h in logmod.logger.handlers}
+        self.assertNotIn(config.LOG_FILE, targets)
+        self.assertIn(config.CHROME_AGENT_LOG_FILE, targets)
+
+    def test_agent_records_land_in_own_file_not_download_log(self):
+        """探针日志必须只进 Agent 文件，一条都不能落进 download.log。"""
+        chrome_agent.configure_agent_logging()
+        self._log_probe_and_flush()
+        self.assertIn(self._probe, self._read(config.CHROME_AGENT_LOG_FILE))
+        self.assertNotIn(self._probe, self._read(config.LOG_FILE))
+        self.assertEqual(self._read(config.LOG_FILE), self._main_before)
+
+    def test_agent_main_entry_wires_its_own_log(self):
+        """入口 agent_main 必须真的调 configure——否则函数在但没人用。"""
+        with mock.patch.object(
+                chrome_agent, "find_chrome_binary", return_value=None):
+            rc = asyncio.run(chrome_agent.agent_main())
+        self.assertEqual(rc, 1)  # 无 Chrome 可执行文件 → 快速退出
+        self.assertEqual(
+            logmod.current_log_path(), config.CHROME_AGENT_LOG_FILE)
 
 
 if __name__ == "__main__":

@@ -95,6 +95,13 @@ SAVE_FOLDER = os.environ.get("TG_SAVE_FOLDER", DEFAULT_SAVE_FOLDER)
 RUNTIME_DIR = os.path.join(SAVE_FOLDER, "runtime")
 LOG_RETENTION_DAYS = 7  # download.log 按天轮转，只保留最近 7 天
 LOG_FILE = os.path.join(RUNTIME_DIR, "download.log")
+# Chrome Agent 是独立进程，必须写自己的日志文件：两个进程各持一个
+# TimedRotatingFileHandler 写同一文件时，午夜各自轮转，POSIX rename 静默替换
+# → 后轮转者覆盖先轮转者刚归档的内容，而先轮转者的句柄仍绑在已被改名的 inode
+# 上、此后持续写进归档名文件。2026-09-10 实测：主进程 9/9 全天日志被覆盖丢失，
+# 其日志此后全灌进 download.log.2026-09-09（issues/001）。Agent 日志语义本就
+# 独立（自己的任务状态机 trace），分开正是所需的隔离。
+CHROME_AGENT_LOG_FILE = os.path.join(RUNTIME_DIR, "chrome_agent.log")
 CD2_LAUNCH_LOG = os.path.join(RUNTIME_DIR, "cd2_launch.log")
 
 

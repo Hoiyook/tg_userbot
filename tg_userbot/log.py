@@ -89,7 +89,15 @@ def configure(log_file: str, retention_days: int = 7) -> None:
     """
     global _active_log_file
     logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+    # 关掉旧 handler 再摘：否则被摘掉的文件 handler 仍持着旧文件的 FD 直到进程
+    # 退出（Chrome Agent 重定向日志后会一直握着 download.log 的句柄，正是本函数
+    # 要切断的耦合；也避免测试里刷 ResourceWarning）。
+    for old in list(logger.handlers):
+        logger.removeHandler(old)
+        try:
+            old.close()
+        except Exception:
+            pass
     logger.propagate = False
 
     file_handler = _make_file_handler(log_file, retention_days)

@@ -21,6 +21,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from .config import (
+    CHROME_AGENT_LOG_FILE,
     CHROME_AGENT_PID_FILE,
     CHROME_CDP_CONNECT_TIMEOUT,
     CHROME_CDP_HOST,
@@ -34,7 +35,9 @@ from .config import (
     CHROME_REQUESTS_FILE,
     CHROME_RETRY_WAIT_SECONDS,
     CHROME_TASKS_FILE,
+    LOG_RETENTION_DAYS,
 )
+from .log import configure as configure_log
 from .log import logger
 from .naming import sanitize_filename, unique_path
 
@@ -541,8 +544,20 @@ async def process_pending_tasks(cdp, tasks, tasks_path, download_dir,
     return processed
 
 
+def configure_agent_logging():
+    """把 Agent 进程的日志切到独占文件（config.CHROME_AGENT_LOG_FILE）。
+
+    不能写在模块级：主 userbot 进程也会 import 本模块（chrome_client.py 用它的
+    纯函数），模块级 configure 会把主进程日志一并劫走。import 包时 config 已按
+    主进程路径 configure 过一次，进程入口再调一次覆盖它即可（configure 幂等，
+    先 clear 旧 handler）。详见 issues/001。
+    """
+    configure_log(CHROME_AGENT_LOG_FILE, LOG_RETENTION_DAYS)
+
+
 async def agent_main():
     """Chrome Agent 进程入口（python -m tg_userbot.chrome_agent）。"""
+    configure_agent_logging()
     os.makedirs(CHROME_DOWNLOAD_DIR, exist_ok=True)
     os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
     stop = asyncio.Event()
