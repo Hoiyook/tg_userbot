@@ -4,8 +4,10 @@
 三个菜单动作、等待窗口内的输入处理（原文立即删除）。
 """
 import asyncio
+import atexit
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -13,6 +15,8 @@ import unittest
 from unittest import mock
 
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_cookie_test_")
+# 退出时回收临时目录（测试跑完就地删，别让 /var/folders 越堆越多）
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 import telethon  # noqa: E402

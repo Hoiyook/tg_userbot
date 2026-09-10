@@ -9,7 +9,9 @@
     .venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
 """
 import asyncio
+import atexit
 import os
+import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -17,6 +19,8 @@ from unittest import mock
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_commands_test_")
+# 退出时回收临时目录（测试跑完就地删，别让 /var/folders 越堆越多）
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import commands  # noqa: E402
@@ -140,11 +144,6 @@ class TextCommandRegressionTest(unittest.TestCase):
                 state.DOWNLOAD_SEMAPHORE = old
             queue._RUNNING_TASKS.clear()
             queue._SPAWNED_TASKS.clear()
-
-
-if __name__ == "__main__":
-    unittest.main()
-
 
 class CaptionFilterCommandTest(unittest.TestCase):
     """/caption_filter 子命令分发（服务函数在 caption_filter 模块，可单测）。"""

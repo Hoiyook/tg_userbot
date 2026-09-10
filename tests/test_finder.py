@@ -8,12 +8,16 @@
 
 路径/基准日/队列可注入（纯函数）；日志/历史文件写临时目录。
 """
+import atexit
 import os
+import shutil
 import tempfile
 import unittest
 from datetime import date
 
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_finder_test_")
+# 退出时回收临时目录（测试跑完就地删，别让 /var/folders 越堆越多）
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import finder  # noqa: E402

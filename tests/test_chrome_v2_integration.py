@@ -34,9 +34,11 @@ Run with:
 只保存了一半的 V2 残件）。
 """
 import asyncio
+import atexit
 import importlib
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -45,6 +47,8 @@ from datetime import datetime, timedelta
 
 # Must set temp directory before importing tg_userbot
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_chrome_v2_test_")
+# 退出时回收临时目录（测试跑完就地删，别让 /var/folders 越堆越多）
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import config

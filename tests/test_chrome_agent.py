@@ -6,8 +6,10 @@
     .venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
 """
 import asyncio
+import atexit
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -16,6 +18,8 @@ from unittest import mock
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_chrome_test_")
+# 退出时回收临时目录（测试跑完就地删，别让 /var/folders 越堆越多）
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import config  # noqa: E402
@@ -1086,6 +1090,43 @@ class CleanPartialTest(unittest.TestCase):
         stray = self._touch("stray.zip.crdownload")
         chrome_agent.clean_partial_download(self.root, task, filename=None)
         self.assertTrue(os.path.exists(stray))
+
+
+class TrimTerminalTasksTest(unittest.TestCase):
+    """历史终态任务裁剪：只裁最老的，非终态一条都不动。"""
+
+    def _done(self, tid):
+        task = _task(tid)
+        chrome_agent.finish_success(task, f"{tid}.zip", 1)
+        return task
+
+    def test_under_limit_keeps_everything(self):
+        tasks = [self._done("a"), self._done("b")]
+        self.assertEqual(chrome_agent.trim_terminal_tasks(tasks, keep=5), [])
+        self.assertEqual(len(tasks), 2)
+
+    def test_oldest_terminal_dropped(self):
+        tasks = [self._done("a"), self._done("b"), self._done("c")]
+        removed = chrome_agent.trim_terminal_tasks(tasks, keep=2)
+        self.assertEqual([t["task_id"] for t in removed], ["a"])
+        self.assertEqual([t["task_id"] for t in tasks], ["b", "c"])
+
+    def test_non_terminal_never_touched(self):
+        """在跑/排队的任务一条都不能动（错误地裁掉 = 任务凭空消失）。"""
+        running = _task("r1")
+        running["status"] = "RUNNING"
+        pending = _task("p1")
+        tasks = [running, self._done("a"), pending, self._done("b")]
+        chrome_agent.trim_terminal_tasks(tasks, keep=1)
+        self.assertEqual([t["task_id"] for t in tasks], ["r1", "p1", "b"])
+
+    def test_keeps_in_place_and_returns_dropped(self):
+        """原地裁剪：调用方持有的列表对象不变（agent_main 全程用同一个）。"""
+        tasks = [self._done("a"), self._done("b")]
+        ref = tasks
+        chrome_agent.trim_terminal_tasks(tasks, keep=1)
+        self.assertIs(tasks, ref)
+        self.assertEqual([t["task_id"] for t in tasks], ["b"])
 
 
 class OrphanPartialSweepTest(unittest.TestCase):

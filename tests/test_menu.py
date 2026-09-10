@@ -4,7 +4,9 @@
     .venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
 """
 import asyncio
+import atexit
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -12,6 +14,8 @@ from unittest import mock
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_menu_test_")
+# 退出时回收临时目录（测试跑完就地删，别让 /var/folders 越堆越多）
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import state, config  # noqa: E402
@@ -260,6 +264,7 @@ class CleanTempFilesTest(unittest.TestCase):
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="tg_clean_test_")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         for name in ("a.mp4.download", "b.jpg.download", "keep.mp4"):
             with open(os.path.join(self.dir, name), "w") as f:
                 f.write("x")
@@ -469,11 +474,6 @@ class BotCleanupPlanTest(unittest.TestCase):
         to_delete, to_keep = cleanup.plan_bot_chat_cleanup([], age_limit=1)
         self.assertEqual(to_delete, [])
         self.assertEqual(to_keep, set())
-
-
-if __name__ == "__main__":
-    unittest.main()
-
 
 class FindMenuEntryTest(unittest.TestCase):
     """主菜单带【🔍 查询】按钮，动作注册为 find（2026-09-08 媒体查询）。"""

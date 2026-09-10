@@ -5,12 +5,16 @@
 MockTransport 模拟 CDN）。
 """
 import asyncio
+import atexit
 import os
+import shutil
 import tempfile
 import unittest
 from unittest import mock
 
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_urlqueue_test_")
+# 退出时回收临时目录（测试跑完就地删，别让 /var/folders 越堆越多）
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 import httpx  # noqa: E402  f2 的依赖，装 f2 即有

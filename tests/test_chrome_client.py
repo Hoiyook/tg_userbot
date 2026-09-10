@@ -6,8 +6,10 @@ URL 验证、进程管理（幂等/过期 PID）、requests 映射持久化、�
     .venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
 """
 import asyncio
+import atexit
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -15,6 +17,8 @@ from unittest import mock
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_chrome_client_test_")
+# 退出时回收临时目录（测试跑完就地删，别让 /var/folders 越堆越多）
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import chrome_agent  # noqa: E402
@@ -23,21 +27,29 @@ from tg_userbot import config  # noqa: E402
 
 
 class ChromeCommandParseTest(unittest.TestCase):
-    """命令识别（规格 37）：四条合法命令 + 非法形态。"""
+    """命令分发（规格 37）：`is_chrome_dispatch` 是唯一入口。
 
-    def test_valid_commands(self):
-        self.assertTrue(chrome_client.is_chrome_command("/chrome_start"))
-        self.assertTrue(chrome_client.is_chrome_command("/chrome_stop"))
-        self.assertTrue(chrome_client.is_chrome_command("/chrome_status"))
-        self.assertTrue(chrome_client.is_chrome_command(
-            "/chrome https://example.com/a.zip"))
+    刻意"宽"——非法形态（/chrome 无参、/chrome abc 非法 URL）也要落进
+    handle_chrome_command 里回一句人话，而不是掉进普通下载逻辑里悄无声息。
+    历史注：曾有一个更严格的 `is_chrome_command`（还要求 URL 合法），但没有任何
+    生产代码调用它、只有测试在喂它，2026-09-10 删掉并把这些断言改成测真谓词。
+    """
 
-    def test_invalid_commands(self):
-        self.assertFalse(chrome_client.is_chrome_command("/chrome"))
-        self.assertFalse(chrome_client.is_chrome_command("/chrome abc"))
-        self.assertFalse(chrome_client.is_chrome_command("/chromestatus"))
-        self.assertFalse(chrome_client.is_chrome_command("/status"))
-        self.assertFalse(chrome_client.is_chrome_command(""))
+    def test_all_chrome_forms_are_dispatched(self):
+        for text in ("/chrome_start", "/chrome_stop", "/chrome_status",
+                     "/chrome_tasks", "/chrome_cancel", "/chrome_cancel 2",
+                     "/chrome https://example.com/a.zip",
+                     "/chrome #标 https://a.com/t.zip",
+                     "/chrome A/B/#标 https://a.com/t.zip",
+                     "/chrome", "/chrome abc"):
+            with self.subTest(text=text):
+                self.assertTrue(chrome_client.is_chrome_dispatch(text))
+
+    def test_non_chrome_commands_not_dispatched(self):
+        for text in ("/chromestatus", "/status", "/chrome2", "chrome_start",
+                     "", "   ", None):
+            with self.subTest(text=text):
+                self.assertFalse(chrome_client.is_chrome_dispatch(text))
 
 
 class ChromeDownloadDirTest(unittest.TestCase):
@@ -458,10 +470,6 @@ class NotifyScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("notified_at", rec)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ChromeLabelParseTest(unittest.IsolatedAsyncioTestCase):
     """/chrome <#标注> <URL>：标注拼在原文件名前（空格分隔）。"""
 
@@ -518,10 +526,6 @@ class ChromeLabelParseTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("URL" in r for r in self.replies))
         self.assertEqual(chrome_client.load_requests(self.requests_path), [])
 
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 class StatusUnclaimedTest(unittest.TestCase):
     """/chrome_status 必须显示「已提交未认领」的请求（验收反馈：当前任务
@@ -660,18 +664,17 @@ class ChromeSubdirParseTest(unittest.TestCase):
         self.assertIsNone(label)
         self.assertIsNone(subdir)
 
-    def test_is_chrome_command_accepts_subdir_form(self):
-        """命令面板/清理白名单判定必须与 handler 用同一套解析——
-        否则带子目录的命令会被判成「不是 chrome 命令」。"""
-        self.assertTrue(chrome_client.is_chrome_command(
-            "/chrome A/B/#标 https://a.com/t.zip"))
-        self.assertTrue(chrome_client.is_chrome_command(
-            "/chrome A/B https://a.com/t.zip"))
-        self.assertTrue(chrome_client.is_chrome_command(
-            "/chrome https://a.com/t.zip"))
-        self.assertFalse(chrome_client.is_chrome_command(
-            "/chrome A/B/#标 not-a-url"))
-        self.assertFalse(chrome_client.is_chrome_command(
+    def test_subdir_forms_reach_the_handler(self):
+        """分发谓词必须放过带子目录/标注的命令——否则它们会被判成「不是
+        chrome 命令」，掉进普通下载逻辑里连回执都没有。"""
+        for text in ("/chrome A/B/#标 https://a.com/t.zip",
+                     "/chrome A/B https://a.com/t.zip",
+                     "/chrome https://a.com/t.zip",
+                     "/chrome A/B/#标 not-a-url"):
+            with self.subTest(text=text):
+                self.assertTrue(chrome_client.is_chrome_dispatch(text))
+        # URL 合不合法由 handler 判定（非法就回执 URL 无效），解析规则两边一致
+        self.assertTrue(chrome_client.is_chrome_dispatch(
             "/chrome A/B not-a-url"))
 
 

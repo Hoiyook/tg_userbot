@@ -3,13 +3,17 @@
 运行方式（在项目根目录）：
     .venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
 """
+import atexit
 import os
+import shutil
 import tempfile
 import unittest
 from unittest import mock
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_cleanup_test_")
+# 退出时回收临时目录（测试跑完就地删，别让 /var/folders 越堆越多）
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import cleanup  # noqa: E402
@@ -86,11 +90,6 @@ class CleanupTextMessageTest(unittest.TestCase):
     def test_plain_user_content_kept(self):
         # 普通收藏内容既不是命令/链接指令也不是程序通知 → 不清理
         self.assertFalse(cleanup.is_cleanup_message(make_msg(text="今天天气不错")))
-
-
-if __name__ == "__main__":
-    unittest.main()
-
 
 class CleanupFindTest(unittest.TestCase):
     """/find 命令与「🔍 查询」回复纳入自动清理白名单（2026-09-08）。"""

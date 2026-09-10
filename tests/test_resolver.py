@@ -3,7 +3,9 @@
 覆盖：bit_rate 最高档挑选、链接评论提取、url 任务命名、f2 import 失败
 时的静默降级（import 副作用被 try/except 包住是 resolver 的关键契约）。
 """
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -11,6 +13,8 @@ from datetime import datetime
 from unittest import mock
 
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_resolver_test_")
+# 退出时回收临时目录（测试跑完就地删，别让 /var/folders 越堆越多）
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import naming, resolver  # noqa: E402

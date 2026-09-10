@@ -5,13 +5,17 @@
 退避/上限/空闲 worker 预算的语义在 test_queue.py::AutoReplayDueTest 覆盖。
 """
 import asyncio
+import atexit
 import os
+import shutil
 import tempfile
 import unittest
 from unittest import mock
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_sweeper_test_")
+# 退出时回收临时目录（测试跑完就地删，别让 /var/folders 越堆越多）
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import app  # noqa: E402

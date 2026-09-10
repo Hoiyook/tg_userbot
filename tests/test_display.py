@@ -3,7 +3,9 @@
 运行方式（在项目根目录）：
     .venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
 """
+import atexit
 import os
+import shutil
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -11,6 +13,8 @@ from unittest import mock
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_display_test_")
+# 退出时回收临时目录（测试跑完就地删，别让 /var/folders 越堆越多）
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import state  # noqa: E402
@@ -624,6 +628,7 @@ class ReserveFinalPathTest(unittest.TestCase):
 
     def tearDown(self):
         download_mod._RESERVED_FINAL_PATHS.clear()
+        shutil.rmtree(self.dir, ignore_errors=True)
 
     def test_returns_plain_path_when_free(self):
         p = download_mod._reserve_final_path(self.dir, "a.jpg")

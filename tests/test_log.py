@@ -3,13 +3,17 @@
 刻意不调 log.configure() 改全局 logger 的 handler（会干扰同进程其它测试模块）；
 改而直接构造 _TraceFormatter / _make_file_handler 验证，或只读 current_log_path()。
 """
+import atexit
 import logging
 import os
+import shutil
 import tempfile
 import unittest
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_log_test_")
+# 退出时回收临时目录（测试跑完就地删，别让 /var/folders 越堆越多）
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import log as logmod  # noqa: E402
