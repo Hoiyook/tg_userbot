@@ -33,6 +33,7 @@ from .config import (
     API_HASH,
     API_ID,
     AUTO_CLEAN_SAVED_MESSAGES,
+    AUTO_RETRY_SWEEP_SECONDS,
     BOT_KEEPALIVE_INTERVAL,
     BOT_SESSION_NAME,
     BOT_TOKEN,
@@ -207,6 +208,28 @@ async def _bot_keepalive():
                 f"🤖 bot 菜单重连失败（{type(e).__name__}: {e}），"
                 f"{BOT_KEEPALIVE_INTERVAL} 秒后重试"
             )
+
+
+async def _retry_sweeper():
+    """retry 榜到期自动重放（issues/002）：每 AUTO_RETRY_SWEEP_SECONDS 扫一次。
+
+    链路分钟级抖动时，3 次尝试必然全撞上、任务快速入榜后原本「永久停靠」等人肉
+    /retry all。这里按指数退避（queue._backoff_delay）逐轮重放，网络恢复后无需
+    人工干预；坏窗口内退避自动拉长、每轮又只放空闲 worker 数条，不会形成风暴。
+    异常一律兜住 → 本任务永不因单次失败退出。被 main 取消（停止信号）时以
+    CancelledError 收尾。
+    """
+    while True:
+        await asyncio.sleep(AUTO_RETRY_SWEEP_SECONDS)
+        try:
+            n = queue.replay_due()
+            if n:
+                logger.info(f"♻️ 自动重放到期任务 {n} 条（retry 榜共 "
+                            f"{len(state.QUEUE['retry'])} 条）")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            logger.error(f"♻️ 自动重放扫描失败（{type(e).__name__}: {e}）")
 
 
 def _install_stop_handlers(stop_event):
@@ -984,17 +1007,19 @@ async def main():
     if BOT_TOKEN and state.bot_client is not None:
         bot_keepalive_task = asyncio.create_task(_bot_keepalive())
     main_serve_task = asyncio.create_task(_main_serve())
+    retry_sweeper_task = asyncio.create_task(_retry_sweeper())
 
     try:
         await state.STOP_EVENT.wait()
         logger.info("🛑 收到停止信号，正在收尾退出...")
     finally:
         # 取消后台服务任务：主客户端挂在 run_until_disconnected，取消会触发其
-        # finally 里的 disconnect，随后以 CancelledError 收尾；bot 探活同理。
-        for t in (main_serve_task, bot_keepalive_task):
+        # finally 里的 disconnect，随后以 CancelledError 收尾；bot 探活/重放
+        # 扫描同理。
+        for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task):
             if t is not None:
                 t.cancel()
-        for t in (main_serve_task, bot_keepalive_task):
+        for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task):
             if t is not None:
                 try:
                     await t

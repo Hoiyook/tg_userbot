@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -610,6 +611,150 @@ class RetryAllTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_retry_all_empty_returns_zero(self):
         self.assertEqual(queue.retry_all(), 0)
+
+
+class AutoReplayDueTest(unittest.IsolatedAsyncioTestCase):
+    """retry 榜到期自动重放：指数退避 + 自动重试次数上限 + 空闲 worker 预算。"""
+
+    async def asyncSetUp(self):
+        self.old = (state.QUEUE, state.QUEUE_LOCK, state.EXECUTING,
+                    state.DOWNLOAD_WORKER_QUEUE, state.DOWNLOAD_CONCURRENCY)
+        state.QUEUE = {"tasks": [], "retry": []}
+        state.QUEUE_LOCK = asyncio.Lock()
+        state.EXECUTING = set()
+        state.DOWNLOAD_WORKER_QUEUE = None
+        state.DOWNLOAD_CONCURRENCY = 3
+        queue._SPAWNED_TASKS.clear()
+        self.spawned = []
+
+    async def asyncTearDown(self):
+        for t in list(queue._SPAWNED_TASKS):
+            t.cancel()
+        (state.QUEUE, state.QUEUE_LOCK, state.EXECUTING,
+         state.DOWNLOAD_WORKER_QUEUE, state.DOWNLOAD_CONCURRENCY) = self.old
+        queue._SPAWNED_TASKS.clear()
+
+    def _to_retry(self, label, attempts=None, due=None):
+        """造一条停在 retry 榜里的记录，可控 attempts 与 next_retry_at。"""
+        rec = queue.queue_enqueue(state.QUEUE, media_record(label=label))
+        queue.queue_fail_to_retry(state.QUEUE, rec)
+        rec = state.QUEUE["retry"][-1]
+        if attempts is not None:
+            rec["attempts"] = attempts
+        rec.pop("next_retry_at", None)
+        if due is not None:
+            rec["next_retry_at"] = due
+        return rec
+
+    def _set_idle_workers(self, n):
+        q = asyncio.Queue()
+        for _ in range(n):
+            q.put_nowait(object())
+        state.DOWNLOAD_WORKER_QUEUE = q
+
+    def _replay(self, **kw):
+        with mock.patch.object(queue, "spawn_execute",
+                               lambda r: self.spawned.append(r)):
+            return queue.replay_due(**kw)
+
+    # ---------- 退避 ----------
+
+    def test_backoff_sequence_doubles_then_caps(self):
+        f = queue._backoff_delay
+        base, cap = config.AUTO_RETRY_BASE_DELAY, config.AUTO_RETRY_MAX_DELAY
+        self.assertEqual(f(1), base)
+        self.assertEqual(f(2), base * 2)
+        self.assertEqual(f(3), base * 4)
+        self.assertEqual(f(4), base * 8)
+        self.assertEqual(f(99), cap)   # 封顶，不溢出
+        self.assertLessEqual(f(5), cap)
+
+    def test_fail_to_retry_stamps_next_retry_at(self):
+        rec = queue.queue_enqueue(state.QUEUE, media_record())
+        queue.queue_fail_to_retry(state.QUEUE, rec)
+        moved = state.QUEUE["retry"][-1]
+        self.assertEqual(moved["attempts"], 1)
+        self.assertIsNotNone(moved.get("next_retry_at"))
+        # 首次失败 → 退避 base，而不是立即到期
+        self.assertGreater(moved["next_retry_at"], time.time())
+
+    def test_retry_failed_refreshes_next_retry_at(self):
+        rec = self._to_retry("a.mp4", attempts=1)
+        rec["next_retry_at"] = 0.0            # 假装已到期
+        queue.queue_retry_failed(state.QUEUE, rec)
+        self.assertEqual(rec["attempts"], 2)
+        self.assertGreater(rec["next_retry_at"], time.time())
+
+    # ---------- 到期判定 ----------
+
+    def test_not_yet_due_is_skipped(self):
+        self._set_idle_workers(5)
+        self._to_retry("a.mp4", attempts=1, due=2000.0)
+        self.assertEqual(self._replay(now=1000.0), 0)
+        self.assertEqual(self.spawned, [])
+
+    def test_due_is_replayed(self):
+        self._set_idle_workers(5)
+        self._to_retry("a.mp4", attempts=1, due=500.0)
+        self.assertEqual(self._replay(now=1000.0), 1)
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_missing_next_retry_at_counts_as_due(self):
+        """旧记录（本功能上线前入的榜）没有该字段 → 视为到期，重启即自愈。"""
+        self._set_idle_workers(5)
+        self._to_retry("old.mp4", attempts=1)      # 不写 due
+        self.assertNotIn("next_retry_at", state.QUEUE["retry"][0])
+        self.assertEqual(self._replay(now=1000.0), 1)
+
+    def test_executing_records_are_skipped(self):
+        self._set_idle_workers(5)
+        rec = self._to_retry("a.mp4", attempts=1, due=500.0)
+        state.EXECUTING.add(rec["id"])
+        self.assertEqual(self._replay(now=1000.0), 0)
+
+    # ---------- 自动重试次数上限 ----------
+
+    def test_stops_auto_replay_past_attempt_cap(self):
+        self._set_idle_workers(9)
+        cap = config.AUTO_RETRY_MAX_TIMES
+        self._to_retry("at-cap.mp4", attempts=cap, due=500.0)       # 仍可放
+        self._to_retry("over-cap.mp4", attempts=cap + 1, due=500.0)  # 超限不放
+        self.assertEqual(self._replay(now=1000.0), 1)
+        self.assertEqual(self.spawned[0]["label"], "at-cap.mp4")
+        # 超限任务仍留在榜上，等人工 /retry
+        self.assertEqual(len(state.QUEUE["retry"]), 2)
+
+    def test_manual_retry_all_ignores_backoff_and_cap(self):
+        """手动路径不受退避与上限约束（退避只约束自动路径）。"""
+        self._to_retry("over-cap.mp4", attempts=99, due=9e9)
+        with mock.patch.object(queue, "spawn_execute",
+                               lambda r: self.spawned.append(r)):
+            n = queue.retry_all()
+        self.assertEqual(n, 1)
+        self.assertEqual(len(self.spawned), 1)
+
+    # ---------- 空闲 worker 预算 ----------
+
+    def test_round_capped_by_idle_worker_count(self):
+        self._set_idle_workers(2)
+        for i in range(5):
+            self._to_retry(f"r{i}.mp4", attempts=1, due=500.0)
+        self.assertEqual(self._replay(now=1000.0), 2)   # 只放空闲的 2 条
+        self.assertEqual(len(state.QUEUE["retry"]), 5)  # 其余留榜待下轮
+
+    def test_zero_idle_workers_replays_nothing(self):
+        self._set_idle_workers(0)
+        self._to_retry("a.mp4", attempts=1, due=500.0)
+        self.assertEqual(self._replay(now=1000.0), 0)
+        self.assertEqual(self.spawned, [])
+
+    def test_pool_disabled_falls_back_to_concurrency(self):
+        """池被禁用（spawn 全失败）时回落到并发上限，而不是永不自动重放。"""
+        state.DOWNLOAD_WORKER_QUEUE = None
+        state.DOWNLOAD_CONCURRENCY = 2
+        for i in range(4):
+            self._to_retry(f"r{i}.mp4", attempts=1, due=500.0)
+        self.assertEqual(self._replay(now=1000.0), 2)
 
 
 class QueuePaginationTest(unittest.TestCase):

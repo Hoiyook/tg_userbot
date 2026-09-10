@@ -17,6 +17,7 @@ enqueue_and_start / recover_queue_tasks 内部以裸名调用 execute_queued_tas
 import os
 import json
 import re
+import time
 import uuid
 import asyncio
 
@@ -24,6 +25,9 @@ from . import state
 from . import download
 from . import stats
 from .config import (
+    AUTO_RETRY_BASE_DELAY,
+    AUTO_RETRY_MAX_DELAY,
+    AUTO_RETRY_MAX_TIMES,
     QUEUE_FETCH_TIMEOUT,
     QUEUE_FILE,
     QUEUE_KIND_LABELS,
@@ -169,12 +173,22 @@ def queue_enqueue(queue, record):
     return record
 
 
+def _backoff_delay(attempts):
+    """自动重放的退避秒数：base × 2^(attempts-1)，封顶 AUTO_RETRY_MAX_DELAY。
+
+    1→∞ 封顶，位移不会溢出（封顶先于指数爆炸生效）。"""
+    delay = AUTO_RETRY_BASE_DELAY * (2 ** max(0, attempts - 1))
+    return min(delay, AUTO_RETRY_MAX_DELAY)
+
+
 def queue_fail_to_retry(queue, record):
     """执行失败：从 tasks 移除该记录（按 id），attempts+1，追加到 retry 末尾。"""
     for i, r in enumerate(queue["tasks"]):
         if r.get("id") == record.get("id"):
             moved = queue["tasks"].pop(i)
             moved["attempts"] = moved.get("attempts", 0) + 1
+            # 自动重放的到期时间（手动 /retry 不看它，只有后台扫描看）
+            moved["next_retry_at"] = time.time() + _backoff_delay(moved["attempts"])
             queue["retry"].append(moved)
             return
 
@@ -196,10 +210,11 @@ def queue_retry_success(queue, record):
 
 
 def queue_retry_failed(queue, record):
-    """手动重试失败：attempts+1，保持 retry 中的位置不变。"""
+    """重试失败：attempts+1，保持 retry 中的位置不变，并刷新自动重放到期时间。"""
     for r in queue["retry"]:
         if r.get("id") == record.get("id"):
             r["attempts"] = r.get("attempts", 0) + 1
+            r["next_retry_at"] = time.time() + _backoff_delay(r["attempts"])
             return
 
 
@@ -295,6 +310,50 @@ def retry_all():
     triggered = 0
     for record in list(state.QUEUE["retry"]):
         if record.get("id") in state.EXECUTING:
+            continue
+        spawn_execute(record)
+        triggered += 1
+    return triggered
+
+
+def _idle_capacity():
+    """本轮自动重放最多放几条 = 当前空闲 worker 数。
+
+    一次放太多会撞「并发首轮跨 DC 授权导出竞态」（同一账号多条新连接同时首
+    次导出，Telegram 只让极少数成功——实测 6 路并发 5/6 首轮失败，见 config
+    的 EXPORT_RACE_EXTRA_RETRIES）。按空闲数逐轮放既避开冷启动爆发，也天然
+    贴合真实吞吐。池被禁用（spawn 全失败 → QUEUE 为 None）时回落到并发上限，
+    否则会退化成「永不自动重放」。
+    """
+    q = state.DOWNLOAD_WORKER_QUEUE
+    if q is None:
+        return state.DOWNLOAD_CONCURRENCY or 0
+    return q.qsize()
+
+
+def replay_due(now=None):
+    """重放 retry 榜里「已到退避期」的任务，本轮最多放空闲 worker 数条。
+
+    与 retry_all 的分工：retry_all 是手动入口（全放、不看退避/上限）；
+    本函数只服务后台扫描。跳过三类记录：执行中、超过自动重试次数上限
+    （AUTO_RETRY_MAX_TIMES，此后只能人工 /retry）、退避未到期。
+    旧记录没有 next_retry_at 字段 → 视为已到期（功能上线前入的榜，重启即自愈）。
+
+    「查到期 → spawn」之间没有 await：单线程事件循环内不会被抢占，而 EXECUTING
+    在 execute_queued_task 入口第一个 await 之前就已写入，故不会重复放行同一条。
+    """
+    now = time.time() if now is None else now
+    budget = _idle_capacity()
+    triggered = 0
+    for record in list(state.QUEUE["retry"]):
+        if triggered >= budget:
+            break
+        if record.get("id") in state.EXECUTING:
+            continue
+        if record.get("attempts", 0) > AUTO_RETRY_MAX_TIMES:
+            continue
+        due = record.get("next_retry_at")
+        if due is not None and now < due:
             continue
         spawn_execute(record)
         triggered += 1
