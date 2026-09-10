@@ -53,6 +53,8 @@ BOT_COMMANDS = (
     ("chrome_start", "启动 Chrome 下载 Agent"),
     ("chrome_stop", "停止 Chrome 下载 Agent"),
     ("chrome_status", "查看 Chrome Agent 状态"),
+    ("chrome_tasks", "查看可取消的 Chrome 任务"),
+    ("chrome_cancel", "取消 Chrome 任务：/chrome_cancel <序号>"),
     ("chrome", "用 Chrome 下载：/chrome <URL>"),
     ("clearmsg", "清理程序产生的消息"),
     ("help", "查看全部命令"),

@@ -512,6 +512,14 @@ CLEAN_COMMANDS = {
 # 程序通知回复的前缀（以此开头的消息会被自动清理）
 CLEAN_NOTIFICATION_PREFIXES = (
     "🤖 Chrome",
+    # /chrome_tasks 与 /chrome_cancel 的回复（任务取消功能）
+    "🌐 Chrome 任务",
+    "❌ 用法：/chrome_cancel",
+    "❌ 序号必须是数字。",
+    "❌ 任务序号无效",
+    "ℹ️ 任务已经完成，无法取消。",
+    "ℹ️ 任务已经失败，无法取消。",
+    "ℹ️ 任务已经取消。",
     "🟢 TG Userbot 状态正常",
     "📁 保存目录：",
     "📋 日志文件：",
@@ -600,6 +608,9 @@ CLEAN_NOTIFICATION_PREFIXES = (
 PERSISTENT_NOTIFICATION_PREFIXES = (
     "✅ Chrome 下载完成",
     "❌ Chrome 下载失败",
+    # 取消也是「结果报告」：用户主动取消后要能看到它到底停没停，
+    # 和成功/失败同样豁免瞬态清理（2026-09-09 的教训见上）
+    "🛑 Chrome 下载已取消",
 )
 
 # ------------------------------------------------------------
@@ -816,6 +827,9 @@ CHROME_POLL_SECONDS = 1.0
 # 持久化文件（规格 24：两进程各写各的，temp+os.replace 原子写）
 CHROME_TASKS_FILE = os.path.join(RUNTIME_DIR, "chrome_tasks.json")
 CHROME_REQUESTS_FILE = os.path.join(RUNTIME_DIR, "chrome_requests.json")
+# 取消请求：User Bot 独占写、Agent 只读（与 chrome_requests.json 同款单向通道）
+CHROME_CANCEL_REQUESTS_FILE = os.path.join(
+    RUNTIME_DIR, "chrome_cancel_requests.json")
 CHROME_AGENT_PID_FILE = os.path.join(RUNTIME_DIR, "chrome_agent.pid")
 
 # Chrome Agent V2 Recovery constants

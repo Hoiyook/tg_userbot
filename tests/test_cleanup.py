@@ -158,3 +158,30 @@ class ChromeResultNotificationTest(unittest.TestCase):
         self.assertTrue(cleanup.is_cleanup_message(msg))
         self.assertTrue(cleanup.is_cleanup_message(msg,
                                                    include_persistent=True))
+
+    def test_cancelled_result_not_auto_cleaned(self):
+        """取消也是结果报告：用户要能看到它到底停没停（与成功/失败同待遇）。"""
+        msg = make_msg(
+            text="🛑 Chrome 下载已取消\n\n任务 ID：abc\n状态：CANCELLED")
+        self.assertFalse(cleanup.is_cleanup_message(msg))
+        self.assertTrue(cleanup.is_cleanup_message(msg,
+                                                   include_persistent=True))
+
+    def test_cancel_command_and_replies_auto_cleaned(self):
+        """/chrome_tasks 与 /chrome_cancel 的命令、回执、提示都要被清掉。"""
+        for text in (
+            "/chrome_tasks",
+            "/chrome_cancel 2",
+            "🌐 Chrome 任务\n\n1. 🟢 进行中\n   ID: abc12345\n"
+            "   URL: https://a.com/a.zip\n\n可取消：1",
+            "🌐 Chrome 任务\n\n当前没有可取消的任务。",
+            "🤖 Chrome 取消请求已提交\n\n任务 ID：abc12345",
+            "❌ 用法：/chrome_cancel <序号>\n\n先发送 /chrome_tasks 查看任务列表。",
+            "❌ 序号必须是数字。",
+            "❌ 任务序号无效，请先发送 /chrome_tasks。",
+            "ℹ️ 任务已经完成，无法取消。",
+            "ℹ️ 任务已经失败，无法取消。",
+            "ℹ️ 任务已经取消。",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(cleanup.is_cleanup_message(make_msg(text=text)))

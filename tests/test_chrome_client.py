@@ -429,6 +429,34 @@ class NotifyScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("FAILED", sent[0][1])
         self.assertIn("下载超时", sent[0][1])
 
+    async def test_cancelled_task_notifies_once(self):
+        """§21 测试 8：CANCELLED 也发通知，并按 notified_at 幂等。"""
+        task = chrome_agent.create_task("https://a.com/3.zip", "t3")
+        chrome_agent.mark_cancelled(task)
+        chrome_agent.save_tasks([task], self.tasks_path)
+        chrome_client.add_request("t3", "https://a.com/3.zip",
+                                  user_id=545, chat_id=545, message_id=11,
+                                  path=self.requests_path)
+        sent = []
+
+        async def fake_send(chat_id, text):
+            sent.append((chat_id, text))
+
+        with mock.patch.object(chrome_client, "CHROME_TASKS_FILE",
+                               self.tasks_path), \
+                mock.patch.object(chrome_client, "CHROME_REQUESTS_FILE",
+                                  self.requests_path), \
+                mock.patch.object(chrome_client, "send_owner_message",
+                                  fake_send):
+            await chrome_client.notify_pending_results()
+            await chrome_client.notify_pending_results()  # 第二轮不重发
+        self.assertEqual(len(sent), 1)
+        self.assertIn("CANCELLED", sent[0][1])
+        self.assertIn("已取消", sent[0][1])
+        self.assertIn("用户主动取消", sent[0][1])
+        rec = chrome_client.get_request("t3", path=self.requests_path)
+        self.assertIn("notified_at", rec)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -734,3 +762,224 @@ class ChromeSubdirCommandFlowTest(unittest.IsolatedAsyncioTestCase):
         body = chrome_client.result_text(task)
         self.assertIn("A/B", body)
         self.assertNotIn(f"\n{chrome_client.download_dir()}\n", body)
+
+
+class ChromeTasksListTest(unittest.TestCase):
+    """`/chrome_tasks` 列表：只列可取消的，顺序 进行中→排队→等待重试（§4）。"""
+
+    def _task(self, tid, status, **extra):
+        task = chrome_agent.create_task(f"https://a.com/{tid}.zip", tid)
+        task["status"] = status
+        task.update(extra)
+        return task
+
+    def test_empty_list(self):
+        self.assertIn("没有可取消的任务", chrome_client.tasks_text([]))
+
+    def test_order_skips_terminal(self):
+        tasks = [self._task("p1", "PENDING"),
+                 self._task("r1", "RUNNING"),
+                 self._task("w1", "RETRY_WAIT"),
+                 self._task("s1", "SUCCESS"),
+                 self._task("c1", "CANCELLED")]
+        text = chrome_client.tasks_text(tasks)
+        self.assertLess(text.index("进行中"), text.index("排队中"))
+        self.assertLess(text.index("排队中"), text.index("等待重试"))
+        self.assertNotIn("s1", text)   # 成功的不列
+        self.assertNotIn("c1", text)   # 已取消的不列
+        self.assertIn("可取消：1、2、3", text)
+        # 序号 1 就是列表里的第一个（进行中）——两处用的是同一个排序
+        self.assertEqual(
+            [t["task_id"] for t in chrome_client.cancelable_tasks(tasks)],
+            ["r1", "p1", "w1"])
+
+    def test_shows_label_and_subdir(self):
+        text = chrome_client.tasks_text([
+            self._task("l1", "PENDING", label="#标", download_subdir="A/B")])
+        self.assertIn("l1", text)      # 短 task_id
+        self.assertIn("#标", text)
+        self.assertIn("A/B", text)
+
+
+class ChromeCancelFlowTest(unittest.IsolatedAsyncioTestCase):
+    """`/chrome_cancel <序号>`：解析、文案、请求落盘（任务书 §5/§9）。"""
+
+    def setUp(self):
+        self.tasks_path = os.path.join(_TMP, "chrome_tasks_cancel_cmd.json")
+        self.cancel_path = os.path.join(_TMP, "chrome_cancel_cmd.json")
+        for p in (self.tasks_path, self.cancel_path):
+            if os.path.exists(p):
+                os.remove(p)
+        self.replies = []
+        out = self
+
+        class _Event:
+            sender_id = 545
+
+            async def reply(self, text, **kw):
+                out.replies.append(text)
+
+        self.event = _Event()
+
+    def tearDown(self):
+        for p in (self.tasks_path, self.cancel_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+    def _seed(self, *tasks):
+        chrome_agent.save_tasks(list(tasks), self.tasks_path)
+
+    def _patch(self, stack):
+        stack.enter_context(mock.patch.object(
+            chrome_client, "CHROME_TASKS_FILE", self.tasks_path))
+        stack.enter_context(mock.patch.object(
+            chrome_client, "CHROME_CANCEL_REQUESTS_FILE", self.cancel_path))
+        stack.enter_context(mock.patch.object(
+            chrome_client, "agent_running", lambda: True))
+
+    def _run(self, cmd):
+        return chrome_client.handle_chrome_command(
+            self.event, cmd, owner_id=545)
+
+    def _task(self, tid, status):
+        task = chrome_agent.create_task(f"https://a.com/{tid}.zip", tid)
+        task["status"] = status
+        return task
+
+    async def test_cancel_running_task_writes_request(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            self._seed(self._task("p2", "PENDING"),
+                       self._task("r1", "RUNNING"))
+            await self._run("/chrome_cancel 1")   # 1 = 进行中的那个
+        reqs = chrome_client.load_cancellations(self.cancel_path)
+        self.assertEqual([r["task_id"] for r in reqs], ["r1"])
+        self.assertTrue(any("取消请求已提交" in r for r in self.replies))
+
+    async def test_cancel_queued_task_writes_request(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            self._seed(self._task("r1", "RUNNING"),
+                       self._task("p2", "PENDING"))
+            await self._run("/chrome_cancel 2")
+        reqs = chrome_client.load_cancellations(self.cancel_path)
+        self.assertEqual([r["task_id"] for r in reqs], ["p2"])
+
+    async def test_usage_without_index(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            await self._run("/chrome_cancel")
+        self.assertIn("用法：/chrome_cancel <序号>", self.replies[0])
+        self.assertFalse(os.path.exists(self.cancel_path))
+
+    async def test_non_numeric_index(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            await self._run("/chrome_cancel abc")
+        self.assertIn("序号必须是数字", self.replies[0])
+
+    async def test_out_of_range_index(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            self._seed(self._task("p1", "PENDING"))
+            await self._run("/chrome_cancel 9")
+        self.assertIn("任务序号无效", self.replies[0])
+        self.assertFalse(os.path.exists(self.cancel_path))
+
+    async def test_terminal_race_reported_not_cancelled(self):
+        """看到列表→按下取消之间任务可能已经跑完：如实回话，不写取消请求。"""
+        import contextlib
+        pending = self._task("q1", "PENDING")
+        done = self._task("q1", "SUCCESS")
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            stack.enter_context(mock.patch.object(
+                chrome_agent, "load_tasks", side_effect=[[pending], [done]]))
+            await self._run("/chrome_cancel 1")
+        self.assertIn("已经完成，无法取消", self.replies[0])
+        self.assertFalse(os.path.exists(self.cancel_path))
+
+    async def test_cancelled_task_race_message(self):
+        import contextlib
+        pending = self._task("q2", "PENDING")
+        already = self._task("q2", "CANCELLED")
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            stack.enter_context(mock.patch.object(
+                chrome_agent, "load_tasks", side_effect=[[pending], [already]]))
+            await self._run("/chrome_cancel 1")
+        self.assertIn("已经取消", self.replies[0])
+
+    async def test_cancel_by_task_id_prefix(self):
+        """按 task_id 寻址：不受「列表前移」影响（序号漂移的根治手段）。"""
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            self._seed(self._task("aaaa1111", "PENDING"),
+                       self._task("bbbb2222", "PENDING"))
+            await self._run("/chrome_cancel bbbb22")
+        reqs = chrome_client.load_cancellations(self.cancel_path)
+        self.assertEqual([r["task_id"] for r in reqs], ["bbbb2222"])
+
+    async def test_cancel_by_id_ignores_list_shift(self):
+        """列表前移的现场：先取列表再按 ID 取消，仍落在原任务上。"""
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            first = self._task("cccc3333", "PENDING")
+            second = self._task("dddd4444", "PENDING")
+            self._seed(first, second)
+            # 列表此时是 [cccc3333, dddd4444]；先完成第一个（列表前移）
+            first["status"] = "SUCCESS"
+            chrome_agent.save_tasks([first, second], self.tasks_path)
+            await self._run("/chrome_cancel dddd4444")
+        reqs = chrome_client.load_cancellations(self.cancel_path)
+        self.assertEqual([r["task_id"] for r in reqs], ["dddd4444"])
+
+    async def test_unknown_id_reports_not_found(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            self._seed(self._task("eeee5555", "PENDING"))
+            await self._run("/chrome_cancel ffff99")
+        self.assertIn("没找到这个任务 ID", self.replies[0])
+        self.assertFalse(os.path.exists(self.cancel_path))
+
+    async def test_ambiguous_id_prefix_rejected(self):
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            self._seed(self._task("abcd1111", "PENDING"),
+                       self._task("abcd1122", "RUNNING"))
+            await self._run("/chrome_cancel abcd11")   # 6 位，两个都命中
+        self.assertIn("匹配到多个任务", self.replies[0])
+        self.assertFalse(os.path.exists(self.cancel_path))
+
+    async def test_write_failure_is_reported_not_hidden(self):
+        """写盘失败必须如实回执——取消是单向通道，谎报等于什么都没做。"""
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            self._seed(self._task("gggg6666", "PENDING"))
+            stack.enter_context(mock.patch.object(
+                chrome_client, "save_cancellations", lambda *a, **k: False))
+            await self._run("/chrome_cancel 1")
+        self.assertIn("取消请求写入失败", self.replies[0])
+
+    async def test_agent_down_note(self):
+        """Agent 没跑时照样登记请求，但如实告知何时生效。"""
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            stack.enter_context(mock.patch.object(
+                chrome_client, "agent_running", lambda: False))
+            self._seed(self._task("p1", "PENDING"))
+            await self._run("/chrome_cancel 1")
+        self.assertIn("Agent 当前未运行", self.replies[0])
+        self.assertEqual(
+            len(chrome_client.load_cancellations(self.cancel_path)), 1)

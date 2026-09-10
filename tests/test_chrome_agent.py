@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from unittest import mock
@@ -333,6 +334,14 @@ class FakeCDP:
             # 模拟「永远等不到事件」：睡满调用方给的窗口后返回 None
             await asyncio.sleep(max(0.0, timeout))
         return None
+
+    async def command(self, method, params=None, timeout=30):
+        """CDP command 入口（真客户端发 WS；这里只记账）。
+
+        取消功能要发 Browser.cancelDownload，所以假客户端也得有这一格。
+        """
+        self.commands.append((method, params))
+        return {}
 
 
 class CDPEventAttributionTest(unittest.IsolatedAsyncioTestCase):
@@ -925,6 +934,457 @@ class ChromeSubdirDownloadTest(unittest.IsolatedAsyncioTestCase):
             timeout=5, retries=3, wait_seconds=0)
         self.assertIn(("setup_download", self.root), cdp.commands)
         self.assertTrue(os.path.isfile(os.path.join(self.root, "x.zip")))
+
+
+# ------------------------------------------------------------
+# 任务取消（任务书 §3/§7/§8/§11/§14/§15/§16）
+# ------------------------------------------------------------
+
+class CancelStateTest(unittest.TestCase):
+    """CANCELLED 终态：保留记录、不加 attempts、认领逻辑永不认领（§3）。"""
+
+    def test_pending_cancelled_is_not_claimed(self):
+        task = _task("c1")
+        chrome_agent.mark_cancelled(task)
+        self.assertEqual(task["status"], "CANCELLED")
+        self.assertEqual(task["error"], chrome_agent.CANCEL_REASON)
+        self.assertIsNotNone(task["finished_at"])
+        self.assertIsNotNone(task["updated_at"])
+        self.assertEqual(task["attempts"], 0)  # 取消不算一次尝试（§3）
+        self.assertIsNone(chrome_agent.claim_next([task]))
+
+    def test_retry_wait_cancelled_is_not_claimed_even_when_due(self):
+        """§21 测试 2+4：RETRY_WAIT → CANCELLED 后，到期也绝不认领（错误 E）。"""
+        task = _task("c2")
+        chrome_agent.start_attempt(task)
+        chrome_agent.fail_attempt(task, "网络断", retries=3, wait_seconds=0,
+                                  now=datetime(2026, 9, 10, 10, 0, 0))
+        self.assertEqual(task["status"], "RETRY_WAIT")
+        chrome_agent.mark_cancelled(task)
+        after_due = datetime(2026, 9, 10, 12, 0, 0)
+        self.assertIsNone(chrome_agent.claim_next([task], now=after_due))
+
+    def test_cancelled_survives_recovery(self):
+        """§24 场景 D：重启恢复后仍是 CANCELLED，不得回落成 PENDING。"""
+        task = _task("c3")
+        chrome_agent.mark_cancelled(task)
+        chrome_agent.recover_tasks([task], _TMP)
+        self.assertEqual(task["status"], "CANCELLED")
+
+
+class ApplyCancellationsTest(unittest.TestCase):
+    """取消请求文件 → 任务状态（§7：User Bot 独占写、Agent 只读）。"""
+
+    def setUp(self):
+        self.path = os.path.join(_TMP, "chrome_cancel_apply.json")
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _write(self, ids):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"cancellations": [
+                {"task_id": i, "created_at": "2026-09-10 12:00:00"}
+                for i in ids]}, f)
+
+    def test_pending_and_retry_wait_are_cancelled(self):
+        pending = _task("k1")
+        retry = _task("k2")
+        chrome_agent.start_attempt(retry)
+        chrome_agent.fail_attempt(retry, "断", retries=3, wait_seconds=30)
+        self._write(["k1", "k2"])
+        cancelled = chrome_agent.apply_cancellations(
+            [pending, retry], self.path)
+        self.assertEqual(sorted(cancelled), ["k1", "k2"])
+        self.assertEqual(pending["status"], "CANCELLED")
+        self.assertEqual(retry["status"], "CANCELLED")
+
+    def test_terminal_tasks_untouched(self):
+        """§21 测试 7：SUCCESS / FAILED / 已取消的任务一律不动。"""
+        ok = _task("k3")
+        chrome_agent.finish_success(ok, "a.zip", 1)
+        bad = _task("k4")
+        for _ in range(3):
+            chrome_agent.start_attempt(bad)
+        chrome_agent.fail_attempt(bad, "x", retries=3, wait_seconds=0)
+        done = _task("k5")
+        chrome_agent.mark_cancelled(done)
+        self._write(["k3", "k4", "k5"])
+        self.assertEqual(
+            chrome_agent.apply_cancellations([ok, bad, done], self.path), [])
+        self.assertEqual([ok["status"], bad["status"], done["status"]],
+                         ["SUCCESS", "FAILED", "CANCELLED"])
+
+    def test_missing_file_is_noop(self):
+        task = _task("k6")
+        self.assertEqual(
+            chrome_agent.apply_cancellations([task], self.path), [])
+        self.assertEqual(task["status"], "PENDING")
+
+    def test_repeat_apply_is_idempotent(self):
+        """请求文件是 append-only，同一 id 会被反复读到——不能重复改写终态。"""
+        task = _task("k7")
+        self._write(["k7"])
+        self.assertEqual(chrome_agent.apply_cancellations([task], self.path),
+                         ["k7"])
+        finished_at = task["finished_at"]
+        self.assertEqual(chrome_agent.apply_cancellations([task], self.path),
+                         [])
+        self.assertEqual(task["finished_at"], finished_at)
+
+
+class CleanPartialTest(unittest.TestCase):
+    """§15：半成品清理必须绑定「任务自己的目录 + 自己的文件名」，绝不 glob。"""
+
+    def setUp(self):
+        self.root = os.path.join(_TMP, "chrome_dl_partial")
+        os.makedirs(self.root, exist_ok=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _touch(self, *parts):
+        path = os.path.join(self.root, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"half")
+        return path
+
+    def test_partial_of_own_task_is_deleted(self):
+        """§21 测试 5：取消 RUNNING 后本任务的 .crdownload 被删除。"""
+        task = _task("d1")
+        partial = self._touch("a.zip.crdownload")
+        chrome_agent.clean_partial_download(self.root, task, filename="a.zip")
+        self.assertFalse(os.path.exists(partial))
+
+    def test_other_tasks_partial_is_kept(self):
+        """§21 测试 6：取消 A，A 的半成品删、B 的半成品留（错误 D）。"""
+        task = _task("d2")
+        mine = self._touch("a.zip.crdownload")
+        other = self._touch("b.zip.crdownload")
+        chrome_agent.clean_partial_download(self.root, task, filename="a.zip")
+        self.assertFalse(os.path.exists(mine))
+        self.assertTrue(os.path.exists(other))
+
+    def test_subdir_isolation(self):
+        """带 download_subdir 的任务只在**自己的**目录里删（§15 兼容项）。"""
+        task = _task("d3")
+        task["download_subdir"] = "A/B"
+        mine = self._touch("A", "B", "x.zip.crdownload")
+        same_name_elsewhere = self._touch("x.zip.crdownload")
+        chrome_agent.clean_partial_download(self.root, task, filename="x.zip")
+        self.assertFalse(os.path.exists(mine))
+        self.assertTrue(os.path.exists(same_name_elsewhere))
+
+    def test_unknown_filename_deletes_nothing(self):
+        """文件名未知（downloadWillBegin 尚未到）时无从归属，宁可不动手。"""
+        task = _task("d4")
+        stray = self._touch("stray.zip.crdownload")
+        chrome_agent.clean_partial_download(self.root, task, filename=None)
+        self.assertTrue(os.path.exists(stray))
+
+
+class OrphanPartialSweepTest(unittest.TestCase):
+    """启动清扫孤儿 .crdownload：只删「没人认领且久未动过」的（§15 漏网口）。"""
+
+    def setUp(self):
+        self.root = os.path.join(_TMP, "chrome_dl_sweep")
+        os.makedirs(self.root, exist_ok=True)
+        self.old = time.time() - chrome_agent.ORPHAN_PARTIAL_MIN_AGE_SECONDS - 60
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _touch(self, *parts, age=None):
+        path = os.path.join(self.root, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"half")
+        if age is not None:
+            os.utime(path, (age, age))
+        return path
+
+    def test_old_unclaimed_partial_is_removed(self):
+        orphan = self._touch("ghost.zip.crdownload", age=self.old)
+        self.assertEqual(
+            chrome_agent.sweep_orphan_partials(self.root, []), [orphan])
+        self.assertFalse(os.path.exists(orphan))
+
+    def test_live_task_partial_is_kept(self):
+        """非终态任务（已认领、等待重试等）的半成品必须留着给它续跑。"""
+        task = _task("w1")
+        task["filename"] = "mine.zip"
+        task["status"] = "RETRY_WAIT"
+        kept = self._touch("mine.zip.crdownload", age=self.old)
+        self.assertEqual(chrome_agent.sweep_orphan_partials(self.root, [task]),
+                         [])
+        self.assertTrue(os.path.exists(kept))
+
+    def test_fresh_partial_is_kept(self):
+        """刚写过的半成品可能是上一个 Agent 进程仍在写的（Chrome 还活着）。"""
+        fresh = self._touch("busy.zip.crdownload", age=time.time())
+        self.assertEqual(chrome_agent.sweep_orphan_partials(self.root, []), [])
+        self.assertTrue(os.path.exists(fresh))
+
+    def test_finished_files_are_never_touched(self):
+        """成品与主下载链路的 .download 都不归它管（只碰 .crdownload）。"""
+        completed = self._touch("done.zip", age=self.old)
+        other = self._touch("x.download", age=self.old)
+        chrome_agent.sweep_orphan_partials(self.root, [])
+        self.assertTrue(os.path.exists(completed))
+        self.assertTrue(os.path.exists(other))
+
+    def test_subdir_task_partial_kept(self):
+        """带子目录的任务：文件在它自己的目录里，同样按全路径认定归属。"""
+        task = _task("w2")
+        task["filename"] = "deep.zip"
+        task["download_subdir"] = "A/B"
+        task["status"] = "PENDING"
+        kept = self._touch("A", "B", "deep.zip.crdownload", age=self.old)
+        orphan = self._touch("A", "ghost.zip.crdownload", age=self.old)
+        self.assertEqual(
+            chrome_agent.sweep_orphan_partials(self.root, [task]), [orphan])
+        self.assertTrue(os.path.exists(kept))
+
+
+class _HangingCDP(FakeCDP):
+    """吐完脚本事件后挂起（下载进行中的样子），直到被取消或超时。"""
+
+    def __init__(self, guid, filename):
+        super().__init__([
+            {"method": "Browser.downloadWillBegin",
+             "params": {"guid": guid, "suggestedFilename": filename}},
+        ], hang=True)
+
+
+class _DelayedBeginCDP(FakeCDP):
+    """downloadWillBegin 迟到（模拟「先收到取消、guid 还没产生」，§11）。
+
+    事件经真 asyncio 队列由后台任务延迟投递：取消掉一次 next_event **不会
+    吞掉**在途事件——这正是真 ChromeCDPClient 的语义（wait_for(queue.get())
+    被取消不消费队列），也是 §13 要求不能丢事件的那条线。
+    """
+
+    def __init__(self, guid, filename, delay):
+        super().__init__([], hang=True)
+        self._queue = asyncio.Queue()
+        self._producer = None
+        self._delay = delay
+        self._begin = {"method": "Browser.downloadWillBegin",
+                       "params": {"guid": guid,
+                                  "suggestedFilename": filename}}
+
+    async def next_event(self, timeout):
+        if self._producer is None:
+            self._producer = asyncio.ensure_future(self._produce())
+        try:
+            return await asyncio.wait_for(self._queue.get(), timeout)
+        except asyncio.TimeoutError:
+            return None
+
+    async def _produce(self):
+        await asyncio.sleep(self._delay)
+        await self._queue.put(self._begin)
+
+
+class _PerUrlCDP(FakeCDP):
+    """按 URL 分脚本的 CDP：任务串行执行，B 的事件不会串进 A 的下载。
+
+    平面事件表会让「A 还在跑」时把 B 的 downloadWillBegin 认成自己的
+    （真实 FIFO 串行下不可能发生），所以这里按 open_tab 的 URL 取脚本。
+    """
+
+    def __init__(self, script):
+        super().__init__([], hang=True)
+        self._script = script      # {url: [event, ...]}
+        self._current = []
+
+    async def open_tab(self, url):
+        self.commands.append(("open_tab", url))
+        self._current = list(self._script.get(url, []))
+        return "target-1"
+
+    async def next_event(self, timeout):
+        if self._current:
+            return self._current.pop(0)
+        if self._hang:
+            await asyncio.sleep(max(0.0, timeout))
+        return None
+
+
+class _CompleteWithCancelCDP(FakeCDP):
+    """返回 completed 事件的同时置位取消：模拟「完成与取消同时确认」（§14）。"""
+
+    def __init__(self, events, cancel_event):
+        super().__init__(events)
+        self._cancel = cancel_event
+
+    async def next_event(self, timeout):
+        event = await super().next_event(timeout)
+        if (event or {}).get("params", {}).get("state") == "completed":
+            self._cancel.set()
+        return event
+
+
+class CancelRunningTest(unittest.IsolatedAsyncioTestCase):
+    """§8/§11/§14：取消 RUNNING 必须真正中止 Chrome 下载，而不是只改 JSON。"""
+
+    def setUp(self):
+        self.dl_dir = os.path.join(_TMP, "chrome_dl_cancel")
+        os.makedirs(self.dl_dir, exist_ok=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dl_dir, ignore_errors=True)
+
+    async def test_cancel_with_guid_issues_cdp_cancel(self):
+        cdp = _HangingCDP("g1", "a.zip")
+        cancel = asyncio.Event()
+        attempt = asyncio.ensure_future(chrome_agent.run_download_attempt(
+            cdp, "https://a.com/a.zip", self.dl_dir, timeout=30,
+            cancel_event=cancel))
+        await asyncio.sleep(0.05)  # 让 downloadWillBegin 先被消费
+        cancel.set()
+        ok, filename, size, error = await asyncio.wait_for(attempt, 5)
+        self.assertFalse(ok)
+        self.assertEqual(filename, "a.zip")  # 供半成品清理定位
+        self.assertIn(("Browser.cancelDownload", {"guid": "g1"}),
+                      cdp.commands)
+        # 收尾照旧：标签页不能因为取消而不关
+        self.assertIn(("close_tab", "target-1"), cdp.commands)
+
+    async def test_cancel_before_guid_still_cancels(self):
+        """§11/错误 G：guid 尚未产生就取消，宽限窗口内等到 begin 立刻取消。"""
+        cdp = _DelayedBeginCDP("g2", "b.zip", delay=0.15)
+        cancel = asyncio.Event()
+        attempt = asyncio.ensure_future(chrome_agent.run_download_attempt(
+            cdp, "https://a.com/b.zip", self.dl_dir, timeout=30,
+            cancel_event=cancel))
+        await asyncio.sleep(0.02)
+        cancel.set()
+        ok, filename, size, error = await asyncio.wait_for(attempt, 5)
+        self.assertFalse(ok)
+        self.assertIn(("Browser.cancelDownload", {"guid": "g2"}),
+                      cdp.commands)
+
+    async def test_completed_event_not_lost_when_cancel_lands_together(self):
+        """§14：完成与取消同时到达时不能丢掉 completed 事件（保留 SUCCESS）。"""
+        final = os.path.join(self.dl_dir, "c.zip")
+        with open(final, "wb") as f:
+            f.write(b"z" * 7)
+        cancel = asyncio.Event()
+        cdp = _CompleteWithCancelCDP([
+            {"method": "Browser.downloadWillBegin",
+             "params": {"guid": "g3", "suggestedFilename": "c.zip"}},
+            {"method": "Browser.downloadProgress",
+             "params": {"guid": "g3", "state": "completed"}},
+        ], cancel)
+        ok, filename, size, error = await chrome_agent.run_download_attempt(
+            cdp, "https://a.com/c.zip", self.dl_dir, timeout=5,
+            cancel_event=cancel)
+        self.assertTrue(ok)
+        self.assertEqual(size, 7)
+        self.assertNotIn(("Browser.cancelDownload", {"guid": "g3"}),
+                         cdp.commands)
+
+    async def test_no_cancel_event_keeps_old_behaviour(self):
+        """回归：不传 cancel_event 时一切照旧（现存调用点与测试不受影响）。"""
+        final = os.path.join(self.dl_dir, "d.zip")
+        with open(final, "wb") as f:
+            f.write(b"z" * 3)
+        cdp = FakeCDP([
+            {"method": "Browser.downloadWillBegin",
+             "params": {"guid": "g4", "suggestedFilename": "d.zip"}},
+            {"method": "Browser.downloadProgress",
+             "params": {"guid": "g4", "state": "completed"}},
+        ])
+        ok, filename, size, error = await chrome_agent.run_download_attempt(
+            cdp, "https://a.com/d.zip", self.dl_dir, timeout=5)
+        self.assertTrue(ok)
+        self.assertEqual(size, 3)
+
+
+class CancelProcessFlowTest(unittest.IsolatedAsyncioTestCase):
+    """process_pending_tasks 与取消请求文件的接线（§16：取消后继续跑下一个）。"""
+
+    def setUp(self):
+        self.dl_dir = os.path.join(_TMP, "chrome_dl_cancel_flow")
+        os.makedirs(self.dl_dir, exist_ok=True)
+        self.tasks_path = os.path.join(_TMP, "chrome_tasks_cancel.json")
+        self.cancel_path = os.path.join(_TMP, "chrome_cancel_flow.json")
+        for p in (self.tasks_path, self.cancel_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dl_dir, ignore_errors=True)
+        for p in (self.tasks_path, self.cancel_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+    def _write_cancel(self, task_id):
+        with open(self.cancel_path, "w", encoding="utf-8") as f:
+            json.dump({"cancellations": [{"task_id": task_id}]}, f)
+
+    async def test_cancel_running_task_then_next_task_runs(self):
+        """§24 场景 C：A 下载中被取消 → A CANCELLED，B 接着跑完成。"""
+        with open(os.path.join(self.dl_dir, "b.zip"), "wb") as f:
+            f.write(b"z" * 11)
+        cdp = _PerUrlCDP({
+            # A：只给 downloadWillBegin，此后一直挂着（正在下载）
+            "https://a.com/a.zip": [
+                {"method": "Browser.downloadWillBegin",
+                 "params": {"guid": "ga", "suggestedFilename": "a.zip"}},
+            ],
+            # B：完整跑完
+            "https://a.com/b.zip": [
+                {"method": "Browser.downloadWillBegin",
+                 "params": {"guid": "gb", "suggestedFilename": "b.zip"}},
+                {"method": "Browser.downloadProgress",
+                 "params": {"guid": "gb", "state": "completed"}},
+            ],
+        })
+        a = chrome_agent.create_task("https://a.com/a.zip", "a1")
+        b = chrome_agent.create_task("https://a.com/b.zip", "b2")
+
+        original_open = cdp.open_tab
+
+        async def open_tab_and_cancel(url):
+            # A 的标签页一开就写下取消请求：模拟「用户在其下载中取消 A」
+            self._write_cancel("a1")
+            return await original_open(url)
+
+        cdp.open_tab = open_tab_and_cancel
+
+        await chrome_agent.process_pending_tasks(
+            cdp, [a, b], self.tasks_path, self.dl_dir,
+            timeout=1, retries=3, wait_seconds=0,
+            cancel_path=self.cancel_path, cancel_poll=0.01)
+
+        self.assertEqual(a["status"], "CANCELLED")
+        self.assertEqual(b["status"], "SUCCESS")     # 错误 F：取消 A 后 B 照样执行
+        # 取消本身不加 attempts：A 的 1 次来自它真的跑过（start_attempt）
+        self.assertEqual(a["attempts"], 1)
+        self.assertEqual(b["attempts"], 1)
+        self.assertIn(("Browser.cancelDownload", {"guid": "ga"}), cdp.commands)
+
+    async def test_cancel_pending_before_start_never_downloads(self):
+        """排队任务取消：认领前就被拦下，绝不发起下载。"""
+        cdp = FakeCDP([], hang=True)
+        a = chrome_agent.create_task("https://a.com/a.zip", "z1")
+        self._write_cancel("z1")
+        await chrome_agent.process_pending_tasks(
+            cdp, [a], self.tasks_path, self.dl_dir,
+            timeout=1, retries=3, wait_seconds=0,
+            cancel_path=self.cancel_path, cancel_poll=0.01)
+        self.assertEqual(a["status"], "CANCELLED")
+        self.assertEqual([c for c in cdp.commands if c[0] == "open_tab"], [])
 
 
 if __name__ == "__main__":

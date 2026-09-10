@@ -22,6 +22,7 @@ from . import chrome_agent
 from . import state
 from .config import (
     CHROME_AGENT_PID_FILE,
+    CHROME_CANCEL_REQUESTS_FILE,
     CHROME_CDP_HOST,
     CHROME_CDP_PORT,
     CHROME_DOWNLOAD_DIR,
@@ -34,8 +35,22 @@ from .naming import format_size
 # 回复统一前缀（进自动清理白名单）
 CHROME_TEXT_PREFIX = "🤖 Chrome"
 
+# /chrome_tasks 里可取消的状态与展示顺序（任务书 §4：进行中 → 排队 → 等待重试）
+CANCELABLE_STATUSES = ("RUNNING", "PENDING", "RETRY_WAIT")
+_STATUS_ICON = {
+    "RUNNING": "🟢 进行中",
+    "PENDING": "⏳ 排队中",
+    "RETRY_WAIT": "⏳ 等待重试",
+}
+# 取消请求文件是 append-only 的（Agent 只读、无回执通道），只保留最近这些条，
+# 免得多年前的取消记录无限堆积。
+CANCEL_KEEP_ENTRIES = 200
+# /chrome_cancel 也接受 task_id 前缀寻址（列表里打的短 ID 即可复制）：
+# 序号会随列表变动漂移，ID 不会。太短的前缀会撞车，故要求 ≥6 位。
+_TASK_ID_TOKEN_RE = re.compile(r"[0-9a-fA-F]{6,32}")
+
 _CHROME_CMD_RE = re.compile(
-    r"^/(chrome_start|chrome_stop|chrome_status|chrome)"
+    r"^/(chrome_tasks|chrome_cancel|chrome_start|chrome_stop|chrome_status|chrome)"
     r"(?:\s+(\S+))?(?:\s+(\S+))?\s*$",
     re.IGNORECASE,
 )
@@ -187,6 +202,7 @@ def status_text(agent_up, chrome_running, cdp_ok, tasks, dl_dir,
                                                          "RETRY_WAIT"))
     success = sum(1 for t in tasks if t.get("status") == "SUCCESS")
     failed = sum(1 for t in tasks if t.get("status") == "FAILED")
+    cancelled = sum(1 for t in tasks if t.get("status") == "CANCELLED")
     # 最近完成的任务单行展示（终态任务在「当前任务/队列」里都看不到，
     # 验收反馈：任务成功后状态里没有任何统计）。优先展示最近成功的下载
     # （用户关心什么落了地）；没有成功才回落展示最近的失败。
@@ -207,7 +223,7 @@ def status_text(agent_up, chrome_running, cdp_ok, tasks, dl_dir,
         f"当前任务：{running['task_id'][:8] if running else '无'}",
         f"队列：{queued}",
         f"任务统计：累计 {len(tasks)}"
-        f"（成功 {success} / 失败 {failed}"
+        f"（成功 {success} / 失败 {failed} / 取消 {cancelled}"
         f" / 进行中 {1 if running else 0} / 排队 {queued}）",
     ]
     # 已提交未被 Agent 认领的请求（当前任务下载中时提交的链接住在这里，
@@ -235,6 +251,99 @@ def status_text(agent_up, chrome_running, cdp_ok, tasks, dl_dir,
     return "\n".join(lines)
 
 
+def cancelable_tasks(tasks):
+    """可取消的任务，按 进行中 → 排队 → 等待重试 排序（任务书 §4）。
+
+    组内保持 chrome_tasks.json 的文件顺序。`/chrome_tasks` 显示的序号就是这个
+    列表的下标 + 1，`/chrome_cancel N` 用同一个函数重建列表——两边不会错位。
+    """
+    order = {s: i for i, s in enumerate(CANCELABLE_STATUSES)}
+    indexed = [(i, t) for i, t in enumerate(tasks)
+               if t.get("status") in order]
+    indexed.sort(key=lambda pair: (order[pair[1].get("status")], pair[0]))
+    return [t for _, t in indexed]
+
+
+def tasks_text(tasks):
+    """`/chrome_tasks` 正文（任务书 §4）。"""
+    items = cancelable_tasks(tasks)
+    if not items:
+        return "🌐 Chrome 任务\n\n当前没有可取消的任务。"
+    lines = ["🌐 Chrome 任务", ""]
+    for i, task in enumerate(items, 1):
+        status = task.get("status")
+        lines.append(f"{i}. {_STATUS_ICON.get(status, status)}")
+        lines.append(f"   ID: {str(task.get('task_id') or '')[:8]}")
+        lines.append(f"   URL: {task.get('url')}")
+        if task.get("label"):
+            lines.append(f"   标注：{task['label']}")
+        subdir = chrome_agent.safe_subdir(task.get("download_subdir"))
+        if subdir:
+            lines.append(f"   子目录：{subdir}")
+        lines.append("")
+    lines.append("可取消：" + "、".join(str(i) for i in range(1, len(items) + 1))
+                 + "（或直接发上面的 ID）")
+    return "\n".join(lines)
+
+
+def cancel_usage_text():
+    return ("❌ 用法：/chrome_cancel <序号>\n\n"
+            "先发送 /chrome_tasks 查看任务列表。\n"
+            "也可以直接给任务 ID：/chrome_cancel a1b2c3d4（不受列表变动影响）。")
+
+
+def resolve_cancel_target(tasks, token):
+    """把 `/chrome_cancel` 的参数解析成 (task, error_text)。
+
+    两种寻址方式：
+      * **序号**——对应 `/chrome_tasks` 当前显示的列表（任务书 §5）；
+      * **task_id 前缀**（≥6 位十六进制）——列表里每行都打了短 ID。
+        序号是在**按下取消的瞬间**按当前列表重新解析的：若这期间前面的任务
+        刚好完成、列表前移，同一个序号会落到另一个任务上，静默取消错人。
+        按 ID 寻址没有这个问题。
+    """
+    text = (token or "").strip()
+    if not text:
+        return None, cancel_usage_text()
+    if text.isdigit():
+        items = cancelable_tasks(tasks)
+        index = int(text)
+        if index < 1 or index > len(items):
+            return None, "❌ 任务序号无效，请先发送 /chrome_tasks。"
+        return items[index - 1], None
+    if not _TASK_ID_TOKEN_RE.fullmatch(text):
+        return None, "❌ 序号必须是数字，或 6 位以上的任务 ID。"
+    prefix = text.lower()
+    matches = [t for t in tasks
+               if str(t.get("task_id") or "").lower().startswith(prefix)]
+    if not matches:
+        return None, "❌ 没找到这个任务 ID，请先发送 /chrome_tasks。"
+    if len(matches) > 1:
+        return None, "❌ 这个 ID 前缀匹配到多个任务，请多输入几位。"
+    return matches[0], None
+
+
+def cancel_ok_text(task, agent_up=True):
+    """取消请求已提交的回执（§5 未规定文案，这里把「接下来会发生什么」说清）。"""
+    status = task.get("status")
+    if status == "RUNNING":
+        note = "正在下载：会立即中止 Chrome 下载并清理半成品文件"
+    else:
+        note = "尚未开始：会被直接跳过，不再下载"
+    lines = [
+        f"{CHROME_TEXT_PREFIX} 取消请求已提交",
+        "",
+        f"任务 ID：{str(task.get('task_id') or '')[:8]}",
+        f"状态：{_STATUS_ICON.get(status, status)}",
+        f"URL：{task.get('url')}",
+        "",
+        f"{note}，完成后会通知结果。",
+    ]
+    if not agent_up:
+        lines += ["", "⚠️ Chrome Agent 当前未运行，取消将在它下次启动时生效。"]
+    return "\n".join(lines)
+
+
 def result_text(task):
     """终态通知（规格 20 的 [CHROME_RESULT] 字段以人类可读形式呈现）。"""
     tid = task.get("task_id", "")[:8]
@@ -250,6 +359,14 @@ def result_text(task):
             f"文件：{task.get('filename')}\n"
             f"{size_line}\n"
             f"目录：\n{chrome_agent.get_task_download_dir(download_dir(), task)}"
+        )
+    if status == "CANCELLED":
+        return (
+            f"🛑 Chrome 下载已取消\n\n"
+            f"任务 ID：{tid}\n"
+            f"状态：CANCELLED\n"
+            f"URL：{task.get('url')}\n"
+            f"原因：{task.get('error') or chrome_agent.CANCEL_REASON}"
         )
     attempts = task.get("attempts", 0)
     return (
@@ -428,6 +545,61 @@ def add_request(task_id, url, user_id, chat_id, message_id, path=None,
     save_requests(reqs, path)
 
 
+# ------------------------------------------------------------
+# chrome_cancel_requests.json（User Bot 独占写、Agent 只读；任务书 §9）
+# ------------------------------------------------------------
+
+def load_cancellations(path=None):
+    path = path or CHROME_CANCEL_REQUESTS_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        logger.warning(f"读取 Chrome 取消请求文件失败：{e}")
+        return []
+    items = (data or {}).get("cancellations") if isinstance(data, dict) else None
+    return [c for c in items if isinstance(c, dict)] if isinstance(
+        items, list) else []
+
+
+def save_cancellations(items, path=None):
+    """原子写取消请求，返回是否真的落盘。
+
+    与 `save_requests` 那种「失败仅告警」的写法刻意不同：取消是**单向通道**
+    （Agent 不回执、也没有自查入口），写失败却回一句「已提交」，用户会以为
+    取消了而实际什么都没发生。故这里把成败交给调用方，由它如实回话。
+    """
+    path = path or CHROME_CANCEL_REQUESTS_FILE
+    try:
+        temp_path = path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump({"cancellations": items}, f,
+                      ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
+        return True
+    except Exception as e:
+        logger.warning(f"保存 Chrome 取消请求文件失败：{e}")
+        return False
+
+
+def add_cancellation(task_id, path=None, now=None):
+    """登记一条取消请求；返回「请求是否确实在盘上」。
+
+    同一个 task_id 只写一次；已经在文件里说明先前那次写成功了，直接算成功
+    （Agent 迟早会应用它）。返回 False **只**代表这次写盘失败——调用方必须
+    如实告诉用户。文件只保留最近 CANCEL_KEEP_ENTRIES 条：单向通道没有别的
+    回收时机。
+    """
+    items = load_cancellations(path)
+    if any(c.get("task_id") == task_id for c in items):
+        return True
+    ts = (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+    items.append({"task_id": task_id, "created_at": ts})
+    return save_cancellations(items[-CANCEL_KEEP_ENTRIES:], path)
+
+
 def get_request(task_id, path=None):
     return next((r for r in load_requests(path)
                  if r.get("task_id") == task_id), None)
@@ -452,6 +624,39 @@ def _chrome_version(binary):
         return out.stdout.strip() or None
     except Exception:
         return None
+
+
+async def _handle_cancel(event, arg):
+    """`/chrome_cancel <序号>`（任务书 §5）：序号对应 /chrome_tasks 的列表。
+
+    列表是文件快照，用户看到列表到按下取消之间任务可能已经跑完——写请求
+    前复核一次状态，已经是终态就如实回话，绝不假装取消成功（§14）。
+    """
+    task, error = resolve_cancel_target(
+        chrome_agent.load_tasks(CHROME_TASKS_FILE), arg)
+    if error:
+        await event.reply(error)
+        return
+    fresh = chrome_agent.get_task(
+        chrome_agent.load_tasks(CHROME_TASKS_FILE), task.get("task_id"))
+    status = (fresh or task).get("status")
+    if status == "SUCCESS":
+        await event.reply("ℹ️ 任务已经完成，无法取消。")
+        return
+    if status == "FAILED":
+        await event.reply("ℹ️ 任务已经失败，无法取消。")
+        return
+    if status == "CANCELLED":
+        await event.reply("ℹ️ 任务已经取消。")
+        return
+    if not add_cancellation(task["task_id"]):
+        # 单向通道：写失败必须如实说，否则用户以为取消了、实际没有任何动作
+        await event.reply("❌ 取消请求写入失败，请重试。")
+        logger.warning(f"取消请求写入失败，任务 [{task['task_id'][:8]}]")
+        return
+    await event.reply(cancel_ok_text(task, agent_up=agent_running()))
+    logger.info(f"执行命令：/chrome_cancel {arg} → 任务 "
+                f"[{task['task_id'][:8]}] {status}")
 
 
 async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
@@ -519,6 +724,16 @@ async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
         logger.info("执行命令：/chrome_status")
         return True
 
+    if sub == "chrome_tasks":
+        await event.reply(tasks_text(
+            chrome_agent.load_tasks(CHROME_TASKS_FILE)))
+        logger.info("执行命令：/chrome_tasks")
+        return True
+
+    if sub == "chrome_cancel":
+        await _handle_cancel(event, arg)
+        return True
+
     # sub == "chrome"：[目录/][#标注] <URL> 提交下载（规格 15：Agent 未运行不自动启动）
     # 最后一个 "/" 之后的 #xxx 是文件名标注，前面的是下载子目录
     url, label, download_subdir = parse_chrome_submit(match)
@@ -559,7 +774,7 @@ async def notify_pending_results():
     """扫描终态任务，按映射逐条通知并打 notified 标记（幂等，可重复调用）。"""
     tasks = chrome_agent.load_tasks(CHROME_TASKS_FILE)
     for task in tasks:
-        if task.get("status") not in ("SUCCESS", "FAILED"):
+        if task.get("status") not in chrome_agent.TERMINAL_STATUSES:
             continue
         rec = get_request(task["task_id"])
         if not rec or rec.get("notified_at"):
