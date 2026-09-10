@@ -104,31 +104,41 @@ pids_text() {  # 把 PID 列表拼成一行（去尾随空格），供回执展�
     tr '\n' ' ' | sed 's/ *$//'
 }
 
-uptime_of() {  # $1=PID → 已运行时长
-    ps -p "$1" -o etime= 2>/dev/null | tr -d ' '
+uptime_of() {
+    # $1=PID → 已运行时长（中文可读）。ps 的 etime 是 [[dd-]hh:]mm:ss，
+    # 直接照搬会有歧义：`06:55` 是 6 分 55 秒，不是 6 小时 55 分——
+    # 2026-09-11 排查时作者本人就把它读成了 7 小时，白紧张一场。
+    local e
+    e="$(ps -p "$1" -o etime= 2>/dev/null | tr -d ' ')"
+    case "$e" in
+        '') return ;;
+        *-*)   # dd-hh:mm:ss
+            echo "$(printf '%s' "$e" | cut -d- -f1)天$(printf '%s' "$e" | cut -d- -f2)"
+            ;;
+        *:*:*) # hh:mm:ss
+            echo "$(printf '%s' "$e" | cut -d: -f1)小时$(printf '%s' "$e" | cut -d: -f2)分"
+            ;;
+        *:*)   # mm:ss
+            echo "$(printf '%s' "$e" | cut -d: -f1)分$(printf '%s' "$e" | cut -d: -f2)秒"
+            ;;
+        *) echo "${e}秒" ;;
+    esac
 }
 
 # ------------------------------------------------------------
 # 代理
 # ------------------------------------------------------------
-resolve_proxy() {
-    if [ -n "${TG_PROXY:-}" ]; then
-        echo "env"
-        return
-    fi
-    local value
-    value="$("$PY" -c 'import json
+proxy_from_secrets() {
+    # 只**输出**值，绝不在这里 export：本函数是在 $( ) 子壳里调用的，
+    # 子壳里的 export 传不回父壳。第一版就是栽在这儿——脚本打印
+    # 「代理来源：secrets」，进程却拿到空的 TG_PROXY、直连 Telegram，
+    # 卡在 SYN_SENT 上一整夜（日志横幅写着「代理：未启用（直连）」）。
+    "$PY" -c 'import json
 try:
     data = json.load(open("tg_secrets.json", encoding="utf-8"))
 except Exception:
     data = {}
-print((data.get("tg_proxy") or "").strip())' 2>/dev/null)"
-    if [ -n "$value" ]; then
-        export TG_PROXY="$value"
-        echo "secrets"
-    else
-        echo "none"
-    fi
+print((data.get("tg_proxy") or "").strip())' 2>/dev/null
 }
 
 warn_no_proxy() {
@@ -199,12 +209,17 @@ do_stop() {
 }
 
 do_start() {
-    local proxy older
-    proxy="$(resolve_proxy)"
-    if [ "$proxy" = "none" ]; then
-        warn_no_proxy
+    local value
+    if [ -n "${TG_PROXY:-}" ]; then
+        echo "▶ 代理来源：环境变量 TG_PROXY"
     else
-        echo "▶ 代理来源：${proxy}"
+        value="$(proxy_from_secrets)"
+        if [ -n "$value" ]; then
+            export TG_PROXY="$value"      # 必须在**父壳**里 export（见函数注释）
+            echo "▶ 代理来源：tg_secrets.json 的 tg_proxy"
+        else
+            warn_no_proxy
+        fi
     fi
 
     if pgrep_any_userbot; then
@@ -270,10 +285,11 @@ do_status() {
         fi
     fi
 
-    case "$(resolve_proxy)" in
-        none) echo "⚠️  代理           未配置（将直连）" ;;
-        *)    echo "🟢 代理           已配置" ;;
-    esac
+    if [ -n "${TG_PROXY:-}" ] || [ -n "$(proxy_from_secrets)" ]; then
+        echo "🟢 代理           已配置"
+    else
+        echo "⚠️  代理           未配置（将直连，国内网络下连不上）"
+    fi
 
     echo "── 最近日志 ──"
     echo "  userbot: $(last_line "$RUNTIME_DIR/download.log")"
