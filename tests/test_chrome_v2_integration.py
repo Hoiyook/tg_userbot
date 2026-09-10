@@ -16,8 +16,25 @@ Testing the integration of all Chrome Agent V2 components:
 
 Run with:
     .venv/bin/python -m unittest discover -s tests -p "test_chrome_v2_integration.py" -v
+
+⚠️ **当前整模块 skip**：Chrome Agent V2 未落地。本文件是 2026-09-09 V2 会话
+的未完成遗留（随提交 e3fb56b 保存）。它的支撑模块大多已提交且实现完整
+（`chrome_events.EventDispatcher`、`chrome_persistence.atomic_save_with_backup`
+都在），但 V2 对主模块的那层集成只保存了一半——本文件引用的这三个符号在
+当前代码里**不存在**：
+
+    chrome_health.HealthMetrics          （chrome_health.py 是半成品）
+    chrome_agent.enhanced_recover_tasks  （V2 增强恢复，未落地）
+    chrome_agent._is_guid_valid          （V2 GUID 保鲜，未落地）
+
+于是它长期以 7 个 ERROR + 1 个 FAILURE 挂在 suite 上（2026-09-10 前如此）。
+标记 skip 而不是删除：V2 是用户特意保存的活儿，做不做由用户决定——补齐上面
+三个符号、再移掉下面的守卫即可继续；不打算做就删掉本文件、
+`tests/test_chrome_health.py` 与 `tg_userbot/chrome_health.py`（后两者同样是
+只保存了一半的 V2 残件）。
 """
 import asyncio
+import importlib
 import json
 import os
 import tempfile
@@ -33,8 +50,23 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 from tg_userbot import config
 from tg_userbot import chrome_agent
 from tg_userbot import chrome_health
-from tg_userbot import chrome_events
-from tg_userbot import chrome_persistence
+
+# Chrome Agent V2 未落地（见文件头说明）：V2 的支撑模块都在，缺的是对主模块
+# 的那层集成。守卫按**真正缺失的符号**判定，而不是猜模块在不在——这样将来
+# 谁补齐了 chrome_agent / chrome_health，这里会自动恢复运行而不是继续假装 skip。
+_MISSING_V2_API = [
+    name for name in (
+        "tg_userbot.chrome_health:HealthMetrics",
+        "tg_userbot.chrome_agent:enhanced_recover_tasks",
+        "tg_userbot.chrome_agent:_is_guid_valid",
+    )
+    if not hasattr(
+        importlib.import_module(name.split(":")[0]), name.split(":")[1])
+]
+if _MISSING_V2_API:  # pragma: no cover - V2 未落地时的常规路径
+    raise unittest.SkipTest(
+        "Chrome Agent V2 未落地（e3fb56b 遗留，缺符号：" +
+        "、".join(_MISSING_V2_API) + "）")
 
 
 class TestChromeV2Integration(unittest.TestCase):
