@@ -19,6 +19,7 @@ from . import whitelist
 from . import cleanup
 from . import stats
 from . import finder
+from . import caption_filter
 from .config import (
     BOT_USERNAME,
     DONE_DEFAULT_LINES,
@@ -277,6 +278,13 @@ async def handle_command(event, cmd_text):
         await event.reply(stats.stats_text(days), link_preview=False)
         return True
 
+    parsed_caption = caption_filter.parse_caption_filter_command(cmd_text)
+    if parsed_caption is not None:
+        action, arg = parsed_caption
+        logger.info(f"执行命令：/caption_filter {action}")
+        await event.reply(caption_filter.command_reply(action, arg))
+        return True
+
     if finder.is_find_command(cmd_text):
         # 媒体下落查询：完整字段子串匹配（列表视图截尾 48 字符是它存在的理由）
         parts = cmd_text.split(maxsplit=1)
@@ -302,7 +310,9 @@ async def handle_command(event, cmd_text):
             f"/thread 5 - 设置并行下载路数为 5"
             f"（{DOWNLOAD_CONCURRENCY_MIN}-{DOWNLOAD_CONCURRENCY_MAX}，每条各占一条独立连接）\n"
             "/dedup - 查看重复媒体去重状态\n"
-            "/dedup off - 关闭去重（重新下载已删文件时用）\n"            "/wl - 查看下载白名单\n"
+            "/dedup off - 关闭去重（重新下载已删文件时用）\n"
+            "/caption_filter - 查看/修改 Caption 命名清洗规则\n"
+            "/wl - 查看下载白名单\n"
             "/wl add @用户名 - 加入白名单（也可回复转发消息后 /wl add）\n"
             "/wl del ID或序号 - 移出白名单\n"
             "/queue - 查看下载队列\n"

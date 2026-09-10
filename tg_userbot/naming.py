@@ -9,6 +9,7 @@ import re
 import mimetypes
 from datetime import datetime
 
+from . import caption_filter
 from .config import MAX_FILENAME_BYTES, UUID_FILENAME_PATTERN
 from .log import logger
 
@@ -177,17 +178,39 @@ def get_file_extension(message, filename: str) -> str:
     return ""
 
 
-def get_caption(message) -> str:
-    """获取 Caption / 消息文字；无 caption 返回空串。
+def raw_caption(message) -> str:
+    """消息的原始说明文本（未清洗、未 sanitize）；无则空串。
+
+    判断「谁的文字优先」要用原始文本：sanitize 会把换行与 ASCII 冒号换成
+    '_'，之后再交给 Caption 清洗就认不出字段结构了。
+    """
+    try:
+        return (message.message or "").strip()
+    except Exception:
+        return ""
+
+
+def get_caption(message, override=None) -> str:
+    """命名用说明：原始文本 → Caption 清洗 → sanitize；无则空串。
+
+    清洗只在这里做一次（入队展示名与落盘名都走 compute_final_filename，两处
+    天然一致），且必须在 sanitize **之前**——sanitize 会把换行、ASCII 冒号换成
+    '_'，之后 field: 规则再也认不出字段边界。
+
+    override：显式传入的说明（相册转发副本补不了 caption，调用方把从源 chat
+    读到的同组说明传进来），非空时优先于消息自带文字。
 
     注意不能用 sanitize_filename("") 的兜底值「未命名文件」——
     那会把所有无说明文件的文件名都加上「未命名文件 - 」前缀。
     """
     try:
-        text = (message.message or "").strip()
-        return sanitize_filename(text) if text else ""
+        text = str(override or "").strip() or raw_caption(message)
     except Exception:
         return ""
+    if not text:
+        return ""
+    cleaned = caption_filter.clean_caption(text)
+    return sanitize_filename(cleaned) if cleaned else ""
 
 
 def pick_group_caption_text(messages, grouped_id) -> str:
@@ -299,17 +322,16 @@ def compute_final_filename(message, caption=None, label=None, max_bytes=None) ->
     caption 参数：显式传入覆盖「消息自身文字」作为命名用说明（默认 None =
     取消息自带 caption）。相册的转发副本无法补 caption，调用方把从源 chat 读
     到的同组说明传进来，无文字图片即可沿用相册标题命名而非媒体类型_时间戳。
+    两条来源都会先过 Caption 清洗（见 caption_filter / get_caption），且只清
+    洗一次——清洗结果为空时不产生任何 fallback 文本。
 
     max_bytes 参数：非 None 时开启字节预算（download_file 传 MAX_FILENAME_BYTES），
     拼出超限名时按用户约定的优先级裁剪——文件名/日期前缀最后才动、先裁原
     caption、然后才裁 #标注。None（缺省，队列展示/单测用）不裁剪、照原样拼。
     """
     original_filename = sanitize_filename(get_original_filename(message))
-    if caption is None:
-        caption = get_caption(message)
-    else:
-        raw = str(caption or "").strip()
-        caption = sanitize_filename(raw) if raw else ""
+    # 消息自带文字与显式传入的说明走同一个解析点：原文 → 清洗 → sanitize
+    caption = get_caption(message, caption)
 
     label_piece = _label_piece(label)  # '#xxx' 或 ''
 

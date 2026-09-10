@@ -36,7 +36,7 @@ from .naming import (
     compute_final_filename,
     compute_url_filename,
     format_size,
-    get_caption,
+    raw_caption,
     get_original_filename,
     sanitize_filename,
 )
@@ -598,7 +598,10 @@ async def download_file(message, source_override=None, caption_override=None,
         source = await resolve_download_source(message, source_override)
         # 命名用 caption：消息自带文字优先；否则用调用方继承的相册同组说明
         # （转发副本无 caption，图片名靠它避免落到 媒体类型_时间戳 兜底名）
-        own_caption = get_caption(message)
+        # 这里只做「谁优先」的选择、取**原始**文本：清洗与 sanitize 统一由
+        # compute_final_filename → get_caption 做一次，避免清洗过的文本被二次
+        # 清洗（sanitize 换掉换行/ASCII 冒号后字段边界就认不出了）
+        own_caption = raw_caption(message)
         caption = own_caption or (caption_override or "")
         # 最终名一次交给 compute_final_filename：label（手工转发评论，代码加 #）
         # 与原 caption 一并拼入；超出字节上限时按用户约定的优先级裁剪——先裁原

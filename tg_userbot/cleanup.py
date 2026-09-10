@@ -21,6 +21,7 @@ from . import whitelist
 from . import platform
 from . import stats
 from . import finder
+from . import caption_filter
 from . import chrome_client
 from .config import (
     CLEANUP_DELETE_TIMEOUT,
@@ -159,6 +160,10 @@ def is_cleanup_message(message, include_persistent=False) -> bool:
 
         # /find 指令（媒体下落查询，含关键字）
         if finder.is_find_command(text):
+            return True
+
+        # /caption_filter 指令（Caption 命名清洗，含子命令）
+        if caption_filter.is_caption_filter_command(text):
             return True
 
         # /chrome* 指令（Chrome Agent，含 URL 参数）

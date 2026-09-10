@@ -103,6 +103,36 @@ class CleanupFindTest(unittest.TestCase):
         self.assertTrue(cleanup.is_cleanup_message(msg))
 
 
+class CleanupCaptionFilterTest(unittest.TestCase):
+    """/caption_filter 命令与「🧹 Caption」回复纳入自动清理白名单。"""
+
+    def test_command_cleaned(self):
+        for text in ("/caption_filter", "/caption_filter add field:作者",
+                     "/caption_filter test 作者：A"):
+            with self.subTest(text=text):
+                self.assertTrue(cleanup.is_cleanup_message(make_msg(text=text)))
+
+    def test_replies_cleaned(self):
+        for text in (
+            "🧹 Caption 清洗规则\n\n1. field:作者\n\n共 1 条",
+            "🧪 Caption 清洗测试\n\n原文：\n作者：A\n\n结果：\nA",
+            "✅ 已添加规则：\n\nfield:作者",
+            "✅ 已删除规则 1：\n\nfield:作者",
+            "🗑 已清空全部 Caption 清洗规则",
+            "♻️ 已恢复默认规则（共 7 条）",
+            "❌ 不支持的规则类型。\n\n支持：",
+            "❌ 正则表达式无效：regex:(abc",
+            "❌ 规则编号不存在。",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(cleanup.is_cleanup_message(make_msg(text=text)))
+
+    def test_plain_content_with_caption_word_kept(self):
+        # 只按前缀匹配：普通收藏内容提到「Caption」不该被删
+        self.assertFalse(
+            cleanup.is_cleanup_message(make_msg(text="这个 Caption 写得不错"))
+        )
+
 class ChromeResultNotificationTest(unittest.TestCase):
     """Chrome 下载结果通知持久保留（2026-09-09 验收反馈：通知 85 秒后就被
     自动清理删掉，用户没看到）。结果类通知豁免自动清理（include_persistent

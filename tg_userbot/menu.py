@@ -80,7 +80,21 @@ def main_menu_buttons():
          Button.inline("🛑 停止CD2", encode_menu_data("cd2_stop"))],
         [Button.inline("🗂 备份记录", encode_menu_data("bak")),
          Button.inline("📊 台账", encode_menu_data("stats"))],
-        [Button.inline("🔍 查询", encode_menu_data("find"))],
+        [Button.inline("🔍 查询", encode_menu_data("find")),
+         Button.inline("🧹 Caption 清洗", encode_menu_data("capf"))],
+    ]
+
+
+def caption_filter_menu_buttons():
+    """Caption 清洗视图：查看/添加/删除/测试/恢复默认/清空 + 返回。"""
+    return [
+        [Button.inline("📋 查看规则", encode_menu_data("capf"))],
+        [Button.inline("➕ 添加规则", encode_menu_data("capf_add")),
+         Button.inline("➖ 删除规则", encode_menu_data("capf_del"))],
+        [Button.inline("🧪 测试清洗", encode_menu_data("capf_test"))],
+        [Button.inline("♻️ 恢复默认", encode_menu_data("capf_reset")),
+         Button.inline("🗑 清空规则", encode_menu_data("capf_clear"))],
+        [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
     ]
 
 

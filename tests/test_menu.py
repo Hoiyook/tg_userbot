@@ -487,6 +487,182 @@ class FindMenuEntryTest(unittest.TestCase):
         self.assertIn("find", actions)
 
 
+class CaptionFilterMenuTest(unittest.TestCase):
+    """【🧹 Caption 清洗】菜单入口与按钮（命令是主路径，菜单复用同一批服务函数）。"""
+
+    def test_main_menu_has_caption_filter_entry(self):
+        rows = menu.main_menu_buttons()
+        texts = [b.text for row in rows for b in row]
+        actions = [menu.parse_menu_data(b.data)[0] for row in rows for b in row]
+        self.assertTrue(any("Caption" in t for t in texts), texts)
+        self.assertIn("capf", actions)
+
+    def test_caption_filter_menu_buttons(self):
+        rows = menu.caption_filter_menu_buttons()
+        actions = [menu.parse_menu_data(b.data)[0] for row in rows for b in row]
+        for action in ("capf_add", "capf_del", "capf_test",
+                       "capf_reset", "capf_clear", "home"):
+            self.assertIn(action, actions)
+
+    def test_actions_registered(self):
+        for action in ("capf", "capf_add", "capf_del", "capf_test",
+                       "capf_reset", "capf_clear"):
+            self.assertIn(action, config.MENU_ACTIONS)
+
+
+class CaptionFilterMenuFlowTest(unittest.IsolatedAsyncioTestCase):
+    """菜单动作：查看/恢复默认/清空直接生效；添加/删除/测试进输入窗口。"""
+
+    async def asyncSetUp(self):
+        self.path = os.path.join(_TMP, "caption_filter_menu_test.json")
+        self._patch = mock.patch.object(
+            config, "CAPTION_FILTER_CONFIG_FILE", self.path
+        )
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        self._saved_rules = state.CAPTION_FILTER_RULES
+        state.CAPTION_FILTER_RULES = list(config.DEFAULT_CAPTION_FILTER_RULES)
+        self._saved_win = (state.CAPTION_INPUT_UNTIL, state.CAPTION_INPUT_MODE)
+        state.CAPTION_INPUT_UNTIL = 0.0
+        state.CAPTION_INPUT_MODE = ""
+        self._saved_state = (state.MY_ID, state.bot_client)
+        state.MY_ID = 5452449426
+        self.bot_client = mock.MagicMock()
+        self.bot_client.send_message = mock.AsyncMock()
+        state.bot_client = self.bot_client
+        self._log_patch = mock.patch.object(bot.logger, "info")
+        self._log_patch.start()
+        self.addCleanup(self._log_patch.stop)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        state.CAPTION_FILTER_RULES = self._saved_rules
+        state.CAPTION_INPUT_UNTIL, state.CAPTION_INPUT_MODE = self._saved_win
+        state.MY_ID, state.bot_client = self._saved_state
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    async def _press(self, action, arg=None):
+        return await bot.handle_menu_action(action, arg, mock.MagicMock())
+
+    async def _send_text(self, text):
+        msg = mock.MagicMock()
+        msg.message = text
+        msg.fwd_from = None
+        ev = mock.MagicMock()
+        ev.out = False
+        ev.chat_id = state.MY_ID
+        ev.message = msg
+        ev.reply = mock.AsyncMock()  # "/" 开头会走 handle_command
+        await bot.bot_message_handler(ev)
+
+    def _sent_texts(self):
+        return [c.args[1] for c in self.bot_client.send_message.call_args_list]
+
+    async def test_view_shows_rules(self):
+        text, buttons = await self._press("capf")
+        self.assertIn("1. field:作者", text)
+        self.assertTrue(buttons)
+
+    async def test_reset_and_clear_take_effect(self):
+        await self._press("capf_clear")
+        self.assertEqual(state.CAPTION_FILTER_RULES, [])
+        text, _ = await self._press("capf_reset")
+        self.assertIn("默认", text)
+        self.assertEqual(
+            state.CAPTION_FILTER_RULES, config.DEFAULT_CAPTION_FILTER_RULES
+        )
+
+    async def test_add_via_input_window(self):
+        text, _ = await self._press("capf_add")
+        self.assertIn("发送", text)
+        self.assertGreater(state.CAPTION_INPUT_UNTIL, 0)
+        self.assertEqual(state.CAPTION_INPUT_MODE, "add")
+
+        await self._send_text("field:自定义")
+        self.assertIn("field:自定义", state.CAPTION_FILTER_RULES)
+        # 一次即关：窗口不会把后续普通文本继续吃掉
+        self.assertEqual(state.CAPTION_INPUT_UNTIL, 0.0)
+        self.assertTrue(any("已添加规则" in t for t in self._sent_texts()))
+
+    async def test_test_via_input_window(self):
+        with mock.patch.object(state, "CAPTION_FILTER_RULES",
+                               ["field:作者"]):
+            text, _ = await self._press("capf_test")
+            self.assertIn("发送", text)
+            self.assertEqual(state.CAPTION_INPUT_MODE, "test")
+            await self._send_text("作者：#腿玩年")
+        self.assertTrue(
+            any("#腿玩年" in t for t in self._sent_texts()),
+            self._sent_texts(),
+        )
+
+    async def test_del_via_input_window(self):
+        await self._press("capf_del")
+        self.assertEqual(state.CAPTION_INPUT_MODE, "del")
+        await self._send_text("1")
+        self.assertNotIn("field:作者", state.CAPTION_FILTER_RULES)
+
+    async def test_slash_command_cancels_window(self):
+        state.CAPTION_INPUT_UNTIL = time.monotonic() + 60
+        state.CAPTION_INPUT_MODE = "add"
+        before = list(state.CAPTION_FILTER_RULES)
+        await self._send_text("/help")
+        self.assertEqual(state.CAPTION_INPUT_UNTIL, 0.0)
+        self.assertEqual(state.CAPTION_FILTER_RULES, before)
+
+    async def test_rule_text_not_eaten_when_window_closed(self):
+        # 窗口关闭时，普通文本仍回落主菜单（不会被当规则存下）
+        before = list(state.CAPTION_FILTER_RULES)
+        await self._send_text("field:不该被存下")
+        self.assertEqual(state.CAPTION_FILTER_RULES, before)
+
+
+class InputWindowExclusivityTest(unittest.IsolatedAsyncioTestCase):
+    """三个「等待下一条文本」窗口互斥：开新的必须关掉旧的。
+
+    否则先开的窗口会把本该给后开窗口的文本吃掉——cookie 窗口校验顺序最前，
+    误吃的代价也最重（一段 Caption 规则会被当成抖音 cookie 存进
+    tg_secrets.json）。窗口语义见 bot.bot_message_handler。
+    """
+
+    async def asyncSetUp(self):
+        self.old = (state.MY_ID, state.COOKIE_INPUT_UNTIL,
+                    state.FIND_INPUT_UNTIL, state.CAPTION_INPUT_UNTIL,
+                    state.CAPTION_INPUT_MODE)
+        state.MY_ID = 5452449426
+
+    async def asyncTearDown(self):
+        (state.MY_ID, state.COOKIE_INPUT_UNTIL, state.FIND_INPUT_UNTIL,
+         state.CAPTION_INPUT_UNTIL, state.CAPTION_INPUT_MODE) = self.old
+
+    async def _press(self, action):
+        return await bot.handle_menu_action(action, None, mock.MagicMock())
+
+    async def test_caption_window_closes_cookie_and_find(self):
+        state.COOKIE_INPUT_UNTIL = time.monotonic() + 60
+        state.FIND_INPUT_UNTIL = time.monotonic() + 60
+        await self._press("capf_add")
+        self.assertGreater(state.CAPTION_INPUT_UNTIL, 0)
+        self.assertEqual(state.CAPTION_INPUT_MODE, "add")
+        self.assertEqual(state.COOKIE_INPUT_UNTIL, 0)
+        self.assertEqual(state.FIND_INPUT_UNTIL, 0)
+
+    async def test_cookie_window_closes_caption(self):
+        await self._press("capf_test")
+        self.assertGreater(state.CAPTION_INPUT_UNTIL, 0)
+        await self._press("cookie_set")
+        self.assertGreater(state.COOKIE_INPUT_UNTIL, 0)
+        self.assertEqual(state.CAPTION_INPUT_UNTIL, 0)
+        self.assertEqual(state.CAPTION_INPUT_MODE, "")
+
+    async def test_find_window_closes_cookie(self):
+        state.COOKIE_INPUT_UNTIL = time.monotonic() + 60
+        await self._press("find")
+        self.assertGreater(state.FIND_INPUT_UNTIL, 0)
+        self.assertEqual(state.COOKIE_INPUT_UNTIL, 0)
+
+
 class BotHandlerIgnoresReporterTest(unittest.IsolatedAsyncioTestCase):
     """Runtime Reporter 的汇报发到 bot 对话时，不得被当成「给 bot 的指令」。
 

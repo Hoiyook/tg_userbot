@@ -27,6 +27,7 @@ from . import cleanup
 from . import cd2
 from . import stats
 from . import finder
+from . import caption_filter
 from . import commands
 from . import config
 from .config import DONE_DEFAULT_LINES, REPORT_STATUS_PREFIX
@@ -46,6 +47,7 @@ BOT_COMMANDS = (
     ("done", "查看最近下载记录"),
     ("thread", "查看/设置并行下载路数"),
     ("dedup", "查看/设置重复媒体去重"),
+    ("caption_filter", "查看/修改 Caption 命名清洗规则"),
     ("wl", "查看下载白名单"),
     ("clean", "清理 .download 临时文件"),
     ("chrome_start", "启动 Chrome 下载 Agent"),
@@ -68,6 +70,33 @@ async def register_bot_commands(client):
         ],
     ))
     logger.info(f"🤖 bot 命令面板已注册：{len(BOT_COMMANDS)} 个命令")
+
+
+def open_input_window(kind):
+    """开一个「等待下一条文本」的输入窗口，并关掉其它两个。
+
+    同一时刻只允许一个窗口开着（cookie / 查询 / Caption 清洗）：三个窗口的
+    判定是 if 顺序执行，若同时非零，排在前的会把本该给后者的文本吃掉——
+    cookie 排最前、代价也最重（一段 Caption 规则会被当成抖音 cookie 存进
+    tg_secrets.json）。kind：\"cookie\" / \"find\" / \"add\"|\"del\"|\"test\"。
+    """
+    state.COOKIE_INPUT_UNTIL = 0.0
+    state.FIND_INPUT_UNTIL = 0.0
+    state.CAPTION_INPUT_UNTIL = 0.0
+    state.CAPTION_INPUT_MODE = ""
+    if kind == "cookie":
+        state.COOKIE_INPUT_UNTIL = (
+            time.monotonic() + config.COOKIE_INPUT_WINDOW_SECONDS
+        )
+    elif kind == "find":
+        state.FIND_INPUT_UNTIL = (
+            time.monotonic() + config.FIND_INPUT_WINDOW_SECONDS
+        )
+    else:
+        state.CAPTION_INPUT_UNTIL = (
+            time.monotonic() + config.CAPTION_INPUT_WINDOW_SECONDS
+        )
+        state.CAPTION_INPUT_MODE = kind
 
 
 async def handle_menu_action(action, arg, event):
@@ -137,9 +166,7 @@ async def handle_menu_action(action, arg, event):
     if action == "find":
         # 查询按钮没法打字：进入输入窗口（同 cookie 模式），下一条普通文本
         # 即关键字；/ 开头视为命令退出窗口。
-        state.FIND_INPUT_UNTIL = (
-            time.monotonic() + config.FIND_INPUT_WINDOW_SECONDS
-        )
+        open_input_window("find")
         return (
             "🔍 请直接发送要查询的关键字（发到本对话）。\n\n"
             f"{config.FIND_INPUT_WINDOW_SECONDS} 秒内有效，"
@@ -149,9 +176,7 @@ async def handle_menu_action(action, arg, event):
     if action == "cookie":
         return menu.cookie_status_text(), menu.cookie_menu_buttons()
     if action == "cookie_set":
-        state.COOKIE_INPUT_UNTIL = (
-            time.monotonic() + config.COOKIE_INPUT_WINDOW_SECONDS
-        )
+        open_input_window("cookie")
         return (
             "🍪 请直接发送 cookie 内容（整段粘贴，发到本对话）。\n\n"
             f"⚠️ 你发的这条消息会被立即删除；"
@@ -199,6 +224,22 @@ async def handle_menu_action(action, arg, event):
             return "❌ 任务已不存在", menu.back_home_buttons()
         verb = "🛑 已取消下载并移除" if cancelled else "✅ 已从队列移除"
         return f"{verb}：{removed.get('label', '')}", menu.back_home_buttons()
+    if action == "capf":
+        return caption_filter.rules_text(), menu.caption_filter_menu_buttons()
+    if action in ("capf_add", "capf_del", "capf_test"):
+        # 这三个要用户输入内容（规则 / 序号 / 原文）：进输入窗口，下一条普通
+        # 文本按 mode 处理（同 cookie / 查询的窗口模式）
+        mode = action[len("capf_"):]
+        open_input_window(mode)
+        return (
+            caption_filter.input_prompt(mode),
+            menu.caption_filter_menu_buttons(),
+        )
+    if action in ("capf_reset", "capf_clear"):
+        return (
+            caption_filter.command_reply(action[len("capf_"):], None),
+            menu.caption_filter_menu_buttons(),
+        )
     if action == "dedup":
         return dedup.status_text(), menu.dedup_menu_buttons()
     if action == "dedup_toggle":
@@ -286,6 +327,18 @@ async def bot_message_handler(event):
             return
         state.FIND_INPUT_UNTIL = 0.0
 
+    # Caption 清洗等待窗口：普通文本按 mode 当规则 / 序号 / 待清洗原文。
+    if (state.CAPTION_INPUT_UNTIL
+            and time.monotonic() < state.CAPTION_INPUT_UNTIL):
+        if not text.startswith("/"):
+            mode = state.CAPTION_INPUT_MODE
+            state.CAPTION_INPUT_UNTIL = 0.0
+            state.CAPTION_INPUT_MODE = ""
+            await _handle_caption_input(mode, text)
+            return
+        state.CAPTION_INPUT_UNTIL = 0.0
+        state.CAPTION_INPUT_MODE = ""
+
     if from_id:
         chat_id, title = await whitelist.resolve_wl_target(
             state.bot_client, None, fwd
@@ -344,6 +397,15 @@ async def _handle_find_input(event, text):
     logger.info(f"🤖 bot 菜单查询：{text.strip()!r}")
     await state.bot_client.send_message(
         state.MY_ID, finder.find_media(text), link_preview=False
+    )
+
+
+async def _handle_caption_input(mode, text):
+    """处理 Caption 清洗等待窗口内发来的文本：按 mode 当规则/序号/原文。"""
+    action = mode if mode in ("add", "del", "test") else "add"
+    logger.info(f"🤖 bot 菜单 Caption 清洗：{action} {text[:40]!r}")
+    await state.bot_client.send_message(
+        state.MY_ID, caption_filter.command_reply(action, text)
     )
 
 

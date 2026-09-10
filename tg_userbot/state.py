@@ -39,6 +39,12 @@ PROCESSING_DOUYIN_IDS = set()
 # bot 菜单「🍪 抖音Cookie」的等待输入标记：monotonic 时间戳，超过即窗口关闭
 COOKIE_INPUT_UNTIL = 0.0
 FIND_INPUT_UNTIL = 0.0
+# bot 菜单「🧹 Caption 清洗」的等待输入标记 + 这次输入当什么用：
+# "add" = 下一条文本是一条规则，"del" = 规则编号，"test" = 要试清洗的原文。
+# 三个输入窗口（cookie / 查询 / Caption 清洗）互斥，由 bot.open_input_window
+# 统一开关，避免先开的窗口把本该给后开窗口的文本吃掉。
+CAPTION_INPUT_UNTIL = 0.0
+CAPTION_INPUT_MODE = ""
 
 MY_ID = None  # 本人（owner）用户 id，登录后填充
 
@@ -61,6 +67,11 @@ WHITELIST_CHATS = {}
 # dedup.load_dedup_config() 从 dedup_config.json 还原（/dedup off|on 切换）
 DEDUP_INDEX = {}
 DEDUP_ENABLED = True
+
+# Caption 清洗规则当前值（列表，顺序=用户看到的顺序）。初值是 config 里的
+# 默认规则；启动时 caption_filter.load_caption_filter_config() 从
+# caption_filter.json 还原（/caption_filter 增删改实时生效并持久化）。
+CAPTION_FILTER_RULES = list(config.DEFAULT_CAPTION_FILTER_RULES)
 
 # CD2 进程句柄（仅防 GC 回收后台进程，无人读取）
 _CD2_PROC = None

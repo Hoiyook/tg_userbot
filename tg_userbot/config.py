@@ -248,6 +248,29 @@ DEDUP_INDEX_FILE = os.path.join(RUNTIME_DIR, "dedup_index.txt")
 DEDUP_CONFIG_FILE = os.path.join(RUNTIME_DIR, "dedup_config.json")
 DEDUP_MAX_ENTRIES = 10000
 
+# ------------------------------------------------------------
+# Caption 命名清洗（2026-09-10）：把转发说明里的字段标签、URL 等噪音从
+# **文件名**里去掉。规则是普通字符串列表，4 种前缀：
+#   exact:<串>     删除这个确切子串
+#   contains:<串>  删除所有出现的该子串（有意宽匹配）
+#   regex:<正则>   按正则删除（非法正则跳过，不影响其它规则）
+#   field:<字段名> 剥掉「字段名+冒号」，保留字段值；字段名后紧跟 【（[ 也算
+#                  字段起点（i站地址【 https://… 】 这类没有冒号的写法）
+# 默认值 = DEFAULT_CAPTION_FILTER_RULES；当前值存 state.CAPTION_FILTER_RULES，
+# 持久化在 CAPTION_FILTER_CONFIG_FILE，由 bot 命令/菜单增删改（实时生效）。
+# 清洗只作用于 Telegram caption 那条命名链（compute_final_filename），
+# 本地解析链的抖音 url 任务标题不走清洗。
+DEFAULT_CAPTION_FILTER_RULES = [
+    "field:作者",
+    "field:期数",
+    "field:角色",
+    "field:i站地址",
+    "field:标签",
+    r"regex:https?://\S+",
+    r"regex:【.*?】",
+]
+CAPTION_FILTER_CONFIG_FILE = os.path.join(RUNTIME_DIR, "caption_filter.json")
+
 # 任务生命周期事件日志（JSONL，append-only 单行追加，写失败仅告警）：
 # 台账按 task_id 重建统计的数据源。每行一个事件
 # {"ts","ev","id","label",...}，ev ∈ RECEIVED/QUEUED/RUNNING/RETRY/FAILED/
@@ -340,6 +363,10 @@ DOUYIN_HEADERS = {
 COOKIE_INPUT_WINDOW_SECONDS = 120
 # 【🔍 查询】按钮的等待输入窗口（按下后发关键字，同 cookie 模式）
 FIND_INPUT_WINDOW_SECONDS = 120
+# 【🧹 Caption 清洗】按钮的等待输入窗口（按下「添加规则」/「测试清洗」后
+# 发一条文本，同 cookie/查询模式；窗口内文本按 state.CAPTION_INPUT_MODE
+# 决定当规则还是当待清洗文本）
+CAPTION_INPUT_WINDOW_SECONDS = 120
 
 # ============================================================
 # 下载并发
@@ -386,6 +413,7 @@ MENU_ACTIONS = (
     "cookie", "cookie_set", "cookie_clear", "cookie_imp",
     "dedup", "dedup_toggle",
     "find",
+    "capf", "capf_add", "capf_del", "capf_test", "capf_reset", "capf_clear",
 )
 
 
@@ -517,6 +545,17 @@ CLEAN_NOTIFICATION_PREFIXES = (
     "📊 台账",
     # /find（媒体下落查询）的命令与回复
     "🔍 查询",
+    # /caption_filter（Caption 命名清洗）的回复与输入窗口提示
+    "🧹 Caption 清洗",
+    "🧪 Caption 清洗",
+    "✅ 已添加规则",
+    "✅ 已删除规则",
+    "🗑 已清空全部 Caption",
+    "♻️ 已恢复默认规则",
+    "❌ 不支持的规则类型",
+    "❌ 正则表达式无效",
+    "❌ 规则编号不存在",
+    "❌ /caption_filter",
     # /thread 的回复
     "🧵 当前并发下载数",
     "✅ 并发下载数已设置为",

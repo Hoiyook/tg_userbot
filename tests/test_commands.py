@@ -13,6 +13,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_commands_test_")
@@ -143,6 +144,100 @@ class TextCommandRegressionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CaptionFilterCommandTest(unittest.TestCase):
+    """/caption_filter 子命令分发（服务函数在 caption_filter 模块，可单测）。"""
+
+    def setUp(self):
+        from tg_userbot import config, state, caption_filter
+        self.config = config
+        self.state = state
+        self.caption_filter = caption_filter
+        self.path = os.path.join(_TMP, "caption_filter_cmd_test.json")
+        self._patch = mock.patch.object(
+            config, "CAPTION_FILTER_CONFIG_FILE", self.path
+        )
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        self._saved = state.CAPTION_FILTER_RULES
+        state.CAPTION_FILTER_RULES = list(config.DEFAULT_CAPTION_FILTER_RULES)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        self.state.CAPTION_FILTER_RULES = self._saved
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _run(self, cmd):
+        ev = FakeEvent()
+        ok = asyncio.run(commands.handle_command(ev, cmd))
+        return ok, ev.replies
+
+    def test_list(self):
+        ok, replies = self._run("/caption_filter")
+        self.assertTrue(ok)
+        self.assertIn("1. field:作者", replies[0])
+        self.assertIn("共 7 条", replies[0])
+
+    def test_add_del_clear_reset(self):
+        ok, replies = self._run("/caption_filter add field:测试")
+        self.assertTrue(ok)
+        self.assertIn("已添加规则", replies[0])
+        self.assertIn("field:测试", self.state.CAPTION_FILTER_RULES)
+
+        ok, replies = self._run("/caption_filter del 1")
+        self.assertTrue(ok)
+        self.assertIn("已删除规则 1", replies[0])
+        self.assertNotIn("field:作者", self.state.CAPTION_FILTER_RULES)
+
+        ok, replies = self._run("/caption_filter clear")
+        self.assertTrue(ok)
+        self.assertIn("已清空", replies[0])
+        self.assertEqual(self.state.CAPTION_FILTER_RULES, [])
+        self.assertIn("当前没有任何规则", self._run("/caption_filter")[1][0])
+
+        ok, replies = self._run("/caption_filter reset")
+        self.assertTrue(ok)
+        self.assertIn("默认", replies[0])
+        self.assertEqual(
+            self.state.CAPTION_FILTER_RULES,
+            self.config.DEFAULT_CAPTION_FILTER_RULES,
+        )
+
+    def test_add_rejects_bad_rule(self):
+        ok, replies = self._run("/caption_filter add abc:作者")
+        self.assertTrue(ok)
+        self.assertIn("不支持的规则类型", replies[0])
+        self.assertNotIn("abc:作者", self.state.CAPTION_FILTER_RULES)
+
+        ok, replies = self._run("/caption_filter add regex:(abc")
+        self.assertTrue(ok)
+        self.assertIn("正则表达式无效", replies[0])
+
+    def test_del_out_of_range(self):
+        ok, replies = self._run("/caption_filter del 99")
+        self.assertTrue(ok)
+        self.assertIn("规则编号不存在", replies[0])
+
+    def test_test_runs_real_cleaner(self):
+        ok, replies = self._run("/caption_filter test 作者：#腿玩年 标签：#MMD")
+        self.assertTrue(ok)
+        self.assertIn("🧪 Caption 清洗测试", replies[0])
+        self.assertIn("#腿玩年 #MMD", replies[0])
+
+    def test_unknown_subcommand_shows_usage(self):
+        ok, replies = self._run("/caption_filter wat")
+        self.assertTrue(ok)
+        self.assertIn("用法", replies[0])
+
+    def test_usage_missing_argument(self):
+        for cmd in ("/caption_filter add", "/caption_filter del",
+                    "/caption_filter test"):
+            with self.subTest(cmd=cmd):
+                ok, replies = self._run(cmd)
+                self.assertTrue(ok)
+                self.assertIn("用法", replies[0])
 
 
 class FindCommandTest(unittest.TestCase):

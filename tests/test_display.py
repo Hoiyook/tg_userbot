@@ -178,11 +178,13 @@ class CaptionOverrideNamingTest(unittest.TestCase):
 
     def test_captionless_photo_with_meaningless_name_uses_override(self):
         # 相册无文字图片，原名是无意义 UUID → 用继承的说明（+ 推断 .jpg）
+        # 说明里的字段标签由 Caption 清洗去掉（caption_filter 默认规则），
+        # 值保留——本用例钉的是「继承说明用上了」，不是清洗本身。
         m = fake_message("c80d0ff8-4fdb-4762-8b97-800612217e4c.jpg")
         m.photo = True
         m.date = self.D
         result = naming.compute_final_filename(m, caption="作者：#Furatto 绝区零")
-        self.assertEqual(result, "26-09-05 作者：#Furatto 绝区零.jpg")
+        self.assertEqual(result, "26-09-05 #Furatto 绝区零.jpg")
 
     def test_captionless_photo_with_real_name_keeps_name(self):
         # 无文字但原名有意义（如 IMG_1234.jpg）→ 说明拼在原名前
@@ -190,7 +192,7 @@ class CaptionOverrideNamingTest(unittest.TestCase):
         m.photo = True
         m.date = self.D
         result = naming.compute_final_filename(m, caption="作者：#Furatto")
-        self.assertEqual(result, "26-09-05 作者：#Furatto - IMG_1234.jpg")
+        self.assertEqual(result, "26-09-05 #Furatto - IMG_1234.jpg")
 
     def test_no_caption_no_override_falls_back_to_timestamp(self):
         # 继承说明读不到、消息也无文字 → 仍回 媒体类型_时间戳 兜底

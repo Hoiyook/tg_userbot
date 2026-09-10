@@ -19,6 +19,7 @@ from telethon.network.connection import ConnectionTcpFull, ConnectionTcpObfuscat
 
 from . import state
 from . import commands
+from . import caption_filter
 from . import chrome_client
 from . import dedup
 from . import queue
@@ -898,6 +899,7 @@ async def main():
     state.bot_client = None
     thread.load_thread_config()
     dedup.load_dedup_config()
+    caption_filter.load_caption_filter_config()
     loaded = dedup.load_index()
     logger.info(f"🛡 去重索引已载入：{loaded} 条")
     state.WHITELIST_CHATS = whitelist.load_whitelist()
