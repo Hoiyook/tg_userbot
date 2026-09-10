@@ -425,7 +425,11 @@ async def wait_agent_up(timeout=15):
 
 
 def stop_agent():
-    """SIGTERM Agent 并等待退出（同步、阻塞最长 10s——仅命令路径调用）。"""
+    """SIGTERM Agent 并等待退出（**同步阻塞最长 10s**，调用方放线程里跑）。
+
+    命令路径与菜单按钮都经 `stop_view()` → `asyncio.to_thread(stop_agent)`：
+    这个轮询等退出的循环会把事件循环冻住，而同一条循环上还跑着下载/清理/通知。
+    """
     pid = agent_pid()
     if not pid:
         return False
@@ -644,6 +648,52 @@ def request_cancel(task_id):
     return True, cancel_ok_text(task, agent_up=agent_running())
 
 
+async def status_view():
+    """`/chrome_status` 与菜单【ℹ️ Agent 状态】共用：状态正文。
+
+    含「已提交但 Agent 尚未认领」的请求——下载中提交的链接住在这里，不显示
+    的话用户会以为提交丢了。
+    """
+    agent_up = agent_running()
+    chrome_running = chrome_app_running()
+    cdp_ok = await cdp_available()
+    tasks = chrome_agent.load_tasks(CHROME_TASKS_FILE)
+    known = {t.get("task_id") for t in tasks}
+    unclaimed = [r for r in load_requests(CHROME_REQUESTS_FILE)
+                 if r.get("task_id") not in known]
+    return status_text(agent_up, chrome_running, cdp_ok, tasks, download_dir(),
+                       unclaimed=unclaimed)
+
+
+async def start_view():
+    """启动 Agent 并返回回执（命令与菜单共用同一套流程与文案）。
+
+    `_chrome_version` 会真跑一次 `chrome --version`（子进程），放线程里执行，
+    别阻塞事件循环——这条循环同时还在跑下载/清理/通知。
+    """
+    if agent_running():
+        binary = chrome_agent.find_chrome_binary()
+        version = (await asyncio.to_thread(_chrome_version, binary)
+                   if binary else None)
+        return start_report_text(binary, version, already=True, agent_up=True)
+    binary = chrome_agent.find_chrome_binary()
+    if not binary:
+        return "⚠️ 未找到 Chrome 可执行文件，无法启动 Agent。"
+    spawn_agent()
+    agent_up = await wait_agent_up()
+    version = await asyncio.to_thread(_chrome_version, binary)
+    return start_report_text(binary, version, already=False, agent_up=agent_up)
+
+
+async def stop_view():
+    """停 Agent 并返回是否真的停了（命令与菜单共用）。
+
+    `stop_agent()` 是同步阻塞的（轮询等进程退出，最长 10s），放线程里跑——
+    否则这 10 秒会把整个事件循环连同下载/清理一起冻住。
+    """
+    return await asyncio.to_thread(stop_agent)
+
+
 def load_cancelable_view():
     """菜单与命令共用：读任务文件 → `(正文, 可取消任务列表)`。
 
@@ -684,26 +734,12 @@ async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
     sub, arg = match.group(1).lower(), match.group(2)
 
     if sub == "chrome_start":
-        if agent_running():
-            binary = chrome_agent.find_chrome_binary()
-            await event.reply(start_report_text(
-                binary, _chrome_version(binary) if binary else None,
-                already=True, agent_up=True))
-            return True
-        binary = chrome_agent.find_chrome_binary()
-        if not binary:
-            await event.reply(
-                f"⚠️ 未找到 Chrome 可执行文件，无法启动 Agent。")
-            return True
-        spawn_agent()
-        agent_up = await wait_agent_up()
-        await event.reply(start_report_text(
-            binary, _chrome_version(binary), already=False, agent_up=agent_up))
-        logger.info(f"执行命令：/chrome_start（agent_up={agent_up}）")
+        await event.reply(await start_view())
+        logger.info("执行命令：/chrome_start")
         return True
 
     if sub == "chrome_stop":
-        stopped = stop_agent()
+        stopped = await stop_view()
         if stopped:
             await event.reply(
                 f"{CHROME_TEXT_PREFIX} Agent 已停止\n\n"
@@ -714,18 +750,7 @@ async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
         return True
 
     if sub == "chrome_status":
-        agent_up = agent_running()
-        chrome_running = chrome_app_running()
-        cdp_ok = await cdp_available()
-        tasks = chrome_agent.load_tasks(CHROME_TASKS_FILE)
-        # 已提交但 Agent 尚未认领的请求（下载中提交的链接住在这里）：
-        # 不显示的话用户会以为提交丢了
-        known = {t.get("task_id") for t in tasks}
-        unclaimed = [r for r in load_requests(CHROME_REQUESTS_FILE)
-                     if r.get("task_id") not in known]
-        await event.reply(status_text(
-            agent_up, chrome_running, cdp_ok, tasks, download_dir(),
-            unclaimed=unclaimed))
+        await event.reply(await status_view())
         logger.info("执行命令：/chrome_status")
         return True
 

@@ -491,8 +491,19 @@ class ChromeMenuTest(unittest.TestCase):
 
     def test_actions_registered(self):
         """不登记就会被 encode_menu_data 拦下（它会校验 MENU_ACTIONS）。"""
-        for action in ("chrome_tasks", "chrome_cancel"):
+        for action in ("chrome_tasks", "chrome_cancel", "chrome_start",
+                       "chrome_stop", "chrome_status"):
             self.assertIn(action, config.MENU_ACTIONS)
+
+    def test_agent_controls_present(self):
+        """启停与状态此前只在 Telegram 命令面板里，按钮菜单够不着。"""
+        rows = menu.chrome_menu_buttons([])
+        actions = [menu.parse_menu_data(b.data)[0] for row in rows for b in row]
+        for action in ("chrome_start", "chrome_stop", "chrome_status"):
+            self.assertIn(action, actions)
+        texts = [b.text for row in rows for b in row]
+        self.assertTrue(any("启动" in t for t in texts))
+        self.assertTrue(any("停止" in t for t in texts))
 
     def test_per_task_cancel_button_carries_task_id(self):
         tasks = [{"task_id": "abcd1234ef", "url": "https://a.com/dir/x.zip?a=1",
@@ -505,10 +516,12 @@ class ChromeMenuTest(unittest.TestCase):
         self.assertIn("x.zip", rows[0][0].text)  # 短名去掉了 query
         self.assertNotIn("？", rows[0][0].text)
 
-    def test_empty_list_still_has_refresh_and_home(self):
+    def test_empty_list_still_has_footer(self):
+        """没任务时按钮只剩页脚：启停 + 刷新/状态 + 返回。"""
         rows = menu.chrome_menu_buttons([])
         actions = [menu.parse_menu_data(b.data)[0] for row in rows for b in row]
-        self.assertEqual(actions, ["chrome_tasks", "home"])
+        self.assertEqual(actions, ["chrome_start", "chrome_stop",
+                                   "chrome_tasks", "chrome_status", "home"])
 
     def test_short_name_is_url_tail(self):
         self.assertEqual(
@@ -568,6 +581,21 @@ class ChromeMenuFlowTest(unittest.IsolatedAsyncioTestCase):
         self.chrome_agent.save_tasks([task], self.tasks_path)
         reqs = self.chrome_client.load_cancellations(self.cancel_path)
         self.assertEqual([r["task_id"] for r in reqs], ["menu2"])
+
+    async def test_status_button_renders_status_view(self):
+        """状态按钮走的是与 /chrome_status 同一个服务函数（这里只验接线，
+        真实探测由命令路径的实测覆盖）。"""
+        from tg_userbot import chrome_client
+        with mock.patch.object(chrome_client, "chrome_app_running",
+                               lambda: True), \
+                mock.patch.object(chrome_client, "cdp_available",
+                                  mock.AsyncMock(return_value=True)):
+            body, buttons = await self._press("chrome_status")
+        self.assertIn("Agent", body)
+        self.assertIn("CDP", body)
+        actions = [menu.parse_menu_data(b.data)[0]
+                   for row in buttons for b in row]
+        self.assertIn("chrome_start", actions)   # 状态页也带启停按钮
 
     async def test_terminal_task_button_reports_instead_of_cancelling(self):
         task = self.chrome_agent.create_task("https://a.com/x.zip", "menu3")

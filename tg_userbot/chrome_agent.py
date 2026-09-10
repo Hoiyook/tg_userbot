@@ -29,6 +29,7 @@ from .config import (
     CHROME_CDP_CONNECT_TIMEOUT,
     CHROME_CDP_HOST,
     CHROME_CDP_PORT,
+    CHROME_CDP_RECONNECT_DELAY_SECONDS,
     CHROME_DOWNLOAD_DIR,
     CHROME_DOWNLOAD_RETRIES,
     CHROME_DOWNLOAD_TIMEOUT,
@@ -41,6 +42,9 @@ from .config import (
     CHROME_TASKS_KEEP_TERMINAL,
     LOG_RETENTION_DAYS,
 )
+from .log import configure as configure_log
+from .log import logger
+from .naming import sanitize_filename, unique_path
 
 # 任务取消（任务书 §3）：CANCELLED 是终态，任务记录**保留**（绝不 remove）、
 # attempts 不因取消增加、claim_next 永不认领。
@@ -58,9 +62,6 @@ _CANCEL_SENTINEL = object()
 # 启动清扫孤儿 .crdownload 的最小「没人动过」时长（秒）。见 sweep_orphan_partials：
 # 刚写过的半成品可能是上一个 Agent 进程（Chrome 尚未退出）仍在写的，不能删。
 ORPHAN_PARTIAL_MIN_AGE_SECONDS = 600.0
-from .log import configure as configure_log
-from .log import logger
-from .naming import sanitize_filename, unique_path
 
 # Chrome 可执行文件候选（规格 5：默认路径 + 自动检测）
 _CHROME_CANDIDATES = (
@@ -490,6 +491,8 @@ async def _wait_begin_within_grace(cdp, deadline):
             return None, None
         event = await cdp.next_event(timeout=remaining)
         if event is None:
+            if not cdp.is_alive():
+                return None, None      # 连接没了，别在窗口里空转到 deadline
             continue
         params = event.get("params") or {}
         if event.get("method") == "Browser.downloadWillBegin":
@@ -549,6 +552,10 @@ async def run_download_attempt(cdp, url, download_dir, timeout,
             if event is _CANCEL_SENTINEL:
                 continue  # 取消处理只在循环顶部一处（此刻 cancel_event 已置位）
             if event is None:
+                if not cdp.is_alive():
+                    # 连接断了：当场失败转 RETRY_WAIT，别干等到 timeout——
+                    # 主循环会重连，重试那次就能接着下（旧实现要白等 30 分钟）
+                    return False, filename, None, "CDP 连接已断开（等待重连后重试）"
                 continue
             method = event.get("method")
             params = event.get("params") or {}
@@ -655,11 +662,38 @@ class ChromeCDPClient:
     async def close_tab(self, target_id):
         await self.command("Target.closeTarget", {"targetId": target_id})
 
+    def is_alive(self):
+        """连接是否还活着（接收循环还在跑）。
+
+        2026-09-10 补：旧实现只在启动时连一次，WS 断了之后整个进程生命周期
+        都不会再连——`next_event` 再也等不到事件，之后**每个**任务都只能干等
+        到超时（单次 30 分钟），一夜白跑。判活是稳态重连的前提。
+        """
+        return (self._ws is not None and self._recv_task is not None
+                and not self._recv_task.done())
+
     async def next_event(self, timeout):
+        """等下一个 CDP 事件；连接已死时**立即返回 None**（不等满 timeout）。
+
+        掉线时事件流会永久枯竭，若照旧干等满 timeout，一个中途断线的下载要
+        白等到超时才失败。这里把「等事件」与「接收循环」一起挂上去，谁先结束
+        用谁——接收循环结束=连接没了，立刻交回调用方去判活并快速失败。
+        队列里已经攒下的事件仍然优先返回，不会丢。
+        """
+        if self._recv_task is None:
+            return None          # 根本没连过 / 已关闭：不可能再有事件
+        get_task = asyncio.ensure_future(self._events.get())
         try:
-            return await asyncio.wait_for(self._events.get(), timeout)
-        except asyncio.TimeoutError:
-            return None
+            done, _pending = await asyncio.wait(
+                {get_task, self._recv_task}, timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not get_task.done():
+                get_task.cancel()
+            await asyncio.gather(get_task, return_exceptions=True)
+        if get_task in done:
+            return get_task.result()
+        return None
 
 
 def _http_get_json(url):
@@ -684,6 +718,44 @@ async def wait_for_cdp(host, port, timeout):
         if asyncio.get_event_loop().time() + 0.5 > deadline:
             return None
         await asyncio.sleep(0.5)
+
+
+async def ensure_cdp_client(client, binary, profile_dir, host, port,
+                            connect_timeout, proxy_server, download_dir):
+    """确保拿到一个**活着**的 CDP 客户端；掉线就重连。拿不到返回 None。
+
+    稳态守护（2026-09-10 补）：旧实现只在启动时连一次，WS 断了（Chrome 崩了 /
+    被关了 / 专用实例被清掉）之后整个进程生命周期都不会再连——`next_event`
+    再也等不到事件，之后每个任务都只能干等到超时（单次 30 分钟），一夜白跑。
+    现在主循环每圈先判活：断了就关掉旧客户端重连（专用 Chrome 还活着时
+    `ensure_chrome_cdp` 会直接复用它的 CDP，不用重新拉起 Chrome）。
+    """
+    if client is not None and client.is_alive():
+        return client
+    if client is not None:
+        logger.warning("⚠️ CDP 连接已断开，尝试重连…")
+        try:
+            await client.close()
+        except Exception:
+            pass
+    ws_url = await ensure_chrome_cdp(binary, profile_dir, host, port,
+                                     connect_timeout, proxy_server)
+    if not ws_url:
+        return None
+    new_client = ChromeCDPClient(ws_url)
+    try:
+        await new_client.connect()
+        await new_client.setup_download(download_dir)
+    except Exception as e:
+        logger.warning(f"CDP 重连失败：{e}")
+        try:
+            await new_client.close()
+        except Exception:
+            pass
+        return None
+    if client is not None:
+        logger.info("🟢 CDP 已重连（后续任务继续执行）")
+    return new_client
 
 
 async def ensure_chrome_cdp(binary, profile_dir, host, port,
@@ -938,18 +1010,14 @@ async def agent_main():
     if not binary:
         logger.error("❌ 未找到 Chrome 可执行文件，Agent 退出")
         return 1
-    ws_url = await ensure_chrome_cdp(
-        binary, CHROME_PROFILE_DIR, CHROME_CDP_HOST, CHROME_CDP_PORT,
-        CHROME_CDP_CONNECT_TIMEOUT, proxy_server=CHROME_PROXY_SERVER)
-    if not ws_url:
+    client = await ensure_cdp_client(
+        None, binary, CHROME_PROFILE_DIR, CHROME_CDP_HOST, CHROME_CDP_PORT,
+        CHROME_CDP_CONNECT_TIMEOUT, CHROME_PROXY_SERVER, CHROME_DOWNLOAD_DIR)
+    if client is None:
         logger.error(
             "❌ CDP 不可用（专用 Chrome 未能就绪），Agent 退出。"
             "未创建新的 Profile 目录以外的任何东西。")
         return 1
-
-    client = ChromeCDPClient(ws_url)
-    await client.connect()
-    await client.setup_download(CHROME_DOWNLOAD_DIR)
     logger.info(f"🟢 Chrome Agent 就绪：CDP 已连接，下载目录 "
                 f"{CHROME_DOWNLOAD_DIR}")
 
@@ -960,6 +1028,18 @@ async def agent_main():
     sweep_orphan_partials(CHROME_DOWNLOAD_DIR, tasks)
     try:
         while not stop.is_set():
+            if not client.is_alive():
+                # 稳态重连：Chrome 崩了/被关了不能把 Agent 变成只会超时的僵尸
+                client = await ensure_cdp_client(
+                    client, binary, CHROME_PROFILE_DIR, CHROME_CDP_HOST,
+                    CHROME_CDP_PORT, CHROME_CDP_CONNECT_TIMEOUT,
+                    CHROME_PROXY_SERVER, CHROME_DOWNLOAD_DIR)
+                if client is None:
+                    logger.warning(
+                        f"CDP 重连失败，{CHROME_CDP_RECONNECT_DELAY_SECONDS:.0f}s"
+                        " 后重试（Agent 保持运行）")
+                    await asyncio.sleep(CHROME_CDP_RECONNECT_DELAY_SECONDS)
+                    continue
             claim_new_requests(tasks, CHROME_REQUESTS_FILE)
             await process_pending_tasks(
                 client, tasks, CHROME_TASKS_FILE, CHROME_DOWNLOAD_DIR,

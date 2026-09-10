@@ -415,7 +415,9 @@ MENU_ACTIONS = (
     "find",
     "capf", "capf_add", "capf_del", "capf_test", "capf_reset", "capf_clear",
     # Chrome 任务（/chrome_tasks 的只读视图 + 每条任务一个 🛑 取消按钮）
-    "chrome_tasks", "chrome_cancel",
+    # 外加 Agent 启停与状态（此前只在命令面板里，按钮菜单够不着）
+    "chrome_tasks", "chrome_cancel", "chrome_start", "chrome_stop",
+    "chrome_status",
 )
 
 
@@ -837,6 +839,9 @@ CHROME_CANCEL_REQUESTS_FILE = os.path.join(
 # 「点开链接后隔几秒才开始下载」的站点（取消变成只改状态、文件照样落地），
 # 所以留 5s —— 代价只是这类取消多等几秒，换取真的把下载摁住。
 CHROME_CANCEL_GUID_GRACE_SECONDS = 5.0
+# CDP 重连失败后的重试间隔（秒）。Chrome 崩了/被关了，Agent 不能变成
+# 只会超时的僵尸：主循环每圈判活，断了就重连；重连不成按这个间隔再试。
+CHROME_CDP_RECONNECT_DELAY_SECONDS = 5.0
 # chrome_tasks.json 里保留的终态任务条数上限（成功/失败/取消）：只裁最老的，
 # 刚终结的任务必须留着——chrome_client 的 notify_loop 每 5s 才轮询一次通知。
 CHROME_TASKS_KEEP_TERMINAL = 200

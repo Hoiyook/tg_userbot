@@ -102,9 +102,14 @@ def chrome_menu_buttons(tasks):
             f"🛑 {icon} {tid[:8]} {chrome_task_short_name(task)}",
             encode_menu_data("chrome_cancel", tid))])
     rows.append([
-        Button.inline("🔄 刷新", encode_menu_data("chrome_tasks")),
-        Button.inline("🏠 返回主菜单", encode_menu_data("home")),
+        Button.inline("▶️ 启动 Agent", encode_menu_data("chrome_start")),
+        Button.inline("⏹ 停止 Agent", encode_menu_data("chrome_stop")),
     ])
+    rows.append([
+        Button.inline("🔄 刷新", encode_menu_data("chrome_tasks")),
+        Button.inline("ℹ️ Agent 状态", encode_menu_data("chrome_status")),
+    ])
+    rows.append([Button.inline("🏠 返回主菜单", encode_menu_data("home"))])
     return rows
 
 

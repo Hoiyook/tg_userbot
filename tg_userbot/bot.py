@@ -102,6 +102,16 @@ def open_input_window(kind):
         state.CAPTION_INPUT_MODE = kind
 
 
+def _chrome_view_buttons():
+    """Chrome 视图的按钮（按当前可取消任务现生成）——菜单里四处复用。"""
+    return menu.chrome_menu_buttons(chrome_client.load_cancelable_view()[1])
+
+
+def _chrome_body_sep():
+    """在回执/状态之后接上当前任务列表，省一次「返回→再进」。"""
+    return "\n\n──────\n\n" + chrome_client.load_cancelable_view()[0]
+
+
 async def handle_menu_action(action, arg, event):
     """按按钮动作执行并返回 (新文本, 新按钮)；返回 (None, None) 表示不改动消息。"""
     if action == "home":
@@ -158,8 +168,18 @@ async def handle_menu_action(action, arg, event):
         return body, menu.chrome_menu_buttons(items)
     if action == "chrome_cancel":
         _ok, message = chrome_client.request_cancel(arg or "")
-        body, items = chrome_client.load_cancelable_view()
-        return f"{message}\n\n──────\n\n{body}", menu.chrome_menu_buttons(items)
+        return f"{message}{_chrome_body_sep()}", _chrome_view_buttons()
+    if action == "chrome_status":
+        return await chrome_client.status_view(), _chrome_view_buttons()
+    if action == "chrome_start":
+        # 启动要等 Agent 真起来（最多 15s），按钮会卡一下再刷新视图
+        message = await chrome_client.start_view()
+        return f"{message}{_chrome_body_sep()}", _chrome_view_buttons()
+    if action == "chrome_stop":
+        stopped = await chrome_client.stop_view()
+        head = ("🤖 Chrome Agent 已停止\n\nChrome（含专用实例）保持运行，不受影响。"
+                if stopped else "ℹ️ Chrome Agent 未在运行")
+        return f"{head}{_chrome_body_sep()}", _chrome_view_buttons()
     if action == "cd2":
         return await cd2.cd2_start_or_status(), menu.back_home_buttons()
     if action == "cd2_stop":

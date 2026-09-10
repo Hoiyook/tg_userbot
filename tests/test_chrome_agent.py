@@ -347,6 +347,10 @@ class FakeCDP:
         self.commands.append((method, params))
         return {}
 
+    def is_alive(self):
+        """连接判活（真客户端按 WS/接收循环判定）；假客户端默认活着。"""
+        return True
+
 
 class CDPEventAttributionTest(unittest.IsolatedAsyncioTestCase):
     """run_download_attempt：依据 CDP 下载事件判定 completed/canceled/超时
@@ -1090,6 +1094,171 @@ class CleanPartialTest(unittest.TestCase):
         stray = self._touch("stray.zip.crdownload")
         chrome_agent.clean_partial_download(self.root, task, filename=None)
         self.assertTrue(os.path.exists(stray))
+
+
+class _EndingWS:
+    """WebSocket 替身：消息吐完（或一开始就空）→ 接收循环自然退出。
+
+    这正是「Chrome 崩了 / 专用实例被关掉」时真实 WS 的样子。
+    """
+
+    def __init__(self, messages=()):
+        self._messages = list(messages)
+        self.sent = []
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._messages:
+            raise StopAsyncIteration
+        return self._messages.pop(0)
+
+    async def send(self, data):
+        self.sent.append(data)
+
+    async def close(self):
+        pass
+
+
+class CDPLivenessTest(unittest.IsolatedAsyncioTestCase):
+    """CDP 判活与「断线立刻交回」（旧实现断了之后整个进程生命周期都不再连）。"""
+
+    def _client(self):
+        return chrome_agent.ChromeCDPClient("ws://127.0.0.1:1/devtools/browser/x")
+
+    async def test_not_connected_is_dead(self):
+        self.assertFalse(self._client().is_alive())
+
+    async def test_next_event_returns_promptly_when_dead(self):
+        """断线时不能干等满 timeout——否则一次断线要白等 30 分钟才失败。"""
+        start = time.monotonic()
+        self.assertIsNone(await self._client().next_event(timeout=30))
+        self.assertLess(time.monotonic() - start, 1.0)
+
+    async def test_recv_loop_death_marks_client_dead(self):
+        with mock.patch("websockets.connect",
+                        mock.AsyncMock(return_value=_EndingWS())):
+            client = self._client()
+            await client.connect()
+            self.assertTrue(client.is_alive())
+            await asyncio.sleep(0)      # 让接收循环跑到结束（流已空）
+            await asyncio.sleep(0)
+            self.assertFalse(client.is_alive())
+            # 断线后取事件同样立即返回，而不是等满 timeout
+            start = time.monotonic()
+            self.assertIsNone(await client.next_event(timeout=30))
+            self.assertLess(time.monotonic() - start, 1.0)
+
+    async def test_close_marks_dead(self):
+        with mock.patch("websockets.connect",
+                        mock.AsyncMock(return_value=_EndingWS())):
+            client = self._client()
+            await client.connect()
+            await client.close()
+            self.assertFalse(client.is_alive())
+
+
+class _DeadCDP(FakeCDP):
+    """连接已死：取事件立刻返回 None，判活为 False。"""
+
+    def __init__(self):
+        super().__init__([])
+
+    def is_alive(self):
+        return False
+
+    async def next_event(self, timeout):
+        return None
+
+
+class CDPDeadFastFailTest(unittest.IsolatedAsyncioTestCase):
+    """断线时下载当场失败转 RETRY_WAIT（好让主循环重连后接着跑）。"""
+
+    def setUp(self):
+        self.dl_dir = os.path.join(_TMP, "chrome_dl_dead")
+        os.makedirs(self.dl_dir, exist_ok=True)
+        self.tasks_path = os.path.join(_TMP, "chrome_tasks_dead.json")
+        if os.path.exists(self.tasks_path):
+            os.remove(self.tasks_path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dl_dir, ignore_errors=True)
+        if os.path.exists(self.tasks_path):
+            os.remove(self.tasks_path)
+
+    async def test_attempt_fails_fast_with_clear_error(self):
+        start = time.monotonic()
+        ok, filename, size, error = await chrome_agent.run_download_attempt(
+            _DeadCDP(), "https://a.com/x.zip", self.dl_dir, timeout=30)
+        self.assertFalse(ok)
+        self.assertIn("CDP 连接已断开", error)
+        self.assertLess(time.monotonic() - start, 1.0)   # 不是等满 30s
+
+    async def test_dead_cdp_failure_enters_retry_wait_not_failed(self):
+        """必须留在 RETRY_WAIT（不是 FAILED）：重连后这一轮要能接着跑。"""
+        task = chrome_agent.create_task("https://a.com/x.zip", "dead1")
+        await chrome_agent.process_pending_tasks(
+            _DeadCDP(), [task], self.tasks_path, self.dl_dir,
+            timeout=5, retries=3, wait_seconds=30)
+        self.assertEqual(task["status"], "RETRY_WAIT")
+        self.assertEqual(task["attempts"], 1)
+
+
+class EnsureCdpClientTest(unittest.IsolatedAsyncioTestCase):
+    """ensure_cdp_client：活着复用、断了重连、连不上返回 None（不退出进程）。"""
+
+    def _args(self):
+        return ("bin", "profile", "127.0.0.1", 9222, 1.0, None, _TMP)
+
+    async def test_alive_client_is_reused(self):
+        client = mock.MagicMock()
+        client.is_alive.return_value = True
+        out = await chrome_agent.ensure_cdp_client(client, *self._args())
+        self.assertIs(out, client)
+
+    async def test_dead_client_is_replaced(self):
+        client = mock.MagicMock()
+        client.is_alive.return_value = False
+        client.close = mock.AsyncMock()
+        fresh = mock.MagicMock()
+        fresh.connect = mock.AsyncMock()
+        fresh.setup_download = mock.AsyncMock()
+        with mock.patch.object(chrome_agent, "ensure_chrome_cdp",
+                               mock.AsyncMock(return_value="ws://x")), \
+                mock.patch.object(chrome_agent, "ChromeCDPClient",
+                                  return_value=fresh):
+            out = await chrome_agent.ensure_cdp_client(client, *self._args())
+        self.assertIs(out, fresh)
+        client.close.assert_awaited()          # 旧的先关掉
+        fresh.connect.assert_awaited()
+        fresh.setup_download.assert_awaited()  # 下载目录行为要重新设
+
+    async def test_reconnect_failure_returns_none(self):
+        client = mock.MagicMock()
+        client.is_alive.return_value = False
+        client.close = mock.AsyncMock()
+        with mock.patch.object(chrome_agent, "ensure_chrome_cdp",
+                               mock.AsyncMock(return_value=None)):
+            self.assertIsNone(
+                await chrome_agent.ensure_cdp_client(client, *self._args()))
+
+    async def test_connect_error_is_swallowed(self):
+        """连上了 WS 但握手失败（Chrome 正在关）不能把 Agent 带崩。"""
+        client = mock.MagicMock()
+        client.is_alive.return_value = False
+        client.close = mock.AsyncMock()
+        failed = mock.MagicMock()
+        failed.connect = mock.AsyncMock(side_effect=OSError("connection reset"))
+        failed.close = mock.AsyncMock()
+        with mock.patch.object(chrome_agent, "ensure_chrome_cdp",
+                               mock.AsyncMock(return_value="ws://x")), \
+                mock.patch.object(chrome_agent, "ChromeCDPClient",
+                                  return_value=failed):
+            self.assertIsNone(
+                await chrome_agent.ensure_cdp_client(client, *self._args()))
+        failed.close.assert_awaited()
 
 
 class TrimTerminalTasksTest(unittest.TestCase):
