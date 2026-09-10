@@ -475,6 +475,109 @@ class BotCleanupPlanTest(unittest.TestCase):
         self.assertEqual(to_delete, [])
         self.assertEqual(to_keep, set())
 
+class ChromeMenuTest(unittest.TestCase):
+    """Chrome 任务菜单入口与按钮（按钮直接带 task_id，绕开序号漂移）。
+
+    2026-09-10 验收反馈：/chrome_tasks 与 /chrome_cancel 只注册进了 Telegram
+    的 `/` 命令面板（BOT_COMMANDS），按钮菜单里压根没有 Chrome 这一块。
+    """
+
+    def test_main_menu_has_chrome_entry(self):
+        rows = menu.main_menu_buttons()
+        texts = [b.text for row in rows for b in row]
+        actions = [menu.parse_menu_data(b.data)[0] for row in rows for b in row]
+        self.assertTrue(any("Chrome" in t for t in texts), texts)
+        self.assertIn("chrome_tasks", actions)
+
+    def test_actions_registered(self):
+        """不登记就会被 encode_menu_data 拦下（它会校验 MENU_ACTIONS）。"""
+        for action in ("chrome_tasks", "chrome_cancel"):
+            self.assertIn(action, config.MENU_ACTIONS)
+
+    def test_per_task_cancel_button_carries_task_id(self):
+        tasks = [{"task_id": "abcd1234ef", "url": "https://a.com/dir/x.zip?a=1",
+                  "status": "RUNNING"}]
+        rows = menu.chrome_menu_buttons(tasks)
+        action, arg = menu.parse_menu_data(rows[0][0].data)
+        self.assertEqual(action, "chrome_cancel")
+        self.assertEqual(arg, "abcd1234ef")      # 带的是 ID，不是序号
+        self.assertIn("🛑", rows[0][0].text)
+        self.assertIn("x.zip", rows[0][0].text)  # 短名去掉了 query
+        self.assertNotIn("？", rows[0][0].text)
+
+    def test_empty_list_still_has_refresh_and_home(self):
+        rows = menu.chrome_menu_buttons([])
+        actions = [menu.parse_menu_data(b.data)[0] for row in rows for b in row]
+        self.assertEqual(actions, ["chrome_tasks", "home"])
+
+    def test_short_name_is_url_tail(self):
+        self.assertEqual(
+            menu.chrome_task_short_name({"url": "https://a.com/b/x.zip?a=1"}),
+            "x.zip")
+        self.assertEqual(menu.chrome_task_short_name({}), "")
+        self.assertEqual(menu.chrome_task_short_name({"url": "https://a.com/"}),
+                         "a.com")
+
+
+class ChromeMenuFlowTest(unittest.IsolatedAsyncioTestCase):
+    """菜单动作：任务视图渲染 + 点 🛑 真的写出取消请求。"""
+
+    async def asyncSetUp(self):
+        from tg_userbot import chrome_agent, chrome_client
+        self.chrome_agent = chrome_agent
+        self.chrome_client = chrome_client
+        self.tasks_path = os.path.join(_TMP, "chrome_tasks_menu_flow.json")
+        self.cancel_path = os.path.join(_TMP, "chrome_cancel_menu_flow.json")
+        for path in (self.tasks_path, self.cancel_path):
+            if os.path.exists(path):
+                os.remove(path)
+        for name, value in (("CHROME_TASKS_FILE", self.tasks_path),
+                            ("CHROME_CANCEL_REQUESTS_FILE", self.cancel_path),
+                            ("agent_running", lambda: True)):
+            patcher = mock.patch.object(chrome_client, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for path in (self.tasks_path, self.cancel_path):
+            if os.path.exists(path):
+                os.remove(path)
+
+    async def _press(self, action, arg=None):
+        return await bot.handle_menu_action(action, arg, mock.MagicMock())
+
+    async def test_view_lists_cancelable_tasks(self):
+        task = self.chrome_agent.create_task("https://a.com/x.zip", "menu1")
+        task["status"] = "RUNNING"
+        self.chrome_agent.save_tasks([task], self.tasks_path)
+        body, buttons = await self._press("chrome_tasks")
+        self.assertIn("进行中", body)
+        self.assertIn("menu1", body)
+        actions = [menu.parse_menu_data(b.data)[0]
+                   for row in buttons for b in row]
+        self.assertIn("chrome_cancel", actions)
+        self.assertIn("home", actions)
+
+    async def test_cancel_button_writes_request(self):
+        task = self.chrome_agent.create_task("https://a.com/x.zip", "menu2")
+        task["status"] = "PENDING"
+        self.chrome_agent.save_tasks([task], self.tasks_path)
+        body, buttons = await self._press("chrome_cancel", "menu2")
+        self.assertIn("取消请求已提交", body)
+        self.chrome_agent.save_tasks([task], self.tasks_path)
+        reqs = self.chrome_client.load_cancellations(self.cancel_path)
+        self.assertEqual([r["task_id"] for r in reqs], ["menu2"])
+
+    async def test_terminal_task_button_reports_instead_of_cancelling(self):
+        task = self.chrome_agent.create_task("https://a.com/x.zip", "menu3")
+        self.chrome_agent.finish_success(task, "x.zip", 1)
+        self.chrome_agent.save_tasks([task], self.tasks_path)
+        body, _buttons = await self._press("chrome_cancel", "menu3")
+        self.assertIn("已经完成，无法取消", body)
+        self.assertFalse(os.path.exists(self.cancel_path))
+
+
 class FindMenuEntryTest(unittest.TestCase):
     """主菜单带【🔍 查询】按钮，动作注册为 find（2026-09-08 媒体查询）。"""
 

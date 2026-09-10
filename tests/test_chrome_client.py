@@ -974,6 +974,16 @@ class ChromeCancelFlowTest(unittest.IsolatedAsyncioTestCase):
             await self._run("/chrome_cancel 1")
         self.assertIn("取消请求写入失败", self.replies[0])
 
+    async def test_unknown_task_id_reports_gone(self):
+        """菜单按钮可能带着一个已被裁掉的旧 task_id（历史终态会裁剪）。"""
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            self._patch(stack)
+            self._seed(self._task("hhhh7777", "PENDING"))
+            ok, msg = chrome_client.request_cancel("nonexistent")
+        self.assertFalse(ok)
+        self.assertIn("任务已不存在", msg)
+
     async def test_agent_down_note(self):
         """Agent 没跑时照样登记请求，但如实告知何时生效。"""
         import contextlib

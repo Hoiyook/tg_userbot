@@ -24,6 +24,7 @@ from . import dedup
 from . import thread
 from . import whitelist
 from . import cleanup
+from . import chrome_client
 from . import cd2
 from . import stats
 from . import finder
@@ -150,6 +151,15 @@ async def handle_menu_action(action, arg, event):
     if action == "clean":
         count = cleanup.clean_temp_files()
         return f"🧹 清理完成，共删除 {count} 个临时文件", menu.back_home_buttons()
+    if action == "chrome_tasks":
+        # /chrome_tasks 的菜单形态：同一份正文 + 每条任务一个 🛑（按钮带
+        # task_id，点一下就取消，不需要用户数序号）
+        body, items = chrome_client.load_cancelable_view()
+        return body, menu.chrome_menu_buttons(items)
+    if action == "chrome_cancel":
+        _ok, message = chrome_client.request_cancel(arg or "")
+        body, items = chrome_client.load_cancelable_view()
+        return f"{message}\n\n──────\n\n{body}", menu.chrome_menu_buttons(items)
     if action == "cd2":
         return await cd2.cd2_start_or_status(), menu.back_home_buttons()
     if action == "cd2_stop":

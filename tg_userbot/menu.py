@@ -82,7 +82,37 @@ def main_menu_buttons():
          Button.inline("📊 台账", encode_menu_data("stats"))],
         [Button.inline("🔍 查询", encode_menu_data("find")),
          Button.inline("🧹 Caption 清洗", encode_menu_data("capf"))],
+        [Button.inline("🌐 Chrome 任务", encode_menu_data("chrome_tasks"))],
     ]
+
+
+def chrome_menu_buttons(tasks):
+    """Chrome 任务视图按钮：每条可取消任务一个 🛑 按钮 + 刷新 + 返回。
+
+    🛑 **直接带 task_id**（不是序号）：按钮是一次点击，不存在「看到列表之后
+    列表又变了」的漂移，用户也不用去数序号——这正是 /chrome_cancel 序号形态
+    的已知坑，菜单路径天然绕开它。标签里带短 ID 与文件名尾段，好认人。
+    """
+    rows = []
+    for task in tasks:
+        tid = str(task.get("task_id") or "")
+        icon = {"RUNNING": "🟢", "PENDING": "⏳",
+                "RETRY_WAIT": "⏳"}.get(task.get("status"), "•")
+        rows.append([Button.inline(
+            f"🛑 {icon} {tid[:8]} {chrome_task_short_name(task)}",
+            encode_menu_data("chrome_cancel", tid))])
+    rows.append([
+        Button.inline("🔄 刷新", encode_menu_data("chrome_tasks")),
+        Button.inline("🏠 返回主菜单", encode_menu_data("home")),
+    ])
+    return rows
+
+
+def chrome_task_short_name(task, limit=20):
+    """任务按钮上的短名：URL 最后一段去掉 query，太长就截（纯函数）。"""
+    url = str((task or {}).get("url") or "")
+    tail = url.split("?")[0].rstrip("/").rsplit("/", 1)[-1] or url
+    return tail[:limit]
 
 
 def caption_filter_menu_buttons():

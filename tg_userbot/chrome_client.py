@@ -615,37 +615,53 @@ def _chrome_version(binary):
         return None
 
 
-async def _handle_cancel(event, arg):
-    """`/chrome_cancel <序号>`（任务书 §5）：序号对应 /chrome_tasks 的列表。
+def request_cancel(task_id):
+    """按 task_id 提交取消请求，返回 `(ok, 回执文案)`。
 
-    列表是文件快照，用户看到列表到按下取消之间任务可能已经跑完——写请求
-    前复核一次状态，已经是终态就如实回话，绝不假装取消成功（§14）。
+    `/chrome_cancel`（先把序号/ID 解析成 task_id）与菜单里每条任务的 🛑 按钮
+    （本来就带 task_id）共用这一个服务函数——终态复核、写失败处理、回执文案
+    必须两边一致，否则迟早只改一边。
+
+    写请求前**重新读一次任务文件**复核状态：用户看到列表到按下取消之间任务
+    可能已经跑完了，这时要如实回话，绝不假装取消成功（§14）。
     """
+    task = chrome_agent.get_task(
+        chrome_agent.load_tasks(CHROME_TASKS_FILE), task_id)
+    if task is None:
+        return False, "❌ 任务已不存在，请刷新列表。"
+    status = task.get("status")
+    if status == "SUCCESS":
+        return False, "ℹ️ 任务已经完成，无法取消。"
+    if status == "FAILED":
+        return False, "ℹ️ 任务已经失败，无法取消。"
+    if status == "CANCELLED":
+        return False, "ℹ️ 任务已经取消。"
+    if not add_cancellation(task_id):
+        # 单向通道：写失败必须如实说，否则用户以为取消了、实际没有任何动作
+        logger.warning(f"取消请求写入失败，任务 [{task_id[:8]}]")
+        return False, "❌ 取消请求写入失败，请重试。"
+    logger.info(f"提交取消请求 → 任务 [{task_id[:8]}] {status}")
+    return True, cancel_ok_text(task, agent_up=agent_running())
+
+
+def load_cancelable_view():
+    """菜单与命令共用：读任务文件 → `(正文, 可取消任务列表)`。
+
+    正文与 `/chrome_tasks` 逐字一致，列表供菜单按任务生成 🛑 按钮。
+    """
+    tasks = chrome_agent.load_tasks(CHROME_TASKS_FILE)
+    return tasks_text(tasks), cancelable_tasks(tasks)
+
+
+async def _handle_cancel(event, arg):
+    """`/chrome_cancel <序号|task_id>`（任务书 §5）：写到 request_cancel 里。"""
     task, error = resolve_cancel_target(
         chrome_agent.load_tasks(CHROME_TASKS_FILE), arg)
     if error:
         await event.reply(error)
         return
-    fresh = chrome_agent.get_task(
-        chrome_agent.load_tasks(CHROME_TASKS_FILE), task.get("task_id"))
-    status = (fresh or task).get("status")
-    if status == "SUCCESS":
-        await event.reply("ℹ️ 任务已经完成，无法取消。")
-        return
-    if status == "FAILED":
-        await event.reply("ℹ️ 任务已经失败，无法取消。")
-        return
-    if status == "CANCELLED":
-        await event.reply("ℹ️ 任务已经取消。")
-        return
-    if not add_cancellation(task["task_id"]):
-        # 单向通道：写失败必须如实说，否则用户以为取消了、实际没有任何动作
-        await event.reply("❌ 取消请求写入失败，请重试。")
-        logger.warning(f"取消请求写入失败，任务 [{task['task_id'][:8]}]")
-        return
-    await event.reply(cancel_ok_text(task, agent_up=agent_running()))
-    logger.info(f"执行命令：/chrome_cancel {arg} → 任务 "
-                f"[{task['task_id'][:8]}] {status}")
+    _ok, message = request_cancel(task["task_id"])
+    await event.reply(message)
 
 
 async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):

@@ -414,6 +414,8 @@ MENU_ACTIONS = (
     "dedup", "dedup_toggle",
     "find",
     "capf", "capf_add", "capf_del", "capf_test", "capf_reset", "capf_clear",
+    # Chrome 任务（/chrome_tasks 的只读视图 + 每条任务一个 🛑 取消按钮）
+    "chrome_tasks", "chrome_cancel",
 )
 
 
