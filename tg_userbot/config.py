@@ -317,6 +317,19 @@ LISTEN_STARTUP_DELAY_SECONDS = 20
 ORIGIN_MAX_HOPS = 5
 # 取父消息的网络超时（秒）：telethon 请求没有读超时，僵死连接会挂住入队路径。
 ORIGIN_FETCH_TIMEOUT_SECONDS = 30
+# --- 评论跟进（2026-09-12）---
+# 命中标签的帖子会进「关注列表」，之后按天跟进它的评论区并取回新出现的媒体
+# 评论（频道主/成员常把差分放在评论区）。**不是**扫群全量：每帖每次只发 1 次
+# GetReplies 请求，只为命中标签的那几条帖子服务。
+LISTEN_FOLLOW_INTERVAL_SECONDS = 24 * 3600   # 跟进周期：一天一次
+LISTEN_FOLLOW_TTL_SECONDS = 15 * 24 * 3600   # 关注有效期：15 天
+LISTEN_FOLLOW_MAX = 500                      # 关注列表上限（满了不再新增并告警）
+LISTEN_FOLLOW_COMMENTS_LIMIT = 100           # 单帖单次最多取多少条评论
+# 每帖之间的节流（秒）：500 条关注连起来发就是个突发，攒成「一天一次」的
+# 本意是**摊开**，不能变成「一分钟 500 次」。3 秒是用户定的保守值——满额
+# 500 条一轮 ≈ 25 分钟，对每天一次的任务毫无压力，但把峰值压到 20 次/分钟。
+LISTEN_FOLLOW_MIN_INTERVAL_SECONDS = 3.0
+LISTEN_FOLLOW_KEEP_EXPIRED = 2000            # 失效记录保留条数（裁剪，防无限增长）
 LISTEN_NOTIFY_PREFIX = "📡 标签监听"
 LISTEN_MATCH_PREFIX = "🏷 标签监听"
 # 汇报开关：标签监听扫描命中/失败的事件通知（空扫不发，避免定期刷屏）。
@@ -342,7 +355,7 @@ REPORT_LISTEN = True
 RUNTIME_DB_FILE = os.environ.get(
     "TG_RUNTIME_DB", os.path.join(RUNTIME_DIR, "tg_userbot.db")
 )
-RUNTIME_DB_SCHEMA_VERSION = 1
+RUNTIME_DB_SCHEMA_VERSION = 2   # v2：+ listener_follows（评论跟进关注列表）
 # 单条写事务等锁的上限（毫秒）与 SQLITE_BUSY/LOCKED 的有限重试（规格 §39：
 # 记日志 → 短暂等待 → 有限次数重试，绝不无限循环、绝不因此崩掉主进程）。
 RUNTIME_DB_BUSY_TIMEOUT_MS = 5000

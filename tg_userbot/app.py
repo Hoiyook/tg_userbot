@@ -366,8 +366,14 @@ async def _listener_loop():
     await asyncio.sleep(LISTEN_STARTUP_DELAY_SECONDS)
     while True:
         try:
-            if state.LISTEN_ENABLED and state.LISTEN_RULES:
-                await listener.scan_all()
+            if state.LISTEN_ENABLED:
+                if state.LISTEN_RULES:
+                    await listener.scan_all()
+                # 评论跟进：命中标签的帖子按天跟进它的评论区。**节奏由 DB 把关**
+                # ——list_due_follows 只返回「距上次检查 ≥ LISTEN_FOLLOW_INTERVAL」
+                # 的帖子，所以这里每轮（30 分钟）都调也无妨：没到期就一条都不查、
+                # 不产日志、不发请求。跟随总开关（关掉监听就一并停）。
+                await listener.follow_scan()
         except (KeyboardInterrupt, asyncio.CancelledError):
             raise
         except Exception as e:

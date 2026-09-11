@@ -62,6 +62,11 @@ EV_FAILED = "FAILED"
 EV_CANCELLED = "CANCELLED"
 EV_LEASE_EXPIRED = "LEASE_EXPIRED"
 
+# 关注列表状态。**过期是「置为失效」而不是删除**——保留下来才能回答
+# 「这条帖子到底有没有等到讨论串」，也是排查时的证据。
+FOLLOW_ACTIVE = "ACTIVE"
+FOLLOW_EXPIRED = "EXPIRED"
+
 
 class DbUnavailable(RuntimeError):
     """Runtime DB 本次操作不可用（等锁超限 / 非 BUSY 类 SQL 错误）。
@@ -133,6 +138,36 @@ _SCHEMA = (
     """
     CREATE INDEX IF NOT EXISTS idx_task_events_task
     ON task_events (task_id, id)
+    """,
+    # 评论跟进：命中标签的帖子进关注列表，之后按天跟进它的评论区。
+    # caption / post_date / source_name 是**建列表时的快照**——后面十几次检查
+    # 直接用，不再回频道取一次原帖（原帖被编辑/删除也不影响已定下的命名）。
+    """
+    CREATE TABLE IF NOT EXISTS listener_follows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id INTEGER NOT NULL,
+        post_id INTEGER NOT NULL,
+        source_chat_id INTEGER,
+        caption TEXT,
+        post_date TEXT,
+        source_name TEXT,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        checks INTEGER NOT NULL DEFAULT 0,
+        last_checked_at INTEGER,
+        last_error TEXT
+    )
+    """,
+    # 同一个帖子只关注一次（重跑/重启都不会插出第二条）
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_listener_follow_unique
+    ON listener_follows (channel_id, post_id)
+    """,
+    # 取到期关注用：(status, last_checked_at)
+    """
+    CREATE INDEX IF NOT EXISTS idx_listener_follow_due
+    ON listener_follows (status, last_checked_at)
     """,
 )
 
@@ -376,6 +411,10 @@ def migrate() -> int:
     if version < 1:
         # v0 → v1：本模块的初始 schema（上面的 CREATE 已经覆盖）
         logger.info("🗄 Runtime DB 迁移：建立 v1 schema")
+    if 1 <= version < 2:
+        # v1 → v2：新增 listener_follows（评论跟进关注列表）。纯建表，没有数据
+        # 迁移——旧库补上这张空表即可，所以上面的 CREATE IF NOT EXISTS 就够了。
+        logger.info("🗄 Runtime DB 迁移：v2（+ listener_follows 关注列表）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -817,3 +856,132 @@ def get_listener_stats(since=None, now=None):
         out[name] = out.get(name, 0) + int(row["n"])
     out["total"] = sum(out.values())
     return out
+
+
+# ============================================================
+# 评论跟进：关注列表（命中标签的帖子 → 之后按天跟进它的评论区）
+# ============================================================
+def add_listener_follow(channel_id, post_id, source_chat_id=None,
+                        caption=None, post_date=None, source_name=None,
+                        ttl_seconds=None, max_active=None, now=None):
+    """把一条帖子加入关注列表；返回新记录 id，重复或已满返回 None。
+
+    ``caption`` / ``post_date`` / ``source_name`` 是**建列表时的快照**：后面十
+    几次检查直接用它们，不再回频道取原帖。原帖日后被编辑/删除，已定下的命名
+    也不会漂移（与队列记录的 parent_* 快照同一条纪律）。
+
+    上限按**活跃**条数算（失效的不占额度）；满了只记日志返回 None——这是背压，
+    不是错误，Scanner 照常建它的下载任务。
+    """
+    now = _now(now)
+    ttl = int(config.LISTEN_FOLLOW_TTL_SECONDS if ttl_seconds is None
+              else ttl_seconds)
+    cap = int(config.LISTEN_FOLLOW_MAX if max_active is None else max_active)
+
+    def do(conn):
+        active = int(_execute(
+            conn, "SELECT COUNT(*) FROM listener_follows WHERE status=?",
+            (FOLLOW_ACTIVE,)).fetchone()[0])
+        if active >= cap:
+            logger.warning(
+                f"📡 关注列表已达上限 {cap}（当前 {active}），"
+                f"帖子 {channel_id}/{post_id} 不再加入跟进"
+            )
+            return None
+        cur = _execute(
+            conn,
+            "INSERT OR IGNORE INTO listener_follows "
+            "(channel_id, post_id, source_chat_id, caption, post_date, "
+            " source_name, status, created_at, expires_at, checks) "
+            "VALUES(?,?,?,?,?,?,?,?,?,0)",
+            (int(channel_id), int(post_id),
+             None if source_chat_id is None else int(source_chat_id),
+             caption, post_date, source_name,
+             FOLLOW_ACTIVE, now, now + ttl))
+        return cur.lastrowid if cur.rowcount else None
+
+    return _write(do, "加入关注列表")
+
+
+def list_due_follows(interval_seconds=None, limit=None, now=None):
+    """取到期的活跃关注（从未检查过、或距上次检查已超过间隔）。"""
+    now = _now(now)
+    gap = int(config.LISTEN_FOLLOW_INTERVAL_SECONDS
+              if interval_seconds is None else interval_seconds)
+    sql = ("SELECT * FROM listener_follows WHERE status=? "
+           "AND (last_checked_at IS NULL OR last_checked_at<=?) "
+           "ORDER BY last_checked_at IS NOT NULL, last_checked_at, id")
+    params = [FOLLOW_ACTIVE, now - gap]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    return _read(lambda c: [dict(r) for r in _execute(c, sql, params).fetchall()],
+                 "读到期关注")
+
+
+def touch_listener_follow(follow_id, error=None, now=None):
+    """记一次检查：checks+1、刷 last_checked_at、留最后一次错误文案。"""
+    now = _now(now)
+    return _write(lambda c: _execute(
+        c, "UPDATE listener_follows SET last_checked_at=?, checks=checks+1, "
+           "last_error=? WHERE id=?",
+        (now, (str(error)[:500] if error else None), int(follow_id))),
+        "更新关注检查时间")
+
+
+def expire_listener_follows(now=None):
+    """把过期的活跃关注**置为失效**（不删除——留下「到底等到没有」的证据）。
+
+    返回置失效的条数（调用方要把它报进统计里，所以必须回 rowcount，不能回
+    Cursor）。
+    """
+    now = _now(now)
+
+    def do(conn):
+        return _execute(
+            conn,
+            "UPDATE listener_follows SET status=? WHERE status=? AND expires_at<=?",
+            (FOLLOW_EXPIRED, FOLLOW_ACTIVE, now)).rowcount
+
+    return _write(do, "关注列表置失效")
+
+
+def trim_expired_follows(keep=None):
+    """裁剪失效记录（保留最新 keep 条），防表无限增长。返回删除条数。"""
+    keep = int(config.LISTEN_FOLLOW_KEEP_EXPIRED if keep is None else keep)
+
+    def do(conn):
+        return _execute(
+            conn,
+            "DELETE FROM listener_follows WHERE status=? AND id NOT IN "
+            "(SELECT id FROM listener_follows WHERE status=? "
+            " ORDER BY id DESC LIMIT ?)",
+            (FOLLOW_EXPIRED, FOLLOW_EXPIRED, keep)).rowcount
+
+    return _write(do, "裁剪失效关注")
+
+
+def list_listener_follows(status=None, limit=None):
+    """列出关注记录（视图/排查用）。"""
+    sql = "SELECT * FROM listener_follows"
+    params = []
+    if status is not None:
+        sql += " WHERE status=?"
+        params.append(status)
+    sql += " ORDER BY id DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    return _read(lambda c: [dict(r) for r in _execute(c, sql, params).fetchall()],
+                 "读关注列表")
+
+
+def count_listener_follows(status=None):
+    if status is None:
+        row = _read(lambda c: _execute(
+            c, "SELECT COUNT(*) FROM listener_follows").fetchone(), "统计关注")
+    else:
+        row = _read(lambda c: _execute(
+            c, "SELECT COUNT(*) FROM listener_follows WHERE status=?",
+            (status,)).fetchone(), "统计关注")
+    return int(row[0])

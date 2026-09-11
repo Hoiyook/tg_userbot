@@ -50,6 +50,8 @@ import time
 from datetime import datetime
 
 from telethon import Button
+from telethon.errors import MsgIdInvalidError
+from telethon.tl.functions.messages import GetRepliesRequest
 from telethon.utils import get_peer_id
 
 from . import config
@@ -69,7 +71,7 @@ from .config import (
     LISTEN_NOTIFY_PREFIX,
 )
 from .log import logger
-from .naming import pick_group_caption_text
+from .naming import parse_date, pick_group_caption_text
 from .sources import (
     entity_display_name,
     is_channel_mirror,
@@ -901,6 +903,11 @@ async def _scan_chat(chat_id, rules):
                     f"标签 {' '.join(sorted(hits))} → 建任务 {len(keys)} 条"
                     f"（{'整组 ' + str(len(media)) + ' 个成员' if gid else '单条'}）"
                 )
+                # 命中过的帖子进关注列表：评论区里的差分是**帖子发布之后**才
+                # 出现的，跟进靠 follow_scan 按天做。快照存 caption/日期/目录，
+                # 之后十几次检查都不必再回频道取原帖。
+                # 满额只是不再跟进（记日志），**绝不影响上面刚建好的下载任务**。
+                _add_follow_from_scan(chat_id, anchor, text, origin, media[0])
         processed_upto = max(processed_upto, unit_max_id)
 
     ids = runtime_db.enqueue_listener_tasks(
@@ -1039,6 +1046,175 @@ async def _notify_scan(totals):
 
 
 # ============================================================
+# 评论跟进：命中标签的帖子 → 之后按天跟进它的评论区
+#
+# 起因：频道主常把差分图放在**评论区**，而评论区在讨论组里、监听频道的
+# Scanner 看不到；把整个群加白名单又会全盘接收（风控 + 不需要）。所以只跟进
+# 「命中标签的那几条帖子」——每帖每次 1 次 GetReplies。
+#
+# 与 _scan_chat 的分工：Scanner 管「新消息命中标签」，这里管「命中过的帖子
+# 的评论区后来长出东西」。两者都**只建任务、不转发**（转发仍是 Worker 的事）。
+# ============================================================
+async def _replies_probe(client, peer, post_id, limit):
+    """取评论区，**把 telethon 异常当返回值交出去**（不让它冒进 netio 的告警）。
+
+    「这条帖子还没有讨论串」会抛 ``MsgIdInvalidError``，它是**预期结果**而不是
+    故障——一条帖子跟进 15 天、每天一次，用 warning 打 15 行就成刷屏了。这里
+    把它变成返回值，由调用方分类后决定用什么级别记。
+    """
+    try:
+        return await client(GetRepliesRequest(
+            peer=peer, msg_id=int(post_id), offset_id=0, offset_date=None,
+            add_offset=0, limit=int(limit), max_id=0, min_id=0, hash=0))
+    except Exception as e:      # noqa: BLE001 —— 就是要分类，不能让它冒出去
+        return e
+
+
+async def _fetch_replies(channel_id, post_id, limit):
+    """读一条帖子的评论区，返回 ``(评论列表 或 None, 失败原因 或 None)``。
+
+    走 netio 收口：这条路径跑在**跟进循环**里，一次网络层取消冒出来会把整个
+    循环当停服信号打死（本项目最贵的坑，已咬过三次）。
+    """
+    client = state.client
+    if client is None:
+        return None, "客户端未就绪"
+    peer = await netio.shielded(
+        lambda: client.get_input_entity(channel_id),
+        LISTEN_FETCH_TIMEOUT_SECONDS, "解析原帖 peer")
+    if peer is None:
+        return None, "解析原帖 peer 失败"
+    got = await netio.shielded(
+        lambda: _replies_probe(client, peer, post_id, limit),
+        LISTEN_FETCH_TIMEOUT_SECONDS, "读取帖子评论区")
+    if got is None:
+        return None, "读取评论区超时或连接被取消"
+    if isinstance(got, MsgIdInvalidError):
+        return None, "尚无讨论串"
+    if isinstance(got, Exception):
+        return None, f"{type(got).__name__}: {got}"
+    return list(getattr(got, "messages", None) or []), None
+
+
+def _add_follow_from_scan(chat_id, post_id, text, origin, message):
+    """把命中标签的帖子写进关注列表（失败只记日志，绝不影响主链路）。
+
+    关注是**附加收益**（评论区里的差分），它自己的成败不该波及 Scanner 本轮
+    已经建好的下载任务。所以这里整个包在 try 里，任何异常都只是「这次没关注上」。
+    """
+    try:
+        caption = (origin or {}).get("caption") or text or ""
+        date = (origin or {}).get("date") or getattr(message, "date", None)
+        runtime_db.add_listener_follow(
+            channel_id=int(chat_id),
+            post_id=int(post_id),
+            caption=caption,
+            post_date=(date.isoformat() if hasattr(date, "isoformat") else None),
+            source_name=(origin or {}).get("source_name"),
+        )
+    except Exception as e:
+        logger.warning(f"📡 帖子 {chat_id}/{post_id} 加入关注列表失败（不影响下载）：{e}")
+
+
+def _origin_from_follow(follow):
+    """关注记录里的快照 → ``_build_tasks`` 要的 origin 形态。
+
+    用**建列表时**存下的 caption/日期/目录，不再回频道取原帖——跟进要跑 15 天，
+    原帖被编辑或删除都不该让已定下的命名漂移。
+    """
+    return {
+        "peer_id": None,
+        "channel_post": follow.get("post_id"),
+        "caption": follow.get("caption") or "",
+        "date": parse_date(follow.get("post_date")),
+        "source_name": follow.get("source_name"),
+    }
+
+
+async def follow_scan(now=None, fetcher=None, sleep=None):
+    """跟进一轮关注列表：取到期关注 → 读评论区 → 新评论建成任务。
+
+    ``fetcher`` / ``sleep`` 可注入（单测完全不联网、也不用真等节流）。
+    """
+    result = {"due": 0, "checked": 0, "no_thread": 0, "created": 0,
+              "duplicate": 0, "expired": 0, "skipped_whitelist": 0}
+    fetch = fetcher or _fetch_replies
+    nap = sleep or asyncio.sleep
+    try:
+        gap = float(getattr(config, "LISTEN_FOLLOW_MIN_INTERVAL_SECONDS", 1.0))
+    except (TypeError, ValueError):
+        gap = 1.0
+
+    # 先把到期的置失效（不删——留下「到底等到没有」的证据），再裁掉过老的
+    result["expired"] = runtime_db.expire_listener_follows(now)
+    runtime_db.trim_expired_follows()
+
+    due = runtime_db.list_due_follows(now=now)
+    result["due"] = len(due)
+    tasks_by_chat = {}
+    for idx, follow in enumerate(due):
+        if idx:
+            # 节流：500 条关注连起来发就是个突发，「一天一次」的本意是摊开
+            await nap(gap)
+        try:
+            comments, err = await fetch(
+                follow["channel_id"], follow["post_id"],
+                int(config.LISTEN_FOLLOW_COMMENTS_LIMIT))
+        except Exception as e:      # 单帖抛错不能打断整个跟进循环（稳定性 §23）
+            comments, err = None, f"{type(e).__name__}: {e}"
+        if comments is None:
+            runtime_db.touch_listener_follow(follow["id"], error=err, now=now)
+            result["no_thread"] += 1
+            if not follow.get("checks"):
+                # 只报第一次：一条帖子要跟进 15 天，每次都报就是刷屏
+                logger.info(
+                    f"📡 关注帖 {follow['post_id']} 本轮没取到评论区（{err}），"
+                    f"继续等下一轮"
+                )
+            continue
+        runtime_db.touch_listener_follow(follow["id"], now=now)
+        result["checked"] += 1
+        origin = _origin_from_follow(follow)
+        for unit in group_by_album(comments):
+            media = [m for m in unit if is_downloadable(m)]
+            if not media:
+                continue
+            chat_id = getattr(media[0], "chat_id", None)
+            if chat_id is None:
+                continue
+            chat_id = int(chat_id)
+            # §14 的重叠判定：源群已在下载白名单时，实时链路已经转发+下载过，
+            # 这里不再为它重复建任务。
+            if chat_id in (state.WHITELIST_CHATS or {}):
+                result["skipped_whitelist"] += 1
+                continue
+            anchor = min(m.id for m in media)
+            gid = getattr(media[0], "grouped_id", None)
+            text = (pick_group_caption_text(media, gid) if gid
+                    else (getattr(media[0], "message", "") or "").strip())
+            # 评论区一律「转发收藏夹 + 下载」：跟进的目的就是把这些文件拿下来。
+            # 重复由 listener_tasks 的唯一索引挡（同一条评论只建一次任务）。
+            tasks_by_chat.setdefault(chat_id, []).extend(
+                _build_tasks(chat_id, media, {("saved_messages", None)}, True,
+                             text, anchor, origin))
+
+    for chat_id, tasks in tasks_by_chat.items():
+        ids = runtime_db.enqueue_listener_tasks(chat_id, tasks)
+        created = sum(1 for i in ids if i)
+        result["created"] += created
+        result["duplicate"] += len(ids) - created
+
+    if due:
+        logger.info(
+            f"📡 评论跟进完成：到期 {result['due']} 条 | 取到讨论串 "
+            f"{result['checked']} 条 | 没取到 {result['no_thread']} 条 | "
+            f"新任务 {result['created']} 条（重复 {result['duplicate']}）"
+            + (f" | 失效 {result['expired']} 条" if result["expired"] else "")
+        )
+    return result
+
+
+# ============================================================
 # 展示 / 菜单 / 命令
 # ============================================================
 def _format_interval(minutes) -> str:
@@ -1102,6 +1278,18 @@ def view_text() -> str:
             f"任务队列：待执行 {q['pending']} | 处理中 {q['processing']}"
             f" | 成功 {q['success']} | 失败 {q['failed']}"
             + (f" | 取消 {q['cancelled']}" if q["cancelled"] else "")
+        )
+    # 评论跟进存量：命中标签的帖子在有效期内按天跟进它的评论区
+    try:
+        active = runtime_db.count_listener_follows(runtime_db.FOLLOW_ACTIVE)
+        expired = runtime_db.count_listener_follows(runtime_db.FOLLOW_EXPIRED)
+    except runtime_db.DbUnavailable:
+        active = expired = None
+    if active:
+        days = int(config.LISTEN_FOLLOW_TTL_SECONDS // 86400)
+        lines.append(
+            f"评论跟进：{active} 条帖子在跟进（有效期 {days} 天"
+            + (f"，已失效 {expired} 条" if expired else "") + "）"
         )
     return "\n".join(lines).rstrip()
 
