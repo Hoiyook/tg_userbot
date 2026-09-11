@@ -18,6 +18,7 @@ from telethon import TelegramClient, events
 from telethon.network.connection import ConnectionTcpFull, ConnectionTcpObfuscated
 
 from . import state
+from . import notify
 from . import commands
 from . import caption_filter
 from . import chrome_client
@@ -54,6 +55,7 @@ from .config import (
     REPORT_ENABLED,
     REPORT_INTERVAL_SECONDS,
     REPORT_PROGRESS_INTERVAL_SECONDS,
+    REPORT_RESTART_DELAY_SECONDS,
     SAVE_FOLDER,
     SECRETS_FILE,
     SESSION_NAME,
@@ -215,12 +217,59 @@ async def _bot_keepalive():
             )
 
 
+async def _reporter_supervisor(instance):
+    """守护 Runtime Reporter 主循环：意外结束就记 ERROR 并节流重启。
+
+    2026-09-11 事故：当天 07:08 起汇报静默停摆数小时，直到用户发现「不再主动
+    汇总数据」。原因是 telethon 断线对 pending 请求 future 调 cancel()，
+    CancelledError 穿透 `Reporter.run()`（它对取消是 re-raise）把任务打死；
+    而任务句柄只在进程退出时才被 await，中间无人发现、也无人重启。
+
+    第一道网在 `reporter._safe_send/_safe_edit`（收口把网络层取消变成「本轮
+    没做成」），这里是最后一道：循环还是以取消/异常收场时，只要不是停服就
+    记 ERROR、等 `REPORT_RESTART_DELAY_SECONDS` 再用**同一条实例**重跑
+    （沿用实例才保得住 status_message_id，面板继续原地编辑而不是重建）。
+
+    「是不是停服」以 `state.STOP_EVENT` 判定：它只在 main() 收到停止信号时
+    置位，本函数被 main 取消时也已经置位。
+    """
+    delay = REPORT_RESTART_DELAY_SECONDS
+    while True:
+        task = asyncio.create_task(instance.run())
+        try:
+            await task
+        except asyncio.CancelledError:
+            stopping = (state.STOP_EVENT is not None
+                        and state.STOP_EVENT.is_set())
+            if not task.done():
+                # 取消来自本函数（停服）→ 把子任务一并收走，别留孤儿
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            if stopping:
+                raise
+            logger.error(
+                f"🤖 汇报任务被意外取消（非停服），{delay}s 后自动重启")
+        except Exception:
+            logger.exception(f"🤖 汇报任务异常结束，{delay}s 后自动重启")
+        else:
+            if state.STOP_EVENT is not None and state.STOP_EVENT.is_set():
+                return
+            logger.error(f"🤖 汇报任务意外结束，{delay}s 后自动重启")
+        await asyncio.sleep(delay)
+
+
 async def _start_reporter():
     """构造并启动 Runtime Reporter，返回 (实例, 任务)。
 
     REPORT_ENABLED 关闭时返回 (None, None)。启动通知（start）在此发出——
     此时客户端与 worker 池都已就绪。start 自身失败只记日志：Reporter 是
     观察者，它起不来绝不能拖垮主程序。
+
+    返回的任务是 `_reporter_supervisor`（而非 `instance.run()`）：主循环由
+    守护函数持有，意外死亡能自愈（见其 docstring）。
     """
     if not REPORT_ENABLED:
         return None, None
@@ -235,7 +284,7 @@ async def _start_reporter():
         f"🤖 Runtime Reporter 已启动（状态面板每 "
         f"{REPORT_INTERVAL_SECONDS}s 刷新，下载中 {REPORT_PROGRESS_INTERVAL_SECONDS}s）"
     )
-    return instance, asyncio.create_task(instance.run())
+    return instance, asyncio.create_task(_reporter_supervisor(instance))
 
 
 async def _retry_sweeper():
@@ -502,7 +551,7 @@ async def enqueue_media(message, chat_id, source_override, source_link=None,
         # 台账输入侧事件：收到但未产生下载任务（无 task_id，不进任务集）
         stats.emit_event("DEDUP_SKIPPED")
         try:
-            await state.client.send_message("me", notice)
+            await notify.notify_user(notice)
         except Exception as e:
             logger.warning(f"发送重复媒体通知失败：{e}")
         return

@@ -1038,6 +1038,23 @@ class TaskEventEmissionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(removed), 1)
         self.assertEqual(removed[0].get("why"), "manual")
 
+    async def test_source_message_deleted_notifies_via_unified_outlet(self):
+        """「原消息已删除」通知走统一出口 notify_user（2026-09-11 起主动通知
+        一律进 bot 控制面板对话，收藏夹只留媒体）。"""
+        rec = media_record(chat_id=111, label="没源2.mp4")
+
+        async def fake_get_messages(*args, **kwargs):
+            return None
+
+        state.client.get_messages = fake_get_messages
+        with mock.patch.object(stats_mod, "TASK_EVENTS_FILE", self.ev_file), \
+                mock.patch.object(queue.notify, "notify_user",
+                                  new=mock.AsyncMock()) as notify_mock:
+            ok = await queue._run_queued_task(rec)
+        self.assertTrue(ok)
+        notify_mock.assert_awaited_once()
+        self.assertIn("原消息已被删除", notify_mock.await_args.args[0])
+
     async def test_source_message_deleted_emits_removed(self):
         rec = media_record(chat_id=111, label="没源.mp4")
 

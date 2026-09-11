@@ -14,6 +14,7 @@ import json
 import asyncio
 
 from . import state
+from . import netio
 from . import queue
 from . import thread
 from . import dedup
@@ -24,6 +25,7 @@ from . import finder
 from . import caption_filter
 from . import chrome_client
 from .config import (
+    BOT_CHAT_KEEP_NOTIFICATIONS,
     CLEANUP_DELETE_TIMEOUT,
     CLEANUP_FETCH_TIMEOUT,
     CLEAN_COMMANDS,
@@ -194,51 +196,13 @@ async def _collect_messages(client, entity, limit):
 
 
 async def _shielded(proc, timeout, what):
-    """在子任务上跑一个会产生网络请求的协程 proc()，返回其成功结果。
+    """本模块网络调用（iter_messages / delete_messages）的收口。
 
-    本模块所有网络请求（iter_messages / delete_messages）都经它收口。原因与
-    queue/download 对取消息、传字节的处理同源：telethon 断线会对 pending
-    请求 future 调 cancel()，py3.8+ 的 CancelledError 是 BaseException，会绕开
-    except Exception 一路冒上来。清理若把它当停服信号漏给 cleanup_loop，外层
-    except asyncio.CancelledError 会记「🛑 已停止」并 re-raise → 自动清理任务
-    永久退出，而进程照常重连下载（实测：主客户端中途掉线正撞上清理在拉消息，
-    清理当场被杀，此后数小时收藏夹的下载通知再无人清理）。这里把请求放进子
-    任务、结局一律经 result() 读取：子任务以 CancelledError 收场 = 网络层取消
-    → 返回 None（本轮跳过、下轮再试）；只有清理任务本身被真取消（停服）才在
-    此 await 处抛 CancelledError 原样上抛。返回值 None 一律表示「本轮没做成」。
+    实现已于 2026-09-11 提取为共享工具 `netio.shielded`（reporter 的汇报循环
+    也踩了同一个坑），这里保留原名转调，调用点与单测零改动。语义见
+    `netio` 模块 docstring：网络层取消/超时 → 返回 None；停服真取消 → 上抛。
     """
-    task = asyncio.ensure_future(proc())
-    try:
-        try:
-            await asyncio.wait({task}, timeout=timeout)
-        except asyncio.CancelledError:
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-            raise
-        if not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            logger.warning(f"⏰ {what} 超时（{timeout}s），本轮跳过")
-            return None
-        try:
-            return task.result()
-        except asyncio.CancelledError:
-            logger.warning(
-                f"{what} 被底层连接取消（网络层 future.cancel()），本轮跳过"
-            )
-            return None
-        except Exception as e:
-            logger.warning(f"{what} 失败：{e}")
-            return None
-    except asyncio.CancelledError:
-        raise
+    return await netio.shielded(proc, timeout, what)
 
 
 async def _fetch_for_cleanup(client, entity, limit):
@@ -357,21 +321,31 @@ def clean_temp_files(root=None):
     return count
 
 
-def plan_bot_chat_cleanup(messages, age_limit):
-    """bot 菜单对话清理决策：删除超过时限的消息，但始终保留两条「活消息」——
-    最新一条带按钮的菜单，以及最新一条 Runtime Reporter 状态面板。
+def plan_bot_chat_cleanup(messages, age_limit, keep_recent=None):
+    """bot 控制面板对话清理决策：删除超过时限的消息，但保留三类——
 
-    面板也必须留（2026-09-10 起汇报发到这个对话）：它靠 edit_message 原地刷新，
-    被删掉后下一轮会 MessageIdInvalid → 重建，于是每两分钟多一条面板、永远刷屏。
+    ① 最新一条带按钮的菜单；② 最新一条 Runtime Reporter 状态面板；
+    ③ 除这两者之外**最新的 keep_recent 条**（程序通知时间线，2026-09-11 起
+    主动通知都发到这个对话，删光了面板就没法回溯）。
+
+    ①②必须留：菜单是入口，面板靠 edit_message 原地刷新（被删掉后下一轮会
+    MessageIdInvalid → 重建，于是每两分钟多一条面板、永远刷屏）。
+
+    ③按「条数」而不是「时长」保留：时间线有界（≈keep_recent + 2 条封顶），
+    空闲多久都不会攒出一屏旧消息。
 
     messages: 按时间从新到旧排列
         [{"id", "age_minutes", "has_buttons", "is_panel"}, ...]
+    keep_recent: None = config.BOT_CHAT_KEEP_NOTIFICATIONS（测试可显式传 0）
     返回 (要删除的 id 列表, 要保留的 id 集合)
     """
+    if keep_recent is None:
+        keep_recent = BOT_CHAT_KEEP_NOTIFICATIONS
     keep = set()
     delete = []
     kept_menu = False
     kept_panel = False
+    recent_left = max(0, keep_recent)
     for m in messages:
         if m.get("has_buttons") and not kept_menu:
             keep.add(m["id"])
@@ -380,6 +354,10 @@ def plan_bot_chat_cleanup(messages, age_limit):
         if m.get("is_panel") and not kept_panel:
             keep.add(m["id"])
             kept_panel = True
+            continue
+        if recent_left > 0:
+            keep.add(m["id"])
+            recent_left -= 1
             continue
         if m["age_minutes"] > age_limit:
             delete.append(m["id"])

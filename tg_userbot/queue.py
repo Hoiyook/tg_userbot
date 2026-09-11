@@ -22,6 +22,7 @@ import uuid
 import asyncio
 
 from . import state
+from . import notify
 from . import download
 from . import stats
 from .config import (
@@ -455,8 +456,7 @@ async def _run_queued_task(record):
             stats.emit_event("REMOVED", task_id=record.get("id"), label=label,
                              why="source_deleted")
             try:
-                await state.client.send_message(
-                    "me",
+                await notify.notify_user(
                     f"❌ 队列任务原消息已被删除，已移除：\n{label}",
                 )
             except Exception:

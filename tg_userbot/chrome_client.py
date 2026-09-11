@@ -19,6 +19,7 @@ import sys
 from datetime import datetime
 
 from . import chrome_agent
+from . import notify
 from . import state
 from .config import (
     CHROME_AGENT_PID_FILE,
@@ -792,12 +793,18 @@ async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
 # ------------------------------------------------------------
 
 async def send_owner_message(chat_id, text):
+    """把 Chrome 任务结果发给提交人。
+
+    目标是 owner 本人（用户在收藏夹发的 /chrome）时走统一通知出口——主动
+    通知一律进 bot 控制面板对话，收藏夹只留媒体（2026-09-11）；在别处发的
+    命令仍回到那个对话（命令回复留原地）。
+    """
+    if chat_id == getattr(state, "MY_ID", None):
+        await notify.notify_user(text)
+        return
     if state.client is None:
         return
-    if chat_id == getattr(state, "MY_ID", None):
-        await state.client.send_message("me", text, link_preview=False)
-    else:
-        await state.client.send_message(chat_id, text, link_preview=False)
+    await state.client.send_message(chat_id, text, link_preview=False)
 
 
 async def notify_pending_results():

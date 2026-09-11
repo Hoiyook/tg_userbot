@@ -496,6 +496,13 @@ AUTO_CLEAN_SAVED_MESSAGES = True
 # 消息至少存在多少分钟后才允许删除
 CLEAN_MESSAGE_AGE_MINUTES = 1
 
+# bot 控制面板对话里额外保留的「最近消息」条数（除最新菜单与最新状态面板外）。
+# 2026-09-11 起程序主动通知都发到这个对话，若照旧「超时即删」，面板就成不了
+# 可回溯的时间线（打开只剩菜单和面板两行）。保留最新 N 条 + 其余按超时删除 =
+# 时间线有界（≈N+2 条封顶），既不刷屏也不会越攒越多。
+BOT_CHAT_KEEP_NOTIFICATIONS = 20
+
+
 # 自动清理执行间隔，默认 1 分钟，可通过 /setcleartime 修改
 DEFAULT_CLEAR_INTERVAL_SECONDS = 60
 CLEAR_TIME_CONFIG_FILE = os.path.join(RUNTIME_DIR, "clear_time.json")
@@ -621,8 +628,9 @@ PERSISTENT_NOTIFICATION_PREFIXES = (
 # Runtime Reporter（主动运行状态汇报，2026-09-10）
 # ------------------------------------------------------------
 # Reporter 是**只读观察者**：只读 state.* 与 stats 事件流，不参与任何调度。
-# 两类输出——① Status Panel：收藏夹里的一条消息，首发 send_message、之后原地
-# edit_message 刷新；② Event Notification：重要事件发独立消息。
+# 两类输出——① Status Panel：bot 控制面板对话里的一条消息（主账号发，bot 有
+# 48h 编辑时限），首发 send_message、之后原地 edit_message 刷新；
+# ② Event Notification：重要事件发独立消息（bot 账号发，见 REPORT_TO_BOT_CHAT）。
 # 它自己的任何异常都被兜住，绝不拖垮下载/队列/worker。
 REPORT_ENABLED = True
 
@@ -668,6 +676,19 @@ REPORT_MAX_FILENAME_CHARS = 52
 # 都全量扫描 task_events.jsonl（实测 3 万行封顶时一次 load+rebuild 约 116ms
 # 同步阻塞事件循环，而下载中面板每 15s 刷一次）。
 REPORT_STATS_CACHE_SECONDS = 300
+
+# 单条程序通知发送的超时（秒）：通知都在下载收尾路径上，不能被一条僵死连接
+# 拖住（telethon 请求没有读超时）。超时即按「没发出去」处理、走回落/放弃。
+NOTIFY_TIMEOUT_SECONDS = 30
+
+# 单次汇报网络请求的超时（秒）：telethon 请求没有读超时，代理节点卡住时
+# send/edit 会无限挂住——而汇报是**单条后台循环**，一次挂住 = 面板从此不再
+# 更新（2026-09-11 事故的另一半）。超时即放弃本轮、下轮再试。
+REPORT_NET_TIMEOUT_SECONDS = 30
+
+# 汇报主循环意外结束（网络层取消这类非停服原因）后，隔多久自动重启。
+# 见 app._reporter_supervisor：这是「循环被打死却没人知道」的最后一道网。
+REPORT_RESTART_DELAY_SECONDS = 5
 
 # 汇报目标：True=发到 bot 私聊（控制/状态频道，自带清理），False=发收藏夹。
 # bot 未就绪（BOT_ID 为空）时自动回落收藏夹，绝不发丢。

@@ -17,6 +17,7 @@ from itertools import count
 from telethon.errors import AuthBytesInvalidError, RPCError
 
 from . import state
+from . import notify
 from . import workers
 from . import config
 from . import dedup
@@ -131,8 +132,7 @@ async def _content_dedupe_check(temp_path, metadata_keys, display_name,
     stats.emit_event("DEDUP_HIT", task_id=task_id, label=display_name)
     dedup.remember(list(metadata_keys or []), prior_name)
     try:
-        await state.client.send_message(
-            "me",
+        await notify.notify_user(
             "⏭️ 内容重复已拦截\n\n"
             f"文件：{display_name}\n"
             f"与已下载的「{prior_name}」字节相同\n\n"
@@ -227,8 +227,7 @@ async def _delegate_url_task_to_bot(record, display_name):
     except Exception as e:
         logger.exception(f"转交解析 bot 失败：{e}")
         try:
-            await state.client.send_message(
-                "me",
+            await notify.notify_user(
                 "❌ 直链下载失败，且转交解析 bot 失败\n\n"
                 f"文件：{display_name}\n"
                 f"链接：{share_url}\n"
@@ -238,8 +237,7 @@ async def _delegate_url_task_to_bot(record, display_name):
             pass
         return False
     try:
-        await state.client.send_message(
-            "me",
+        await notify.notify_user(
             "⚠️ 直链已过期且重新解析无效（cookie 可能失效），"
             "已把原始链接转给解析 bot 兜底，回复视频将自动下载\n\n"
             f"文件：{display_name}",
@@ -416,8 +414,7 @@ async def download_url_media(record):
                     logger.info(f"实际大小：{format_size(actual_size)}")
 
                     try:
-                        await state.client.send_message(
-                            "me",
+                        await notify.notify_user(
                             "✅ 下载完成\n\n"
                             f"来源：抖音（本地解析）\n"
                             f"文件：{os.path.basename(final_path)}\n"
@@ -486,8 +483,7 @@ async def download_url_media(record):
 
             logger.error("❌ 已达到最大重试次数，直链下载失败")
             try:
-                await state.client.send_message(
-                    "me",
+                await notify.notify_user(
                     "❌ 直链下载失败\n\n"
                     f"文件：{os.path.basename(final_path)}\n"
                     f"请查看 download.log",
@@ -662,8 +658,7 @@ async def download_file(message, source_override=None, caption_override=None,
 
             # 开始下载即发通知（程序消息稍后会被自动清理）
             try:
-                await state.client.send_message(
-                    "me",
+                await notify.notify_user(
                     "📥 开始下载\n\n"
                     f"来源：{source}\n"
                     f"文件：{os.path.basename(final_path)}\n"
@@ -832,8 +827,7 @@ async def download_file(message, source_override=None, caption_override=None,
                     logger.info("=" * 60)
 
                     try:
-                        await state.client.send_message(
-                            "me",
+                        await notify.notify_user(
                             "✅ 下载完成\n\n"
                             f"来源：{source}\n"
                             f"文件：{os.path.basename(final_path)}\n"
@@ -883,8 +877,7 @@ async def download_file(message, source_override=None, caption_override=None,
             logger.error("❌ 已达到最大重试次数，下载失败")
 
             try:
-                await state.client.send_message(
-                    "me",
+                await notify.notify_user(
                     "❌ 文件下载失败\n\n"
                     f"来源：{source}\n"
                     f"文件：{os.path.basename(final_path)}\n"

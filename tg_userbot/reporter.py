@@ -34,6 +34,8 @@ from telethon.errors import (
     RPCError,
 )
 
+from . import netio
+from . import notify
 from . import state
 from . import stats
 from . import workers
@@ -51,6 +53,7 @@ from .config import (
     REPORT_MAX_FILENAME_CHARS,
     REPORT_MAX_MESSAGE_CHARS,
     REPORT_MAX_WORKER_ALERTS_SHOWN,
+    REPORT_NET_TIMEOUT_SECONDS,
     REPORT_PROGRESS_ENABLED,
     REPORT_PROGRESS_INTERVAL_SECONDS,
     REPORT_RECOVERY,
@@ -512,51 +515,65 @@ class Reporter:
     async def _safe_send(self, text):
         """发一条独立消息；返回发出的 Message（失败/异常返回 None）。
 
-        任何 Telegram 异常都吞掉并记日志：记日志 → 本轮结束 → 下轮再试，
-        绝不紧密重试（规格 §33）。
+        请求经 `netio.shielded` 收口（超时 + 网络层取消）：telethon 请求没有
+        读超时，僵死连接会让 send 永久挂住；断线又会对 pending future 调
+        cancel()，而 CancelledError 是 BaseException、会绕开 except Exception
+        把整个汇报循环当停服信号打死（2026-09-11 事故）——收口把这两种结局都
+        变成了「本轮没做成」，循环照常进入下一轮，绝不紧密重试（规格 §33）。
+        停服时调用方被真取消，收口会原样上抛。
         """
         client = self.client
         if client is None:
             return None
-        try:
-            msg = await client.send_message(self.target, self._fit(text))
-            self._touch_activity()
-            return msg
-        except asyncio.CancelledError:
-            raise
-        except FloodWaitError as e:
-            logger.warning(f"🤖 汇报被 FloodWait 限流 {e.seconds}s，跳过本轮")
+
+        async def _send():
+            try:
+                return await client.send_message(self.target, self._fit(text))
+            except FloodWaitError as e:
+                logger.warning(f"🤖 汇报被 FloodWait 限流 {e.seconds}s，跳过本轮")
+                return None
+            except (MessageIdInvalidError, RPCError) as e:
+                logger.warning(f"🤖 汇报发送失败（{type(e).__name__}: {e}）")
+                return None
+
+        msg = await netio.shielded(_send, REPORT_NET_TIMEOUT_SECONDS, "汇报发送")
+        if msg is None:
             return None
-        except (MessageIdInvalidError, RPCError) as e:
-            logger.warning(f"🤖 汇报发送失败（{type(e).__name__}: {e}）")
-            return None
-        except Exception as e:
-            logger.warning(f"🤖 汇报发送失败（{type(e).__name__}: {e}）")
-            return None
+        self._touch_activity()
+        return msg
 
     async def _safe_edit(self, text):
-        """原地刷新面板；返回 True=已刷新，False=本轮放弃。"""
+        """原地刷新面板；返回 True=已刷新，False=本轮放弃。
+
+        与 `_safe_send` 同源经收口：网络层取消/超时只是「本轮没刷新」，面板
+        id 必须保住——丢了就会走重建分支、每轮多一条面板刷屏。
+        """
         client = self.client
-        try:
-            await client.edit_message(
-                self.target, self.status_message_id, self._fit(text))
+
+        async def _edit():
+            """把三种「非异常」结局转成哨兵值，其余交给收口兜住。"""
+            try:
+                await client.edit_message(
+                    self.target, self.status_message_id, self._fit(text))
+                return "ok"
+            except MessageNotModifiedError:
+                return "unchanged"           # 内容没变 = 正常，不是错误
+            except MessageIdInvalidError:
+                return "invalid"
+
+        outcome = await netio.shielded(
+            _edit, REPORT_NET_TIMEOUT_SECONDS, "状态面板刷新")
+        if outcome == "ok":
             self._touch_activity()
             return True
-        except asyncio.CancelledError:
-            raise
-        except MessageNotModifiedError:
-            return True                      # 内容没变 = 正常，不是错误
-        except MessageIdInvalidError:
+        if outcome == "unchanged":
+            return True
+        if outcome == "invalid":
             # 面板被清理/删除了 → 下一轮重建，本轮不连发两条
             logger.info("🤖 状态面板消息已失效，下一轮重建")
             self.status_message_id = None
             return False
-        except FloodWaitError as e:
-            logger.warning(f"🤖 状态面板刷新被 FloodWait 限流 {e.seconds}s")
-            return False
-        except Exception as e:
-            logger.warning(f"🤖 状态面板刷新失败（{type(e).__name__}: {e}）")
-            return False
+        return False                         # None：网络层取消/超时/异常
 
     async def update_status(self, now=None):
         """刷新 Status Panel：首轮创建、之后原地编辑（不重复创建消息）。"""
@@ -572,10 +589,22 @@ class Reporter:
         return await self._safe_edit(text)
 
     async def notify_event(self, kind, **kw):
-        """发一条事件通知（独立消息）。未知 kind 不发。"""
+        """发一条事件通知（独立消息）。未知 kind 不发。
+
+        事件通知走统一出口 `notify.notify_user`（bot 账号 → 控制面板对话）。
+        由 bot 账号发是刻意的：主账号发到 bot 对话会被 `bot_message_handler`
+        当成 owner 指令、每发一条就回一次主菜单（2026-09-11 实测刷屏）。
+        面板例外——它必须由主账号发并原地编辑（bot 有 48h 编辑时限）。
+        REPORT_TO_BOT_CHAT=False（钉在收藏夹）时退回原路径。
+        """
         text = build_event_text(kind, **kw)
         if text is None:
             return False
+        if REPORT_TO_BOT_CHAT:
+            ok = await notify.notify_user(self._fit(text))
+            if ok:
+                self._touch_activity()
+            return ok
         return await self._safe_send(text) is not None
 
     # ---------- 异常指纹与去重（规格 §26） ----------

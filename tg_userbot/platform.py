@@ -21,6 +21,7 @@ from datetime import datetime
 from telethon.utils import get_peer_id
 
 from . import state
+from . import notify
 from . import config
 from . import dedup
 from . import stats
@@ -184,7 +185,7 @@ async def _handle_douyin_urls(message, douyin_urls):
             # 台账输入侧事件：收到但未产生下载任务
             stats.emit_event("DEDUP_SKIPPED")
             try:
-                await state.client.send_message("me", notice)
+                await notify.notify_user(notice)
             except Exception as e:
                 logger.warning(f"发送重复视频通知失败：{e}")
             continue
@@ -200,8 +201,7 @@ async def _handle_douyin_urls(message, douyin_urls):
             continue
         logger.info(f"🛠 抖音链接已本地解析并入队下载：{record['final_name']}")
         try:
-            await state.client.send_message(
-                "me",
+            await notify.notify_user(
                 "🛠 本地解析成功，已入队下载\n\n"
                 f"文件：{record['final_name']}\n"
                 f"链接：{url}",
@@ -256,8 +256,7 @@ async def _relay_kind_links(kind: str, urls):
         except Exception as e:
             logger.exception(f"❌ {label}链接处理失败：{url} | {e}")
             try:
-                await state.client.send_message(
-                    "me",
+                await notify.notify_user(
                     f"❌ {label}链接处理失败\n\n"
                     f"链接：{url}\n"
                     f"请查看：{LOG_FILE}",

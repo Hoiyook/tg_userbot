@@ -242,7 +242,7 @@ class _FakeClient:
     def is_connected(self):
         return True
 
-    async def send_message(self, target, text):
+    async def send_message(self, target, text, link_preview=False):
         if self.send_error:
             raise self.send_error
         self.sent.append((target, text))
@@ -253,6 +253,120 @@ class _FakeClient:
         if self.edit_error:
             raise self.edit_error
         self.edited.append((target, message, text))
+
+
+class _HangingClient(_FakeClient):
+    """send_message 永不返回：模拟「僵死连接」（telethon 请求没有读超时）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.attempts = []
+
+    async def send_message(self, target, text):
+        self.attempts.append(text)
+        await asyncio.sleep(30)          # 由收口的超时取消掉
+
+
+class NetworkResilienceTest(unittest.IsolatedAsyncioTestCase):
+    """2026-09-11 事故回归：汇报循环不得被网络层取消 / 僵死连接打死。
+
+    当天 07:08 起汇报静默停摆数小时（用户次日发现「不再主动汇总数据」）：
+    telethon 断线对 pending 请求 future 调 cancel()，CancelledError 穿透
+    run()（它对取消是 re-raise）把任务打死，而任务句柄只在进程退出时才被
+    await，中间无人发现、也无人重启。
+    """
+
+    async def test_network_cancel_does_not_kill_loop(self):
+        fake = _FakeClient()
+        fake.send_error = asyncio.CancelledError()
+        rep = reporter.Reporter(client=fake)
+        rep._started_at = 0.0
+        with mock.patch.object(reporter, "REPORT_EVENT_POLL_SECONDS", 0.01), \
+                mock.patch.object(reporter, "REPORT_INTERVAL_SECONDS", 0.01):
+            task = asyncio.create_task(rep.run())
+            await asyncio.sleep(0.06)
+            alive = not task.done()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(alive, "网络层取消把汇报循环打死了（当天事故）")
+
+    async def test_cancelled_panel_edit_does_not_lose_panel(self):
+        fake = _FakeClient()
+        rep = reporter.Reporter(client=fake)
+        await rep.update_status()                        # 先建面板
+        fake.edit_error = asyncio.CancelledError()
+        self.assertFalse(await rep.update_status())      # 不抛
+        self.assertIsNotNone(rep.status_message_id,
+                             "网络层取消不得丢掉面板 id（否则每轮重建刷屏）")
+
+    async def test_stalled_send_does_not_freeze_loop(self):
+        fake = _HangingClient()
+        rep = reporter.Reporter(client=fake)
+        rep._started_at = 0.0
+        with mock.patch.object(reporter, "REPORT_NET_TIMEOUT_SECONDS", 0.02), \
+                mock.patch.object(reporter, "REPORT_EVENT_POLL_SECONDS", 0.01), \
+                mock.patch.object(reporter, "REPORT_INTERVAL_SECONDS", 0.01):
+            task = asyncio.create_task(rep.run())
+            await asyncio.sleep(0.2)
+            alive = not task.done()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(alive, "僵死请求把汇报循环永久冻住了")
+        self.assertGreaterEqual(len(fake.attempts), 2, "超时后下一轮应继续尝试")
+
+
+class ReporterSupervisorTest(unittest.IsolatedAsyncioTestCase):
+    """app._reporter_supervisor：汇报主循环的最后一道网（2026-09-11 补）。"""
+
+    async def asyncSetUp(self):
+        self._saved = state.STOP_EVENT
+        state.STOP_EVENT = asyncio.Event()
+
+    async def asyncTearDown(self):
+        state.STOP_EVENT = self._saved
+
+    async def test_restarts_after_unexpected_cancel(self):
+        runs = []
+
+        class _Flaky:
+            async def run(self):
+                runs.append(1)
+                if len(runs) == 1:
+                    raise asyncio.CancelledError()   # 模拟网络层取消打死循环
+
+        with mock.patch.object(app, "REPORT_RESTART_DELAY_SECONDS", 0.01):
+            task = asyncio.create_task(app._reporter_supervisor(_Flaky()))
+            await asyncio.sleep(0.1)
+            alive = not task.done()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(alive)
+        self.assertGreaterEqual(len(runs), 2, "汇报任务意外死了却没人重启")
+
+    async def test_stop_event_prevents_restart(self):
+        runs = []
+
+        class _Flaky:
+            async def run(self):
+                runs.append(1)
+                raise asyncio.CancelledError()
+
+        state.STOP_EVENT.set()
+        with mock.patch.object(app, "REPORT_RESTART_DELAY_SECONDS", 0.01):
+            with self.assertRaises(asyncio.CancelledError):
+                await app._reporter_supervisor(_Flaky())
+        self.assertEqual(len(runs), 1, "停服时不该重启")
+
+    async def test_returns_when_run_ends_normally_while_stopping(self):
+        class _Idle:
+            async def run(self):
+                return              # REPORT_ENABLED 关闭时 run() 直接返回
+
+        state.STOP_EVENT.set()
+        self.assertIsNone(await app._reporter_supervisor(_Idle()))
 
 
 class StatusPanelTest(unittest.IsolatedAsyncioTestCase):
@@ -440,6 +554,12 @@ class EventPollTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.fake = _FakeClient()
         self.rep = reporter.Reporter(client=self.fake)
+        # 事件通知走真实路由：统一出口 notify_user → bot 账号 → 控制面板
+        #（2026-09-11 起；面板仍由注入的 client 发/改）。把假客户端装上 bot
+        # 席位，断言才覆盖真链路而不是绕开它。
+        self._saved_tg = (state.bot_client, state.MY_ID)
+        state.bot_client = self.fake
+        state.MY_ID = 42
         self.ev_file = os.path.join(_TMP, "reporter_events.jsonl")
         with open(self.ev_file, "w", encoding="utf-8") as f:
             f.write("")                     # 空文件
@@ -447,6 +567,7 @@ class EventPollTest(unittest.IsolatedAsyncioTestCase):
         self._p.start()
 
     async def asyncTearDown(self):
+        state.bot_client, state.MY_ID = self._saved_tg
         self._p.stop()
         if os.path.exists(self.ev_file):
             os.remove(self.ev_file)

@@ -443,7 +443,9 @@ class BotCleanupPlanTest(unittest.TestCase):
             self._msg(2, age_minutes=9, has_buttons=True),   # 最新菜单
             self._msg(3, age_minutes=5, has_buttons=False),
         ]
-        to_delete, to_keep = cleanup.plan_bot_chat_cleanup(messages, age_limit=1)
+        # keep_recent=0：隔离出「菜单/面板/超时」三条规则，最近通知预算另测
+        to_delete, to_keep = cleanup.plan_bot_chat_cleanup(
+            messages, age_limit=1, keep_recent=0)
         self.assertEqual(to_keep, {2})
         self.assertEqual(set(to_delete), {1, 3})
 
@@ -457,7 +459,9 @@ class BotCleanupPlanTest(unittest.TestCase):
             self._msg(2, age_minutes=20, has_buttons=False, is_panel=True),   # 旧面板
             self._msg(1, age_minutes=30, has_buttons=False),                  # 旧通知
         ]
-        to_delete, to_keep = cleanup.plan_bot_chat_cleanup(messages, age_limit=1)
+        to_delete, to_keep = cleanup.plan_bot_chat_cleanup(
+            messages, age_limit=1, keep_recent=0)
+        # 旧面板照删：它只能靠「最新面板」规则活下来，不占最近通知预算
         self.assertEqual(to_keep, {3, 4}, "最新菜单 + 最新面板都要保留")
         self.assertEqual(set(to_delete), {1, 2}, "旧面板与旧通知照删")
 
@@ -466,7 +470,8 @@ class BotCleanupPlanTest(unittest.TestCase):
             self._msg(1, age_minutes=0.5, has_buttons=False),
             self._msg(2, age_minutes=2, has_buttons=False),
         ]
-        to_delete, to_keep = cleanup.plan_bot_chat_cleanup(messages, age_limit=1)
+        to_delete, to_keep = cleanup.plan_bot_chat_cleanup(
+            messages, age_limit=1, keep_recent=0)
         self.assertEqual(to_delete, [2])
         self.assertEqual(to_keep, set())
 
@@ -474,6 +479,39 @@ class BotCleanupPlanTest(unittest.TestCase):
         to_delete, to_keep = cleanup.plan_bot_chat_cleanup([], age_limit=1)
         self.assertEqual(to_delete, [])
         self.assertEqual(to_keep, set())
+
+    def test_keeps_newest_notifications_within_budget(self):
+        """控制面板要成为可回溯的通知时间线：除菜单与面板外，再保留最新
+        N 条（默认来自 config.BOT_CHAT_KEEP_NOTIFICATIONS）。"""
+        keep_recent = config.BOT_CHAT_KEEP_NOTIFICATIONS
+        messages = [self._msg(i, age_minutes=60, has_buttons=False)
+                    for i in range(1, keep_recent + 6)]      # 比预算多 5 条
+        to_delete, to_keep = cleanup.plan_bot_chat_cleanup(messages, age_limit=1)
+        newest = {m["id"] for m in messages[:keep_recent]}
+        self.assertEqual(to_keep, newest, "最新 N 条通知必须留着")
+        self.assertEqual(set(to_delete),
+                         {m["id"] for m in messages[keep_recent:]})
+
+    def test_old_notifications_beyond_budget_still_deleted(self):
+        """预算之外的旧通知照旧按超时删除——总量有界，不会越攒越多。"""
+        messages = [self._msg(i, age_minutes=60, has_buttons=False)
+                    for i in range(1, 8)]
+        to_delete, to_keep = cleanup.plan_bot_chat_cleanup(
+            messages, age_limit=1, keep_recent=3)
+        self.assertEqual(to_keep, {1, 2, 3})
+        self.assertEqual(set(to_delete), {4, 5, 6, 7})
+
+    def test_recent_budget_ignores_age(self):
+        """预算内的消息即使已超时也留：面板对话看的是「最近发生了什么」，
+        不差这几条老几分钟的通知。"""
+        messages = [
+            self._msg(1, age_minutes=999, has_buttons=False),
+            self._msg(2, age_minutes=999, has_buttons=False),
+        ]
+        to_delete, to_keep = cleanup.plan_bot_chat_cleanup(
+            messages, age_limit=1, keep_recent=2)
+        self.assertEqual(to_delete, [])
+        self.assertEqual(to_keep, {1, 2})
 
 class ChromeMenuTest(unittest.TestCase):
     """Chrome 任务菜单入口与按钮（按钮直接带 task_id，绕开序号漂移）。
