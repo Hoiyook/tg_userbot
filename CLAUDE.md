@@ -123,6 +123,60 @@ Telegram ──► listener.Scanner ──► SQLite 任务表 ──► listene
 
 **台账与汇报**：`enqueue_media`/`queue.enqueue_and_start` 有可选 `src`，监听传 `"listen"`——否则监听副本的 chat_id 也是我，跟用户在收藏夹手动转发完全分不开。台账 `📥 输入事件` 因此显示「收藏 / 中转 / 监听」三桶（相加 = 收到媒体总数，可勾稽），并新增 `📡 标签监听` 分节：扫描/命中/入队任务（Scanner 口径）**+ 任务结果（成功/失败/待执行，从 SQLite 读，§37）**；只在窗口内真扫过时才出现，老日子输出不变。事件 `LISTEN_SCAN`（每聊天一次成功扫描，带 `scanned/matched/created/duplicate`）/`LISTEN_FAIL`（单聊天读失败，**独立事件**——否则失败的聊天会把「扫描 N 次」算虚高）都是无 task_id 的输入侧事件，不参与任务集构造、不扰动对账恒等式。**注意 SQLite 的 `task_events` 与 `runtime/task_events.jsonl` 是两套 ID 空间、同名不同物**（前者是 listener 任务的自增 id，后者是下载任务的 uuid），绝不混用：SQLite 事件只服务 listener 自身排查，喂给 reporter/台账 的永远是 JSONL。Reporter 面板加一行只读快照（`state.LISTEN_LAST_SCAN`，含队列存量；Reporter 是只读观察者，不碰数据库不做网络），事件通知按批聚合且**只在有命中或失败时发**（空扫也发就成固定刷屏）。单测 `tests/test_runtime_db.py`（schema/迁移幂等/WAL 与 PRAGMA 如实反映/checkpoint/UNIQUE 含 **NULL 收藏夹目标**去重/事务回滚 Case A·B/claim·complete·retry·fail·cancel/lease 恢复 Case C/BUSY 有限重试/事件外键）、`tests/test_listener_worker.py`（错误分类与退避/FloodWait 采信服务端值并全 Worker 暂停/临时与永久错误/重试耗尽/租约恢复/节流/优雅停机/强引用/单任务失败不退出）、`tests/test_listener.py`（标签边界/目标身份/相册分桶/规则校验/配置持久化含重载保护/规格书 §27 测试 A–G/队列上限背压 Case E/相册边界补齐/旧状态迁移含「不倒回更新游标」/命令与视图），回归在 `test_stats.py`、`test_reporter.py`、`test_menu.py`、`test_commands.py`、`test_cookie_menu.py`、`test_cleanup.py`。
 
+**标签监听配置指引。** 分三层，改东西之前先认清「改哪里 / 什么时候生效」：
+
+| 想改什么 | 改哪里 | 生效时机 |
+|---|---|---|
+| 总开关 | bot 菜单 `🔄` 或 `/listen on\|off` | **立即**（写内存 + listen.json） |
+| 扫描周期 | 菜单 `⏱` 或 `/listen interval <分钟>`（1–10080） | **下一轮**扫描 |
+| 增删改规则 | 菜单 `➕`/`✏️`/`🗑` 或 `/listen add\|del`（带多步向导） | **下一轮**扫描 |
+| 手工编辑 `listen.json` | 自己改文件 | **下一轮**扫描（按 mtime 探测到变化才重读；解析失败保持当前生效配置） |
+| 队列上限 / 转发节流 / 租约 / 重试上限 / 轮询间隔 | `config.py` 的 `LISTEN_MAX_PENDING_TASKS`、`LISTEN_WORKER_MIN_FORWARD_INTERVAL_SECONDS`、`LISTEN_WORKER_LEASE_SECONDS`、`LISTEN_WORKER_MAX_ATTEMPTS`、`LISTEN_WORKER_POLL_SECONDS` | **需重启** |
+| 数据库写盘强度 | 环境变量 `TG_DB_SYNCHRONOUS=NORMAL\|FULL\|OFF`（默认 FULL；提交慢时降 NORMAL，WAL 下仍是崩溃安全的） | **需重启** |
+| 数据库位置 | 环境变量 `TG_RUNTIME_DB=<绝对路径>`（默认 `RUNTIME_DIR/tg_userbot.db`；Termux 上若 WAL 回落可挪到应用私有目录） | **需重启** |
+
+`runtime/listen.json` 字段（**身份一律只认 id，名称/username 只用于展示**，改名换用户名都不影响监听）：
+
+```json
+{
+  "enabled": true,                 // 总开关
+  "interval_minutes": 1440,        // 全局扫描周期，所有规则共用（1–10080）
+  "listeners": [
+    {
+      "source_chat_id": -1001234567890,   // ★ 唯一身份：监听来源（不扫历史，从添加时刻起）
+      "source_name": "仓鼠_杂项",           // 仅展示
+      "source_username": "speedlearnnn",    // 仅展示（也是 /listen add 的输入方式）
+      "tag": "#测试标签",                   // 须以 # 开头；大小写不敏感、有前后边界
+      "targets": [
+        {"type": "saved_messages"},                                  // 收藏夹
+        {"type": "chat", "chat_id": -1009876543210, "name": "目标"}   // ★ 身份=(type,chat_id)
+      ],
+      "download": true                // true = 转发收藏夹 + 入队下载（隐含收藏夹目标）
+    }
+  ]
+}
+```
+
+命令形态的语法（菜单能做的它都能做，手机上临时加规则更快）：
+
+```
+/listen                            查看状态、规则与任务队列存量
+/listen on | off                   总开关
+/listen interval <分钟>            改周期（1-10080）
+/listen del <序号>                 删规则
+/listen scan                       立即扫描一次（不等周期）
+/listen add <聊天> <标签> [目标,目标] [on|off]
+     例：/listen add @speedlearnnn #测试标签 me,@某个频道 on
+     目标可用 me（收藏夹）/ @用户名 / 数字 ID；省略则只转发收藏夹
+     末尾 on/off 控制是否自动下载（省略 = off，只转发不下载）
+```
+
+**三条容易踩的配置语义**（都是有意的设计，不是 bug）：
+
+1. **`add` 的时机决定起点**：checkpoint 取的是「添加那一刻该聊天的最新消息 id」，**之前发的帖子永远不会被扫**（§17 不扫历史）。所以调试时一定要**先加规则、再发消息**。
+2. **`download=true` 隐含收藏夹目标**：它的实现就是「转发进收藏夹 + 入队那份副本」，所以规则里不写 `me` 也会转发收藏夹。而 `download=false` + 显式写 `me` = **只转发不入队**（收藏夹留一份不下载的副本）。
+3. **落盘目录按真实来源**：下载目录由转发副本的 `fwd_from` 解析，所以监听一个**聚合/转发频道**时，文件会落到各自**原帖所在**的目录（如 `1仓鼠_cosplay&画集/`），而不是监听源的目录（`仓鼠_杂项/`）。这与下载白名单链路一致（re-forward 落真实来源）；若想让监听来的都归到一个目录，需要另加「监听来源目录覆盖」开关（当前未实现）。
+
 **Concurrency model.**
 - `DOWNLOAD_SEMAPHORE` (custom `AdjustableSemaphore`, default limit 3) bounds concurrent downloads — every media download (Saved Messages originals, whitelist-relayed copies, douyin/IG video copies) shares the pool. Unlike `asyncio.Semaphore`, the limit can change at runtime: `/thread n` calls `set_limit()` (range 1–25), persists to `thread_config.json`, and is loaded at startup via `load_thread_config()`. Reducing the limit does not cancel in-flight downloads; new tasks wait until the count drops below the new limit.
 - `PROCESSING_DOUYIN_IDS` (a set of message IDs) prevents duplicate link relays for the same Saved Messages message (no conversation/no per-platform lock anymore — the parse bot is reached by plain `send_message`, so nothing needs serializing); IDs are discarded in a `finally`.
@@ -191,6 +245,8 @@ Telegram ──► listener.Scanner ──► SQLite 任务表 ──► listene
   - 替换规则 = 跳过（或历史版本）；实时监控开启。
 
 安全原理：白名单外的一切（`download_history.txt`、`download_queue.json`、`download.log`、`whitelist_config.json`、`thread_config.json`、`clear_time.json`、`*.download`）不会进入备份 → 没有「完成后」→ 删除源规则不会碰它们。自运行时文件归集后这 7 个文件都挪进了 `SAVE_FOLDER/runtime/` 子目录（仍非媒体扩展名，免疫规则不变；CD2 备份源是 `SAVE_FOLDER` 递归范围，`runtime/` 在范围内也一样不被碰）。**设计取舍**：zip/rar/pdf 等归档类不在白名单，会一直留在本地（若也转发大量归档，磁盘仍会缓慢增长，需手动加后缀进白名单）。校验过一次真实运行：频道子文件夹的媒体被搬空删净、6 个运行时文件健在。（`Douyin/`、`Instagram/` 是统一下载链路重构前的历史目录，新版本不再写入——抖音/IG 视频现随普通下载落转发来源目录，如 `@DouYintg_bot 显示名/`，仍在 `SAVE_FOLDER` 递归备份范围内。）
+
+**排查提示（2026-09-11 实测，别被日志吓到）**：CD2 日志里的 `backup_to_all: "<路径>"` 行是**备份尝试**、不代表已经上传——扩展名白名单是在之后才过滤的。判断「真的备份成功并触发了完成规则删源」的唯一可靠判据是 `handle_cloudfs_notify: delete file and remove from all dests "<路径>"` 那一行。实测新加的 `runtime/tg_userbot.db`（含 `-wal`/`-shm`）**会**出现 backup_to_all 行，但云端 `Nekogram/runtime/` 始终为空、且全程没有任何 delete 行 → 数据库确实没被搬走也没被删（`.db` 不在白名单里）。反过来说，**看到 backup_to_all 不等于出事，看到 delete 才是**。
 
 **.download 半成品**：中断的下载重启后是「删半成品、整文件重下」，不支持断点续传（见下载模式）。残留的 `.download` 不会被 CD2 搬走。清理由 `clean_temp_files()` 负责，入口有二：`/clean` 命令/bot 菜单「🧹 清理」按钮，以及 **每次启动时 `main()` 会先自动清一次**（此时尚无下载，安全）——自动清理专门兜住异常退出、`/queue del` 后无人认领、或命名逻辑跨版本变化留下的孤儿 `.download`。正常情况下重启能自愈（任务已持久化，重下前删同名 temp）；出现孤儿 `.download` 的成因为：队列任务被移除后旧 temp 无人认领——原消息已删除被自动终结、`/queue del`/`/retry del` 清掉任务，或**命名逻辑跨版本变化**导致重启后算出的最终名与旧 temp 不同（实测案例：无 caption 文件旧版名 `未命名文件 - X.mp4`、新版名 `X.mp4`，旧半成品成死文件）。
 
