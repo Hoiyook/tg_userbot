@@ -28,6 +28,7 @@ from . import chrome_client
 from . import cd2
 from . import stats
 from . import finder
+from . import listener
 from . import caption_filter
 from . import commands
 from . import config
@@ -49,6 +50,7 @@ BOT_COMMANDS = (
     ("thread", "查看/设置并行下载路数"),
     ("dedup", "查看/设置重复媒体去重"),
     ("caption_filter", "查看/修改 Caption 命名清洗规则"),
+    ("listen", "标签监听：按周期扫描聊天并按标签转发/下载"),
     ("wl", "查看下载白名单"),
     ("clean", "清理 .download 临时文件"),
     ("chrome_start", "启动 Chrome 下载 Agent"),
@@ -76,17 +78,22 @@ async def register_bot_commands(client):
 
 
 def open_input_window(kind):
-    """开一个「等待下一条文本」的输入窗口，并关掉其它两个。
+    """开一个「等待下一条文本」的输入窗口，并关掉其它所有窗口。
 
-    同一时刻只允许一个窗口开着（cookie / 查询 / Caption 清洗）：三个窗口的
-    判定是 if 顺序执行，若同时非零，排在前的会把本该给后者的文本吃掉——
-    cookie 排最前、代价也最重（一段 Caption 规则会被当成抖音 cookie 存进
-    tg_secrets.json）。kind：\"cookie\" / \"find\" / \"add\"|\"del\"|\"test\"。
+    同一时刻只允许一个窗口开着（cookie / 查询 / Caption 清洗 / 标签监听）：
+    窗口的判定是 if 顺序执行，若同时非零，排在前的会把本该给后者的文本吃掉——
+    cookie 排最前、代价也最重（一段 Caption 规则或标签会被当成抖音 cookie
+    存进 tg_secrets.json）。
+
+    kind：\"cookie\" / \"find\" / \"add\"|\"del\"|\"test\"（Caption 清洗）
+    / \"listen_chat\"|\"listen_tag\"|\"listen_target\"（标签监听向导）。
     """
     state.COOKIE_INPUT_UNTIL = 0.0
     state.FIND_INPUT_UNTIL = 0.0
     state.CAPTION_INPUT_UNTIL = 0.0
     state.CAPTION_INPUT_MODE = ""
+    state.LISTEN_INPUT_UNTIL = 0.0
+    state.LISTEN_INPUT_STEP = ""
     if kind == "cookie":
         state.COOKIE_INPUT_UNTIL = (
             time.monotonic() + config.COOKIE_INPUT_WINDOW_SECONDS
@@ -95,6 +102,11 @@ def open_input_window(kind):
         state.FIND_INPUT_UNTIL = (
             time.monotonic() + config.FIND_INPUT_WINDOW_SECONDS
         )
+    elif kind.startswith("listen_"):
+        state.LISTEN_INPUT_UNTIL = (
+            time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
+        )
+        state.LISTEN_INPUT_STEP = kind[len("listen_"):]
     else:
         state.CAPTION_INPUT_UNTIL = (
             time.monotonic() + config.CAPTION_INPUT_WINDOW_SECONDS
@@ -272,6 +284,74 @@ async def handle_menu_action(action, arg, event):
             caption_filter.command_reply(action[len("capf_"):], None),
             menu.caption_filter_menu_buttons(),
         )
+    # ---------- 标签监听（独立于下载白名单的一套配置） ----------
+    if action == "listen":
+        return listener.view_text(), listener.menu_buttons()
+    if action == "listen_add":
+        listener.draft_start()
+        open_input_window("listen_chat")
+        return listener.input_prompt("chat"), listener.menu_buttons()
+    if action == "listen_cancel":
+        listener.draft_cancel()
+        return listener.view_text(), listener.menu_buttons()
+    if action == "listen_toggle":
+        listener.set_enabled(not state.LISTEN_ENABLED)
+        return listener.view_text(), listener.menu_buttons()
+    if action == "listen_interval":
+        return ("⏱ 选择扫描周期：", menu.listen_interval_buttons())
+    if action == "listen_interval_set":
+        ok, msg = listener.set_interval(arg)
+        return f"{msg}\n\n{listener.view_text()}", listener.menu_buttons()
+    if action == "listen_scan":
+        totals = await listener.scan_all(manual=True)
+        return listener.summary_text(totals), listener.menu_buttons()
+    if action == "listen_del":
+        if not state.LISTEN_RULES:
+            return (f"{config.LISTEN_NOTIFY_PREFIX}\n\n尚未配置任何监听规则。",
+                    listener.menu_buttons())
+        if arg is None:
+            return ("🗑 选择要删除的规则：",
+                    listener.rule_pick_buttons("listen_del"))
+        ok, msg = listener.del_listener(arg)
+        return f"{msg}\n\n{listener.view_text()}", listener.menu_buttons()
+    if action == "listen_edit":
+        if not state.LISTEN_RULES:
+            return (f"{config.LISTEN_NOTIFY_PREFIX}\n\n尚未配置任何监听规则。",
+                    listener.menu_buttons())
+        if arg is None:
+            return ("✏️ 选择要修改的规则：",
+                    listener.rule_pick_buttons("listen_edit"))
+        try:
+            index = int(arg)
+        except ValueError:
+            return listener.view_text(), listener.menu_buttons()
+        rules = state.LISTEN_RULES
+        if not 1 <= index <= len(rules):
+            return listener.view_text(), listener.menu_buttons()
+        # 用同一个向导，草稿用现有规则预填，保存时覆盖该序号
+        listener.draft_start(seed=rules[index - 1], edit_index=index)
+        open_input_window("listen_chat")
+        return (
+            f"✏️ 修改规则 {index}（重新走一遍向导）\n\n"
+            + listener.input_prompt("chat"),
+            listener.menu_buttons(),
+        )
+    if action in ("listen_tgt", "listen_tgtadd", "listen_dl", "listen_save"):
+        if not listener.draft_active():
+            return listener.view_text(), listener.menu_buttons()
+        if action == "listen_tgt":
+            listener.draft_toggle_target(arg)
+            return (listener.draft_summary_text(), listener.draft_buttons())
+        if action == "listen_tgtadd":
+            open_input_window("listen_target")
+            return (listener.input_prompt("target"), listener.draft_buttons())
+        if action == "listen_dl":
+            draft = listener.draft_get()
+            listener.draft_set_download(not draft.get("download"))
+            return (listener.draft_summary_text(), listener.draft_buttons())
+        ok, msg = await listener.draft_save()
+        return (f"{msg}\n\n{listener.view_text() if ok else listener.draft_summary_text()}",
+                listener.menu_buttons() if ok else listener.draft_buttons())
     if action == "dedup":
         return dedup.status_text(), menu.dedup_menu_buttons()
     if action == "dedup_toggle":
@@ -371,6 +451,20 @@ async def bot_message_handler(event):
         state.CAPTION_INPUT_UNTIL = 0.0
         state.CAPTION_INPUT_MODE = ""
 
+    # 标签监听向导：普通文本按当前步骤当「来源聊天 / 标签 / 目标聊天」。
+    # 必须排在 cookie/find/caption 之后但仍在转发判定之前——转发消息也要
+    # 能落进这个窗口（用户可能直接转发一条来自目标频道的消息当输入）。
+    if (state.LISTEN_INPUT_UNTIL
+            and time.monotonic() < state.LISTEN_INPUT_UNTIL):
+        if not text.startswith("/"):
+            step = state.LISTEN_INPUT_STEP
+            state.LISTEN_INPUT_UNTIL = 0.0
+            state.LISTEN_INPUT_STEP = ""
+            await _handle_listen_input(step, text)
+            return
+        state.LISTEN_INPUT_UNTIL = 0.0
+        state.LISTEN_INPUT_STEP = ""
+
     if from_id:
         chat_id, title = await whitelist.resolve_wl_target(
             state.bot_client, None, fwd
@@ -430,6 +524,57 @@ async def _handle_find_input(event, text):
     await state.bot_client.send_message(
         state.MY_ID, finder.find_media(text), link_preview=False
     )
+
+
+async def _handle_listen_input(step, text):
+    """标签监听向导的一步输入：来源聊天 → 标签 → 目标聊天。
+
+    来源与目标都要联网解析成 chat_id（username 只是输入方式，不是持久化
+    身份——§22.4），解析失败就把窗口留在原步骤让用户重发。
+    """
+    if not listener.draft_active():
+        return
+    if step == "chat":
+        info, err = await listener.resolve_chat(text)
+        if err:
+            open_input_window("listen_chat")
+            await state.bot_client.send_message(state.MY_ID, err)
+            return
+        listener.draft_set_source(info)
+        open_input_window("listen_tag")
+        await state.bot_client.send_message(
+            state.MY_ID,
+            f"✅ 来源聊天：{info['name']} ({info['chat_id']})\n\n"
+            + listener.input_prompt("tag"),
+        )
+        return
+    if step == "tag":
+        ok, err = listener.draft_set_tag(text)
+        if not ok:
+            open_input_window("listen_tag")
+            await state.bot_client.send_message(state.MY_ID, err)
+            return
+        await state.bot_client.send_message(
+            state.MY_ID, listener.draft_summary_text(),
+            buttons=listener.draft_buttons(),
+        )
+        return
+    if step == "target":
+        if text.strip().lower() in ("me", "saved_messages", "收藏夹"):
+            listener.draft_toggle_target(listener.WORK_SAVED)
+        else:
+            info, err = await listener.resolve_chat(text)
+            if err:
+                open_input_window("listen_target")
+                await state.bot_client.send_message(state.MY_ID, err)
+                return
+            added, err = listener.draft_add_target(info)
+            if not added:
+                await state.bot_client.send_message(state.MY_ID, err)
+        await state.bot_client.send_message(
+            state.MY_ID, listener.draft_summary_text(),
+            buttons=listener.draft_buttons(),
+        )
 
 
 async def _handle_caption_input(mode, text):

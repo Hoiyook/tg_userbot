@@ -824,5 +824,104 @@ class StartReporterWiringTest(unittest.IsolatedAsyncioTestCase):
             await task
 
 
+class ListenReportingTest(unittest.TestCase):
+    """汇报要汇总标签监听：面板一行 + 扫描事件通知（空扫不发、失败必发）。"""
+
+    def setUp(self):
+        self.old = (state.LISTEN_ENABLED, state.LISTEN_RULES,
+                    state.LISTEN_INTERVAL_MINUTES, state.LISTEN_LAST_SCAN)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        (state.LISTEN_ENABLED, state.LISTEN_RULES,
+         state.LISTEN_INTERVAL_MINUTES, state.LISTEN_LAST_SCAN) = self.old
+
+    def test_panel_shows_listen_line(self):
+        state.LISTEN_ENABLED = True
+        state.LISTEN_RULES = [{"source_chat_id": -100, "tag": "#a",
+                               "targets": [], "download": True}]
+        state.LISTEN_LAST_SCAN = {"ts": "07:20", "matched": 9,
+                                  "forwarded": 14}
+        text = reporter.build_status_text(_snap(listen={
+            "enabled": True, "rules": 1, "interval_minutes": 1440,
+            "last": state.LISTEN_LAST_SCAN}))
+        self.assertIn("📡 标签监听", text)
+        self.assertIn("规则 1 条", text)
+        self.assertIn("07:20", text)
+        self.assertIn("命中 9", text)
+
+    def test_snapshot_reads_state_readonly(self):
+        state.LISTEN_ENABLED = False
+        state.LISTEN_RULES = []
+        state.LISTEN_LAST_SCAN = None
+        rep = reporter.Reporter(client=None)
+        snap = rep.snapshot()
+        self.assertEqual(snap["listen"]["enabled"], False)
+        self.assertEqual(snap["listen"]["rules"], 0)
+        self.assertIsNone(snap["listen"]["last"])
+
+    def test_listen_line_never_blank(self):
+        self.assertTrue(reporter._listen_line({}))
+        self.assertIn("尚未扫描", reporter._listen_line(
+            {"enabled": True, "rules": 0, "last": None}))
+
+    def test_event_text_for_listen(self):
+        text = reporter.build_event_text(
+            "listen", chats=2, scanned=30, matched=4, forwarded=7,
+            failed=1, chat_failures=1, errors=["读取失败"])
+        self.assertIn("🏷 标签监听", text)
+        self.assertIn("命中：4 条", text)
+        self.assertIn("转发：7 项", text)
+        self.assertIn("下轮自动续做", text)
+        self.assertIn("读取失败", text)
+
+    def test_unknown_kind_still_none(self):
+        self.assertIsNone(reporter.build_event_text("nope"))
+
+
+class ListenEventDispatchTest(unittest.IsolatedAsyncioTestCase):
+    """dispatch_events：LISTEN_* 聚合通知；空扫不发；失败必发。"""
+
+    def setUp(self):
+        self.sent = []
+
+        async def fake_notify(text):
+            self.sent.append(text)
+            return True
+
+        self._p = mock.patch.object(reporter, "notify")
+        self.notify_mod = self._p.start()
+        self.notify_mod.notify_user = fake_notify
+        self.addCleanup(self._p.stop)
+        self.rep = reporter.Reporter(client=None)
+
+    async def test_empty_scan_does_not_notify(self):
+        await self.rep.dispatch_events([
+            {"ev": "LISTEN_SCAN", "label": "-100", "scanned": 5,
+             "matched": 0, "forwarded": 0, "failed": 0},
+        ])
+        self.assertEqual(self.sent, [])
+
+    async def test_match_triggers_one_aggregated_notification(self):
+        await self.rep.dispatch_events([
+            {"ev": "LISTEN_SCAN", "label": "-100", "scanned": 5,
+             "matched": 2, "forwarded": 3, "failed": 0},
+            {"ev": "LISTEN_SCAN", "label": "-101", "scanned": 7,
+             "matched": 1, "forwarded": 2, "failed": 0},
+        ])
+        self.assertEqual(len(self.sent), 1)     # 按批聚合，不刷屏
+        self.assertIn("🏷 标签监听", self.sent[0])
+        self.assertIn("命中：3 条", self.sent[0])
+        self.assertIn("转发：5 项", self.sent[0])
+
+    async def test_chat_failure_always_notifies(self):
+        await self.rep.dispatch_events([
+            {"ev": "LISTEN_FAIL", "label": "-100", "error": "读取新消息失败"},
+        ])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("聊天失败：1 个", self.sent[0])
+        self.assertIn("读取新消息失败", self.sent[0])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -467,6 +467,82 @@ class StatsTextEventModeTest(unittest.TestCase):
         self.assertIn("🧮 对账", text)
         self.assertIn("✓", text)                   # 严格分区恒等
 
+    def test_listen_section_absent_when_no_scans(self):
+        """没扫过（标签监听上线前的日子）→ 不出现监听分节，老输出保持原样。"""
+        self._write_events([
+            _ev(7, "10:00:00", "RECEIVED", "a" * 32, src="me"),
+            _ev(7, "10:00:01", "QUEUED", "a" * 32, kind="media"),
+            _ev(7, "10:00:02", "RUNNING", "a" * 32),
+            _ev(7, "10:00:03", "SUCCESS", "a" * 32, bytes=10),
+        ])
+        text = stats.stats_text(
+            1, today=TODAY, log_path=os.path.join(_TMP, "nope.log"),
+            history_path=os.path.join(_TMP, "nope_history.txt"),
+            events_path=self.ev_file,
+        )
+        self.assertNotIn("📡 标签监听", text)
+        self.assertIn("监听 0", text)      # 输入侧仍显式列出，便于勾稽
+
+    def test_listen_section_and_source_bucket(self):
+        """标签监听要能在台账里单独数出来：扫描/命中/转发/触发下载。"""
+        self._write_events([
+            _ev(7, "09:00:00", "LISTEN_SCAN", label="-100123",
+                scanned=20, matched=3, forwarded=6, failed=0),
+            _ev(7, "09:00:00", "LISTEN_SCAN", label="-100456",
+                scanned=5, matched=0, forwarded=0, failed=0),
+            _ev(7, "09:00:01", "RECEIVED", "a" * 32, src="listen"),
+            _ev(7, "09:00:02", "QUEUED", "a" * 32, kind="media"),
+            _ev(7, "09:00:03", "RUNNING", "a" * 32),
+            _ev(7, "09:00:04", "SUCCESS", "a" * 32, bytes=99),
+        ])
+        text = stats.stats_text(
+            1, today=TODAY, log_path=os.path.join(_TMP, "nope.log"),
+            history_path=os.path.join(_TMP, "nope_history.txt"),
+            events_path=self.ev_file,
+        )
+        self.assertIn("📡 标签监听", text)
+        self.assertIn("扫描：2 次", text)
+        self.assertIn("检查 25 条", text)
+        self.assertIn("命中：3 条", text)
+        self.assertIn("转发：6 项", text)
+        self.assertIn("触发下载：1 条", text)
+        self.assertIn("监听 1", text)      # 输入侧分桶
+        self.assertIn("✓", text)           # LISTEN_* 不扰动对账恒等式
+
+    def test_listen_chat_failure_shown(self):
+        self._write_events([
+            _ev(7, "09:00:00", "LISTEN_FAIL", label="-100123",
+                error="读取新消息失败"),
+            _ev(7, "09:00:01", "LISTEN_SCAN", label="-100456",
+                scanned=1, matched=0, forwarded=0, failed=0),
+        ])
+        text = stats.stats_text(
+            1, today=TODAY, log_path=os.path.join(_TMP, "nope.log"),
+            history_path=os.path.join(_TMP, "nope_history.txt"),
+            events_path=self.ev_file,
+        )
+        self.assertIn("聊天失败 1 个", text)
+        self.assertIn("扫描：1 次", text)   # 失败的聊天不算一次成功扫描
+
+    def test_listen_events_do_not_create_tasks(self):
+        """LISTEN_* 是输入侧事件（无 task_id），不得进入任务集/对账分区。"""
+        base = [
+            _ev(7, "10:00:00", "QUEUED", "a" * 32, kind="media"),
+            _ev(7, "10:00:01", "RUNNING", "a" * 32),
+            _ev(7, "10:00:02", "SUCCESS", "a" * 32, bytes=1000),
+        ]
+        extra = base + [
+            _ev(7, "09:00:00", "LISTEN_SCAN", label="-100", scanned=9,
+                matched=2, forwarded=4, failed=0),
+            _ev(7, "09:00:01", "LISTEN_FAIL", label="-101", error="x"),
+        ]
+        a = stats.rebuild_stats(base, days=1, today=TODAY)
+        b = stats.rebuild_stats(extra, days=1, today=TODAY)
+        for key in ("task_total", "success", "failed_final", "removed",
+                    "dedup_hit", "active", "success_bytes"):
+            with self.subTest(key=key):
+                self.assertEqual(a[key], b[key])
+
     def test_legacy_fallback_when_no_events_in_window(self):
         """窗口内无事件（功能上线前的老日子）→ 回落关键词口径并注明。"""
         log_path, history_path = _write(None)

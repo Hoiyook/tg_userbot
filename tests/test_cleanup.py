@@ -132,6 +132,34 @@ class CleanupCaptionFilterTest(unittest.TestCase):
             cleanup.is_cleanup_message(make_msg(text="这个 Caption 写得不错"))
         )
 
+
+class CleanupListenTest(unittest.TestCase):
+    """/listen 命令与「📡/🏷 标签监听」回复纳入自动清理白名单。"""
+
+    def test_command_cleaned(self):
+        for text in ("/listen", "/listen on", "/listen add @a #b me on",
+                     "/listen del 1", "/listen interval 30"):
+            with self.subTest(text=text):
+                self.assertTrue(cleanup.is_cleanup_message(make_msg(text=text)))
+
+    def test_replies_cleaned(self):
+        for text in (
+            "📡 标签监听\n\n状态：🟢 开启\n扫描周期：24 小时",
+            "🏷 标签监听 扫描完成\n\n命中：3 条",
+            "📡 标签监听 已开启",
+            "📡 标签监听：无法解析聊天：@nope",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(cleanup.is_cleanup_message(make_msg(text=text)))
+
+    def test_plain_content_mentioning_listen_kept(self):
+        # 只按前缀匹配，普通内容提到「标签监听」不该被删
+        self.assertFalse(
+            cleanup.is_cleanup_message(
+                make_msg(text="这个标签监听功能不错，但文字不是前缀"))
+        )
+
+
 class ChromeResultNotificationTest(unittest.TestCase):
     """Chrome 下载结果通知持久保留（2026-09-09 验收反馈：通知 85 秒后就被
     自动清理删掉，用户没看到）。结果类通知豁免自动清理（include_persistent

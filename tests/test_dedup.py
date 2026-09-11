@@ -444,7 +444,7 @@ class EnqueueMediaKeysTest(unittest.IsolatedAsyncioTestCase):
     async def test_record_carries_dedup_keys_list(self):
         captured = []
 
-        async def fake_enqueue(record):
+        async def fake_enqueue(record, src=None):
             captured.append(record)
 
         with mock.patch.object(app.queue, "enqueue_and_start", fake_enqueue):
@@ -462,7 +462,7 @@ class EnqueueMediaKeysTest(unittest.IsolatedAsyncioTestCase):
         }
         captured = []
 
-        async def fake_enqueue(record):
+        async def fake_enqueue(record, src=None):
             captured.append(record)
 
         async def fake_send(*a, **k):
@@ -486,7 +486,7 @@ class EnqueueMediaKeysTest(unittest.IsolatedAsyncioTestCase):
         if os.path.exists(ev_file):
             os.remove(ev_file)
 
-        async def fake_enqueue(record):
+        async def fake_enqueue(record, src=None):
             raise AssertionError("去重命中不应入队")
 
         async def fake_send(*a, **k):

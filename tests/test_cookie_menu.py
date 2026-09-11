@@ -266,3 +266,50 @@ class BrowserImportTest(unittest.TestCase):
         self.assertIn("chrome 导入", text)
         self.assertIn("实时生效", text)
         self.assertEqual(config.DOUYIN_COOKIE, cookie)
+
+
+class ListenInputWindowTest(unittest.TestCase):
+    """四个输入窗口（cookie/查询/Caption 清洗/标签监听）必须互斥。
+
+    窗口判定是 if 顺序执行：若同时非零，排在前的会把本该给后者的文本吃掉
+    ——cookie 排最前、代价也最重（一段标签会被当成抖音 cookie 存进
+    tg_secrets.json）。标签监听向导的每一步都必须关掉其它三个。
+    """
+
+    def setUp(self):
+        self._saved = (state.COOKIE_INPUT_UNTIL, state.FIND_INPUT_UNTIL,
+                       state.CAPTION_INPUT_UNTIL, state.CAPTION_INPUT_MODE,
+                       state.LISTEN_INPUT_UNTIL, state.LISTEN_INPUT_STEP)
+
+    def tearDown(self):
+        (state.COOKIE_INPUT_UNTIL, state.FIND_INPUT_UNTIL,
+         state.CAPTION_INPUT_UNTIL, state.CAPTION_INPUT_MODE,
+         state.LISTEN_INPUT_UNTIL,
+         state.LISTEN_INPUT_STEP) = self._saved
+
+    def test_listen_window_closes_cookie_and_caption(self):
+        bot.open_input_window("cookie")
+        self.assertGreater(state.COOKIE_INPUT_UNTIL, 0)
+        bot.open_input_window("listen_tag")
+        self.assertEqual(state.COOKIE_INPUT_UNTIL, 0.0)
+        self.assertEqual(state.CAPTION_INPUT_UNTIL, 0.0)
+        self.assertEqual(state.FIND_INPUT_UNTIL, 0.0)
+        self.assertGreater(state.LISTEN_INPUT_UNTIL, 0)
+        self.assertEqual(state.LISTEN_INPUT_STEP, "tag")
+
+    def test_cookie_window_closes_listen(self):
+        bot.open_input_window("listen_chat")
+        self.assertEqual(state.LISTEN_INPUT_STEP, "chat")
+        bot.open_input_window("cookie")
+        self.assertEqual(state.LISTEN_INPUT_UNTIL, 0.0)
+        self.assertEqual(state.LISTEN_INPUT_STEP, "")
+        self.assertGreater(state.COOKIE_INPUT_UNTIL, 0)
+        # 后开的 cookie 窗口留下时，前面存的 step 不能残留把文本吃掉
+        self.assertEqual(state.CAPTION_INPUT_MODE, "")
+
+    def test_listen_steps_are_recorded(self):
+        for kind, step in (("listen_chat", "chat"), ("listen_tag", "tag"),
+                           ("listen_target", "target")):
+            with self.subTest(kind=kind):
+                bot.open_input_window(kind)
+                self.assertEqual(state.LISTEN_INPUT_STEP, step)

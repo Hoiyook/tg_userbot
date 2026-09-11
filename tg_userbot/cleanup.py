@@ -22,6 +22,7 @@ from . import whitelist
 from . import platform
 from . import stats
 from . import finder
+from . import listener
 from . import caption_filter
 from . import chrome_client
 from .config import (
@@ -166,6 +167,10 @@ def is_cleanup_message(message, include_persistent=False) -> bool:
 
         # /caption_filter 指令（Caption 命名清洗，含子命令）
         if caption_filter.is_caption_filter_command(text):
+            return True
+
+        # /listen 指令（标签监听，含子命令）
+        if listener.is_listen_command(text):
             return True
 
         # /chrome* 指令（Chrome Agent，含 URL 参数）

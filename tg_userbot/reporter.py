@@ -41,6 +41,7 @@ from . import stats
 from . import workers
 from .config import (
     REPORT_AUTO_REPLAY,
+    REPORT_LISTEN,
     REPORT_DOWNLOAD_FAILED,
     REPORT_DOWNLOAD_START,
     REPORT_DOWNLOAD_SUCCESS,
@@ -256,6 +257,20 @@ def _workers_block(snapshot):
     return lines
 
 
+def _listen_line(listen):
+    """面板里的标签监听一行（只读快照渲染，纯函数）。"""
+    if not listen:
+        return "（无数据）"
+    head = "🟢 开启" if listen.get("enabled") else "⚪ 关闭"
+    last = listen.get("last") or {}
+    if last:
+        tail = (f"上轮 {last.get('ts') or '--'} 命中 "
+                f"{last.get('matched', 0)} 条 / 转发 {last.get('forwarded', 0)} 项")
+    else:
+        tail = "尚未扫描"
+    return f"{head} | 规则 {listen.get('rules', 0)} 条 | {tail}"
+
+
 def _compose(snapshot, max_downloads=REPORT_MAX_DOWNLOADS_SHOWN):
     """渲染面板正文（内层；下载条数由外层按长度预算逐级下调）。"""
     st = snapshot.get("state") or "RUNNING"
@@ -286,6 +301,11 @@ def _compose(snapshot, max_downloads=REPORT_MAX_DOWNLOADS_SHOWN):
     lines += _download_block(snapshot.get("downloads") or [], max_downloads)
     lines.append("")
     lines += _workers_block(snapshot)
+    lines += [
+        "",
+        "📡 标签监听",
+        _listen_line(snapshot.get("listen") or {}),
+    ]
     lines += [
         "",
         "📈 今日统计",
@@ -504,8 +524,25 @@ class Reporter:
             "workers_unhealthy": unhealthy,
             "clients": clients,
             "stats": self.collect_stats(now=now),
+            "listen": self._collect_listen(),
             "last_activity_ago": now - self._last_activity,
         }
+
+    def _collect_listen(self):
+        """标签监听快照：**只读** state（与 WHITELIST_CHATS/DEDUP_ENABLED 同款）。
+
+        Reporter 是只读观察者——不读配置文件、不做网络请求，所以监听把运行态
+        都放在 state 里（listener 自己负责落盘）。
+        """
+        try:
+            return {
+                "enabled": bool(state.LISTEN_ENABLED),
+                "rules": len(state.LISTEN_RULES or []),
+                "interval_minutes": state.LISTEN_INTERVAL_MINUTES,
+                "last": state.LISTEN_LAST_SCAN,
+            }
+        except Exception:
+            return {}
 
     def build_status_text(self, now=None):
         return build_status_text(self.snapshot(now=now))
@@ -696,6 +733,25 @@ class Reporter:
             await self.notify_event(
                 "auto_replay", count=len(auto),
                 labels=[e.get("label") for e in auto if e.get("label")])
+        if REPORT_LISTEN:
+            # 标签监听按批聚合（一轮扫描每个聊天一条 LISTEN_SCAN），
+            # 且**只在有命中或失败时**发——定时扫描一天一次，空扫也发的话
+            # 就变成固定刷屏了。失败必发。
+            scans = [e for e in events if e.get("ev") == "LISTEN_SCAN"]
+            fails = [e for e in events if e.get("ev") == "LISTEN_FAIL"]
+            matched = sum(int(e.get("matched") or 0) for e in scans)
+            item_failed = sum(int(e.get("failed") or 0) for e in scans)
+            if scans and (matched or item_failed) or fails:
+                await self.notify_event(
+                    "listen",
+                    chats=len(scans),
+                    scanned=sum(int(e.get("scanned") or 0) for e in scans),
+                    matched=matched,
+                    forwarded=sum(int(e.get("forwarded") or 0) for e in scans),
+                    failed=item_failed,
+                    chat_failures=len(fails),
+                    errors=[e.get("error") for e in fails if e.get("error")],
+                )
         if REPORT_DOWNLOAD_SUCCESS:
             for e in events:
                 if e.get("ev") == "SUCCESS":
@@ -839,6 +895,22 @@ def build_event_text(kind, **kw):
             more = len(labels) - min(len(labels), 3)
             lines.append(f"文件：{preview}" + (f" 等 {more} 个" if more else ""))
         lines.append("原因：等待期已过，网络恢复后自动续跑")
+        return "\n".join(lines)
+    if kind == "listen":
+        # 标签监听扫描汇总（LISTEN_SCAN / LISTEN_FAIL 聚合；空扫不发）
+        lines = [
+            "🏷 标签监听",
+            "",
+            f"扫描：{kw.get('chats', 0)} 个聊天 / {kw.get('scanned', 0)} 条消息",
+            f"命中：{kw.get('matched', 0)} 条",
+            f"转发：{kw.get('forwarded', 0)} 项",
+        ]
+        if kw.get("failed"):
+            lines.append(f"转发失败：{kw['failed']} 项（下轮自动续做）")
+        if kw.get("chat_failures"):
+            lines.append(f"聊天失败：{kw['chat_failures']} 个")
+        for err in (kw.get("errors") or [])[:3]:
+            lines.append(f"⚠️ {err}")
         return "\n".join(lines)
     if kind == "error":
         return ("⚠️ Userbot 异常\n\n"

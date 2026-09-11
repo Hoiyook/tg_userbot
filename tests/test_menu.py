@@ -211,6 +211,55 @@ class RefreshButtonsTest(unittest.TestCase):
         self.assertIn("📊 台账", texts)
 
 
+class ListenMenuTest(unittest.TestCase):
+    """标签监听菜单：独立入口（规格书 §18——不能塞进 📋 白名单）+ 向导按钮。"""
+
+    def test_main_menu_has_listen_entry(self):
+        texts = [b.text for row in menu.main_menu_buttons() for b in row]
+        self.assertIn("📡 标签监听", texts)
+
+    def test_main_menu_still_has_whitelist_separately(self):
+        """两套系统必须各有各的入口，用户要能明显区分。"""
+        texts = [b.text for row in menu.main_menu_buttons() for b in row]
+        self.assertIn("📋 白名单", texts)
+        self.assertIn("📡 标签监听", texts)
+
+    def test_listen_view_buttons_registered(self):
+        from tg_userbot import listener
+        rows = listener.menu_buttons()
+        pairs = [menu.parse_menu_data(b.data) for row in rows for b in row]
+        actions = [a for a, _arg in pairs]
+        for a in ("listen_add", "listen_edit", "listen_del", "listen_scan",
+                  "listen_interval", "listen_toggle", "home"):
+            self.assertIn(a, actions)
+
+    def test_listen_interval_buttons_registered(self):
+        pairs = [menu.parse_menu_data(b.data)
+                 for row in menu.listen_interval_buttons() for b in row]
+        actions = [a for a, _arg in pairs]
+        self.assertIn("listen_interval_set", actions)
+        self.assertIn("listen", actions)
+
+    def test_listen_wizard_buttons_registered(self):
+        from tg_userbot import listener
+        listener.draft_start()
+        self.addCleanup(listener.draft_cancel)
+        pairs = [menu.parse_menu_data(b.data)
+                 for row in listener.draft_buttons() for b in row]
+        actions = [a for a, _arg in pairs]
+        for a in ("listen_tgt", "listen_tgtadd", "listen_dl", "listen_save",
+                  "listen_cancel"):
+            self.assertIn(a, actions)
+
+    def test_all_listen_actions_in_menu_actions(self):
+        from tg_userbot import config
+        for a in ("listen", "listen_add", "listen_edit", "listen_del",
+                  "listen_scan", "listen_interval", "listen_interval_set",
+                  "listen_toggle", "listen_tgt", "listen_tgtadd", "listen_dl",
+                  "listen_save", "listen_cancel"):
+            self.assertIn(a, config.MENU_ACTIONS)
+
+
 class BotCommandsRegistryTest(unittest.IsolatedAsyncioTestCase):
     """bot 命令面板：BOT_COMMANDS 表合法，注册时发 SetBotCommandsRequest。"""
 

@@ -19,6 +19,7 @@ from . import whitelist
 from . import cleanup
 from . import stats
 from . import finder
+from . import listener
 from . import caption_filter
 from .config import (
     BOT_USERNAME,
@@ -285,6 +286,14 @@ async def handle_command(event, cmd_text):
         await event.reply(caption_filter.command_reply(action, arg))
         return True
 
+    parsed_listen = listener.parse_listen_command(cmd_text)
+    if parsed_listen is not None:
+        action, arg = parsed_listen
+        logger.info(f"执行命令：/listen {action}")
+        await event.reply(await listener.command_reply(action, arg),
+                          link_preview=False)
+        return True
+
     if finder.is_find_command(cmd_text):
         # 媒体下落查询：完整字段子串匹配（列表视图截尾 48 字符是它存在的理由）
         parts = cmd_text.split(maxsplit=1)
@@ -312,6 +321,9 @@ async def handle_command(event, cmd_text):
             "/dedup - 查看重复媒体去重状态\n"
             "/dedup off - 关闭去重（重新下载已删文件时用）\n"
             "/caption_filter - 查看/修改 Caption 命名清洗规则\n"
+            "/listen - 标签监听：按周期扫描聊天并按标签转发/下载\n"
+            "/listen add @频道 #标签 me,@目标 on - 新增监听规则\n"
+            "/listen scan - 立即扫描一次\n"
             "/wl - 查看下载白名单\n"
             "/wl add @用户名 - 加入白名单（也可回复转发消息后 /wl add）\n"
             "/wl del ID或序号 - 移出白名单\n"

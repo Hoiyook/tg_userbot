@@ -251,6 +251,22 @@ def rebuild_stats(events, days=1, today=None):
                            and e.get("src") == "me"),
         "received_wl": sum(1 for e in window if e.get("ev") == "RECEIVED"
                            and e.get("src") == "wl"),
+        # 标签监听触发的下载（RECEIVED 带 src="listen"）+ 扫描自身的事件。
+        # LISTEN_* 是输入侧事件（无 task_id），不参与任务集构造，故不影响
+        # 对账恒等式——与 DEDUP_SKIPPED 同类。
+        "received_listen": sum(1 for e in window if e.get("ev") == "RECEIVED"
+                               and e.get("src") == "listen"),
+        "listen_scans": sum(1 for e in window if e.get("ev") == "LISTEN_SCAN"),
+        "listen_scanned": sum(int(e.get("scanned") or 0) for e in window
+                              if e.get("ev") == "LISTEN_SCAN"),
+        "listen_matched": sum(int(e.get("matched") or 0) for e in window
+                              if e.get("ev") == "LISTEN_SCAN"),
+        "listen_forwarded": sum(int(e.get("forwarded") or 0) for e in window
+                                if e.get("ev") == "LISTEN_SCAN"),
+        "listen_failed": sum(int(e.get("failed") or 0) for e in window
+                             if e.get("ev") == "LISTEN_SCAN"),
+        "listen_chat_failures": sum(1 for e in window
+                                    if e.get("ev") == "LISTEN_FAIL"),
     }
 
     # 按任务聚合（全量事件流），只收窗口内出现过的任务
@@ -318,14 +334,32 @@ def _event_text(events, days, today, log_path, history_path):
                 + s["dedup_hit"] + s["active"])
     tail = " ✓" if balanced else "（分区异常，请查事件日志）"
 
-    return "\n".join([
+    lines = [
         _header(days, today),
         "",
         "📥 输入事件",
+        # 三个来源相加 = 收到媒体总数（可勾稽）：收藏夹直发 / 下载白名单中转
+        # / 标签监听转发后入队（监听副本的 chat_id 也是我，不看 src 区分不开）
         f"收到媒体：{s['received']} 条"
-        f"（收藏 {s['received_me']} / 中转 {s['received_wl']}）",
+        f"（收藏 {s['received_me']} / 中转 {s['received_wl']}"
+        f" / 监听 {s['received_listen']}）",
         f"去重跳过：{s['dedup_skipped']} 条",
         f"🛠 抖音解析：本地 {parse_local} + bot 中转 {parse_relay}",
+    ]
+    if s["listen_scans"]:
+        # 只在窗口内真的扫过才出现——标签监听上线前的日子输出保持原样
+        lines += [
+            "",
+            "📡 标签监听",
+            f"扫描：{s['listen_scans']} 次 | 检查 {s['listen_scanned']} 条",
+            f"命中：{s['listen_matched']} 条",
+            f"转发：{s['listen_forwarded']} 项"
+            + (f"（失败 {s['listen_failed']} 项）" if s["listen_failed"] else ""),
+            f"触发下载：{s['received_listen']} 条"
+            + (f" | 聊天失败 {s['listen_chat_failures']} 个"
+               if s["listen_chat_failures"] else ""),
+        ]
+    lines += [
         "",
         "📦 下载任务",
         f"新建任务：{s['queued_new']}"
@@ -349,7 +383,8 @@ def _event_text(events, days, today, log_path, history_path):
         f"🧮 对账：窗口任务 {total} = 成功 {s['success']}"
         f" + 最终失败 {s['failed_final']} + 移除 {s['removed']}"
         f" + 拦截 {s['dedup_hit']} + 进行中 {s['active']}{tail}",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def _header(days, today):

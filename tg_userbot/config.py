@@ -271,6 +271,47 @@ DEFAULT_CAPTION_FILTER_RULES = [
 ]
 CAPTION_FILTER_CONFIG_FILE = os.path.join(RUNTIME_DIR, "caption_filter.json")
 
+# ------------------------------------------------------------
+# 标签监听（2026-09-11，V1）：按周期主动扫描指定聊天，命中配置的标签后
+# 转发到目标（收藏夹/频道）并按需触发下载。
+#
+# **与下载白名单完全独立**：监听来源存在自己的 listen.json + 独立的
+# state.LISTEN_RULES，绝不从 state.WHITELIST_CHATS 推导，也绝不要求监听
+# 聊天必须加入 /wl。一个聊天可以只在下载白名单、只在标签监听、两边都在、
+# 或两边都不在。唯一一次「读」白名单是 §14 的重叠判定——源聊天已在下载
+# 白名单时，实时链路已经转发+下载过，监听就跳过 me 目标与下载，只跑其余
+# 目标（只读，不改其语义）。
+#
+# download=true 的实现 = 转发到收藏夹 + 入队那份转发副本，复用现有
+# enqueue_media → 下载队列 → dedup → 命名的整条链路，不新增第二套下载器。
+# ------------------------------------------------------------
+LISTEN_CONFIG_FILE = os.path.join(RUNTIME_DIR, "listen.json")
+LISTEN_STATE_FILE = os.path.join(RUNTIME_DIR, "listen_state.json")
+LISTEN_DEFAULT_INTERVAL_MINUTES = 1440     # 默认每天扫一次
+LISTEN_MIN_INTERVAL_MINUTES = 1
+LISTEN_MAX_INTERVAL_MINUTES = 10080        # 上限 7 天
+# 单轮单聊天最多处理多少条新消息：防止长时间停机后一次性爆发（剩余的下轮再取；
+# checkpoint 只推进到本轮真正处理完的那条）。
+LISTEN_MAX_MESSAGES_PER_SCAN = 200
+# 每个聊天最多挂多少条「未处理完」的待续做记录（目标频道长期不可达时兜底，
+# 超出丢最旧并告警——绝不无限增长）。
+LISTEN_MAX_PENDING = 200
+# 单轮单聊天最多续做几个待办单元：一条 get_messages 的 ids 数组不宜过大
+#（200 个单元 × 最多 10 个相册成员 = 2000 个 id）。没轮到的下轮继续，不会丢。
+LISTEN_MAX_RETRY_UNITS = 20
+# 读消息 / 转发的网络超时（秒）：telethon 请求没有读超时，僵死连接会挂住循环。
+LISTEN_FETCH_TIMEOUT_SECONDS = 60
+LISTEN_FORWARD_TIMEOUT_SECONDS = 120
+# bot 菜单「添加/修改监听」的等待输入窗口（秒），与 cookie/查询/Caption 同款。
+LISTEN_INPUT_WINDOW_SECONDS = 120
+# 启动后首次扫描的延迟（秒）：等登录、worker 池、队列恢复都就位再开扫。
+LISTEN_STARTUP_DELAY_SECONDS = 20
+# 进自动清理白名单的回复/通知前缀（/listen 命令回复与扫描通知都以此开头）。
+LISTEN_NOTIFY_PREFIX = "📡 标签监听"
+LISTEN_MATCH_PREFIX = "🏷 标签监听"
+# 汇报开关：标签监听扫描命中/失败的事件通知（空扫不发，避免定期刷屏）。
+REPORT_LISTEN = True
+
 # 任务生命周期事件日志（JSONL，append-only 单行追加，写失败仅告警）：
 # 台账按 task_id 重建统计的数据源。每行一个事件
 # {"ts","ev","id","label",...}，ev ∈ RECEIVED/QUEUED/RUNNING/RETRY/FAILED/
@@ -418,6 +459,12 @@ MENU_ACTIONS = (
     # 外加 Agent 启停与状态（此前只在命令面板里，按钮菜单够不着）
     "chrome_tasks", "chrome_cancel", "chrome_start", "chrome_stop",
     "chrome_status",
+    # 标签监听：视图 / 增删改 / 立即扫描 / 周期 / 总开关 + 添加向导的
+    # 目标勾选（listen_tgt 带目标键）、加目标、下载开关、保存、取消
+    "listen", "listen_add", "listen_edit", "listen_del", "listen_scan",
+    "listen_interval", "listen_interval_set", "listen_toggle",
+    "listen_tgt", "listen_tgtadd", "listen_dl", "listen_save",
+    "listen_cancel",
 )
 
 
@@ -564,6 +611,9 @@ CLEAN_NOTIFICATION_PREFIXES = (
     "📊 台账",
     # /find（媒体下落查询）的命令与回复
     "🔍 查询",
+    # /listen（标签监听）的命令、回复与扫描通知
+    "📡 标签监听",
+    "🏷 标签监听",
     # /caption_filter（Caption 命名清洗）的回复与输入窗口提示
     "🧹 Caption 清洗",
     "🧪 Caption 清洗",

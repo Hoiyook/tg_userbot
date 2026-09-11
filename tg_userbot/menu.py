@@ -82,7 +82,10 @@ def main_menu_buttons():
          Button.inline("📊 台账", encode_menu_data("stats"))],
         [Button.inline("🔍 查询", encode_menu_data("find")),
          Button.inline("🧹 Caption 清洗", encode_menu_data("capf"))],
-        [Button.inline("🌐 Chrome 任务", encode_menu_data("chrome_tasks"))],
+        # 标签监听是**独立于下载白名单**的入口（规格书 §18：不能塞进 📋 白名单，
+        # 用户必须能明显区分两套系统）
+        [Button.inline("📡 标签监听", encode_menu_data("listen")),
+         Button.inline("🌐 Chrome 任务", encode_menu_data("chrome_tasks"))],
     ]
 
 
@@ -146,6 +149,17 @@ def stats_menu_buttons(days=1):
         [_btn(1), _btn(3), _btn(LOG_RETENTION_DAYS)],
         [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
     ]
+
+
+def listen_interval_buttons():
+    """标签监听扫描周期预设（避免再加一个输入窗口模式）。"""
+    presets = [(30, "30 分钟"), (60, "1 小时"), (360, "6 小时"),
+               (1440, "24 小时"), (10080, "7 天")]
+    rows = [[Button.inline(label, encode_menu_data("listen_interval_set",
+                                                   str(minutes)))]
+            for minutes, label in presets]
+    rows.append([Button.inline("🔙 返回", encode_menu_data("listen"))])
+    return rows
 
 
 def dedup_menu_buttons():

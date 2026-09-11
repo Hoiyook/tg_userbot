@@ -343,5 +343,62 @@ class ClearmsgEntryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.deleted[-1], [500])
 
 
+class ListenCommandTest(unittest.IsolatedAsyncioTestCase):
+    """/listen 命令分发（标签监听）：与菜单共用同一套服务函数。"""
+
+    async def asyncSetUp(self):
+        from tg_userbot import state
+        self.old = (list(state.LISTEN_RULES), state.LISTEN_ENABLED,
+                    state.LISTEN_INTERVAL_MINUTES)
+        state.LISTEN_RULES = []
+        state.LISTEN_ENABLED = True
+
+    async def asyncTearDown(self):
+        from tg_userbot import state
+        (state.LISTEN_RULES, state.LISTEN_ENABLED,
+         state.LISTEN_INTERVAL_MINUTES) = self.old
+
+    async def _run(self, cmd):
+        ev = FakeEvent()
+        ok = await commands.handle_command(ev, cmd)
+        return ok, ev.replies
+
+    async def test_listen_view_dispatches(self):
+        ok, replies = await self._run("/listen")
+        self.assertTrue(ok)
+        self.assertIn("📡 标签监听", replies[0])
+
+    async def test_listen_on_off_and_interval(self):
+        ok, replies = await self._run("/listen off")
+        self.assertTrue(ok)
+        self.assertIn("已关闭", replies[0])
+        ok, replies = await self._run("/listen on")
+        self.assertIn("已开启", replies[0])
+        ok, replies = await self._run("/listen interval 30")
+        self.assertIn("30", replies[0])
+
+    async def test_listen_interval_invalid(self):
+        _, replies = await self._run("/listen interval 0")
+        self.assertIn("❌", replies[0])
+
+    async def test_listen_del_out_of_range(self):
+        _, replies = await self._run("/listen del 9")
+        self.assertIn("❌", replies[0])
+
+    async def test_listen_scan_without_rules_is_harmless(self):
+        _, replies = await self._run("/listen scan")
+        self.assertIn("📡 标签监听", replies[0])
+
+    async def test_listen_usage_for_unknown_subcommand(self):
+        _, replies = await self._run("/listen wobble")
+        self.assertIn("用法", replies[0])
+
+    async def test_wl_command_still_works(self):
+        """/listen 的加入不能抢走 /wl 的分发（两套白名单各走各的）。"""
+        ok, replies = await self._run("/wl list")
+        self.assertTrue(ok)
+        self.assertIn("📋 下载白名单", replies[0])
+
+
 if __name__ == "__main__":
     unittest.main()

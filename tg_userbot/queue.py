@@ -370,8 +370,14 @@ def replay_due(now=None):
 # 队列执行（异步部分）
 # ------------------------------------------------------------
 
-async def enqueue_and_start(record):
-    """任务入队（持久化）并立即触发执行。"""
+async def enqueue_and_start(record, src=None):
+    """任务入队（持久化）并立即触发执行。
+
+    src：台账「输入侧」来源标记，None 时按记录归属推断——``me``（收藏夹
+    直发）/ ``wl``（下载白名单中转）。标签监听传入 ``listen``，让 /stats
+    的「📥 输入事件」能把监听触发的下载单独数出来（监听转发进收藏夹的
+    副本 chat_id 也是 MY_ID，不显式传就与用户手动转发混在一起）。
+    """
     async with state.QUEUE_LOCK:
         # queue_enqueue 返回带 id 的副本，执行必须用这份副本，
         # 否则 execute_queued_task 按 id 收尾时对不上队列里的记录。
@@ -379,12 +385,12 @@ async def enqueue_and_start(record):
         save_queue(state.QUEUE)
     # 台账事件：这里是媒体与 url 任务唯一的入队咽喉——白名单中转的
     # 「源消息→转发副本」也只在这里入队一次，天然保证一个逻辑任务一个
-    # task_id（RECEIVED 仅媒体任务有，src 区分 收藏/中转 供输入侧拆分）。
+    # task_id（RECEIVED 仅媒体任务有，src 区分 收藏/中转/监听 供输入侧拆分）。
     kind = record.get("kind")
     if kind == "media":
         stats.emit_event(
             "RECEIVED", task_id=record["id"], label=record.get("label"),
-            src="me" if record.get("chat_id") == state.MY_ID else "wl",
+            src=src or ("me" if record.get("chat_id") == state.MY_ID else "wl"),
         )
     stats.emit_event("QUEUED", task_id=record["id"],
                      label=record.get("label"), kind=kind)

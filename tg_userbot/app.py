@@ -23,6 +23,7 @@ from . import commands
 from . import caption_filter
 from . import chrome_client
 from . import dedup
+from . import listener
 from . import queue
 from . import reporter
 from . import stats
@@ -45,6 +46,7 @@ from .config import (
     DOUYIN_BOT_USERNAME,
     INSTAGRAM_BOT_USERNAME,
     IS_TERMUX,
+    LISTEN_STARTUP_DELAY_SECONDS,
     LOG_FILE,
     LOGIN_RETRIES,
     LOGIN_TIMEOUT_SECONDS,
@@ -309,6 +311,32 @@ async def _retry_sweeper():
             logger.error(f"♻️ 自动重放扫描失败（{type(e).__name__}: {e}）")
 
 
+async def _listener_loop():
+    """标签监听后台扫描循环（规格书 §16）：按周期主动扫描监听的聊天。
+
+    **与下载白名单是两套完全独立的配置**：本循环只读 state.LISTEN_RULES，
+    从不碰 state.WHITELIST_CHATS（唯一一次读它是 listener 内部的 §14 重叠
+    判定，而且是只读）。每轮扫描前按需重读 listen.json（§17：改配置无需
+    重启；损坏的文件不会清空正在生效的规则，见 listener.reload_listen_config）。
+
+    异常一律兜住 → 本任务永不因单次失败退出；单个聊天的隔离在
+    listener.scan_all 内部（一个聊天失败不影响其它）。被 main 取消（停止
+    信号）时以 CancelledError 收尾。
+    """
+    await asyncio.sleep(LISTEN_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            if state.LISTEN_ENABLED and state.LISTEN_RULES:
+                await listener.scan_all()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            logger.error(f"📡 标签监听扫描异常（{type(e).__name__}: {e}）")
+        # 周期每轮重读：/listen interval 改完立即作用于下一轮
+        delay = max(60, int(state.LISTEN_INTERVAL_MINUTES) * 60)
+        await asyncio.sleep(delay)
+
+
 def _install_stop_handlers(stop_event):
     """把 SIGINT/SIGTERM 转成「设 STOP_EVENT 优雅退出」，接管 telethon 对
     KeyboardInterrupt 的吞并。
@@ -532,12 +560,13 @@ async def _enqueue_me(message):
 
 
 async def enqueue_media(message, chat_id, source_override, source_link=None,
-                        album_caption=None, user_label=None):
+                        album_caption=None, user_label=None, src=None):
     """把一条媒体消息入队下载（持久化，重启不丢任务）。
 
     source_link 显式传入时覆盖默认的来源链接；album_caption 为相册无文字
     成员继承到的同组说明（入队即随记录持久化，下载命名时使用）；user_label
-    为手工转发评论标注（同样随记录持久化）。
+    为手工转发评论标注（同样随记录持久化）；src 为台账输入侧来源标记
+    （标签监听传 "listen"，缺省按 chat_id 归属推断 收藏/中转）。
     入队前先过重复媒体判重（tg:<file_unique_id> 两级：已下载索引 + 在途
     队列）：命中只拦下载不拦转发（白名单转发的「转发自」副本照旧留在收藏
     夹当书签），并通知；键拿不到或 /dedup off 时照常入队。
@@ -561,7 +590,7 @@ async def enqueue_media(message, chat_id, source_override, source_link=None,
     )
     if keys:
         record["dedup_keys"] = keys  # 在途判重 + 成功后 remember 复用
-    await queue.enqueue_and_start(record)
+    await queue.enqueue_and_start(record, src=src)
 
 
 async def relay_chat_media(message, origin_chat_id, source_override):
@@ -949,6 +978,8 @@ async def main():
     thread.load_thread_config()
     dedup.load_dedup_config()
     caption_filter.load_caption_filter_config()
+    listener.load_listen_config()
+    listener.load_listen_state()
     loaded = dedup.load_index()
     logger.info(f"🛡 去重索引已载入：{loaded} 条")
     state.WHITELIST_CHATS = whitelist.load_whitelist()
@@ -979,6 +1010,11 @@ async def main():
     logger.info(
         f"📥 下载队列：{len(state.QUEUE['tasks'])} 个任务 | "
         f"待重试 {len(state.QUEUE['retry'])} 个"
+    )
+    logger.info(
+        "📡 标签监听：{}（规则 {} 条，周期 {} 分钟）"
+        .format("开启" if state.LISTEN_ENABLED else "关闭",
+                len(state.LISTEN_RULES), state.LISTEN_INTERVAL_MINUTES)
     )
     if BOT_TOKEN:
         logger.info(f"🤖 bot 菜单：{BOT_USERNAME}")
@@ -1086,6 +1122,8 @@ async def main():
         bot_keepalive_task = asyncio.create_task(_bot_keepalive())
     main_serve_task = asyncio.create_task(_main_serve())
     retry_sweeper_task = asyncio.create_task(_retry_sweeper())
+    # 标签监听：定时主动扫描（与下载白名单完全独立的一套配置）
+    listener_task = asyncio.create_task(_listener_loop())
     # Runtime Reporter（只读观察者）：发启动通知 + 后台刷新状态面板
     reporter_instance, reporter_task = await _start_reporter()
 
@@ -1106,11 +1144,11 @@ async def main():
         # finally 里的 disconnect，随后以 CancelledError 收尾；bot 探活/重放
         # 扫描/Reporter 主循环同理。
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
-                  reporter_task):
+                  reporter_task, listener_task):
             if t is not None:
                 t.cancel()
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
-                  reporter_task):
+                  reporter_task, listener_task):
             if t is not None:
                 try:
                     await t
