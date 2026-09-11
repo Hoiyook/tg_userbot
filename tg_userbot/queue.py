@@ -24,6 +24,7 @@ import asyncio
 from . import state
 from . import notify
 from . import download
+from . import naming
 from . import stats
 from .config import (
     AUTO_RETRY_BASE_DELAY,
@@ -472,8 +473,14 @@ async def _run_queued_task(record):
             message,
             record.get("source_override"),
             caption_override=record.get("album_caption"),
+            # 讨论组评论继承到的频道原帖 caption——走**强制**槽，与
+            # album_caption（fallback）分开（见 naming.effective_caption）。
+            parent_caption=record.get("parent_caption"),
             label_override=record.get("user_label"),
             task_id=record.get("id"),
+            # 讨论组评论继承到的频道原帖日期（入队时快照的 ISO 串）。认不出就
+            # 当没有——退回消息自身日期，绝不让一条坏记录把下载打死。
+            date_override=naming.parse_date(record.get("parent_date")),
         )
     if kind == "url":
         # 本地解析链的 HTTP 直链下载：没有 Telegram 消息概念，直链/标题/

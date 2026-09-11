@@ -36,6 +36,7 @@ from .history import append_history
 from .naming import (
     compute_final_filename,
     compute_url_filename,
+    effective_caption,
     format_size,
     raw_caption,
     get_original_filename,
@@ -589,7 +590,8 @@ def unregister_download(did):
 
 
 async def download_file(message, source_override=None, caption_override=None,
-                        label_override=None, task_id=None):
+                        label_override=None, task_id=None, date_override=None,
+                        parent_caption=None):
     async with state.DOWNLOAD_SEMAPHORE:
         source = await resolve_download_source(message, source_override)
         # 命名用 caption：消息自带文字优先；否则用调用方继承的相册同组说明
@@ -597,8 +599,9 @@ async def download_file(message, source_override=None, caption_override=None,
         # 这里只做「谁优先」的选择、取**原始**文本：清洗与 sanitize 统一由
         # compute_final_filename → get_caption 做一次，避免清洗过的文本被二次
         # 清洗（sanitize 换掉换行/ASCII 冒号后字段边界就认不出了）
-        own_caption = raw_caption(message)
-        caption = own_caption or (caption_override or "")
+        # 谁优先的取舍收在 effective_caption 一处（入队展示名用的是同一处），
+        # 否则「列表里显示的名字」与「实际落盘的名字」会各算各的。
+        caption = effective_caption(message, parent_caption, caption_override)
         # 最终名一次交给 compute_final_filename：label（手工转发评论，代码加 #）
         # 与原 caption 一并拼入；超出字节上限时按用户约定的优先级裁剪——先裁原
         # caption、其次才动 #标注、最后才截文件名（早年对整名一刀切的
@@ -609,6 +612,9 @@ async def download_file(message, source_override=None, caption_override=None,
                 caption=caption or None,
                 label=label_override,
                 max_bytes=MAX_FILENAME_BYTES,
+                # 讨论组评论继承到的频道原帖日期（记录里快照好的 datetime）。
+                # 传 None 就是消息自身日期，零回归。
+                date_override=date_override,
             )
         )
         # 日志展示用（与 final_filename 的计算共用同一套规则）

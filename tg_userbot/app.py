@@ -69,11 +69,17 @@ from .config import (
     AdjustableSemaphore,
 )
 from .log import logger
-from .naming import compute_final_filename, pick_group_caption_text
+from .naming import (
+    compute_final_filename,
+    effective_caption,
+    parse_date,
+    pick_group_caption_text,
+)
 from .sources import (
     get_media_type,
     is_downloadable,
     message_source_link,
+    resolve_origin_snapshot,
 )
 
 
@@ -221,6 +227,26 @@ async def _bot_keepalive():
             )
 
 
+async def _await_child_task(task):
+    """等子任务结束并原样抛出它的结局；**调用方被取消时不波及子任务**。
+
+    为什么不直接 `await task`：asyncio 的 ``Task.cancel()`` 会顺手取消
+    ``self._fut_waiter``，而 ``await task`` 的 ``_fut_waiter`` **正是那条子任务**
+    ——于是取消一到手，子任务就已经 done，「子任务自己被取消（网络层）」与
+    「调用方被取消（停服）」再也没法区分（实测：`_reporter_supervisor` 因此把
+    自己的取消当成子任务意外死亡而重启，任务变成杀不掉的僵尸）。
+
+    ``asyncio.wait`` 只等它自己的内部 waiter，取消调用方不会波及子任务 ——
+    判据这才立得住。与 ``netio.shielded`` 用的是同一个办法、同一个理由。
+    """
+    await asyncio.wait({task})
+    if task.cancelled():
+        raise asyncio.CancelledError()
+    exc = task.exception()
+    if exc is not None:
+        raise exc
+
+
 async def _reporter_supervisor(instance):
     """守护 Runtime Reporter 主循环：意外结束就记 ERROR 并节流重启。
 
@@ -241,17 +267,25 @@ async def _reporter_supervisor(instance):
     while True:
         task = asyncio.create_task(instance.run())
         try:
-            await task
+            await _await_child_task(task)
         except asyncio.CancelledError:
             stopping = (state.STOP_EVENT is not None
                         and state.STOP_EVENT.is_set())
             if not task.done():
-                # 取消来自本函数（停服）→ 把子任务一并收走，别留孤儿
+                # 子任务还没结束就收到了取消 → 取消是打给**本函数**的（停服，
+                # 或外面直接 task.cancel() 这个守护任务）：把子任务一并收走，
+                # 然后**原样上抛**。
+                #
+                # 这里必须 raise，不能顺着往下走去重启：吞掉自己的取消会让
+                # 这个守护任务变成杀不掉的僵尸（外部 cancel 只有落在
+                # `asyncio.sleep(delay)` 那一行才生效）。判据能立住，全靠
+                # _await_child_task 用 asyncio.wait 而不是直接 await task。
                 task.cancel()
                 try:
-                    await task
+                    await asyncio.wait({task})
                 except asyncio.CancelledError:
                     pass
+                raise
             if stopping:
                 raise
             logger.error(
@@ -504,14 +538,23 @@ async def new_message_handler(event):
 
 
 def _build_media_record(message, chat_id, source_override, source_link=None,
-                        album_caption=None, user_label=None):
+                        album_caption=None, user_label=None, parent_date=None,
+                        parent_caption=None):
     """组装一条 media 队列任务记录（入队展示与实际下载命名共用同一规则）。
 
-    album_caption：相册无自身文字的成员继承到的同组说明。转发副本本身没有
-    caption，把它持久化进记录，下载/列表展示命名时无文字图片即可沿用相册标题
-    （而非 photo_时间戳 兜底）。
+    album_caption：相册无自身文字的成员继承到的同组说明（**fallback**：消息自己
+    有文字就用它自己的）。转发副本本身没有 caption，把它持久化进记录，下载/列表
+    展示命名时无文字图片即可沿用相册标题（而非 photo_时间戳 兜底）。
     user_label：手工转发评论（待关联标注，见 _record_me_label）。代码加 '#' 后
     拼到命名最前，下载/展示与入队保持一致；持久化供重启后下载侧沿用。
+    parent_caption：讨论组评论继承到的频道原帖 caption（**强制**：盖过评论自己
+    的文字——「👍」这种评论文字没有命名价值，原帖标题才是信息）。
+    parent_date：讨论组评论继承到的频道原帖日期（ISO 字符串，见
+    sources.resolve_origin_snapshot）。**入队时快照**，不留给下载 worker 事后再
+    查——原帖被编辑/删除时 retry 出来的文件名必须还是同一个（任务书 §5）。
+
+    caption 的取舍只有 naming.effective_caption 一处，且它与 download_file 用的是
+    同一个调用——列表展示名与实际落盘名因此不可能漂移。
     """
     text = (message.message or "").strip()
     file_name = None
@@ -528,7 +571,10 @@ def _build_media_record(message, chat_id, source_override, source_link=None,
         "label": label,
         # 入队时算好最终文件名，列表展示与实际下载命名保持一致
         "final_name": compute_final_filename(
-            message, caption=album_caption, label=user_label
+            message,
+            caption=effective_caption(message, parent_caption, album_caption),
+            label=user_label,
+            date_override=parse_date(parent_date),
         ),
         # 转发消息链到原频道消息；否则用消息自身 chat 生成
         "source_link": (
@@ -540,7 +586,44 @@ def _build_media_record(message, chat_id, source_override, source_link=None,
         record["album_caption"] = album_caption
     if user_label:
         record["user_label"] = user_label
+    if parent_date:
+        record["parent_date"] = parent_date
+    if parent_caption:
+        record["parent_caption"] = parent_caption
     return record
+
+
+def _origin_caption(origin):
+    """频道原帖快照 → 命名用说明（无则 None），走 parent_caption 槽（**强制**）。
+
+    刻意**不**复用 album_caption：那个槽是 fallback（消息有字就用消息的），
+    而原帖标题要盖过评论自己那句「👍」。两者语义不同，混用一个槽会连相册命名
+    一起改坏（见 naming.effective_caption）。
+    """
+    if not origin:
+        return None
+    return (origin.get("caption") or "").strip() or None
+
+
+def _origin_folder(origin):
+    """频道原帖快照 → 落盘目录名（无则 None）。
+
+    B 是 A 的评论时，B 下载的文件与 A 放同一个目录（用户要求）——副本自身的
+    fwd_from 指向讨论组，不覆盖的话评论会另起一个「××群组/」目录。
+    """
+    if not origin:
+        return None
+    return (origin.get("source_name") or "").strip() or None
+
+
+def _origin_date(origin):
+    """频道原帖快照 → ISO 日期串（无则 None），随记录持久化。"""
+    if not origin or origin.get("date") is None:
+        return None
+    try:
+        return origin["date"].isoformat()
+    except Exception:
+        return None
 
 
 async def _enqueue_me(message):
@@ -559,14 +642,19 @@ async def _enqueue_me(message):
     if user_label:
         logger.info(f"🏷 媒体 {message.id} 继承转发评论标注：\"{user_label}\"")
     album_caption = await _maybe_album_caption(message)
+    origin = await resolve_origin_snapshot(message)
     await enqueue_media(
-        message, state.MY_ID, None,
-        album_caption=album_caption, user_label=user_label,
+        message, state.MY_ID, _origin_folder(origin),
+        album_caption=album_caption,
+        user_label=user_label,
+        parent_date=_origin_date(origin),
+        parent_caption=_origin_caption(origin),
     )
 
 
 async def enqueue_media(message, chat_id, source_override, source_link=None,
-                        album_caption=None, user_label=None, src=None):
+                        album_caption=None, user_label=None, src=None,
+                        parent_date=None, parent_caption=None):
     """把一条媒体消息入队下载（持久化，重启不丢任务）。
 
     source_link 显式传入时覆盖默认的来源链接；album_caption 为相册无文字
@@ -592,7 +680,7 @@ async def enqueue_media(message, chat_id, source_override, source_link=None,
         return
     record = _build_media_record(
         message, chat_id, source_override, source_link,
-        album_caption, user_label,
+        album_caption, user_label, parent_date, parent_caption,
     )
     if keys:
         record["dedup_keys"] = keys  # 在途判重 + 成功后 remember 复用
@@ -629,6 +717,8 @@ async def _relay_single(message, chat_id, source_override):
     """
     link = message_source_link(message, chat_id or message.chat_id)
     album_caption = await _maybe_album_caption(message)
+    # 评论继承频道原帖命名：**从源消息**解析（比从转发副本解析少一跳回源）。
+    origin = await resolve_origin_snapshot(message)
     try:
         fwd = await _forward_to_me(message)
         logger.info(
@@ -636,8 +726,10 @@ async def _relay_single(message, chat_id, source_override):
             "将下载该转发副本"
         )
         await enqueue_media(
-            fwd, state.MY_ID, None, source_link=link,
+            fwd, state.MY_ID, _origin_folder(origin) or None, source_link=link,
             album_caption=album_caption,
+            parent_date=_origin_date(origin),
+            parent_caption=_origin_caption(origin),
         )
     except Exception as e:
         logger.exception(
@@ -645,8 +737,10 @@ async def _relay_single(message, chat_id, source_override):
             f"{message.id}），回退直下原消息：{e}"
         )
         await enqueue_media(
-            message, chat_id, source_override,
+            message, chat_id, _origin_folder(origin) or source_override,
             album_caption=album_caption,
+            parent_date=_origin_date(origin),
+            parent_caption=_origin_caption(origin),
         )
 
 
@@ -919,13 +1013,18 @@ async def _relay_album_group(key, chat_id, source_override):
             f"新消息 ID={copies[0].id if ok else '-'}），将逐个下载转发副本"
         )
         link = message_source_link(members[0], chat_id)
+        # 整组共用一次解析（同一单元的目标一致），别 N 个成员各查一遍
+        origin = await resolve_origin_snapshot(members[0])
+        origin_caption = _origin_caption(origin)
         for copy in copies:
             # 转发保留挂说明成员自己的 caption；无文字副本沿用相册说明做命名
             own_text = (copy.message or "").strip()
             album_caption = None if own_text else (group_caption or None)
             await enqueue_media(
-                copy, state.MY_ID, None,
-                source_link=link, album_caption=album_caption,
+                copy, state.MY_ID, _origin_folder(origin), source_link=link,
+                album_caption=album_caption,
+                parent_date=_origin_date(origin),
+                parent_caption=origin_caption,
             )
 
         st["done"] = True

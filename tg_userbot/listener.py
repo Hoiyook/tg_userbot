@@ -70,7 +70,12 @@ from .config import (
 )
 from .log import logger
 from .naming import pick_group_caption_text
-from .sources import entity_display_name, is_downloadable
+from .sources import (
+    entity_display_name,
+    is_channel_mirror,
+    is_downloadable,
+    resolve_origin_snapshot,
+)
 
 # 扫描重入保护：定时扫描与「▶️ 立即扫描」不能同时跑（同一份 checkpoint 会被
 # 两个执行流各自推进）。检查与置位之间没有 await，单线程事件循环内不可能被
@@ -745,7 +750,7 @@ async def fetch_unit_messages(source_chat_id, member_ids):
     return [by_id[i] for i in ids if i in by_id]
 
 
-def _build_tasks(chat_id, media, keys, download, caption, anchor):
+def _build_tasks(chat_id, media, keys, download, caption, anchor, origin=None):
     """把「一个消息单元 × 一组目标」展开成待落盘的任务记录（纯函数）。
 
     **每个目标一条任务**（规格 §15）：目标之间彼此独立，A 失败不会牵连 B，
@@ -758,9 +763,24 @@ def _build_tasks(chat_id, media, keys, download, caption, anchor):
 
     ``download`` 只挂在收藏夹目标上：下载的实现是「转发进收藏夹 + 入队那份
     副本」，普通聊天目标没有可入队的副本。
+
+    ``origin``：这条消息评论的频道原帖快照（``sources.resolve_origin_snapshot``）。
+    快照在**扫描时**定死进 payload，Worker 与下载侧都不会再去查一次——原帖被
+    编辑/删除时，retry 出来的文件名必须还是同一个（任务书 §5）。
     """
     member_ids = [m.id for m in media]
     gid = getattr(media[0], "grouped_id", None)
+    # caption 是**fallback**（相册同组说明：评论自己没写字才用）；原帖 caption
+    # 走 parent_caption 槽，是**强制**的——「👍」这种评论文字没有命名价值。
+    # 两个槽分开，才是 naming.effective_caption 那套优先级。
+    payload_base = {"member_ids": member_ids, "caption": caption or ""}
+    if origin is not None:
+        if origin.get("caption"):
+            payload_base["parent_caption"] = origin["caption"]
+        if origin.get("date") is not None:
+            payload_base["parent_date"] = origin["date"].isoformat()
+        if origin.get("source_name"):
+            payload_base["source_name"] = origin["source_name"]
     out = []
     for key in sorted(keys, key=lambda k: (k[0] != "saved_messages", str(k[1]))):
         is_saved = key[0] == "saved_messages"
@@ -770,7 +790,7 @@ def _build_tasks(chat_id, media, keys, download, caption, anchor):
             "target_type": "saved_messages" if is_saved else "chat",
             "target_chat_id": None if is_saved else int(key[1]),
             "download": bool(download) and is_saved,
-            "payload": {"member_ids": member_ids, "caption": caption or ""},
+            "payload": dict(payload_base),
         })
     return out
 
@@ -830,6 +850,19 @@ async def _scan_chat(chat_id, rules):
     for unit in group_by_album(new_msgs):
         unit_max_id = max(m.id for m in unit)
         media = [m for m in unit if is_downloadable(m)]
+        if media:
+            # **跳过频道帖在讨论组里的镜像副本**（is_channel_mirror）：同一篇
+            # 帖子在频道侧会被自己的监听规则命中一次，镜像副本又会在讨论组侧
+            # 命中一次——转发会重复（下载有 dedup 拦，转发没有）。镜像帖的
+            # caption 与标签跟原帖一模一样，靠内容根本区分不出来，只能认
+            # fwd_from.channel_post 这个结构特征。
+            kept = [m for m in media if not is_channel_mirror(m)]
+            if len(kept) != len(media):
+                logger.info(
+                    f"📡 {chat_id} #{min(m.id for m in media)}：跳过 "
+                    f"{len(media) - len(kept)} 条频道帖镜像副本（频道侧负责）"
+                )
+            media = kept
         if not media:
             # 只处理媒体消息：纯文本转发进收藏夹会被 app._record_me_label
             # 当成「待关联评论标注」拼进下一个下载文件的文件名。
@@ -858,8 +891,11 @@ async def _scan_chat(chat_id, rules):
                     )
                     break
                 result["matched"] += 1
+                # 评论继承频道原帖的 caption/日期：解析要走 1~2 次网络请求，
+                # 只在**真的命中标签**时才做（未命中的消息一分钱不花）。
+                origin = await resolve_origin_snapshot(media[0])
                 tasks.extend(_build_tasks(chat_id, media, keys, download,
-                                          text, anchor))
+                                          text, anchor, origin))
                 logger.info(
                     f"🏷 标签监听命中：{chat_id} #{anchor} "
                     f"标签 {' '.join(sorted(hits))} → 建任务 {len(keys)} 条"

@@ -67,7 +67,8 @@ class _EnqueueMeHarness:
     def patch(self, grace):
         async def fake_enqueue(message, chat_id, source_override,
                                source_link=None, album_caption=None,
-                               user_label=None):
+                               user_label=None, src=None, parent_date=None,
+                               parent_caption=None):
             self.labels.append(user_label)
 
         return mock.patch.multiple(

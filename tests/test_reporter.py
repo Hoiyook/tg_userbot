@@ -360,6 +360,28 @@ class ReporterSupervisorTest(unittest.IsolatedAsyncioTestCase):
                 await app._reporter_supervisor(_Flaky())
         self.assertEqual(len(runs), 1, "停服时不该重启")
 
+    async def test_outer_cancel_actually_stops_supervisor(self):
+        """外部 cancel 必须真的能停掉守护任务，不能被它当成「子任务意外死亡」吞掉。
+
+        回归（2026-09-11 修）：旧实现在 `await task` 那一行收到取消时，分不清
+        「子任务被取消」与「本函数被取消」，一律走「重启」分支——`task.cancel()`
+        被吞掉，守护任务变成只能靠 STOP_EVENT 才能停的僵尸；落在
+        `await asyncio.sleep(delay)` 那一行的取消反而是好的，于是表现为
+        「时灵时不灵」。真机上的后果是停服时汇报任务赖着不走。
+        """
+
+        class _Forever:
+            async def run(self):
+                await asyncio.sleep(3600)
+
+        with mock.patch.object(app, "REPORT_RESTART_DELAY_SECONDS", 0.01):
+            task = asyncio.create_task(app._reporter_supervisor(_Forever()))
+            await asyncio.sleep(0.05)   # 确保它停在 `await task` 那一行
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                # 修好前：取消被吞、循环继续 → 这里会 TimeoutError
+                await asyncio.wait_for(task, timeout=2)
+
     async def test_returns_when_run_ends_normally_while_stopping(self):
         class _Idle:
             async def run(self):

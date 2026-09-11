@@ -230,18 +230,25 @@ def recover_expired(now=None):
 # ============================================================
 # 执行
 # ============================================================
-async def _enqueue_copy(copy, source_link, album_caption, src):
+async def _enqueue_copy(copy, source_link, album_caption, src, parent_date=None,
+                        parent_caption=None, source_name=None):
     """入队一份转发副本（走现有下载链路，不新增第二套下载器 §22）。
 
     ``app`` 函数内导入：app 顶层 `from . import listener_worker`（要挂 Worker
     任务），模块级互相导入会成环。本模块只在发送路径上用到它。
+
+    ``parent_date`` / ``parent_caption`` / ``source_name``：评论继承到的频道
+    原帖日期、caption 与目录名（扫描时快照进 payload，Worker 原样透传——
+    Worker 不读 listen.json，也不该在这时候再去查一次原帖）。
     """
     from . import app
     await app.enqueue_media(
-        copy, state.MY_ID, None,
+        copy, state.MY_ID, source_name,
         source_link=source_link,
         album_caption=album_caption,
         src=src,
+        parent_date=parent_date,
+        parent_caption=parent_caption,
     )
 
 
@@ -295,7 +302,12 @@ async def execute_task(task):
         )
 
         if is_saved and task.get("download"):
-            caption = (task.get("payload") or {}).get("caption") or ""
+            payload = task.get("payload") or {}
+            caption = payload.get("caption") or ""
+            # 评论继承到的频道原帖日期：扫描时快照进 payload，这里原样透传。
+            parent_date = payload.get("parent_date")
+            parent_caption = payload.get("parent_caption") or None
+            source_name = payload.get("source_name") or None
             source_link = _source_link(messages[0], task["source_chat_id"])
             for copy in copies:
                 own_text = (getattr(copy, "message", "") or "").strip()
@@ -303,7 +315,9 @@ async def execute_task(task):
                 # （否则相册里的图片会退化成 媒体类型_时间戳 命名）
                 cap = None if own_text else (caption or None)
                 try:
-                    await _enqueue_copy(copy, source_link, cap, "listen")
+                    await _enqueue_copy(copy, source_link, cap, "listen",
+                                        parent_date, parent_caption,
+                                        source_name)
                 except Exception as e:
                     # 转发已发生且成功：入队失败不该把任务判成失败（重跑会重复
                     # 转发）。记错误即可——副本已躺在收藏夹，用户看得见。

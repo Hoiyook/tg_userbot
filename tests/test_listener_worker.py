@@ -136,8 +136,11 @@ class _WorkerTestCase(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self._restore)
         self.copies = []
 
-        async def fake_enqueue(copy, source_link, album_caption, src):
-            self.copies.append((copy.id, source_link, album_caption, src))
+        async def fake_enqueue(copy, source_link, album_caption, src,
+                               parent_date=None, parent_caption=None,
+                               source_name=None):
+            self.copies.append((copy.id, source_link, album_caption, src,
+                                parent_date, parent_caption, source_name))
 
         self._p2 = mock.patch.object(lw, "_enqueue_copy", fake_enqueue)
         self._p2.start()

@@ -311,6 +311,12 @@ LISTEN_INPUT_WINDOW_SECONDS = 120
 # 启动后首次扫描的延迟（秒）：等登录、worker 池、队列恢复都就位再开扫。
 LISTEN_STARTUP_DELAY_SECONDS = 20
 # 进自动清理白名单的回复/通知前缀（/listen 命令回复与扫描通知都以此开头）。
+# 评论继承原帖命名信息（2026-09-11）：讨论组评论顺着 reply_to 上溯到「频道帖
+# 在群里的镜像副本」，每次上溯最多查几条消息。评论可以回复评论，但同一帖子
+# 的评论区深度有限；限死是为了「父消息恒取不回 / 成环」时不会无限查下去。
+ORIGIN_MAX_HOPS = 5
+# 取父消息的网络超时（秒）：telethon 请求没有读超时，僵死连接会挂住入队路径。
+ORIGIN_FETCH_TIMEOUT_SECONDS = 30
 LISTEN_NOTIFY_PREFIX = "📡 标签监听"
 LISTEN_MATCH_PREFIX = "🏷 标签监听"
 # 汇报开关：标签监听扫描命中/失败的事件通知（空扫不发，避免定期刷屏）。

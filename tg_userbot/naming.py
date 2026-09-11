@@ -101,11 +101,18 @@ def is_meaningless_filename(name: str) -> bool:
     return bool(UUID_FILENAME_PATTERN.match(name.strip()))
 
 
-def generate_fallback_filename(message, kind: str) -> str:
-    """用媒体类型 + 消息时间生成兜底文件名，如 video_20260904_021530。"""
+def generate_fallback_filename(message, kind: str, date_override=None) -> str:
+    """用媒体类型 + 消息时间生成兜底文件名，如 video_20260904_021530。
+
+    ``date_override``：继承频道原帖日期时传原帖日期——兜底名里的日期戳也是
+    「日期」的一部分，只改前缀不改它就会做出「caption 来自 A、日期仍是 B」的
+    半实现（任务书 §14-B 点名要审计这个）。缺省 None = 现行为。
+    """
+    when = date_override if date_override is not None else getattr(
+        message, "date", None)
     try:
-        if message.date:
-            stamp = message.date.strftime("%Y%m%d_%H%M%S")
+        if when:
+            stamp = when.strftime("%Y%m%d_%H%M%S")
         else:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     except Exception:
@@ -190,6 +197,44 @@ def raw_caption(message) -> str:
         return ""
 
 
+def parse_date(value):
+    """把记录里持久化的日期还原成 datetime；认不出返回 None。
+
+    队列记录是 JSON，datetime 只能以 ISO 字符串存（`parent_date`）。重试/重启
+    后要拿它重新拼文件名，所以这里必须**软失败**：认不出就当没有，退回消息
+    自身的日期，绝不让一条坏记录把下载打死。已经是 datetime 的原样返回。
+    """
+    if value is None or value == "":
+        return None
+    if hasattr(value, "strftime"):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def effective_caption(message, parent_caption=None, album_caption=None) -> str:
+    """命名用说明的最终取舍——**入队展示与实际落盘共用这一处，杜绝两处漂移**。
+
+    优先级（任务书 §3 那张表）：::
+
+        频道原帖 caption  >  消息自带文字  >  相册同组说明
+
+    两个继承来源的**语义不同，不能混用一个参数**：
+
+    * ``album_caption``（相册同组说明）是 **fallback**——相册里某个成员自己写了
+      字，就该用它自己的，不该被同组标题盖掉；
+    * ``parent_caption``（讨论组评论继承到的频道原帖 caption）是**强制**——
+      它是筛选出来的那篇帖子的标题，比评论那句「👍」信息量大得多，要盖过它。
+
+    调用方必须传**原始**文本（清洗与 sanitize 统一由 compute_final_filename →
+    get_caption 做一次；清洗过的文本会被二次清洗，字段边界就认不出来了）。
+    纯函数、无 I/O。
+    """
+    return parent_caption or raw_caption(message) or (album_caption or "")
+
+
 def get_caption(message, override=None) -> str:
     """命名用说明：原始文本 → Caption 清洗 → sanitize；无则空串。
 
@@ -235,7 +280,7 @@ def pick_group_caption_text(messages, grouped_id) -> str:
     return ""
 
 
-def date_prefix(message) -> str:
+def date_prefix(message, date_override=None) -> str:
     """原消息日期前缀，形如 '26-09-05 '（`%y-%m-%d `），供文件名开头排序/防重名。
 
     统一下载链路后抖音/IG 视频等都用通用命名落同来源目录，同名会撞出
@@ -245,19 +290,30 @@ def date_prefix(message) -> str:
     期，如频道原帖日期），缺失才退回 message.date（转发时间）。Telegram 的
     日期是 UTC 感知时间，按本地时区渲染（= 客户端里看到的日期），避免晚间
     发布的内容差一天。日期缺失/异常时返回空串（不强加前缀）。纯函数、无 I/O。
+
+    ``date_override``：讨论组评论继承频道原帖日期时传原帖日期（见
+    sources.resolve_origin_snapshot），**优先于**上面两条来源。缺省 None =
+    现行为，零回归。
     """
     try:
+        if date_override is not None:
+            return _render_date_prefix(date_override)
         fwd = getattr(message, "fwd_from", None)
         d = getattr(fwd, "date", None) if fwd is not None else None
         if d is None:
             d = getattr(message, "date", None)
-        if d is None:
-            return ""
-        if d.tzinfo is not None:
-            d = d.astimezone()
-        return d.strftime("%y-%m-%d ")
+        return _render_date_prefix(d)
     except Exception:
         return ""
+
+
+def _render_date_prefix(d) -> str:
+    """datetime → '26-09-05 '；无日期/类型不对返回空串。纯函数。"""
+    if d is None or not hasattr(d, "strftime"):
+        return ""
+    if getattr(d, "tzinfo", None) is not None:
+        d = d.astimezone()
+    return d.strftime("%y-%m-%d ")
 
 
 def _label_piece(label) -> str:
@@ -307,7 +363,8 @@ def _truncate_utf8_bytes(text, max_bytes):
     return text.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
 
 
-def compute_final_filename(message, caption=None, label=None, max_bytes=None) -> str:
+def compute_final_filename(message, caption=None, label=None, max_bytes=None,
+                           date_override=None) -> str:
     """根据消息计算最终落盘文件名（download_file 与队列展示共用）。
 
     规则：文件名开头加原消息日期前缀（'YY-MM-DD '，见 date_prefix）；有
@@ -325,6 +382,10 @@ def compute_final_filename(message, caption=None, label=None, max_bytes=None) ->
     两条来源都会先过 Caption 清洗（见 caption_filter / get_caption），且只清
     洗一次——清洗结果为空时不产生任何 fallback 文本。
 
+    date_override 参数：讨论组评论继承频道原帖日期时传原帖日期（见
+    sources.resolve_origin_snapshot）——前缀与兜底名的时间戳都改用它，避免
+    「caption 来自 A、日期仍是 B」的半实现。缺省 None = 取消息自身的日期。
+
     max_bytes 参数：非 None 时开启字节预算（download_file 传 MAX_FILENAME_BYTES），
     拼出超限名时按用户约定的优先级裁剪——文件名/日期前缀最后才动、先裁原
     caption、然后才裁 #标注。None（缺省，队列展示/单测用）不裁剪、照原样拼。
@@ -339,7 +400,7 @@ def compute_final_filename(message, caption=None, label=None, max_bytes=None) ->
     if extension and not os.path.splitext(original_filename)[1]:
         original_filename += extension
 
-    prefix = date_prefix(message)
+    prefix = date_prefix(message, date_override)
     meaningful = not is_meaningless_filename(original_filename)
     # 无意义文件名时的扩展名：原名带出的优先，否则按 MIME 推断的
     m_ext = os.path.splitext(original_filename)[1] or extension or ""
@@ -367,7 +428,8 @@ def compute_final_filename(message, caption=None, label=None, max_bytes=None) ->
             if text_block:
                 return prefix + text_block + m_ext
             # 兜底名已含 媒体类型_时间戳（同为消息日期），不再前缀
-            return generate_fallback_filename(message, kind) + m_ext
+            return generate_fallback_filename(
+                message, kind, date_override) + m_ext
 
     text_block = " ".join(p for p in (label_piece, caption) if p)
     if max_bytes is None:
