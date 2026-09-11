@@ -484,12 +484,16 @@ class StatsTextEventModeTest(unittest.TestCase):
         self.assertIn("监听 0", text)      # 输入侧仍显式列出，便于勾稽
 
     def test_listen_section_and_source_bucket(self):
-        """标签监听要能在台账里单独数出来：扫描/命中/转发/触发下载。"""
+        """标签监听要能在台账里单独数出来：扫描/命中/入队/触发下载。
+
+        口径是 **Scanner 的**（created）：拆分 Scanner/Worker 之后扫描阶段只
+        「入队任务」，转发由 Worker 做，所以这里不再出现「转发 N 项」。
+        """
         self._write_events([
             _ev(7, "09:00:00", "LISTEN_SCAN", label="-100123",
-                scanned=20, matched=3, forwarded=6, failed=0),
+                scanned=20, matched=3, created=6, duplicate=1),
             _ev(7, "09:00:00", "LISTEN_SCAN", label="-100456",
-                scanned=5, matched=0, forwarded=0, failed=0),
+                scanned=5, matched=0, created=0, duplicate=0),
             _ev(7, "09:00:01", "RECEIVED", "a" * 32, src="listen"),
             _ev(7, "09:00:02", "QUEUED", "a" * 32, kind="media"),
             _ev(7, "09:00:03", "RUNNING", "a" * 32),
@@ -504,17 +508,61 @@ class StatsTextEventModeTest(unittest.TestCase):
         self.assertIn("扫描：2 次", text)
         self.assertIn("检查 25 条", text)
         self.assertIn("命中：3 条", text)
-        self.assertIn("转发：6 项", text)
+        self.assertIn("入队任务：6 条", text)
+        self.assertIn("重复跳过 1 条", text)
         self.assertIn("触发下载：1 条", text)
         self.assertIn("监听 1", text)      # 输入侧分桶
         self.assertIn("✓", text)           # LISTEN_* 不扰动对账恒等式
+
+    def test_legacy_listen_events_still_renderable(self):
+        """升级前写入的历史 LISTEN_SCAN 带 forwarded —— 老窗口仍要算得出来。"""
+        self._write_events([
+            _ev(7, "09:00:00", "LISTEN_SCAN", label="-100123",
+                scanned=20, matched=3, forwarded=6, failed=0),
+        ])
+        text = stats.stats_text(
+            1, today=TODAY, log_path=os.path.join(_TMP, "nope.log"),
+            history_path=os.path.join(_TMP, "nope_history.txt"),
+            events_path=self.ev_file,
+        )
+        self.assertIn("转发（旧口径）：6 项", text)
+
+    def test_listener_task_results_from_sqlite(self):
+        """Worker 的任务结果从 Runtime DB 读（§37），按窗口过滤。"""
+        from tg_userbot import config as _cfg
+        from tg_userbot import runtime_db
+        db_path = os.path.join(_TMP, "stats_listen.db")
+        with mock.patch.object(_cfg, "RUNTIME_DB_FILE", db_path):
+            runtime_db.close_db()
+            self.addCleanup(runtime_db.close_db)
+            self.assertTrue(runtime_db.init_db())
+            ids = runtime_db.enqueue_listener_tasks(-100123, [{
+                "message_id": 1, "grouped_id": None, "target_type": "chat",
+                "target_chat_id": -5, "download": False, "payload": None,
+            }, {
+                "message_id": 2, "grouped_id": None, "target_type": "chat",
+                "target_chat_id": -5, "download": False, "payload": None,
+            }], checkpoint=2)
+            runtime_db.claim_listener_task()
+            runtime_db.complete_listener_task(ids[0])
+            self._write_events([
+                _ev(7, "09:00:00", "LISTEN_SCAN", label="-100123",
+                    scanned=2, matched=2, created=2),
+            ])
+            text = stats.stats_text(
+                1, today=TODAY, log_path=os.path.join(_TMP, "nope.log"),
+                history_path=os.path.join(_TMP, "nope_history.txt"),
+                events_path=self.ev_file,
+            )
+        self.assertIn("任务结果：成功 1", text)
+        self.assertIn("待执行 1", text)
 
     def test_listen_chat_failure_shown(self):
         self._write_events([
             _ev(7, "09:00:00", "LISTEN_FAIL", label="-100123",
                 error="读取新消息失败"),
             _ev(7, "09:00:01", "LISTEN_SCAN", label="-100456",
-                scanned=1, matched=0, forwarded=0, failed=0),
+                scanned=1, matched=0, created=0),
         ])
         text = stats.stats_text(
             1, today=TODAY, log_path=os.path.join(_TMP, "nope.log"),

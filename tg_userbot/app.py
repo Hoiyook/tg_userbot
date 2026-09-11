@@ -24,7 +24,9 @@ from . import caption_filter
 from . import chrome_client
 from . import dedup
 from . import listener
+from . import listener_worker
 from . import queue
+from . import runtime_db
 from . import reporter
 from . import stats
 from . import thread
@@ -323,6 +325,10 @@ async def _listener_loop():
     listener.scan_all 内部（一个聊天失败不影响其它）。被 main 取消（停止
     信号）时以 CancelledError 收尾。
     """
+    if not state.RUNTIME_DB_READY:
+        # Runtime DB 没起来就不扫：扫了也落不了盘，只会每个周期刷一遍错误日志。
+        logger.warning("📡 标签监听扫描循环未启动（Runtime DB 不可用）")
+        return
     await asyncio.sleep(LISTEN_STARTUP_DELAY_SECONDS)
     while True:
         try:
@@ -979,7 +985,6 @@ async def main():
     dedup.load_dedup_config()
     caption_filter.load_caption_filter_config()
     listener.load_listen_config()
-    listener.load_listen_state()
     loaded = dedup.load_index()
     logger.info(f"🛡 去重索引已载入：{loaded} 条")
     state.WHITELIST_CHATS = whitelist.load_whitelist()
@@ -1027,6 +1032,26 @@ async def main():
         f"Instagram 解析机器人：{INSTAGRAM_BOT_USERNAME}（同上）"
     )
     logger.info("============================================")
+
+    # Runtime DB：标签监听的业务状态层（SQLite）。**必须在登录前就绪**，
+    # 后面的队列恢复/Worker 启动都要用。初始化失败只降级「标签监听不工作」，
+    # 绝不让整个 userbot 起不来。
+    if runtime_db.init_db():
+        state.RUNTIME_DB_READY = True
+        migrated = listener.migrate_legacy_state()
+        if migrated.get("chats") or migrated.get("tasks"):
+            logger.warning(
+                f"🗄 已从旧 listen_state.json 迁移：checkpoint {migrated['chats']} 个"
+                f" / 待续做任务 {migrated['tasks']} 条"
+                + (f"（跳过 {migrated['skipped']} 个已有游标）"
+                   if migrated.get("skipped") else "")
+                + ("，旧文件已改名 .migrated" if migrated.get("moved") else "")
+            )
+    else:
+        state.RUNTIME_DB_READY = False
+        logger.error(
+            "🗄 Runtime DB 不可用：标签监听本次不启动（下载等其余功能不受影响）"
+        )
 
     await start_with_retry(state.client)
 
@@ -1122,8 +1147,16 @@ async def main():
         bot_keepalive_task = asyncio.create_task(_bot_keepalive())
     main_serve_task = asyncio.create_task(_main_serve())
     retry_sweeper_task = asyncio.create_task(_retry_sweeper())
-    # 标签监听：定时主动扫描（与下载白名单完全独立的一套配置）
+    # 标签监听：Scanner（定时生产任务）+ Worker（常驻受控执行）
     listener_task = asyncio.create_task(_listener_loop())
+    listener_worker_task = None
+    if state.RUNTIME_DB_READY:
+        # 启动时必须先恢复过期租约（§24）：上次进程崩溃遗留的 PROCESSING
+        # 任务否则会一直卡到租约自然到期。
+        recovered = listener_worker.recover_expired()
+        if recovered:
+            logger.warning(f"🗄 启动恢复：{recovered} 条租约过期的监听任务已回到待执行")
+        listener_worker_task = listener_worker.start_worker()
     # Runtime Reporter（只读观察者）：发启动通知 + 后台刷新状态面板
     reporter_instance, reporter_task = await _start_reporter()
 
@@ -1144,11 +1177,11 @@ async def main():
         # finally 里的 disconnect，随后以 CancelledError 收尾；bot 探活/重放
         # 扫描/Reporter 主循环同理。
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
-                  reporter_task, listener_task):
+                  reporter_task, listener_task, listener_worker_task):
             if t is not None:
                 t.cancel()
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
-                  reporter_task, listener_task):
+                  reporter_task, listener_task, listener_worker_task):
             if t is not None:
                 try:
                     await t
@@ -1156,6 +1189,9 @@ async def main():
                     pass
                 except Exception:
                     logger.exception("后台服务任务清理出错")
+        # Worker 已在取消时把手上的任务放回 PENDING；这里兜底再释放一次
+        listener_worker.release_inflight()
+        runtime_db.close_db()
         # 断开下载 worker 连接（尽力而为，不影响主客户端退出）
         try:
             await workers.shutdown()

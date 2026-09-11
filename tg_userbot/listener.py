@@ -1,40 +1,46 @@
-"""标签监听：按周期主动扫描指定聊天，命中配置的标签后转发到目标并按需下载。
+"""标签监听 —— Scanner 侧：扫出匹配、落成持久化任务（**不执行**）。
 
-**与下载白名单完全独立**（规格书最重要的设计约束）：
+**扫描 ≠ 执行**（Producer/Consumer）。本模块只做生产者：
 
-    下载白名单 /wl ──► 聊天收到媒体 → 实时转发收藏夹 → 下载
-    标签监听 listen ──► 定时主动扫描 → 标签匹配 → 转发目标 / 下载
+    Telegram ──► Scanner（本模块）──► SQLite 任务表 ──► listener_worker ──► 转发/下载
 
-监听来源来自自己的 ``runtime/listen.json`` 与 ``state.LISTEN_RULES``，**绝不**
-从 ``state.WHITELIST_CHATS`` 推导，也不要求监听聊天加入 /wl。一个聊天可以只在
-下载白名单、只在标签监听、两边都在、或两边都不在。唯一一次「读」白名单是 §14
-的重叠判定：源聊天已在下载白名单时，实时链路已经转发+下载过这条消息，监听就
-跳过 me 目标与下载（``_effective_work``），只跑其余目标——只读，不改其语义。
+这么拆的理由是原先「扫描即执行」有三个真实缺陷：① 一轮扫描命中几十条时，
+进程在中途被杀会把这一轮状态**全部丢掉**（checkpoint 与待续做都没落盘），重启
+后整批重跑、已转发过的重发一遍；② 转发之间零间隔，没有节流手段；③ 失败续做
+用的 ``pending`` 是「半个任务表」，没有状态/租约/次数上限。
 
-**download=true 的实现**：把消息转发进收藏夹，并入队那份转发副本——复用现有
-``app.enqueue_media`` → 下载队列 → dedup → 命名的整条链路，不新增第二套下载器。
-为什么要显式入队而不是指望收藏夹的事件入口：**userbot 自己发出的转发不会回流成
-更新**（2026-09-11 用生产日志核实：转发出的副本 ID=31160 在 208 条「📨 Saved
-Messages 收到消息」里没有对应行），这正是既有白名单链路 ``_relay_single`` 转发
-完也要显式 ``enqueue_media(fwd, …)`` 的原因。转发之所以仍然必要：副本自带系统
-「转发自 <来源>」头，用户在收藏夹看得出处，落盘目录也由副本的 ``fwd_from`` 解析
-回原来源频道。
+**与下载白名单完全独立**：监听来源来自自己的 ``runtime/listen.json`` 与
+``state.LISTEN_RULES``，**绝不**从 ``state.WHITELIST_CHATS`` 推导，也不要求监听
+聊天加入 ``/wl``。一个聊天可以只在一边、两边都在、或都不在。唯一一次读白名单是
+§14 的重叠判定（且只读）：源聊天已在下载白名单时，实时链路已经转发+下载过这条
+消息，监听就不再为它建「收藏夹」任务（``_effective_work``），只建其余目标。
+
+**Scanner 的职责边界**（§11）：读配置 → 发现 source chat → 按 checkpoint 扫新消息
+→ 标签匹配 → 多标签合并 → 相册整组 → 算目标与 download → **建任务** → 在同一
+事务里推进 checkpoint。**Scanner 不转发、不下载、不等待 FloodWait、不重试**
+——那些全是 Worker 的事。
 
 **扫描纪律**：
 * 按 chat 扫描一次，再匹配该 chat 下的全部规则（不按规则重复请求 Telegram）；
-* 第一层：同一消息命中多个标签/多条规则 → 先「匹配 → 合并」再执行，同一
-  (消息, 目标) 只转发一次；
-* 相册按 grouped_id 整组处理（标签常只挂在其中一个成员的说明上）；
+* 同一消息命中多标签/多规则 → 先「匹配 → 合并」（目标是**集合**），再按
+  (单元, 目标) 各建一条任务，同一目标只建一次（§14）；
+* 相册按 grouped_id 整组为一个单元，``message_id`` 存**组内最小成员 id**（锚点），
+  整组成员在 payload 里——这样唯一索引与「整组转发」同时成立（见 runtime_db）；
 * 只处理**媒体**消息——纯文本转发进收藏夹会被 ``app._record_me_label`` 当成
   「待关联评论标注」拼进下一个下载文件的文件名，污染命名；
-* 首次添加监听时以当前最新消息 id 作 checkpoint，**绝不扫历史**（§8）；
-* checkpoint 只推进；失败的目标以 ``pending`` 精确续做（一个目标失败不会让
-  整条消息重放、也不会因为推进 checkpoint 而永久丢失）。
+* 首次添加监听时以当前最新消息 id 作 checkpoint，**绝不扫历史**（§17/§18：新增
+  标签也沿用同一聊天的 checkpoint，不会回头扫历史）；
+* checkpoint 与任务**同事务**提交，语义是「此位置之前需要建的任务都已落盘」
+  （§7/§13）；队列触顶时**绝不推进 checkpoint**（§30，否则那些消息被永久跳过）。
 
-**稳定性**：每 chat 独立 try/except（一个聊天失败不影响其它）；所有网络调用经
-``netio.shielded`` 收口（断线的网络层取消只会变成「本轮没做成」，绝不会把这个
-后台循环打死——本项目最贵的坑，见 CLAUDE.md）；配置/状态读失败回落空配置、
-写盘 temp + ``os.replace`` 原子。
+**配置热加载**：每轮扫描前按 mtime 按需重读 listen.json（§17）；文件损坏时保持
+当前生效配置——半截文件把规则清空后，用户下一次点任何按钮就会把空规则保存回
+文件，规则就真没了。
+
+**稳定性**：每 chat 独立 try/except（一个聊天失败不影响其它，§23）；所有网络调用
+经 ``netio.shielded`` 收口（断线的网络层取消只会变成「本轮没做成」，绝不会把这个
+后台循环打死——本项目最贵的坑，见 CLAUDE.md）；数据库不可用时整轮放弃且
+checkpoint 原地不动，下一轮重扫。
 """
 import asyncio
 import json
@@ -44,21 +50,19 @@ import time
 from datetime import datetime
 
 from telethon import Button
-from telethon.errors import FloodWaitError
 from telethon.utils import get_peer_id
 
 from . import config
 from . import netio
 from . import notify
+from . import runtime_db
 from . import state
 from . import stats
 from .config import (
+    LISTEN_ALBUM_SIBLING_RANGE,
     LISTEN_CONFIG_FILE,
     LISTEN_FETCH_TIMEOUT_SECONDS,
-    LISTEN_FORWARD_TIMEOUT_SECONDS,
     LISTEN_MAX_MESSAGES_PER_SCAN,
-    LISTEN_MAX_PENDING,
-    LISTEN_MAX_RETRY_UNITS,
     LISTEN_MATCH_PREFIX,
     LISTEN_MAX_INTERVAL_MINUTES,
     LISTEN_MIN_INTERVAL_MINUTES,
@@ -66,7 +70,7 @@ from .config import (
 )
 from .log import logger
 from .naming import pick_group_caption_text
-from .sources import entity_display_name, is_downloadable, message_source_link
+from .sources import entity_display_name, is_downloadable
 
 # 扫描重入保护：定时扫描与「▶️ 立即扫描」不能同时跑（同一份 checkpoint 会被
 # 两个执行流各自推进）。检查与置位之间没有 await，单线程事件循环内不可能被
@@ -82,11 +86,6 @@ _LAST_CONFIG_MTIME = 0.0
 
 # 工作项（pending 里存的「还没做成的部分」）
 WORK_SAVED = "saved_messages"      # 转发收藏夹（download=true 时同时入队副本）
-
-
-def work_chat(chat_id) -> str:
-    """普通目标聊天的工作项键（与 target_key 的 ("chat", id) 一一对应）。"""
-    return f"chat:{int(chat_id)}"
 
 
 # ============================================================
@@ -184,14 +183,6 @@ def target_label(target) -> str:
         return "📌 收藏夹"
     name = norm.get("name") or f"chat_{norm['chat_id']}"
     return f"📢 {name}"
-
-
-def work_item_for(target) -> str:
-    """目标 → 工作项键（pending 里存的就是它）。"""
-    key = target_key(target)
-    if key is None:
-        return ""
-    return WORK_SAVED if key[0] == "saved_messages" else work_chat(key[1])
 
 
 # ============================================================
@@ -305,15 +296,6 @@ def _effective_work(rule, in_download_whitelist):
     return keys, download
 
 
-def _work_items(keys):
-    """目标键集合 → 工作项列表；收藏夹排最前（下载依赖它的副本）。"""
-    items = []
-    for key in sorted(keys, key=lambda k: (k[0] != "saved_messages", str(k[1]))):
-        items.append(WORK_SAVED if key[0] == "saved_messages"
-                     else work_chat(key[1]))
-    return items
-
-
 # ============================================================
 # 配置与状态持久化
 #
@@ -323,10 +305,6 @@ def _work_items(keys):
 # ============================================================
 def _config_path():
     return getattr(config, "LISTEN_CONFIG_FILE", LISTEN_CONFIG_FILE)
-
-
-def _state_path():
-    return getattr(config, "LISTEN_STATE_FILE", config.LISTEN_STATE_FILE)
 
 
 def save_listen_config() -> bool:
@@ -448,52 +426,75 @@ def reload_listen_config() -> bool:
     return True
 
 
-def save_listen_state() -> bool:
-    """把扫描游标（checkpoint + pending）原子写盘。"""
-    path = _state_path()
-    tmp_path = path + ".tmp"
-    try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(state.LISTEN_STATE or {}, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(tmp_path, path)
-        return True
-    except Exception as e:
-        logger.warning(f"保存标签监听状态失败（不影响运行）：{e}")
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-        return False
+# ============================================================
+# 扫描游标：SQLite（原 listen_state.json 已退役）
+#
+# checkpoint 语义（§7）：**此位置之前需要建的任务都已落盘**。它不表示任务已经
+# 发送成功——那是 Worker 的事。两者在同一事务里提交，所以这个语义成立。
+# ============================================================
+def get_checkpoint(source_chat_id):
+    """取监听来源的 checkpoint（None = 从未建立，与 0 语义不同）。"""
+    return runtime_db.get_listener_checkpoint(int(source_chat_id))
 
 
-def load_listen_state() -> int:
-    """载入 listen_state.json，返回聊天条目数；损坏回落空状态。"""
-    state.LISTEN_STATE = {}
+def _legacy_state_path():
+    return getattr(config, "LISTEN_STATE_FILE", config.LISTEN_STATE_FILE)
+
+
+def migrate_legacy_state(path=None) -> dict:
+    """把旧的 listen_state.json 一次性迁进 SQLite（§38）。返回迁移计数。
+
+    **两条守卫**，避免这个函数在任何情况下帮倒忙：
+    1. 只有当 **DB 里还没有该聊天的 checkpoint** 时才写入旧 checkpoint——
+       否则「升级后跑了一阵再触发迁移」会把已经推进的游标倒回去，导致重复
+       扫描一大段。
+    2. 迁移成功就把旧文件改名 ``.migrated``（不删，保留人工核对），下次不再跑。
+
+    ``pending``（失败待续做的工作项）**逐项映射成 PENDING 任务**而不是丢弃：
+    它本来就是「未完成的工作」，丢掉等于这些消息永不转发，违反「不降低现有
+    功能能力」。一个 pending 单元（可能含相册整组）按其 work 列表拆成 N 条
+    任务，member_ids 存进 payload。
+    """
+    src = path or _legacy_state_path()
+    if not os.path.exists(src):
+        return {"chats": 0, "tasks": 0, "skipped": 0, "moved": False}
     try:
-        with open(_state_path(), "r", encoding="utf-8") as f:
+        with open(src, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("顶层不是对象")
-    except FileNotFoundError:
-        return 0
     except Exception as e:
-        logger.warning(f"读取标签监听状态失败，改用空状态：{e}")
-        return 0
+        logger.warning(f"🗄 旧 listen_state.json 无法解析，保持原名不动：{e}")
+        return {"chats": 0, "tasks": 0, "skipped": 0, "moved": False}
 
-    clean = {}
-    for chat_id, entry in data.items():
+    chats = tasks = skipped = 0
+    for chat_key, entry in data.items():
         if not isinstance(entry, dict):
             continue
         try:
-            last_id = int(entry.get("last_message_id") or 0)
+            chat_id = int(chat_key)
         except (TypeError, ValueError):
+            logger.warning(f"🗄 迁移跳过非法聊天键：{chat_key!r}")
             continue
-        pending = {}
-        for key, rec in (entry.get("pending") or {}).items():
+
+        try:
+            legacy_ckpt = int(entry.get("last_message_id") or 0)
+        except (TypeError, ValueError):
+            legacy_ckpt = 0
+        current = get_checkpoint(chat_id)
+        if current is None:
+            runtime_db.set_listener_checkpoint(chat_id, legacy_ckpt)
+            chats += 1
+            logger.info(f"🗄 迁移 checkpoint：{chat_id} → {legacy_ckpt}")
+        else:
+            skipped += 1
+            logger.info(
+                f"🗄 迁移跳过 checkpoint {chat_id}：DB 已有 {current}，"
+                f"不能用旧值 {legacy_ckpt} 覆盖"
+            )
+
+        records = []
+        for unit_key, rec in (entry.get("pending") or {}).items():
             if not isinstance(rec, dict):
                 continue
             ids = [int(i) for i in (rec.get("ids") or [])
@@ -501,15 +502,53 @@ def load_listen_state() -> int:
             work = [str(w) for w in (rec.get("work") or [])]
             if not ids or not work:
                 continue
-            pending[str(key)] = {
-                "ids": ids,
-                "work": work,
-                "dl": bool(rec.get("dl")),
-                "cap": str(rec.get("cap") or ""),
-            }
-        clean[str(chat_id)] = {"last_message_id": last_id, "pending": pending}
-    state.LISTEN_STATE = clean
-    return len(clean)
+            for item in work:
+                target_type, target_chat_id = _work_item_to_target(item)
+                if target_type is None:
+                    continue
+                records.append({
+                    "message_id": min(ids),
+                    "grouped_id": None,
+                    "target_type": target_type,
+                    "target_chat_id": target_chat_id,
+                    "download": bool(rec.get("dl")),
+                    "payload": {"member_ids": ids,
+                                "caption": str(rec.get("cap") or ""),
+                                "migrated_from": str(unit_key)},
+                })
+        if records:
+            ids_out = runtime_db.enqueue_listener_tasks(chat_id, records)
+            tasks += sum(1 for i in ids_out if i)
+            logger.info(
+                f"🗄 迁移待续做任务：{chat_id} {len(records)} 条"
+                f"（成功落盘 {sum(1 for i in ids_out if i)} 条）"
+            )
+
+    moved = False
+    if chats or tasks:
+        dst = src + ".migrated"
+        try:
+            if os.path.exists(dst):
+                dst = f"{dst}.{int(time.time())}"
+            os.replace(src, dst)
+            moved = True
+            logger.warning(f"🗄 旧状态文件已迁移并改名为 {os.path.basename(dst)}")
+        except OSError as e:
+            logger.error(f"🗄 迁移完成但改名失败（下次启动会再跑一次，有守卫）：{e}")
+    return {"chats": chats, "tasks": tasks, "skipped": skipped, "moved": moved}
+
+
+def _work_item_to_target(item):
+    """旧 pending 的工作项 → (target_type, target_chat_id)；认不出返回 (None, None)。"""
+    item = str(item or "")
+    if item == WORK_SAVED or item == "saved_messages":
+        return ("saved_messages", None)
+    if item.startswith("chat:"):
+        try:
+            return ("chat", int(item.split(":", 1)[1]))
+        except (IndexError, ValueError):
+            return (None, None)
+    return (None, None)
 
 
 # ============================================================
@@ -562,15 +601,12 @@ async def add_listener(rule) -> tuple:
     rule = normalize_rule(rule)
     chat_id = rule["source_chat_id"]
 
-    if str(chat_id) not in state.LISTEN_STATE:
+    if get_checkpoint(chat_id) is None:
         newest = await _fetch_newest_id(chat_id)
         if newest is None:
             return False, (f"{LISTEN_NOTIFY_PREFIX}：读取该聊天最新消息失败，"
                            "已放弃添加（请确认有访问权限后重试）")
-        state.LISTEN_STATE[str(chat_id)] = {
-            "last_message_id": newest, "pending": {},
-        }
-        save_listen_state()
+        runtime_db.set_listener_checkpoint(chat_id, newest)
         logger.info(
             f"📡 标签监听初始化 checkpoint：{chat_id} → {newest}"
             "（不扫描历史，从下一条新消息开始）"
@@ -619,7 +655,10 @@ async def _fetch_newest_id(chat_id):
 
 
 async def _fetch_new(chat_id, checkpoint):
-    """取 checkpoint 之后的新消息（升序，最多一轮上限）；失败返回 None。"""
+    """取 checkpoint 之后的新消息（升序，最多一轮上限）；失败返回 None。
+
+    取完还会补一次「被条数上限切开的相册」（见 `_complete_boundary_group`）。
+    """
     cli = state.client
     if cli is None:
         return None
@@ -636,18 +675,44 @@ async def _fetch_new(chat_id, checkpoint):
     if got is None:
         return None
     msgs = got if isinstance(got, (list, tuple)) else [got]
-    return sorted(msgs, key=lambda m: m.id)
+    msgs = sorted(msgs, key=lambda m: m.id)
+    return await _complete_boundary_group(chat_id, msgs)
 
 
-async def _fetch_by_ids(chat_id, ids):
-    """按 id 取消息（pending 续做用）；失败返回空列表。"""
+async def _complete_boundary_group(chat_id, msgs):
+    """把被一轮条数上限切开的相册补完整。
+
+    ``limit`` 是从「最新」一侧切的：正好骑在边界上的相册，较旧的成员在里面、
+    较新的成员被切在外面。不补的话 ``group_by_album`` 只看到半组 → 建出的任务
+    只带半个相册 → Worker 转发半个相册，收藏夹里被劈开（这是改造前就存在的
+    真 bug，顺手修掉）。只对「最后一条是相册成员」的情况多取一次，代价可忽略。
+    """
+    if not msgs:
+        return msgs
+    last = msgs[-1]
+    gid = getattr(last, "grouped_id", None)
+    if not gid:
+        return msgs
+    extra = await _fetch_after(chat_id, last.id, LISTEN_ALBUM_SIBLING_RANGE)
+    tail = [m for m in extra if getattr(m, "grouped_id", None) == gid]
+    if tail:
+        logger.info(
+            f"📡 补齐被扫描上限切开的相册：{chat_id} 组 {gid} 追加 {len(tail)} 个成员"
+            f"（该组共 {len([m for m in msgs if getattr(m, 'grouped_id', None) == gid]) + len(tail)} 个）"
+        )
+    return msgs + tail
+
+
+async def _fetch_after(chat_id, after_id, limit):
+    """取 id > after_id 的最早 limit 条（补相册边界用）；失败返回空列表。"""
     cli = state.client
-    if cli is None or not ids:
+    if cli is None:
         return []
     got = await netio.shielded(
-        lambda: cli.get_messages(chat_id, ids=list(ids)),
+        lambda: cli.get_messages(chat_id, limit=int(limit),
+                                 min_id=int(after_id), reverse=True),
         LISTEN_FETCH_TIMEOUT_SECONDS,
-        f"读取待续做消息（{chat_id}）",
+        f"补齐相册边界（{chat_id}）",
     )
     if got is None:
         return []
@@ -655,225 +720,163 @@ async def _fetch_by_ids(chat_id, ids):
     return [m for m in msgs if m is not None]
 
 
-async def _forward_to_target(target, messages, from_peer):
-    """整组转发到目标，返回副本列表；失败返回 None（留给 pending 续做）。
+async def fetch_unit_messages(source_chat_id, member_ids):
+    """按 id 取回一个任务单元的整组成员（Worker 执行前调用）。
 
-    不给 ``netio.shielded`` 传很紧的超时：转发触发 FloodWait 时 Telethon 会
-    自行等待，收口到点取消会把这种合法等待掐成失败。收口仍然必要——它把
-    断线的网络层取消变成「本轮没做成」，而不是把后台扫描循环打死。
+    Worker 手上只有 ``listener_tasks`` 的行（来源聊天 + 锚点 + payload），
+    必须先取回真实消息对象才能转发。**取消息这件事留在 Scanner 模块**（所有
+    Telegram 读操作都在这边，Worker 只负责发送/入队），失败返回空列表由调用方
+    按重试处理。
     """
-    key = target_key(target)
-    if key is None:
-        return None
-    peer = "me" if key[0] == "saved_messages" else key[1]
     cli = state.client
-
-    async def _do():
-        last_error = None
-        for attempt in range(1, 3):
-            try:
-                return await cli.forward_messages(
-                    peer, messages, from_peer=from_peer)
-            except FloodWaitError as e:
-                wait = min(int(getattr(e, "seconds", None) or 30), 60)
-                last_error = e
-                logger.warning(
-                    f"📡 监听转发触发频率限制，等待 {wait}s 后重试"
-                    f"（{peer}，第 {attempt}/2 次）"
-                )
-                await asyncio.sleep(wait)
-        raise last_error or RuntimeError("转发多次被频率限制")
-
-    sent = await netio.shielded(
-        _do, LISTEN_FORWARD_TIMEOUT_SECONDS, f"标签监听转发 → {peer}")
-    if sent is None:
-        return None
-    sent = sent if isinstance(sent, (list, tuple)) else [sent]
-    return [s for s in sent if s is not None]
-
-
-async def _enqueue_copy(copy, source_link, album_caption, src):
-    """入队一份转发副本（走现有下载链路，不新增第二套下载器）。
-
-    ``app`` 在函数内导入：app 顶层 `from . import listener`，模块级互相导入
-    会成环（与 menu 里函数内导入 dedup 同一处理）。
-    """
-    from . import app
-    await app.enqueue_media(
-        copy, state.MY_ID, None,
-        source_link=source_link,
-        album_caption=album_caption,
-        src=src,
+    ids = [int(i) for i in (member_ids or [])]
+    if cli is None or not ids:
+        return []
+    got = await netio.shielded(
+        lambda: cli.get_messages(int(source_chat_id), ids=ids),
+        LISTEN_FETCH_TIMEOUT_SECONDS,
+        f"取任务消息（{source_chat_id}）",
     )
+    if got is None:
+        return []
+    msgs = got if isinstance(got, (list, tuple)) else [got]
+    by_id = {m.id: m for m in msgs if m is not None}
+    # 保持成员顺序（相册顺序即源频道里的顺序）
+    return [by_id[i] for i in ids if i in by_id]
 
 
-# ============================================================
-# 执行：一个消息单元 × 一组工作项
-# ============================================================
-async def _execute_unit(members, work, chat_id, caption, download):
-    """执行一个单元（单条/整组相册）的工作项，返回 (剩余工作项, 成功数, 失败数)。
+def _build_tasks(chat_id, media, keys, download, caption, anchor):
+    """把「一个消息单元 × 一组目标」展开成待落盘的任务记录（纯函数）。
 
-    每个工作项各自成败：收藏夹转发成功就先入队副本，绝不因为「另一个目标
-    失败」把已完成的部分回滚重来（否则下一轮会重复转发/重复下载）。
+    **每个目标一条任务**（规格 §15）：目标之间彼此独立，A 失败不会牵连 B，
+    重试也只重试自己那条。
+
+    ``message_id`` 存**单元锚点**（相册取组内最小成员 id），整组成员 id 放
+    payload["member_ids"]——这样 §8 的唯一索引与 §16「整组转发、收藏夹里仍是
+    一个相册」同时成立。若按成员 id 各建一条任务，Worker 会逐条转发，收藏夹
+    里相册就被劈成 N 条散消息（详见 runtime_db 的索引注释）。
+
+    ``download`` 只挂在收藏夹目标上：下载的实现是「转发进收藏夹 + 入队那份
+    副本」，普通聊天目标没有可入队的副本。
     """
-    remaining = []
-    ok_count = fail_count = 0
-    media = [m for m in (members or []) if is_downloadable(m)]
-    if not media:
-        return remaining, 0, 0
-    source_link = message_source_link(media[0], chat_id)
-
-    for item in work:
-        if item == WORK_SAVED:
-            copies = await _forward_to_target(
-                {"type": "saved_messages"}, media, chat_id)
-            if copies is None:
-                remaining.append(item)
-                fail_count += 1
-                continue
-            ok_count += 1
-            if download:
-                for copy in copies:
-                    # 转发副本保留它自己的说明；无文字的副本继承源侧读到的
-                    # 相册说明做命名（否则图片会退化成 媒体类型_时间戳）
-                    own_text = (getattr(copy, "message", "") or "").strip()
-                    cap = None if own_text else (caption or None)
-                    try:
-                        await _enqueue_copy(copy, source_link, cap, "listen")
-                    except Exception as e:
-                        logger.exception(f"📡 标签监听副本入队失败：{e}")
-        elif isinstance(item, str) and item.startswith("chat:"):
-            try:
-                cid = int(item.split(":", 1)[1])
-            except (IndexError, ValueError):
-                continue
-            sent = await _forward_to_target({"type": "chat", "chat_id": cid},
-                                            media, chat_id)
-            if sent is None:
-                remaining.append(item)
-                fail_count += 1
-            else:
-                ok_count += 1
-    return remaining, ok_count, fail_count
-
-
-def _pending_cap(pending):
-    """pending 条数超上限时丢最旧的（按消息 id 小的先丢）并告警。
-
-    兜底用：目标频道长期不可达时不会让状态文件无界增长。丢了会记日志，
-    不是静默吞掉。
-    """
-    if len(pending) <= LISTEN_MAX_PENDING:
-        return
-    try:
-        ordered = sorted(pending, key=lambda k: int(k))
-    except (TypeError, ValueError):
-        ordered = sorted(pending)
-    excess = len(pending) - LISTEN_MAX_PENDING
-    for key in ordered[:excess]:
-        pending.pop(key, None)
-    logger.warning(f"📡 标签监听待续做条目超上限，已丢弃最旧 {excess} 条")
+    member_ids = [m.id for m in media]
+    gid = getattr(media[0], "grouped_id", None)
+    out = []
+    for key in sorted(keys, key=lambda k: (k[0] != "saved_messages", str(k[1]))):
+        is_saved = key[0] == "saved_messages"
+        out.append({
+            "message_id": int(anchor),
+            "grouped_id": gid,
+            "target_type": "saved_messages" if is_saved else "chat",
+            "target_chat_id": None if is_saved else int(key[1]),
+            "download": bool(download) and is_saved,
+            "payload": {"member_ids": member_ids, "caption": caption or ""},
+        })
+    return out
 
 
 async def _scan_chat(chat_id, rules):
-    """扫一个聊天：先续做 pending，再取新消息匹配执行。返回本轮统计。"""
-    entry = state.LISTEN_STATE.setdefault(
-        str(chat_id), {"last_message_id": 0, "pending": {}})
-    entry.setdefault("last_message_id", 0)
-    entry.setdefault("pending", {})
-    pending = entry["pending"]
+    """扫一个聊天：匹配 → 落成持久化任务。**不做任何转发**（规格 §11）。
 
-    result = {"scanned": 0, "matched": 0, "forwarded": 0, "failed": 0}
+    返回本轮统计。Scanner 的职责边界止于「任务已落盘 + checkpoint 已推进」，
+    真正的 forward 由 listener_worker 受控执行——这样一次扫描发现几十条匹配
+    也不会在短时间内砸出几十个转发请求。
 
-    # ---------- 1. 先续做上一轮没做成的（用记录里的 work，不再看规则） ----------
-    # 每轮最多续做 LISTEN_MAX_RETRY_UNITS 个单元：一条 get_messages 的 ids 数组
-    # 不宜过大（200 个单元 × 最多 10 个相册成员 = 2000 个 id），没轮到的留在
-    # pending 里下一轮继续，不会丢。
-    retry_keys = list(pending.keys())[:LISTEN_MAX_RETRY_UNITS]
-    retry_ids = [i for k in retry_keys for i in (pending[k].get("ids") or [])]
-    retry_msgs = await _fetch_by_ids(chat_id, retry_ids)
-    by_id = {m.id: m for m in retry_msgs}
-    for key in retry_keys:
-        rec = pending[key]
-        unit = [by_id[i] for i in (rec.get("ids") or []) if i in by_id]
-        if not unit:
-            logger.warning(
-                f"📡 待续做消息已不可读（可能被删除），放弃：{chat_id} #{key}")
-            pending.pop(key, None)
-            continue
-        left, ok_n, fail_n = await _execute_unit(
-            unit, rec.get("work") or [], chat_id,
-            rec.get("cap") or "", rec.get("dl"))
-        result["forwarded"] += ok_n
-        result["failed"] += fail_n
-        if left:
-            rec["work"] = left
-        else:
-            pending.pop(key, None)
+    checkpoint 只在**同一个事务**里随任务一起推进（runtime_db 保证），所以
+    任何时刻 checkpoint 都诚实地表示「此位置之前需要建的任务都已落盘」。
+    """
+    result = {"scanned": 0, "matched": 0, "created": 0, "duplicate": 0,
+              "capped": False}
 
-    # ---------- 2. 取新消息并匹配 ----------
-    new_msgs = await _fetch_new(chat_id, entry["last_message_id"])
+    checkpoint = runtime_db.get_listener_checkpoint(chat_id)
+    if checkpoint is None:
+        # 规则存在但 DB 里没有游标（历史遗留/迁移缺失）：就地初始化，
+        # **绝不扫历史**——把当前最新 id 当起点，从下一条新消息开始。
+        newest = await _fetch_newest_id(chat_id)
+        if newest is None:
+            raise RuntimeError(f"无 checkpoint 且读不到最新消息：{chat_id}")
+        runtime_db.set_listener_checkpoint(chat_id, newest)
+        logger.warning(
+            f"📡 {chat_id} 缺少 checkpoint（历史遗留规则），已就地初始化为 "
+            f"{newest}（从新消息开始，不扫历史）"
+        )
+        checkpoint = newest
+
+    new_msgs = await _fetch_new(chat_id, checkpoint)
     if new_msgs is None:
-        # 读失败：checkpoint 原地不动，本轮不处理这个聊天（下轮再试）
         raise RuntimeError(f"读取新消息失败：{chat_id}")
     result["scanned"] = len(new_msgs)
+    if not new_msgs:
+        return result
+
+    # 队列上限背压（§30）：满了就不再建新任务，且 checkpoint **停在原地**
+    #（没入队的消息绝不能被跳过——否则那几条消息永久丢失）。
+    pending_now = runtime_db.count_pending_listener_tasks()
+    budget = int(config.LISTEN_MAX_PENDING_TASKS) - pending_now
+    if budget <= 0:
+        result["capped"] = True
+        logger.warning(
+            f"📡 待执行任务已达上限 {config.LISTEN_MAX_PENDING_TASKS}"
+            f"（当前 {pending_now}），本轮不建新任务；{chat_id} 的 checkpoint "
+            f"停在 {checkpoint}，Worker 消费后下一轮继续"
+        )
+        return result
 
     in_whitelist = int(chat_id) in (state.WHITELIST_CHATS or {})
     tags = [r["tag"] for r in rules]
+    tasks = []
+    processed_upto = checkpoint
 
     for unit in group_by_album(new_msgs):
+        unit_max_id = max(m.id for m in unit)
         media = [m for m in unit if is_downloadable(m)]
         if not media:
-            continue   # 只处理媒体：纯文本转发进收藏夹会污染标注命名
+            # 只处理媒体消息：纯文本转发进收藏夹会被 app._record_me_label
+            # 当成「待关联评论标注」拼进下一个下载文件的文件名。
+            processed_upto = max(processed_upto, unit_max_id)
+            continue
+
+        anchor = min(m.id for m in media)
         gid = getattr(media[0], "grouped_id", None)
         text = (pick_group_caption_text(media, gid) if gid
                 else (getattr(media[0], "message", "") or "").strip())
         hits = matched_tags(text, tags)
-        if not hits:
-            continue
+        if hits:
+            keys, download = set(), False
+            for rule in rules:
+                if rule["tag"] in hits:
+                    k, d = _effective_work(rule, in_whitelist)
+                    keys |= k
+                    download = download or d
+            if keys:
+                if len(tasks) + len(keys) > budget:
+                    # 这一单元要建的都建不下 → 整单元留给下一轮（checkpoint 不动）
+                    result["capped"] = True
+                    logger.warning(
+                        f"📡 {chat_id} 队列额度只剩 {budget - len(tasks)} 条，"
+                        f"暂停在消息 {anchor}（下轮继续）"
+                    )
+                    break
+                result["matched"] += 1
+                tasks.extend(_build_tasks(chat_id, media, keys, download,
+                                          text, anchor))
+                logger.info(
+                    f"🏷 标签监听命中：{chat_id} #{anchor} "
+                    f"标签 {' '.join(sorted(hits))} → 建任务 {len(keys)} 条"
+                    f"（{'整组 ' + str(len(media)) + ' 个成员' if gid else '单条'}）"
+                )
+        processed_upto = max(processed_upto, unit_max_id)
 
-        keys, download = set(), False
-        for rule in rules:
-            if rule["tag"] in hits:
-                k, d = _effective_work(rule, in_whitelist)
-                keys |= k
-                download = download or d
-        if not keys:
-            continue   # 例如源在白名单、规则只有收藏夹目标 → 无事可做
-
-        result["matched"] += 1
-        unit_key = str(min(m.id for m in media))
-        work = _work_items(keys)
-        left, ok_n, fail_n = await _execute_unit(
-            media, work, chat_id, text, download)
-        result["forwarded"] += ok_n
-        result["failed"] += fail_n
-        if left:
-            pending[unit_key] = {
-                "ids": [m.id for m in media],
-                "work": left,
-                "dl": download,
-                "cap": text,
-            }
-        logger.info(
-            f"🏷 标签监听命中：{chat_id} #{unit_key} "
-            f"标签 {' '.join(sorted(hits))} → 转发 {ok_n} 项"
-            + (f"，失败 {fail_n} 项转下轮续做" if fail_n else "")
-        )
-
-    # ---------- 3. 推进 checkpoint（pending 已按 id 记下，不会丢） ----------
-    if new_msgs:
-        newest = max(m.id for m in new_msgs)
-        if newest > int(entry["last_message_id"] or 0):
-            entry["last_message_id"] = newest
-    _pending_cap(pending)
+    ids = runtime_db.enqueue_listener_tasks(
+        chat_id, tasks, checkpoint=processed_upto)
+    result["created"] = sum(1 for i in ids if i)
+    result["duplicate"] = len(ids) - result["created"]
 
     stats.emit_event(
         "LISTEN_SCAN", label=str(chat_id),
         scanned=result["scanned"], matched=result["matched"],
-        forwarded=result["forwarded"], failed=result["failed"],
+        created=result["created"], duplicate=result["duplicate"],
     )
-    save_listen_state()
     return result
 
 
@@ -882,27 +885,30 @@ def is_scanning() -> bool:
 
 
 async def scan_all(manual=False) -> dict:
-    """扫描全部监听聊天。返回汇总桶；被重入保护挡下时带 ``skipped``。
+    """扫描全部监听聊天，把匹配结果落成持久化任务。返回汇总桶。
+
+    被重入保护挡下时带 ``skipped``；关闭/无规则时带 ``disabled``/``empty``。
 
     每个聊天独立 try/except：``@source1`` 失败不影响 ``@source2/@source3``
     （§23）。整体异常也不上抛——调用方是后台循环/菜单回调，绝不能因为一次
     扫描失败把循环打死。
+
+    **本函数不发送任何 Telegram 消息**：匹配 → 落库 → 推进 checkpoint，到此
+    为止。转发由 listener_worker 常驻受控执行。
     """
     global _SCANNING
+    empty = {"chats": 0, "failed_chats": 0, "scanned": 0, "matched": 0,
+             "created": 0, "duplicate": 0, "capped": 0}
     if _SCANNING:
         logger.info("📡 已有扫描在进行中，跳过本次")
-        return {"skipped": True, "chats": 0, "failed_chats": 0, "scanned": 0,
-                "matched": 0, "forwarded": 0, "failed": 0}
+        return dict(empty, skipped=True)
     if not state.LISTEN_ENABLED:
-        return {"disabled": True, "chats": 0, "failed_chats": 0, "scanned": 0,
-                "matched": 0, "forwarded": 0, "failed": 0}
+        return dict(empty, disabled=True)
     if not state.LISTEN_RULES:
-        return {"empty": True, "chats": 0, "failed_chats": 0, "scanned": 0,
-                "matched": 0, "forwarded": 0, "failed": 0}
+        return dict(empty, empty_rules=True)
 
     _SCANNING = True
-    totals = {"chats": 0, "failed_chats": 0, "scanned": 0,
-              "matched": 0, "forwarded": 0, "failed": 0}
+    totals = dict(empty)
     try:
         # 按需重读配置（手工改了 listen.json 时无需重启）。失败保持当前内存态。
         try:
@@ -910,7 +916,7 @@ async def scan_all(manual=False) -> dict:
         except Exception as e:
             logger.warning(f"重读标签监听配置异常（忽略）：{e}")
         if not state.LISTEN_ENABLED or not state.LISTEN_RULES:
-            return dict(totals, **{"empty": True})
+            return dict(totals, empty_rules=True)
 
         by_chat = {}
         for rule in state.LISTEN_RULES:
@@ -923,6 +929,12 @@ async def scan_all(manual=False) -> dict:
                 r = await _scan_chat(chat_id, rules)
             except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
                 raise
+            except runtime_db.DbUnavailable as e:
+                # 数据库写不进去 = 本轮没做成：记日志，**checkpoint 原地不动**
+                #（事务回滚保证），下一轮重扫；绝不让它把扫描循环打死。
+                totals["failed_chats"] += 1
+                logger.error(f"📡 标签监听因数据库不可用中止：{chat_id}（{e}）")
+                continue
             except Exception as e:
                 totals["failed_chats"] += 1
                 logger.exception(f"⚠️ 标签监听失败：{chat_id}（{e}）")
@@ -934,38 +946,56 @@ async def scan_all(manual=False) -> dict:
                 except Exception:
                     pass
                 continue
-            for key in ("scanned", "matched", "forwarded", "failed"):
+            for key in ("scanned", "matched", "created", "duplicate"):
                 totals[key] += r.get(key, 0)
+            if r.get("capped"):
+                totals["capped"] += 1
 
         totals["ts"] = started.strftime("%H:%M")
+        totals["queue"] = runtime_db.get_listener_stats()
         state.LISTEN_LAST_SCAN = dict(totals)
         logger.info(
             f"📡 标签监听扫描完成（{'手动' if manual else '定时'}）："
             f"{totals['chats']} 个聊天 | 检查 {totals['scanned']} 条 | "
-            f"命中 {totals['matched']} 条 | 转发 {totals['forwarded']} 项"
-            + (f" | 失败 {totals['failed']} 项" if totals["failed"] else "")
+            f"命中 {totals['matched']} 条 | 落盘任务 {totals['created']} 条"
+            + (f" | 重复跳过 {totals['duplicate']} 条" if totals["duplicate"] else "")
+            + (f" | {totals['capped']} 个聊天触到队列上限（下轮继续）"
+               if totals["capped"] else "")
             + (f" | 聊天失败 {totals['failed_chats']} 个"
                if totals["failed_chats"] else "")
+            + f" | 待执行 {totals['queue'].get('pending', 0)} 条"
         )
         if manual and (totals["matched"] or totals["failed_chats"]):
             await _notify_scan(totals)
+        return totals
+    except runtime_db.DbUnavailable as e:
+        logger.error(f"📡 扫描汇总读数据库失败（不影响已落盘任务）：{e}")
         return totals
     finally:
         _SCANNING = False
 
 
 async def _notify_scan(totals):
-    """扫描结果通知（只报告「有内容」的扫描，空扫不发，避免定期刷屏）。"""
+    """扫描结果通知（只报告「有内容」的扫描，空扫不发，避免定期刷屏）。
+
+    注意措辞：这里是 **Scanner** 的汇总，说的是「落盘了多少条待执行任务」，
+    不是「转发了多少条」——转发由 Worker 稍后受控执行，结果另有通知。
+    """
     lines = [
         f"{LISTEN_MATCH_PREFIX} 扫描完成",
         "",
         f"聊天：{totals['chats']} 个（失败 {totals['failed_chats']}）",
         f"检查消息：{totals['scanned']} 条",
         f"命中：{totals['matched']} 条",
-        f"转发：{totals['forwarded']} 项",
+        f"已入队待转发：{totals['created']} 条",
     ]
-    if totals["failed"]:
-        lines.append(f"失败：{totals['failed']} 项（下轮自动续做）")
+    if totals.get("duplicate"):
+        lines.append(f"重复跳过：{totals['duplicate']} 条")
+    if totals.get("capped"):
+        lines.append(f"⚠️ {totals['capped']} 个聊天触到队列上限，下轮继续")
+    q = totals.get("queue") or {}
+    if q:
+        lines.append(f"队列存量：待执行 {q.get('pending', 0)} 条")
     try:
         await notify.notify_user("\n".join(lines))
     except Exception as e:
@@ -1022,9 +1052,21 @@ def view_text() -> str:
     if last:
         lines.append(
             f"上轮扫描：{last.get('ts', '-')} 命中 {last.get('matched', 0)} 条"
-            f" / 转发 {last.get('forwarded', 0)} 项")
+            f" / 入队 {last.get('created', 0)} 条")
     else:
         lines.append("上轮扫描：尚未扫描")
+    # 待执行/处理中/成败存量来自 SQLite（队列与 checkpoint 的真相所在），
+    # 读失败只影响这一行展示，绝不让视图整个报错。
+    try:
+        q = runtime_db.get_listener_stats()
+    except runtime_db.DbUnavailable:
+        q = None
+    if q and q["total"]:
+        lines.append(
+            f"任务队列：待执行 {q['pending']} | 处理中 {q['processing']}"
+            f" | 成功 {q['success']} | 失败 {q['failed']}"
+            + (f" | 取消 {q['cancelled']}" if q["cancelled"] else "")
+        )
     return "\n".join(lines).rstrip()
 
 
@@ -1034,7 +1076,7 @@ def summary_text(totals) -> str:
         return f"{LISTEN_NOTIFY_PREFIX}\n\n⏳ 已有扫描在进行中，请稍候。"
     if totals.get("disabled"):
         return f"{LISTEN_NOTIFY_PREFIX}\n\n⚪ 标签监听已关闭，未扫描。"
-    if totals.get("empty"):
+    if totals.get("empty_rules"):
         return f"{LISTEN_NOTIFY_PREFIX}\n\n尚未配置任何监听规则。"
     lines = [
         f"{LISTEN_NOTIFY_PREFIX} 扫描完成",
@@ -1042,10 +1084,20 @@ def summary_text(totals) -> str:
         f"聊天：{totals['chats']} 个（失败 {totals['failed_chats']}）",
         f"检查消息：{totals['scanned']} 条",
         f"命中：{totals['matched']} 条",
-        f"转发：{totals['forwarded']} 项",
+        f"已入队待转发：{totals.get('created', 0)} 条",
     ]
-    if totals["failed"]:
-        lines.append(f"失败：{totals['failed']} 项（下轮自动续做）")
+    if totals.get("duplicate"):
+        lines.append(f"重复跳过：{totals['duplicate']} 条")
+    if totals.get("capped"):
+        lines.append(f"⚠️ {totals['capped']} 个聊天触到队列上限（下轮继续）")
+    q = totals.get("queue") or {}
+    if q:
+        lines.append(
+            f"队列：待执行 {q.get('pending', 0)} | 处理中 {q.get('processing', 0)}"
+            f" | 成功 {q.get('success', 0)} | 失败 {q.get('failed', 0)}"
+        )
+    lines.append("")
+    lines.append("转发由常驻 Worker 受控执行，稍后完成。")
     return "\n".join(lines)
 
 

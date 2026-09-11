@@ -76,20 +76,22 @@ CAPTION_FILTER_RULES = list(config.DEFAULT_CAPTION_FILTER_RULES)
 # ============================================================
 # 标签监听（listener.py，与下载白名单完全独立的一套配置）
 # ============================================================
-# 运行态全部在这里，逻辑在 listener.py —— 与 WHITELIST_CHATS / DEDUP_ENABLED /
-# CAPTION_FILTER_RULES 同款模式：reporter（只读观察者）与 bot 菜单都只读
-# state.*，不碰文件、不做网络请求。main() 启动时 load_listen_config()/
-# load_listen_state() 从 runtime/listen.json 与 runtime/listen_state.json 还原
-# （/listen 命令与菜单增删改实时生效并持久化）。
+# 运行态分两层：
+#   * **配置**（下面三个 + listen.json）——JSON 仍是唯一真相；
+#   * **业务状态**（扫描游标 checkpoint、待执行任务、任务事件）——SQLite
+#     （runtime/tg_userbot.db，见 runtime_db.py）。原先的 listen_state.json
+#     已退役，启动时由 listener.migrate_legacy_state() 一次性迁入。
+# 与 WHITELIST_CHATS / DEDUP_ENABLED / CAPTION_FILTER_RULES 同款模式：reporter
+#（只读观察者）与 bot 菜单都只读 state.*，不碰文件、不做网络请求。
 LISTEN_ENABLED = True          # 总开关（listen.json 的 enabled）
 LISTEN_INTERVAL_MINUTES = config.LISTEN_DEFAULT_INTERVAL_MINUTES
 LISTEN_RULES = []              # 规则列表（每项含 source_chat_id/tag/targets/…）
-# 扫描游标：{source_chat_id 字符串: {"last_message_id": int,
-#   "pending": {消息单元键: {"ids": [...], "work": [未完成工作项]}}}}
-# 按 chat_id 存（username/名称都会变，chat_id 不会）。
-LISTEN_STATE = {}
-# 上轮扫描快照（menu / reporter 只读展示）：{"ts","scanned","matched",
-# "forwarded","failed","chats","failed_chats"}；未扫过为 None。
+# Runtime DB（SQLite）是否就绪。main() 里 init_db() 成功后置 True；失败时
+# 标签监听整体不启动（Scanner 与 Worker 都不挂），下载等其余功能不受影响
+# —— 增量功能起不来，绝不能拖垮主程序。
+RUNTIME_DB_READY = False
+# 上轮扫描快照（menu / reporter 只读展示）：{"ts","chats","scanned","matched",
+# "created","duplicate","capped","queue"}；未扫过为 None。
 LISTEN_LAST_SCAN = None
 
 # bot 菜单「添加/修改监听」的多步向导：等待下一条文本的窗口 + 这一步在等什么

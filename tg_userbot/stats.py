@@ -261,6 +261,15 @@ def rebuild_stats(events, days=1, today=None):
                               if e.get("ev") == "LISTEN_SCAN"),
         "listen_matched": sum(int(e.get("matched") or 0) for e in window
                               if e.get("ev") == "LISTEN_SCAN"),
+        # Scanner 侧口径（2026-09-11 拆分 Scanner/Worker 之后）：
+        "listen_created": sum(int(e.get("created") or 0) for e in window
+                              if e.get("ev") == "LISTEN_SCAN"),
+        "listen_duplicate": sum(int(e.get("duplicate") or 0) for e in window
+                                if e.get("ev") == "LISTEN_SCAN"),
+        "listen_capped": sum(1 for e in window
+                             if e.get("ev") == "LISTEN_SCAN"
+                             and int(e.get("capped") or 0)),
+        # 旧口径：拆分前 LISTEN_SCAN 直接带转发数（历史窗口仍要算得出来）
         "listen_forwarded": sum(int(e.get("forwarded") or 0) for e in window
                                 if e.get("ev") == "LISTEN_SCAN"),
         "listen_failed": sum(int(e.get("failed") or 0) for e in window
@@ -312,6 +321,21 @@ def rebuild_stats(events, days=1, today=None):
     return s
 
 
+def _listener_task_stats(dates):
+    """从 Runtime DB 读窗口内的监听任务结果（§37：Stats 增加 SQLite 数据读取）。
+
+    读不到（DB 未初始化/不可用）返回 None —— 台账绝不能因为标签监听的库有问题
+    就整条渲染失败，少一行信息远好过用户看不到台账。
+    """
+    try:
+        from . import runtime_db
+        since = int(datetime.combine(
+            dates[0], datetime.min.time()).timestamp())
+        return runtime_db.get_listener_stats(since=since)
+    except Exception:
+        return None
+
+
 def _event_text(events, days, today, log_path, history_path):
     """事件模式渲染：按用户约定的分节格式输出。"""
     from .naming import format_size  # 函数内引用：naming 是叶子，无环
@@ -347,18 +371,36 @@ def _event_text(events, days, today, log_path, history_path):
         f"🛠 抖音解析：本地 {parse_local} + bot 中转 {parse_relay}",
     ]
     if s["listen_scans"]:
-        # 只在窗口内真的扫过才出现——标签监听上线前的日子输出保持原样
+        # 只在窗口内真的扫过才出现——标签监听上线前的日子输出保持原样。
+        # 措辞区分 Scanner 与 Worker：扫描阶段只「入队任务」，转发与下载由
+        # 常驻 Worker 受控执行，成功率从 SQLite 读（§37）。
         lines += [
             "",
             "📡 标签监听",
             f"扫描：{s['listen_scans']} 次 | 检查 {s['listen_scanned']} 条",
             f"命中：{s['listen_matched']} 条",
-            f"转发：{s['listen_forwarded']} 项"
-            + (f"（失败 {s['listen_failed']} 项）" if s["listen_failed"] else ""),
+            f"入队任务：{s['listen_created']} 条"
+            + (f"（重复跳过 {s['listen_duplicate']} 条）"
+               if s["listen_duplicate"] else ""),
+        ]
+        tasks = _listener_task_stats(dates)
+        if tasks:
+            lines.append(
+                f"任务结果：成功 {tasks['success']} | 失败 {tasks['failed']}"
+                f" | 待执行 {tasks['pending'] + tasks['processing']}"
+                + (f" | 取消 {tasks['cancelled']}" if tasks["cancelled"] else "")
+            )
+        if s["listen_forwarded"]:
+            # 拆分前的历史窗口（旧事件带 forwarded）
+            lines.append(
+                f"转发（旧口径）：{s['listen_forwarded']} 项"
+                + (f" | 失败 {s['listen_failed']} 项" if s["listen_failed"] else "")
+            )
+        lines.append(
             f"触发下载：{s['received_listen']} 条"
             + (f" | 聊天失败 {s['listen_chat_failures']} 个"
-               if s["listen_chat_failures"] else ""),
-        ]
+               if s["listen_chat_failures"] else "")
+        )
     lines += [
         "",
         "📦 下载任务",

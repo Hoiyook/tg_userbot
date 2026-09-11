@@ -293,6 +293,10 @@ LISTEN_MAX_INTERVAL_MINUTES = 10080        # 上限 7 天
 # 单轮单聊天最多处理多少条新消息：防止长时间停机后一次性爆发（剩余的下轮再取；
 # checkpoint 只推进到本轮真正处理完的那条）。
 LISTEN_MAX_MESSAGES_PER_SCAN = 200
+# 补相册边界时向「更新一侧」多探几条：limit 是从最新一侧切的，正好骑在边界上
+# 的相册会有较新成员被切在外面，导致整组转发退化成半个相册。Telegram 相册
+# 最多 10 个媒体且 id 连续，探 10 条足够覆盖。
+LISTEN_ALBUM_SIBLING_RANGE = 10
 # 每个聊天最多挂多少条「未处理完」的待续做记录（目标频道长期不可达时兜底，
 # 超出丢最旧并告警——绝不无限增长）。
 LISTEN_MAX_PENDING = 200
@@ -311,6 +315,65 @@ LISTEN_NOTIFY_PREFIX = "📡 标签监听"
 LISTEN_MATCH_PREFIX = "🏷 标签监听"
 # 汇报开关：标签监听扫描命中/失败的事件通知（空扫不发，避免定期刷屏）。
 REPORT_LISTEN = True
+
+# ------------------------------------------------------------
+# 标签监听的 Producer/Consumer 执行架构（2026-09-11）
+#
+# 扫描 ≠ 执行：Scanner 只负责「扫出匹配 → 落成持久化任务」，Worker 常驻受控
+# 执行（forward / 触发下载）。任务与 checkpoint 在**同一个 SQLite 事务**里
+# 提交，故 checkpoint 的语义是「此位置之前需要建的任务都已落盘」，与「任务是否
+# 已发送成功」解耦（前者是 Scanner 的事，后者是 Worker 的事）。
+#
+# 数据分层（规格 §4）：**配置 → JSON（listen.json 仍是唯一真相）；业务运行状态
+# → SQLite（runtime/tg_userbot.db，第一阶段只有 listener 这三张表）；技术日志
+# → 文件（download.log 等原样不动）**。
+# ------------------------------------------------------------
+# Runtime DB 路径。默认放 RUNTIME_DIR（规格 §5：禁止各模块自造 runtime 路径）。
+# 留 TG_RUNTIME_DB 环境变量覆盖：Termux 上 SAVE_FOLDER 落在 /storage/emulated/0
+# （FUSE 外部存储），WAL 依赖 mmap 共享内存、在该文件系统上可能不可用；真机上
+# 若探测到 WAL 回落，可把 DB 挪到应用私有目录。注意：**只允许主进程写**，
+# Chrome Agent 进程绝不能开连接（见 runtime_db 的「不做 import 期连接」）。
+RUNTIME_DB_FILE = os.environ.get(
+    "TG_RUNTIME_DB", os.path.join(RUNTIME_DIR, "tg_userbot.db")
+)
+RUNTIME_DB_SCHEMA_VERSION = 1
+# 单条写事务等锁的上限（毫秒）与 SQLITE_BUSY/LOCKED 的有限重试（规格 §39：
+# 记日志 → 短暂等待 → 有限次数重试，绝不无限循环、绝不因此崩掉主进程）。
+RUNTIME_DB_BUSY_TIMEOUT_MS = 5000
+RUNTIME_DB_BUSY_RETRIES = 5
+RUNTIME_DB_BUSY_RETRY_DELAY_SECONDS = 0.2
+# 落盘强度（规格 §5「优先保证 Runtime DB 持久性」）：FULL 每个事务 fsync，
+# 崩溃/断电都不会丢已提交的任务。代价是每任务两次提交 = 两次 fsync，安卓
+# 外部存储上单次可能几十毫秒——真机若卡顿可用 TG_DB_SYNCHRONOUS=NORMAL 降级
+#（WAL 下 NORMAL 仍是崩溃安全的，只是断电可能丢最后几个事务）。
+RUNTIME_DB_SYNCHRONOUS = (
+    os.environ.get("TG_DB_SYNCHRONOUS", "FULL").strip().upper() or "FULL"
+)
+
+# ---- Listener Worker（规格 §27/§31/§32）----
+# 第一版并发固定 1：一次只发一条，配合下面的最小间隔做保守节流。
+LISTEN_WORKER_CONCURRENCY = 1
+# 没有可执行任务时的轮询间隔（秒）
+LISTEN_WORKER_POLL_SECONDS = 2.0
+# 两条转发之间的最小间隔（秒）。**这不是 Telegram 官方安全阈值**，只是保守
+# 节流；真正的限流以服务端 FloodWait 返回值为最高优先级（规格 §32）。
+LISTEN_WORKER_MIN_FORWARD_INTERVAL_SECONDS = 1.5
+# 任务租约：claim 后多久没写完结果就视为 Worker 崩溃，可被恢复重跑（规格 §24）。
+# 必须显著大于单次转发的正常耗时（含 FloodWait 等待之外的部分）。
+LISTEN_WORKER_LEASE_SECONDS = 600
+# 临时错误的最大自动重试次数（attempts 上限），超过转 FAILED 等人看。
+LISTEN_WORKER_MAX_ATTEMPTS = 8
+# 重试退避：与 queue._backoff_delay 同款「base × 2^(attempts-1) 封顶 max」，
+# 复用同一风格而不是另设计一套（规格 §26）。
+LISTEN_WORKER_BACKOFF_BASE_SECONDS = 60
+LISTEN_WORKER_BACKOFF_MAX_SECONDS = 1800
+# 待执行任务上限（规格 §30）：达到上限 Scanner 停止创建新任务，且**不推进
+# checkpoint**（没入队的消息不能被跳过）。是配置项不是硬编码。
+LISTEN_MAX_PENDING_TASKS = 1000
+# FloodWait 的服务端等待值上限保护：正常直接采信服务端返回值（规格 §27 明确
+# 不许固定等 60 秒）；只有离谱到超过这个上限（默认 6 小时）才截断并显著告警，
+# 免得一个异常返回值把 Worker 挂死且不留痕。
+LISTEN_FLOODWAIT_MAX_WAIT_SECONDS = 6 * 3600
 
 # 任务生命周期事件日志（JSONL，append-only 单行追加，写失败仅告警）：
 # 台账按 task_id 重建统计的数据源。每行一个事件

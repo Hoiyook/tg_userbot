@@ -258,16 +258,25 @@ def _workers_block(snapshot):
 
 
 def _listen_line(listen):
-    """面板里的标签监听一行（只读快照渲染，纯函数）。"""
+    """面板里的标签监听一行（只读快照渲染，纯函数）。
+
+    口径是 **Scanner 的**：扫描阶段只「入队任务」，转发由常驻 Worker 受控执行。
+    任务存量来自 runtime_db（listener 在扫描时顺手快照进 state，reporter 不碰
+    数据库、不做网络请求——它始终是只读观察者）。
+    """
     if not listen:
         return "（无数据）"
     head = "🟢 开启" if listen.get("enabled") else "⚪ 关闭"
     last = listen.get("last") or {}
     if last:
         tail = (f"上轮 {last.get('ts') or '--'} 命中 "
-                f"{last.get('matched', 0)} 条 / 转发 {last.get('forwarded', 0)} 项")
+                f"{last.get('matched', 0)} 条 / 入队 {last.get('created', 0)} 条")
     else:
         tail = "尚未扫描"
+    q = last.get("queue") or {}
+    if q.get("total"):
+        tail += (f" | 队列 {q.get('pending', 0) + q.get('processing', 0)}"
+                 f" 待执行")
     return f"{head} | 规则 {listen.get('rules', 0)} 条 | {tail}"
 
 
@@ -740,15 +749,17 @@ class Reporter:
             scans = [e for e in events if e.get("ev") == "LISTEN_SCAN"]
             fails = [e for e in events if e.get("ev") == "LISTEN_FAIL"]
             matched = sum(int(e.get("matched") or 0) for e in scans)
-            item_failed = sum(int(e.get("failed") or 0) for e in scans)
-            if scans and (matched or item_failed) or fails:
+            created = sum(int(e.get("created") or 0) for e in scans)
+            if scans and matched or fails:
                 await self.notify_event(
                     "listen",
                     chats=len(scans),
                     scanned=sum(int(e.get("scanned") or 0) for e in scans),
                     matched=matched,
-                    forwarded=sum(int(e.get("forwarded") or 0) for e in scans),
-                    failed=item_failed,
+                    created=created,
+                    duplicate=sum(int(e.get("duplicate") or 0)
+                                  for e in scans),
+                    capped=sum(1 for e in scans if e.get("capped")),
                     chat_failures=len(fails),
                     errors=[e.get("error") for e in fails if e.get("error")],
                 )
@@ -897,16 +908,19 @@ def build_event_text(kind, **kw):
         lines.append("原因：等待期已过，网络恢复后自动续跑")
         return "\n".join(lines)
     if kind == "listen":
-        # 标签监听扫描汇总（LISTEN_SCAN / LISTEN_FAIL 聚合；空扫不发）
+        # 标签监听扫描汇总（LISTEN_SCAN / LISTEN_FAIL 聚合；空扫不发）。
+        # 措辞是 Scanner 的：扫描只负责把任务落盘，转发由 Worker 受控执行。
         lines = [
             "🏷 标签监听",
             "",
             f"扫描：{kw.get('chats', 0)} 个聊天 / {kw.get('scanned', 0)} 条消息",
             f"命中：{kw.get('matched', 0)} 条",
-            f"转发：{kw.get('forwarded', 0)} 项",
+            f"已入队待转发：{kw.get('created', 0)} 条",
         ]
-        if kw.get("failed"):
-            lines.append(f"转发失败：{kw['failed']} 项（下轮自动续做）")
+        if kw.get("duplicate"):
+            lines.append(f"重复跳过：{kw['duplicate']} 条")
+        if kw.get("capped"):
+            lines.append(f"⚠️ {kw['capped']} 个聊天触到队列上限，下轮继续")
         if kw.get("chat_failures"):
             lines.append(f"聊天失败：{kw['chat_failures']} 个")
         for err in (kw.get("errors") or [])[:3]:

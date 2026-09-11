@@ -19,7 +19,12 @@
 8. 源聊天同时在下载白名单时（§14）：跳过 me 转发与下载（实时链路已做），
    其余目标照常转发。
 
-不联网：FakeClient 记录全部调用；文件全部落在进程级临时 SAVE_FOLDER。
+架构（2026-09-11 起）：Scanner 只把匹配结果落成 SQLite 任务，**不转发**；
+转发由 listener_worker 受控执行（其单测见 test_listener_worker.py）。因此本文件
+的扫描用例断言的是「DB 里建出了什么任务 / checkpoint 推到哪」，而不是「调了几次
+forward」。
+
+不联网：FakeClient 记录全部调用；DB 与配置全部落在进程级临时目录。
 运行方式（项目根目录）：
     .venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
 """
@@ -40,6 +45,7 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 from tg_userbot import config  # noqa: E402
 from tg_userbot import state  # noqa: E402
 from tg_userbot import listener  # noqa: E402
+from tg_userbot import runtime_db  # noqa: E402
 
 ME = 42                      # owner 自己的 id
 SRC = -1001234567890         # 监听来源聊天
@@ -314,14 +320,12 @@ class ConfigStoreTest(unittest.TestCase):
         # 每个用例从「文件不存在」开始，且忘掉上个用例记住的 mtime
         listener._LAST_CONFIG_MTIME = 0.0
         self._saved = (list(state.LISTEN_RULES), state.LISTEN_ENABLED,
-                       state.LISTEN_INTERVAL_MINUTES, dict(state.LISTEN_STATE))
+                       state.LISTEN_INTERVAL_MINUTES)
         self.addCleanup(self._restore)
 
     def _restore(self):
         (state.LISTEN_RULES, state.LISTEN_ENABLED,
-         state.LISTEN_INTERVAL_MINUTES,
-         state.LISTEN_STATE) = (self._saved[0], self._saved[1],
-                                self._saved[2], self._saved[3])
+         state.LISTEN_INTERVAL_MINUTES) = self._saved
 
     def test_load_missing_file_keeps_defaults(self):
         state.LISTEN_RULES = []
@@ -425,96 +429,60 @@ class ConfigStoreTest(unittest.TestCase):
 # ============================================================
 # 5. 扫描状态（listen_state.json）
 # ============================================================
-class StateStoreTest(unittest.TestCase):
-    def setUp(self):
-        self.state_path = os.path.join(_TMP, "listen_state_test2.json")
-        self.cfg_path = os.path.join(_TMP, "listen_cfg_test2.json")
-        self._p1 = mock.patch.object(config, "LISTEN_CONFIG_FILE",
-                                     self.cfg_path)
-        self._p2 = mock.patch.object(config, "LISTEN_STATE_FILE",
-                                     self.state_path)
-        self._p1.start()
-        self._p2.start()
-        self.addCleanup(self._p1.stop)
-        self.addCleanup(self._p2.stop)
-        self._saved = dict(state.LISTEN_STATE)
-        self.addCleanup(setattr, state, "LISTEN_STATE", self._saved)
-
-    def test_save_then_load(self):
-        state.LISTEN_STATE = {
-            str(SRC): {"last_message_id": 500,
-                       "pending": {"490": {"ids": [490],
-                                           "work": ["saved_messages"]}}}
-        }
-        self.assertTrue(listener.save_listen_state())
-        state.LISTEN_STATE = {}
-        self.assertEqual(listener.load_listen_state(), 1)
-        entry = state.LISTEN_STATE[str(SRC)]
-        self.assertEqual(entry["last_message_id"], 500)
-        self.assertEqual(entry["pending"]["490"]["work"], ["saved_messages"])
-
-    def test_corrupt_state_falls_back_to_empty(self):
-        with open(self.state_path, "w", encoding="utf-8") as f:
-            f.write("]]] not json")
-        state.LISTEN_STATE = {str(SRC): {"last_message_id": 1}}
-        self.assertEqual(listener.load_listen_state(), 0)
-        self.assertEqual(state.LISTEN_STATE, {})
-
-
 # ============================================================
 # 6. 扫描（规格书 §27 测试 A-G）
 # ============================================================
 class ScanTest(unittest.IsolatedAsyncioTestCase):
+    """Scanner：扫出匹配 → 落成持久化任务（**不转发**）。"""
+
     def setUp(self):
-        self.cfg_path = os.path.join(_TMP, "listen_scan_cfg.json")
-        self.state_path = os.path.join(_TMP, "listen_scan_state.json")
-        self._p1 = mock.patch.object(config, "LISTEN_CONFIG_FILE",
+        self.dir = tempfile.mkdtemp(prefix="scan_", dir=_TMP)
+        self.db_path = os.path.join(self.dir, "tg_userbot.db")
+        self.cfg_path = os.path.join(self.dir, "listen.json")
+        self.legacy_path = os.path.join(self.dir, "listen_state.json")
+        self._p1 = mock.patch.object(config, "RUNTIME_DB_FILE", self.db_path)
+        self._p2 = mock.patch.object(config, "LISTEN_CONFIG_FILE",
                                      self.cfg_path)
-        self._p2 = mock.patch.object(config, "LISTEN_STATE_FILE",
-                                     self.state_path)
-        self._p1.start()
-        self._p2.start()
-        self.addCleanup(self._p1.stop)
-        self.addCleanup(self._p2.stop)
-        # 每个用例从「配置文件不存在」开始，且忘掉上个用例记住的 mtime
-        for p in (self.cfg_path, self.state_path):
-            if os.path.exists(p):
-                os.remove(p)
+        self._p3 = mock.patch.object(config, "LISTEN_STATE_FILE",
+                                     self.legacy_path)
+        for patch in (self._p1, self._p2, self._p3):
+            patch.start()
+            self.addCleanup(patch.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
         listener._LAST_CONFIG_MTIME = 0.0
 
         self._saved = (list(state.LISTEN_RULES), state.LISTEN_ENABLED,
-                       dict(state.LISTEN_STATE), dict(state.WHITELIST_CHATS),
-                       state.MY_ID, state.client, state.LISTEN_LAST_SCAN)
+                       dict(state.WHITELIST_CHATS), state.MY_ID, state.client,
+                       state.LISTEN_LAST_SCAN)
         self.addCleanup(self._restore)
         state.MY_ID = ME
         state.WHITELIST_CHATS = {}
         state.LISTEN_ENABLED = True
         state.LISTEN_LAST_SCAN = None
-        state.LISTEN_STATE = {}
-
-        self.enqueued = []
-
-        async def fake_enqueue(copy, source_link, album_caption, src):
-            self.enqueued.append((copy.id, source_link, album_caption, src))
-
-        self._p3 = mock.patch.object(listener, "_enqueue_copy", fake_enqueue)
-        self._p3.start()
-        self.addCleanup(self._p3.stop)
 
     def _restore(self):
-        (state.LISTEN_RULES, state.LISTEN_ENABLED, state.LISTEN_STATE,
-         state.WHITELIST_CHATS, state.MY_ID, state.client,
-         state.LISTEN_LAST_SCAN) = self._saved
+        (state.LISTEN_RULES, state.LISTEN_ENABLED, state.WHITELIST_CHATS,
+         state.MY_ID, state.client, state.LISTEN_LAST_SCAN) = self._saved
+        runtime_db.close_db()
+        shutil.rmtree(self.dir, ignore_errors=True)
 
     def _install(self, client, rules, checkpoint=100):
         state.client = client
         state.LISTEN_RULES = rules
-        state.LISTEN_STATE = {
-            str(r["source_chat_id"]): {"last_message_id": checkpoint,
-                                       "pending": {}}
-            for r in rules
-        }
+        for rule in rules:
+            runtime_db.set_listener_checkpoint(
+                int(rule["source_chat_id"]), checkpoint)
 
+    def _tasks(self, status=None):
+        return runtime_db.list_listener_tasks(status=status)
+
+    def _targets(self):
+        """已建任务的 (target_type, target_chat_id) 集合。"""
+        return {(t["target_type"], t["target_chat_id"]) for t in self._tasks()}
+
+    # ---------- 规格书 §27 测试 A–G ----------
     async def test_A_listener_chat_not_in_download_whitelist(self):
         """监听聊天不在 /wl 里也必须正常工作（两套白名单独立的证明）。"""
         msg = FakeMessage(101, text="hello #01musume")
@@ -524,24 +492,23 @@ class ScanTest(unittest.IsolatedAsyncioTestCase):
 
         summary = await listener.scan_all()
         self.assertEqual(summary["matched"], 1)
-        peers = [c[0] for c in client.forward_calls]
-        self.assertIn("me", peers)               # 转发进收藏夹
-        self.assertIn(TARGET_CHAT, peers)        # 以及目标频道
-        self.assertEqual(len(self.enqueued), 1)  # download=true → 入队副本
-        self.assertEqual(self.enqueued[0][3], "listen")
+        self.assertEqual(summary["created"], 2)
+        self.assertEqual(self._targets(),
+                         {("saved_messages", None), ("chat", TARGET_CHAT)})
+        # 扫描阶段绝不转发：forward 只由 Worker 发
+        self.assertEqual(client.forward_calls, [])
 
     async def test_B_source_also_in_download_whitelist(self):
-        """§14：实时链路已转发+下载 → 跳过 me 与 download，其余目标照转。"""
+        """§14：实时链路已转发+下载 → 不为收藏夹建任务，其余目标照建。"""
         msg = FakeMessage(101, text="hello #01musume")
         client = FakeClient({SRC: [msg]})
         self._install(client, [_rule()])
         state.WHITELIST_CHATS = {SRC: "Source Channel"}
 
         await listener.scan_all()
-        peers = [c[0] for c in client.forward_calls]
-        self.assertNotIn("me", peers)            # 不再转发收藏夹
-        self.assertEqual(peers, [TARGET_CHAT])   # 只跑其余目标
-        self.assertEqual(self.enqueued, [])      # 不重复下载
+        self.assertEqual(self._targets(), {("chat", TARGET_CHAT)})
+        for task in self._tasks():
+            self.assertFalse(task["download"], "白名单重叠时不该再触发下载")
 
     async def test_C_tag_mismatch_does_nothing(self):
         msg = FakeMessage(101, text="hello #02musume")
@@ -549,34 +516,31 @@ class ScanTest(unittest.IsolatedAsyncioTestCase):
         self._install(client, [_rule(tag="#01musume")])
         summary = await listener.scan_all()
         self.assertEqual(summary["matched"], 0)
-        self.assertEqual(client.forward_calls, [])
-        self.assertEqual(self.enqueued, [])
+        self.assertEqual(self._tasks(), [])
         # 未命中也推进 checkpoint（这条已经检查过了）
-        self.assertEqual(
-            state.LISTEN_STATE[str(SRC)]["last_message_id"], 101)
+        self.assertEqual(listener.get_checkpoint(SRC), 101)
 
     async def test_D_same_chat_scanned_once_for_all_rules(self):
         msgs = [FakeMessage(101, text="#a"), FakeMessage(102, text="#b")]
-        client = FakeClient({SRC: [msgs[0], msgs[1]]})
+        client = FakeClient({SRC: msgs})
         self._install(client, [_rule(tag="#a"), _rule(tag="#b")])
 
         await listener.scan_all()
         chat_fetches = [c for c in client.get_messages_calls
-                        if c[0] == SRC and "ids" not in c[1]]
-        self.assertEqual(len(chat_fetches), 1)   # 按 chat 扫一次
+                        if c[0] == SRC and "ids" not in c[1]
+                        and c[1].get("limit") != 1]
+        self.assertEqual(len(chat_fetches), 1, "按 chat 扫一次，不按规则重复请求")
 
-    async def test_D_same_message_matching_two_tags_forwards_once(self):
-        """同一消息命中两条规则、目标都含 me → 收藏夹只转发一次。"""
+    async def test_D2_same_message_two_tags_one_task_per_target(self):
+        """同一消息命中两条规则、目标相同 → 每个目标仍只有一条任务。"""
         msg = FakeMessage(101, text="看 #a 和 #b")
         client = FakeClient({SRC: [msg]})
         self._install(client, [_rule(tag="#a"), _rule(tag="#b")])
-        await listener.scan_all()
-        me_forwards = [c for c in client.forward_calls if c[0] == "me"]
-        self.assertEqual(len(me_forwards), 1)
-        self.assertEqual(len(self.enqueued), 1)
+        summary = await listener.scan_all()
+        self.assertEqual(summary["matched"], 1)
+        self.assertEqual(len(self._tasks()), 2)      # 收藏夹 + 目标频道，各一条
 
-    async def test_D2_union_of_targets_across_rules(self):
-        """两条规则目标不同 → 合并执行，各目标各一次。"""
+    async def test_D3_union_of_targets_across_rules(self):
         msg = FakeMessage(101, text="看 #a 和 #b")
         only_me = [{"type": "saved_messages"}]
         only_tg = [{"type": "chat", "chat_id": TARGET_CHAT, "name": "S"}]
@@ -585,8 +549,8 @@ class ScanTest(unittest.IsolatedAsyncioTestCase):
                                _rule(tag="#b", targets=only_tg,
                                      download=False)])
         await listener.scan_all()
-        peers = sorted(str(c[0]) for c in client.forward_calls)
-        self.assertEqual(peers, sorted(["me", str(TARGET_CHAT)]))
+        self.assertEqual(self._targets(),
+                         {("saved_messages", None), ("chat", TARGET_CHAT)})
 
     async def test_E_first_enable_does_not_scan_history(self):
         """聊天里已有 3 条历史，add_listener 后 checkpoint = 最新 id。"""
@@ -599,20 +563,19 @@ class ScanTest(unittest.IsolatedAsyncioTestCase):
 
         ok, msg = await listener.add_listener(_rule())
         self.assertTrue(ok, msg)
-        self.assertEqual(state.LISTEN_STATE[str(SRC)]["last_message_id"], 12)
+        self.assertEqual(listener.get_checkpoint(SRC), 12)
 
         summary = await listener.scan_all()
         self.assertEqual(summary["matched"], 0)      # 一条历史都不处理
-        self.assertEqual(client.forward_calls, [])
+        self.assertEqual(self._tasks(), [])
 
     async def test_E_re_add_keeps_existing_checkpoint(self):
         client = FakeClient({}, newest={SRC: 999})
         state.client = client
         state.LISTEN_RULES = []
-        state.LISTEN_STATE = {str(SRC): {"last_message_id": 500,
-                                         "pending": {}}}
+        runtime_db.set_listener_checkpoint(SRC, 500)
         await listener.add_listener(_rule())
-        self.assertEqual(state.LISTEN_STATE[str(SRC)]["last_message_id"], 500)
+        self.assertEqual(listener.get_checkpoint(SRC), 500)
 
     async def test_F_checkpoint_only_processes_new(self):
         msgs = [FakeMessage(101, text="#01musume"),
@@ -623,42 +586,153 @@ class ScanTest(unittest.IsolatedAsyncioTestCase):
 
         summary = await listener.scan_all()
         self.assertEqual(summary["matched"], 3)
-        self.assertEqual(state.LISTEN_STATE[str(SRC)]["last_message_id"], 103)
+        self.assertEqual(listener.get_checkpoint(SRC), 103)
+        before = len(self._tasks())
 
-        # 第二次扫描：没有新消息 → 一条都不重复处理
-        client.forward_calls.clear()
-        self.enqueued.clear()
+        # 第二次扫描：没有新消息 → 不重复建任务
         summary = await listener.scan_all()
         self.assertEqual(summary["matched"], 0)
-        self.assertEqual(client.forward_calls, [])
-        self.assertEqual(self.enqueued, [])
+        self.assertEqual(summary["created"], 0)
+        self.assertEqual(len(self._tasks()), before)
 
-    async def test_G_failed_target_keeps_pending_and_retries(self):
-        """目标频道转发失败：不影响收藏夹、不丢消息、下轮只补失败的那一项。"""
+    async def test_G_multi_target_creates_independent_tasks(self):
+        """多目标各自独立成任务：一条失败不牵连另一条（§15）。"""
         msg = FakeMessage(101, text="#01musume")
-        client = FakeClient({SRC: [msg]}, fail_peers={TARGET_CHAT})
+        client = FakeClient({SRC: [msg]})
+        self._install(client, [_rule()])
+        await listener.scan_all()
+
+        tasks = self._tasks()
+        self.assertEqual(len(tasks), 2)
+        by_target = {(t["target_type"], t["target_chat_id"]): t for t in tasks}
+        me_task = by_target[("saved_messages", None)]
+        chat_task = by_target[("chat", TARGET_CHAT)]
+
+        # 目标频道那条失败，收藏夹那条不受影响（两条任务互不牵连）
+        runtime_db.fail_listener_task(chat_task["id"], error="ChatWriteForbidden")
+        self.assertEqual(runtime_db.get_listener_task(chat_task["id"])["status"],
+                         "FAILED")
+        self.assertEqual(runtime_db.get_listener_task(me_task["id"])["status"],
+                         "PENDING")
+        self.assertTrue(me_task["download"])
+
+    # ---------- 队列上限 / 事务（§30 / Case E） ----------
+    async def test_queue_cap_stops_and_holds_checkpoint(self):
+        """队列触顶：不建新任务，且 checkpoint **绝不推进**（否则丢消息）。"""
+        msgs = [FakeMessage(101, text="#01musume"),
+                FakeMessage(102, text="#01musume")]
+        client = FakeClient({SRC: [msgs[0], msgs[1]]})
         self._install(client, [_rule()], checkpoint=100)
 
-        await listener.scan_all()
-        # 收藏夹那条成功 → 立即入队，不因另一个目标失败而回滚
-        self.assertEqual(len(self.enqueued), 1)
-        entry = state.LISTEN_STATE[str(SRC)]
-        self.assertEqual(entry["last_message_id"], 101)
-        self.assertIn("101", entry["pending"])
-        self.assertEqual(entry["pending"]["101"]["work"],
-                         [f"chat:{TARGET_CHAT}"])
+        with mock.patch.object(config, "LISTEN_MAX_PENDING_TASKS", 0):
+            summary = await listener.scan_all()
+        self.assertEqual(summary["created"], 0)
+        self.assertEqual(summary["capped"], 1)
+        self.assertEqual(listener.get_checkpoint(SRC), 100,
+                         "触顶时 checkpoint 必须停在原地")
+        self.assertEqual(self._tasks(), [])
 
-        # 下一轮：网络恢复 → 只补目标频道，收藏夹不再转发、不再重复下载
-        client.fail_peers.clear()
-        client.forward_calls.clear()
-        self.enqueued.clear()
-        await listener.scan_all()
-        peers = [c[0] for c in client.forward_calls]
-        self.assertEqual(peers, [TARGET_CHAT])
-        self.assertEqual(self.enqueued, [])          # 不再重复下载
-        self.assertEqual(state.LISTEN_STATE[str(SRC)]["pending"], {})
+        # 容量恢复后重扫 → 原来的消息一条不丢
+        summary = await listener.scan_all()
+        self.assertEqual(summary["matched"], 2)
+        self.assertEqual(listener.get_checkpoint(SRC), 102)
 
-    async def test_G_one_chat_failure_does_not_stop_others(self):
+    async def test_cap_counts_existing_pending(self):
+        msg = FakeMessage(101, text="#01musume")
+        client = FakeClient({SRC: [msg]})
+        self._install(client, [_rule()], checkpoint=100)
+        # 先塞满队列（留 1 个空位 → 只够建 1 条任务）
+        runtime_db.enqueue_listener_tasks(SRC, [{
+            "message_id": 1, "grouped_id": None, "target_type": "chat",
+            "target_chat_id": -1, "download": False, "payload": None,
+        }], checkpoint=None)      # 不动 checkpoint：本用例要验的是扫描时它不动
+        with mock.patch.object(config, "LISTEN_MAX_PENDING_TASKS", 2):
+            summary = await listener.scan_all()
+        self.assertEqual(summary["capped"], 1)
+        self.assertEqual(listener.get_checkpoint(SRC), 100)
+        self.assertEqual(summary["created"], 0)
+
+    async def test_db_failure_does_not_advance_checkpoint(self):
+        """DB 写不进去 = 本轮没做成：checkpoint 原地不动（Case B）。"""
+        msg = FakeMessage(101, text="#01musume")
+        client = FakeClient({SRC: [msg]})
+        self._install(client, [_rule()], checkpoint=100)
+        with mock.patch.object(runtime_db, "enqueue_listener_tasks",
+                               side_effect=runtime_db.DbUnavailable("boom")):
+            summary = await listener.scan_all()
+        self.assertEqual(summary["failed_chats"], 1)
+        self.assertEqual(listener.get_checkpoint(SRC), 100)
+        self.assertEqual(self._tasks(), [])
+
+    # ---------- 相册（§16） ----------
+    async def test_album_one_task_per_target_with_all_members(self):
+        a1 = FakeMessage(101, grouped_id=77, fname="a.mp4")
+        a2 = FakeMessage(102, grouped_id=77, text="#01musume 相册说明",
+                         fname="b.mp4")
+        a3 = FakeMessage(103, grouped_id=77, fname="c.mp4")
+        client = FakeClient({SRC: [a1, a2, a3]})
+        self._install(client, [_rule()])
+
+        summary = await listener.scan_all()
+        self.assertEqual(summary["matched"], 1, "一组算一条命中")
+        self.assertEqual(len(self._tasks()), 2, "每个目标一条任务")
+        for task in self._tasks():
+            self.assertEqual(task["message_id"], 101, "锚点 = 组内最小成员 id")
+            self.assertEqual(task["grouped_id"], 77)
+            self.assertEqual(task["payload"]["member_ids"], [101, 102, 103])
+            self.assertEqual(task["payload"]["caption"], "#01musume 相册说明")
+        self.assertEqual(listener.get_checkpoint(SRC), 103)
+
+    async def test_album_cut_by_scan_limit_is_completed(self):
+        """相册骑在一轮条数上限上时，边界成员必须补齐（否则转发半个相册）。"""
+        a1 = FakeMessage(101, grouped_id=77, fname="a.mp4")
+        a2 = FakeMessage(102, grouped_id=77, text="#01musume", fname="b.mp4")
+        a3 = FakeMessage(103, grouped_id=77, fname="c.mp4")
+        client = FakeClient({SRC: [a1, a2, a3]})
+        self._install(client, [_rule()])
+
+        with mock.patch.object(config, "LISTEN_MAX_MESSAGES_PER_SCAN", 2):
+            await listener.scan_all()
+        task = [t for t in self._tasks()
+                if t["target_type"] == "saved_messages"][0]
+        self.assertEqual(task["payload"]["member_ids"], [101, 102, 103],
+                         "被上限切开的相册要补齐整组")
+
+    async def test_non_media_matched_message_is_ignored(self):
+        """纯文本命中标签 → 不建任务（避免收藏夹标注污染）。"""
+        msg = FakeMessage(101, text="#01musume 公告", is_media=False)
+        client = FakeClient({SRC: [msg]})
+        self._install(client, [_rule()])
+        summary = await listener.scan_all()
+        self.assertEqual(summary["matched"], 0)
+        self.assertEqual(self._tasks(), [])
+
+    async def test_download_false_with_me_target_has_no_download_flag(self):
+        msg = FakeMessage(101, text="#01musume")
+        client = FakeClient({SRC: [msg]})
+        self._install(client, [_rule(targets=[{"type": "saved_messages"}],
+                                     download=False)])
+        await listener.scan_all()
+        tasks = self._tasks()
+        self.assertEqual(len(tasks), 1)
+        self.assertFalse(tasks[0]["download"])
+
+    async def test_download_true_implies_me_target(self):
+        """download=true 但 targets 里没有 me → 仍为收藏夹建任务以触发下载。"""
+        msg = FakeMessage(101, text="#01musume")
+        client = FakeClient({SRC: [msg]})
+        self._install(client, [_rule(targets=[{"type": "chat",
+                                               "chat_id": TARGET_CHAT,
+                                               "name": "S"}],
+                                     download=True)])
+        await listener.scan_all()
+        self.assertIn(("saved_messages", None), self._targets())
+        me_task = [t for t in self._tasks()
+                   if t["target_type"] == "saved_messages"][0]
+        self.assertTrue(me_task["download"])
+
+    # ---------- 单聊天隔离 / 守卫 / 快照 ----------
+    async def test_one_chat_failure_does_not_stop_others(self):
         """单个聊天读失败不影响其他监听聊天（§23）。"""
         bad = FakeMessage(101, text="#01musume")
         good = FakeMessage(201, text="#01musume")
@@ -669,10 +743,7 @@ class ScanTest(unittest.IsolatedAsyncioTestCase):
         summary = await listener.scan_all()
         self.assertEqual(summary["chats"], 2)
         self.assertEqual(summary["failed_chats"], 1)
-        # 另一个聊天照常走完转发
-        peers = [c[0] for c in client.forward_calls]
-        self.assertIn("me", peers)
-        self.assertEqual(len(self.enqueued), 1)
+        self.assertIsNotNone(listener.get_checkpoint(OTHER_SRC))
 
     async def test_disabled_does_nothing(self):
         msg = FakeMessage(101, text="#01musume")
@@ -681,56 +752,7 @@ class ScanTest(unittest.IsolatedAsyncioTestCase):
         state.LISTEN_ENABLED = False
         summary = await listener.scan_all()
         self.assertEqual(summary["matched"], 0)
-        self.assertEqual(client.forward_calls, [])
-
-    async def test_download_false_with_me_target_only_forwards(self):
-        """download=false 且目标显式含 me → 只转发收藏夹，不入队。"""
-        msg = FakeMessage(101, text="#01musume")
-        client = FakeClient({SRC: [msg]})
-        self._install(client, [_rule(targets=[{"type": "saved_messages"}],
-                                     download=False)])
-        await listener.scan_all()
-        self.assertEqual([c[0] for c in client.forward_calls], ["me"])
-        self.assertEqual(self.enqueued, [])
-
-    async def test_download_true_implies_me_target(self):
-        """download=true 但 targets 里没有 me → 隐式转发收藏夹以触发下载。"""
-        msg = FakeMessage(101, text="#01musume")
-        client = FakeClient({SRC: [msg]})
-        self._install(client, [_rule(targets=[{"type": "chat",
-                                               "chat_id": TARGET_CHAT,
-                                               "name": "S"}],
-                                     download=True)])
-        await listener.scan_all()
-        peers = sorted(str(c[0]) for c in client.forward_calls)
-        self.assertEqual(peers, sorted(["me", str(TARGET_CHAT)]))
-        self.assertEqual(len(self.enqueued), 1)
-
-    async def test_album_group_matched_via_one_member(self):
-        """标签只挂在一个成员上 → 整组转发（一次调用）、逐个入队。"""
-        a1 = FakeMessage(101, grouped_id=77, text="", fname="a.mp4")
-        a2 = FakeMessage(102, grouped_id=77, text="#01musume 相册说明",
-                         fname="b.mp4")
-        a3 = FakeMessage(103, grouped_id=77, text="", fname="c.mp4")
-        client = FakeClient({SRC: [a1, a2, a3]})
-        self._install(client, [_rule(download=True)])
-
-        summary = await listener.scan_all()
-        self.assertEqual(summary["matched"], 1)          # 一组算一条
-        me_fwd = [c for c in client.forward_calls if c[0] == "me"]
-        self.assertEqual(len(me_fwd), 1)                 # 整组一次调用
-        self.assertEqual(me_fwd[0][1], [101, 102, 103])
-        self.assertEqual(len(self.enqueued), 3)          # 三个副本各自入队
-        self.assertEqual(self.enqueued[0][2], "#01musume 相册说明")
-
-    async def test_non_media_matched_message_is_ignored(self):
-        """纯文本命中标签 → 不转发（避免收藏夹标注污染）。"""
-        msg = FakeMessage(101, text="#01musume 公告", is_media=False)
-        client = FakeClient({SRC: [msg]})
-        self._install(client, [_rule()])
-        summary = await listener.scan_all()
-        self.assertEqual(summary["matched"], 0)
-        self.assertEqual(client.forward_calls, [])
+        self.assertEqual(self._tasks(), [])
 
     async def test_scan_guard_prevents_overlap(self):
         self.assertFalse(listener.is_scanning())
@@ -749,6 +771,76 @@ class ScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(state.LISTEN_LAST_SCAN)
         self.assertEqual(state.LISTEN_LAST_SCAN["matched"], 1)
         self.assertIn("ts", state.LISTEN_LAST_SCAN)
+        self.assertIn("queue", state.LISTEN_LAST_SCAN)
+
+    async def test_scan_emits_stats_event(self):
+        """台账事件：LISTEN_SCAN 带上 created 口径（Scanner 只建任务）。"""
+        msg = FakeMessage(101, text="#01musume")
+        client = FakeClient({SRC: [msg]})
+        self._install(client, [_rule()])
+        with mock.patch.object(listener.stats, "emit_event") as emit:
+            await listener.scan_all()
+        calls = [c for c in emit.call_args_list
+                 if c[0] and c[0][0] == "LISTEN_SCAN"]
+        self.assertTrue(calls)
+        kwargs = calls[0][1]
+        self.assertEqual(kwargs["created"], 2)
+        self.assertNotIn("forwarded", kwargs)
+
+    # ---------- 旧状态迁移（§38） ----------
+    async def test_legacy_state_migration(self):
+        with open(self.legacy_path, "w", encoding="utf-8") as f:
+            json.dump({
+                str(SRC): {
+                    "last_message_id": 500,
+                    "pending": {
+                        "490": {"ids": [490, 491],
+                                "work": ["saved_messages",
+                                         f"chat:{TARGET_CHAT}"],
+                                "dl": True, "cap": "#a 相册说明"},
+                    },
+                },
+            }, f, ensure_ascii=False)
+
+        out = listener.migrate_legacy_state()
+        self.assertEqual(out["chats"], 1)
+        self.assertEqual(out["tasks"], 2, "pending 的每个工作项都要变成任务")
+        self.assertTrue(out["moved"])
+        self.assertFalse(os.path.exists(self.legacy_path))
+        self.assertTrue(os.path.exists(self.legacy_path + ".migrated"))
+
+        self.assertEqual(listener.get_checkpoint(SRC), 500)
+        tasks = self._tasks()
+        self.assertEqual(self._targets(),
+                         {("saved_messages", None), ("chat", TARGET_CHAT)})
+        me_task = [t for t in tasks if t["target_type"] == "saved_messages"][0]
+        self.assertEqual(me_task["message_id"], 490, "锚点 = 组内最小成员 id")
+        self.assertEqual(me_task["payload"]["member_ids"], [490, 491])
+        self.assertTrue(me_task["download"])
+        self.assertTrue(all(t["status"] == "PENDING" for t in tasks))
+
+    async def test_legacy_migration_does_not_rewind_newer_checkpoint(self):
+        """DB 里已有更新的游标时，旧文件不得把它倒回去（否则重复扫一大段）。"""
+        runtime_db.set_listener_checkpoint(SRC, 900)
+        with open(self.legacy_path, "w", encoding="utf-8") as f:
+            json.dump({str(SRC): {"last_message_id": 500, "pending": {}}}, f)
+        out = listener.migrate_legacy_state()
+        self.assertEqual(out["chats"], 0)
+        self.assertEqual(out["skipped"], 1)
+        self.assertEqual(listener.get_checkpoint(SRC), 900)
+
+    async def test_legacy_migration_is_noop_without_file(self):
+        out = listener.migrate_legacy_state()
+        self.assertEqual(out, {"chats": 0, "tasks": 0, "skipped": 0,
+                               "moved": False})
+
+    async def test_legacy_migration_survives_corrupt_file(self):
+        with open(self.legacy_path, "w", encoding="utf-8") as f:
+            f.write("{ 半截")
+        out = listener.migrate_legacy_state()
+        self.assertEqual(out["tasks"], 0)
+        self.assertFalse(out["moved"])
+        self.assertTrue(os.path.exists(self.legacy_path), "坏文件保持原名")
 
 
 # ============================================================

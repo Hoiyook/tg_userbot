@@ -842,6 +842,9 @@ class ListenReportingTest(unittest.TestCase):
                                "targets": [], "download": True}]
         state.LISTEN_LAST_SCAN = {"ts": "07:20", "matched": 9,
                                   "forwarded": 14}
+        state.LISTEN_LAST_SCAN = {"ts": "07:20", "matched": 9, "created": 6,
+                                  "queue": {"total": 4, "pending": 2,
+                                            "processing": 1}}
         text = reporter.build_status_text(_snap(listen={
             "enabled": True, "rules": 1, "interval_minutes": 1440,
             "last": state.LISTEN_LAST_SCAN}))
@@ -849,6 +852,7 @@ class ListenReportingTest(unittest.TestCase):
         self.assertIn("规则 1 条", text)
         self.assertIn("07:20", text)
         self.assertIn("命中 9", text)
+        self.assertIn("入队 6", text)
 
     def test_snapshot_reads_state_readonly(self):
         state.LISTEN_ENABLED = False
@@ -867,12 +871,13 @@ class ListenReportingTest(unittest.TestCase):
 
     def test_event_text_for_listen(self):
         text = reporter.build_event_text(
-            "listen", chats=2, scanned=30, matched=4, forwarded=7,
-            failed=1, chat_failures=1, errors=["读取失败"])
+            "listen", chats=2, scanned=30, matched=4, created=7,
+            duplicate=1, capped=1, chat_failures=1, errors=["读取失败"])
         self.assertIn("🏷 标签监听", text)
         self.assertIn("命中：4 条", text)
-        self.assertIn("转发：7 项", text)
-        self.assertIn("下轮自动续做", text)
+        self.assertIn("已入队待转发：7 条", text)
+        self.assertIn("重复跳过：1 条", text)
+        self.assertIn("队列上限", text)
         self.assertIn("读取失败", text)
 
     def test_unknown_kind_still_none(self):
@@ -898,21 +903,21 @@ class ListenEventDispatchTest(unittest.IsolatedAsyncioTestCase):
     async def test_empty_scan_does_not_notify(self):
         await self.rep.dispatch_events([
             {"ev": "LISTEN_SCAN", "label": "-100", "scanned": 5,
-             "matched": 0, "forwarded": 0, "failed": 0},
+             "matched": 0, "created": 0},
         ])
         self.assertEqual(self.sent, [])
 
     async def test_match_triggers_one_aggregated_notification(self):
         await self.rep.dispatch_events([
             {"ev": "LISTEN_SCAN", "label": "-100", "scanned": 5,
-             "matched": 2, "forwarded": 3, "failed": 0},
+             "matched": 2, "created": 3},
             {"ev": "LISTEN_SCAN", "label": "-101", "scanned": 7,
-             "matched": 1, "forwarded": 2, "failed": 0},
+             "matched": 1, "created": 2},
         ])
         self.assertEqual(len(self.sent), 1)     # 按批聚合，不刷屏
         self.assertIn("🏷 标签监听", self.sent[0])
         self.assertIn("命中：3 条", self.sent[0])
-        self.assertIn("转发：5 项", self.sent[0])
+        self.assertIn("已入队待转发：5 条", self.sent[0])
 
     async def test_chat_failure_always_notifies(self):
         await self.rep.dispatch_events([
