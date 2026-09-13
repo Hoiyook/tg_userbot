@@ -7,7 +7,7 @@ format_size 来自 naming、get_history_lines 来自 history（均为纯叶子�
 """
 from . import state
 from . import config
-from .config import LOG_FILE, SAVE_FOLDER
+from .config import LOG_FILE, DOWNLOAD_DIR
 from .history import get_history_lines
 from .naming import format_size
 
@@ -22,7 +22,7 @@ def status_text():
         "🟢 TG Userbot 状态正常\n\n"
         f"连接：{'正常' if connected else '断开'}\n"
         f"用户 ID：{state.MY_ID}\n"
-        f"保存目录：{SAVE_FOLDER}\n"
+        f"保存目录：{DOWNLOAD_DIR}\n"
         f"日志：{LOG_FILE}"
     )
 

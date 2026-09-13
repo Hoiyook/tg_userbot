@@ -34,7 +34,7 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 import httpx  # noqa: E402  f2 的依赖，download_url_media 的测试必须真有它
 
 from tg_userbot import state, config  # noqa: E402
-from tg_userbot.config import SAVE_FOLDER  # noqa: E402  进程级真实保存目录
+from tg_userbot.config import DOWNLOAD_DIR  # noqa: E402  进程级真实保存目录
 from tg_userbot import download  # noqa: E402
 from tg_userbot import resolver  # noqa: E402
 from tg_userbot import platform  # noqa: E402
@@ -212,7 +212,7 @@ class DownloadUrlMediaTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.resolver_urls, [])
         self.assertEqual(len(transport.requested), 1)
         self.assertTrue(transport.requested[0].startswith(fresh))
-        self.assertTrue(os.path.exists(os.path.join(SAVE_FOLDER, "抖音", "新直链.mp4")))
+        self.assertTrue(os.path.exists(os.path.join(DOWNLOAD_DIR, "抖音", "新直链.mp4")))
 
     async def test_stale_url_refreshed_before_first_attempt(self):
         """直链已过期：开下前重新解析刷新，旧直链根本不被尝试。"""
@@ -236,7 +236,7 @@ class DownloadUrlMediaTest(unittest.IsolatedAsyncioTestCase):
         # 新直链写回记录（任务收尾时随队列持久化）
         self.assertEqual(record["direct_url"], new)
         self.assertTrue(
-            os.path.exists(os.path.join(SAVE_FOLDER, "抖音", "刷新后下载.mp4"))
+            os.path.exists(os.path.join(DOWNLOAD_DIR, "抖音", "刷新后下载.mp4"))
         )
 
     async def test_403_on_unexpired_url_triggers_refresh_then_downloads(self):
@@ -270,7 +270,7 @@ class DownloadUrlMediaTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.relayed, [("douyin", [_SHARE_URL])])
         # 降级路径不该留下半成品
         self.assertFalse(
-            os.path.exists(os.path.join(SAVE_FOLDER, "抖音", "降级bot.mp4"))
+            os.path.exists(os.path.join(DOWNLOAD_DIR, "抖音", "降级bot.mp4"))
         )
 
     async def test_relay_failure_returns_false_for_retry(self):
@@ -373,7 +373,7 @@ class DownloadUrlMediaTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(ok)
         self.assertFalse(os.path.exists(
-            os.path.join(SAVE_FOLDER, "抖音", "内容重复.mp4")
+            os.path.join(DOWNLOAD_DIR, "抖音", "内容重复.mp4")
         ))
         self.assertIn("dyc:999", temp_index)  # 元数据键补记
 
@@ -441,7 +441,7 @@ class DownloadUrlMediaTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(ok)
         self.assertTrue(os.path.exists(
-            os.path.join(SAVE_FOLDER, "抖音", "内容新增.mp4")
+            os.path.join(DOWNLOAD_DIR, "抖音", "内容新增.mp4")
         ))
         self.assertIn("dyc:888", temp_index)
         self.assertIn(f"c:{digest}", temp_index)

@@ -181,7 +181,7 @@ class DownloadUrlMediaTest(unittest.TestCase):
 
         with mock.patch.object(download, "_make_http_client",
                                return_value=real_client), \
-             mock.patch.object(download, "SAVE_FOLDER", _TMP), \
+             mock.patch.object(download, "DOWNLOAD_DIR", _TMP), \
              mock.patch.object(download.state, "client", new=mock.AsyncMock()):
             ok = self._run(download.download_url_media(record))
 

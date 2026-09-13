@@ -37,7 +37,7 @@ from .config import (
     CLEAR_TIME_CONFIG_FILE,
     DEFAULT_CLEAR_INTERVAL_SECONDS,
     REPORT_STATUS_PREFIX,
-    SAVE_FOLDER,
+    DOWNLOAD_DIR,
 )
 from .history import is_done_command
 from .log import logger
@@ -317,7 +317,7 @@ async def cleanup_loop():
 
 def clean_temp_files(root=None):
     """删除 .download 临时文件，返回删除数量。命令与 bot 菜单共用。"""
-    root = root or SAVE_FOLDER
+    root = root or DOWNLOAD_DIR
     count = 0
     for dirpath, dirs, files in os.walk(root):
         for filename in files:

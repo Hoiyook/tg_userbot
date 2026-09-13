@@ -32,7 +32,7 @@ from .config import (
     DOWNLOAD_CONCURRENCY_MIN,
     LOG_FILE,
     LOG_RETENTION_DAYS,
-    SAVE_FOLDER,
+    DOWNLOAD_DIR,
     SQL_CONSOLE_MAX_ROWS,
 )
 from .log import logger
@@ -45,7 +45,7 @@ async def handle_command(event, cmd_text):
         return True
 
     if cmd_text == "/folder":
-        await event.reply(f"📁 保存目录：\n{SAVE_FOLDER}")
+        await event.reply(f"📁 保存目录：\n{DOWNLOAD_DIR}")
         logger.info("执行命令：/folder")
         return True
 

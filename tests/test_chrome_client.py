@@ -53,12 +53,12 @@ class ChromeCommandParseTest(unittest.TestCase):
 
 
 class ChromeDownloadDirTest(unittest.TestCase):
-    """下载目录（规格 21）：<SAVE_FOLDER>/TG Chrome Download。"""
+    """下载目录（规格 21）：<DOWNLOAD_DIR>/TG Chrome Download。"""
 
     def test_dir_matches_save_folder(self):
         self.assertEqual(
             chrome_client.download_dir(),
-            os.path.join(config.SAVE_FOLDER, "TG Chrome Download"),
+            os.path.join(config.DOWNLOAD_DIR, "TG Chrome Download"),
         )
 
 

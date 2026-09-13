@@ -31,11 +31,11 @@ class ChromeConfigTest(unittest.TestCase):
     """Chrome Agent 的配置常量与目录计算。"""
 
     def test_download_dir_under_save_folder(self):
-        """下载目录必须是 <SAVE_FOLDER>/TG Chrome Download（规格 21），
-        TG_SAVE_FOLDER 变化时自动跟随。"""
+        """下载目录必须是 <DOWNLOAD_DIR>/TG Chrome Download（规格 21），
+        TG_DOWNLOAD_DIR 变化时自动跟随。"""
         self.assertEqual(
             config.CHROME_DOWNLOAD_DIR,
-            os.path.join(config.SAVE_FOLDER, "TG Chrome Download"),
+            os.path.join(config.DOWNLOAD_DIR, "TG Chrome Download"),
         )
 
     def test_cdp_binds_local_only(self):

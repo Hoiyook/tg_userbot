@@ -53,7 +53,7 @@ def save_whitelist(chats, path=None):
 
 
 # 除 Saved Messages（"me"）外，白名单内的 chat 收到媒体消息也会自动下载，
-# 保存到 SAVE_FOLDER/<chat标题>/。/wl 命令只在 "me" 生效。
+# 保存到 DOWNLOAD_DIR/<chat标题>/。/wl 命令只在 "me" 生效。
 def classify_message_chat(chat_id, my_id, whitelist):
     """决定一条消息属于哪个来源：
     ("me", None)    — 自己的 Saved Messages，全功能（命令/链接解析/下载）

@@ -1,11 +1,12 @@
 """配置与平台探测（不可变常量 + import 期一次性启动）。
 
 拆包前这些都在单文件 tg_userbot_final.py 顶部。这里保持同样的求值顺序：
-secrets → 平台探测 → 保存目录/日志 → 代理/传输 → 其余常量 → AdjustableSemaphore，
-模块末尾才做 import 期的文件系统副作用：mkdir(SAVE_FOLDER) 与
-mkdir(RUNTIME_DIR)、把旧版散在根目录的运行时文件迁入 runtime/、然后
-log.configure(LOG_FILE, LOG_RETENTION_DAYS)（download.log 按天轮转、
-只保留最近 7 天）。
+secrets → 平台探测 → 数据根/下载根/Runtime 根 → 代理/传输 → 其余常量 →
+AdjustableSemaphore，模块末尾才做 import 期的文件系统副作用：mkdir(DOWNLOAD_DIR)
+与 mkdir(RUNTIME_DIR)、把旧版散在下载根的运行时文件迁入 runtime/、把旧默认
+数据根（~/Downloads/Nagram）整体迁入新根（仅零配置桌面部署，见
+_legacy_migration_root）、然后 log.configure(LOG_FILE, LOG_RETENTION_DAYS)
+（download.log 按天轮转、只保留最近 7 天）。
 
 可变的运行态全局不在这里（见 state.py）；本模块导出的都是只读常量，
 consumer 模块可用 `from .config import SAVE_FOLDER` 别名（值永不变化）。
@@ -15,8 +16,9 @@ consumer 模块可用 `from .config import SAVE_FOLDER` 别名（值永不变化
 import os
 import json
 import re
+import shutil
 import asyncio
-from collections import deque
+from collections import deque, namedtuple
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -75,24 +77,64 @@ IS_TERMUX = is_termux()
 # 注意：不要把同一台设备的 .session 文件复制到另一台同时运行。
 SESSION_NAME = os.path.expanduser("~/tg_downloader")
 
-# 保存目录：
-#   Termux → /storage/emulated/0/Download/Nagram（手机存储）
-#   macOS  → ~/Downloads/Nagram
-# 也可以用环境变量 TG_SAVE_FOLDER 覆盖。
-if IS_TERMUX:
-    DEFAULT_SAVE_FOLDER = "/storage/emulated/0/Download/Nagram"
-else:
-    DEFAULT_SAVE_FOLDER = str(Path.home() / "Downloads" / "Nagram")
+# ------------------------------------------------------------
+# 数据根目录与路径解耦（2026-09-13）：
+#   DATA_ROOT    正式数据根（桌面默认 /Volumes/V1；Termux 沿用旧根，行为不变）
+#   DOWNLOAD_DIR 媒体下载根（新代码用这个；<根>/<来源>/ 的布局不变）
+#   RUNTIME_DIR  运行数据根（db/JSON/日志/PID；旧版是 SAVE_FOLDER/runtime，强耦合）
+# SAVE_FOLDER 保留为 DOWNLOAD_DIR 的旧别名：既有媒体代码与展示文案不改也对，
+# 新代码一律用 DOWNLOAD_DIR。优先级（高→低）：
+#   DOWNLOAD_DIR: TG_DOWNLOAD_DIR → TG_SAVE_FOLDER(旧变量) → DATA_ROOT/downloads
+#   RUNTIME_DIR : TG_RUNTIME_DIR → 仅设旧 TG_SAVE_FOLDER 时与其同目录 → DATA_ROOT/runtime
+# 解析逻辑独立成纯函数 _resolve_paths：import 期的 mkdir/迁移副作用只在真实
+# 环境跑一次；单测直接喂 env dict，不 reload 模块、不触碰真实文件系统。
+# ------------------------------------------------------------
+ResolvedPaths = namedtuple(
+    "ResolvedPaths",
+    "data_root download_dir runtime_dir runtime_db_file")
 
-SAVE_FOLDER = os.environ.get("TG_SAVE_FOLDER", DEFAULT_SAVE_FOLDER)
 
-# 运行时文件（非媒体的配置/日志/队列）统一归集到 SAVE_FOLDER/runtime/ 子目录：
-# download.log（按天轮转）、download_history.txt、4 个运行时 JSON、cd2_launch.log。
-# 历史版本散在 SAVE_FOLDER 根下的同名文件在启动时自动迁入（_migrate_runtime_files）。
-# 媒体仍存 SAVE_FOLDER/<来源>/（递归范围被 CD2 白名单搬到 115）；运行时文件因为
-# 不是媒体扩展名、天然不被 CD2 备份/删除规则碰（与归集前等价），归集只为了收拢
-# 目录、避免根目录越来越杂。该目录与媒体都在同一 SAVE_FOLDER 里，无跨盘问题。
-RUNTIME_DIR = os.path.join(SAVE_FOLDER, "runtime")
+def _resolve_paths(env, is_termux):
+    """由环境变量与平台分支解析四个路径常量（纯函数，可单测）。
+
+    Termux 不引入新布局：数据根沿用旧默认（/storage/.../Nagram）且
+    DOWNLOAD_DIR == DATA_ROOT——手机端行为与解耦前逐字节一致，桌面才把
+    媒体收进 DATA_ROOT/downloads。只设旧 TG_SAVE_FOLDER（测试基座与老部署
+    的形态）时 runtime 仍与其同目录：不能让只动了旧变量的部署得到一个
+    突兀的 DATA_ROOT/runtime；显式设了 TG_DATA_ROOT/TG_RUNTIME_DIR 即视为
+    新式配置，旧变量的耦合不再生效。
+    """
+    env = env or {}
+    if is_termux:
+        data_root = env.get("TG_DATA_ROOT",
+                            "/storage/emulated/0/Download/Nagram")
+    else:
+        data_root = env.get("TG_DATA_ROOT", "/Volumes/V1")
+    legacy_save = env.get("TG_SAVE_FOLDER")
+    default_download = data_root if is_termux else os.path.join(
+        data_root, "downloads")
+    download_dir = env.get("TG_DOWNLOAD_DIR", legacy_save or default_download)
+    if env.get("TG_RUNTIME_DIR"):
+        runtime_dir = env["TG_RUNTIME_DIR"]
+    elif legacy_save and not env.get("TG_DATA_ROOT"):
+        runtime_dir = os.path.join(legacy_save, "runtime")
+    else:
+        runtime_dir = os.path.join(data_root, "runtime")
+    runtime_db = env.get("TG_RUNTIME_DB",
+                         os.path.join(runtime_dir, "tg_userbot.db"))
+    return ResolvedPaths(data_root, download_dir, runtime_dir, runtime_db)
+
+
+DATA_ROOT, DOWNLOAD_DIR, RUNTIME_DIR, RUNTIME_DB_FILE = _resolve_paths(
+    os.environ, IS_TERMUX)
+# legacy compatibility：下载根旧别名，值永不变化。
+SAVE_FOLDER = DOWNLOAD_DIR
+
+# 运行时文件（非媒体的配置/日志/队列）统一归集到 RUNTIME_DIR：
+# download.log（按天轮转）、download_history.txt、各运行时 JSON、cd2_launch.log。
+# 历史版本散在下载根下的同名文件在启动时自动迁入（_migrate_runtime_files）。
+# 运行时文件不是媒体扩展名、天然不被 CD2 备份/删除规则碰；独立成根后与
+# 媒体目录彻底解耦（旧版 SAVE_FOLDER/runtime 的强耦合到此为止）。
 LOG_RETENTION_DAYS = 7  # download.log 按天轮转，只保留最近 7 天
 LOG_FILE = os.path.join(RUNTIME_DIR, "download.log")
 # Chrome Agent 是独立进程，必须写自己的日志文件：两个进程各持一个
@@ -348,14 +390,12 @@ REPORT_LISTEN = True
 # → SQLite（runtime/tg_userbot.db，第一阶段只有 listener 这三张表）；技术日志
 # → 文件（download.log 等原样不动）**。
 # ------------------------------------------------------------
-# Runtime DB 路径。默认放 RUNTIME_DIR（规格 §5：禁止各模块自造 runtime 路径）。
-# 留 TG_RUNTIME_DB 环境变量覆盖：Termux 上 SAVE_FOLDER 落在 /storage/emulated/0
-# （FUSE 外部存储），WAL 依赖 mmap 共享内存、在该文件系统上可能不可用；真机上
-# 若探测到 WAL 回落，可把 DB 挪到应用私有目录。注意：**只允许主进程写**，
-# Chrome Agent 进程绝不能开连接（见 runtime_db 的「不做 import 期连接」）。
-RUNTIME_DB_FILE = os.environ.get(
-    "TG_RUNTIME_DB", os.path.join(RUNTIME_DIR, "tg_userbot.db")
-)
+# Runtime DB 路径已在模块头部由 _resolve_paths 统一解析：默认放 RUNTIME_DIR
+#（规格 §5：禁止各模块自造 runtime 路径），TG_RUNTIME_DB 单文件覆盖保留。
+# 覆盖的用途：Termux 上 SAVE_FOLDER 落在 /storage/emulated/0（FUSE 外部存储），
+# WAL 依赖 mmap 共享内存、在该文件系统上可能不可用；真机上若探测到 WAL 回落，
+# 可把 DB 挪到应用私有目录。注意：**只允许主进程写**，Chrome Agent 进程绝不
+# 能开连接（见 runtime_db 的「不做 import 期连接」）。
 RUNTIME_DB_SCHEMA_VERSION = 3   # v3：checkpoints 加 chain（listen/wl 双游标）+ tasks 加 origin
 # 单条写事务等锁的上限（毫秒）与 SQLITE_BUSY/LOCKED 的有限重试（规格 §39：
 # 记日志 → 短暂等待 → 有限次数重试，绝不无限循环、绝不因此崩掉主进程）。
@@ -932,27 +972,31 @@ class AdjustableSemaphore:
         self.release()
 
 
+# 历史版本（runtime/ 归集之前）散在下载根下的运行时文件确切 basename。
+# 迁移只认这批名字，绝不误伤其它用户文件；旧数据根整体迁移（_migrate_legacy_data）
+# 也用它优先把这些名字归入 RUNTIME_DIR 而不是 DOWNLOAD_DIR。
+_SCATTERED_RUNTIME_BASENAMES = (
+    "download.log", "download_history.txt", "thread_config.json",
+    "whitelist_config.json", "download_queue.json", "clear_time.json",
+    "cd2_launch.log",
+)
+
+
 def _migrate_runtime_files(save_folder=None, runtime_dir=None):
-    """把历史版本散在 SAVE_FOLDER 根下的运行时文件迁入 runtime/（幂等）。
+    """把历史版本散在下载根下的运行时文件迁入 RUNTIME_DIR（幂等）。
 
     save_folder/runtime_dir 可显式传入（供单测用临时目录）；默认取模块常量。
     仅当 runtime/ 下尚不存在同名文件时才移动：重复 import / 进程已在跑新版本
     都 no-op。返回本次实际迁入的文件名列表。运行时文件本来就是根目录里「非媒体
     扩展名」的那一撮，不会被 CD2 的备份/删除规则碰（按媒体扩展名白名单过滤），
-    搬进子目录后依然免疫，故移动安全。只处理下面 7 个确切 basename，绝不误伤
-    其它用户文件。失败不阻塞启动（下轮启动或手动处理）。
+    搬进子目录后依然免疫，故移动安全。失败不阻塞启动（下轮启动或手动处理）。
     """
     if save_folder is None:
-        save_folder = SAVE_FOLDER
+        save_folder = DOWNLOAD_DIR
     if runtime_dir is None:
         runtime_dir = RUNTIME_DIR
-    basenames = (
-        "download.log", "download_history.txt", "thread_config.json",
-        "whitelist_config.json", "download_queue.json", "clear_time.json",
-        "cd2_launch.log",
-    )
     moved = []
-    for name in basenames:
+    for name in _SCATTERED_RUNTIME_BASENAMES:
         src = os.path.join(save_folder, name)
         dst = os.path.join(runtime_dir, name)
         if os.path.exists(src) and not os.path.exists(dst):
@@ -964,10 +1008,201 @@ def _migrate_runtime_files(save_folder=None, runtime_dir=None):
     return moved
 
 
+def _ensure_dir(path, what):
+    """import 期建目录；失败给出可行动的中文错误而不是一串裸 traceback。
+
+    数据根可能落在外置/第二块盘上（/Volumes/V1）：卷没挂载时 makedirs 会
+    PermissionError/OSError，这里翻译成「去挂载或改用环境变量」的指引。
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        raise RuntimeError(
+            f"无法创建{what}：{path}（{type(e).__name__}: {e}）。"
+            "若是外置数据卷请先挂载；或用 TG_DATA_ROOT / TG_DOWNLOAD_DIR / "
+            "TG_RUNTIME_DIR 改指可用目录。"
+        ) from e
+
+
+def _move_into(src, dst_dir):
+    """把 src（文件/目录/symlink）迁入 dst_dir，保留 basename。跨卷安全。
+
+    单文件走「copy → 同目录 .migrating 临时名 → os.replace 原子就位 → 删源」，
+    任一刻中断都不会留下半个最终文件（残留 .migrating 由 _sweep_migrating_temps
+    与下轮重拷兜底）。目录逐项递归；目标同名目录已存在则**并入**（断点续迁，
+    大目录迁移中断后下轮接着搬），同名文件或形态不同则视为冲突不动。
+    源目录只在搬空后 rmdir——绝不带着未迁走的数据删目录。
+    返回 (moved, conflicts)：相对 dst_dir 的名字列表。
+    """
+    moved, conflicts = [], []
+    name = os.path.basename(src.rstrip(os.sep))
+    dst = os.path.join(dst_dir, name)
+    src_is_dir = os.path.isdir(src) and not os.path.islink(src)
+    if os.path.lexists(dst):
+        if src_is_dir and os.path.isdir(dst) and not os.path.islink(dst):
+            for entry in sorted(os.listdir(src)):
+                m, c = _move_into(os.path.join(src, entry), dst)
+                moved.extend(os.path.join(name, x) for x in m)
+                conflicts.extend(os.path.join(name, x) for x in c)
+            try:
+                os.rmdir(src)
+            except OSError:
+                pass
+        else:
+            conflicts.append(name)
+        return moved, conflicts
+    if src_is_dir:
+        os.makedirs(dst, exist_ok=True)
+        for entry in sorted(os.listdir(src)):
+            m, c = _move_into(os.path.join(src, entry), dst)
+            moved.extend(os.path.join(name, x) for x in m)
+            conflicts.extend(os.path.join(name, x) for x in c)
+        try:
+            os.rmdir(src)
+        except OSError:
+            pass
+        return moved, conflicts
+    tmp = dst + ".migrating"
+    try:
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dst)
+        os.remove(src)
+        moved.append(name)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        conflicts.append(name)
+    return moved, conflicts
+
+
+def _sweep_migrating_temps(root):
+    """清掉迁移中断残留的 .migrating 临时文件（最终文件缺失的下轮重拷会重做）。"""
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if name.endswith(".migrating"):
+                try:
+                    os.remove(os.path.join(dirpath, name))
+                except OSError:
+                    pass
+
+
+def _migrate_legacy_data(legacy_root, download_dir=None, runtime_dir=None):
+    """把旧数据根（如 ~/Downloads/Nagram）整体迁入新根（幂等，跨卷安全）。
+
+    顺序即「先识别旧路径 → 迁移运行数据 → 迁移媒体」（任务书 §19，先迁移后
+    切换，不产生旧数据孤岛）：
+      ① 旧根/runtime/* → RUNTIME_DIR（db/listen 等运行数据，最优先）
+      ② 旧根散落的历史运行时文件 → RUNTIME_DIR
+      ③ 旧根其余全部（媒体目录等）→ DOWNLOAD_DIR
+    目标已存在 → 保留新目标不覆盖、源原样保留、记入 conflicts（§20）；
+    tg_userbot.db 冲突的提示点名两个路径并说明沿用新库（§21）。绝不删除旧根
+    本身（§22）；单条失败留在源侧下轮再迁，绝不阻塞启动。
+    返回 {"old_root", "runtime", "scattered", "media", "conflicts"}。
+    """
+    if download_dir is None:
+        download_dir = DOWNLOAD_DIR
+    if runtime_dir is None:
+        runtime_dir = RUNTIME_DIR
+    summary = {"old_root": legacy_root, "runtime": [], "scattered": [],
+               "media": [], "conflicts": []}
+
+    def _note_conflicts(rel_names, dst_dir):
+        for rel in rel_names:
+            src = os.path.join(legacy_root, rel)
+            dst = os.path.join(dst_dir, rel)
+            if rel == "tg_userbot.db":
+                summary["conflicts"].append(
+                    f"tg_userbot.db 新旧同时存在：沿用 {dst}（不覆盖）；"
+                    f"旧库保留在 {src}，请人工确认后处理")
+            else:
+                summary["conflicts"].append(
+                    f"{rel} 目标已存在，保留新文件不覆盖：{dst}"
+                    f"（旧文件留在 {src}）")
+
+    def _bucket(names, bucket, dst_dir):
+        summary[bucket].extend(names)
+        if names:
+            print(f"[迁移] {legacy_root} → {dst_dir}：{len(names)} 项",
+                  flush=True)
+
+    try:
+        entries = sorted(os.listdir(legacy_root))
+    except OSError:
+        return summary
+    for name in entries:
+        src = os.path.join(legacy_root, name)
+        if name == "runtime":
+            try:
+                children = sorted(os.listdir(src))
+            except OSError:
+                continue
+            for child in children:
+                moved, conflicts = _move_into(
+                    os.path.join(src, child), runtime_dir)
+                _bucket(moved, "runtime", runtime_dir)
+                _note_conflicts(conflicts, runtime_dir)
+            continue
+        if name in _SCATTERED_RUNTIME_BASENAMES:
+            moved, conflicts = _move_into(src, runtime_dir)
+            _bucket(moved, "scattered", runtime_dir)
+            _note_conflicts(conflicts, runtime_dir)
+            continue
+        moved, conflicts = _move_into(src, download_dir)
+        _bucket(moved, "media", download_dir)
+        _note_conflicts(conflicts, download_dir)
+    _sweep_migrating_temps(download_dir)
+    _sweep_migrating_temps(runtime_dir)
+    return summary
+
+
+def _legacy_migration_root(env=None, is_termux=None, legacy_root=None):
+    """import 期自动迁移的闸门：返回旧数据根路径，None = 不迁移。
+
+    只在「零配置桌面默认部署」生效——这是路径切换会甩下旧数据的唯一形态。
+    任何 TG_* 路径变量（含测试基座注入的 TG_SAVE_FOLDER）都视为自定义布局，
+    由用户自己负责；Termux 布局没变无需迁移；TG_MIGRATE_LEGACY=0 可整体关掉；
+    旧根不存在或就是新目标也跳过。
+    """
+    env = os.environ if env is None else env
+    if is_termux is None:
+        is_termux = IS_TERMUX
+    if is_termux or env.get("TG_MIGRATE_LEGACY") == "0":
+        return None
+    if any(env.get(k) for k in ("TG_SAVE_FOLDER", "TG_DOWNLOAD_DIR",
+                                "TG_DATA_ROOT", "TG_RUNTIME_DIR")):
+        return None
+    if legacy_root is None:
+        legacy_root = os.path.join(str(Path.home()), "Downloads", "Nagram")
+    if not os.path.isdir(legacy_root):
+        return None
+    if legacy_root in (DOWNLOAD_DIR, RUNTIME_DIR):
+        return None
+    # 幂等终局检查：旧根只剩 runtime/ 骨架、且其中每个文件都已在新 RUNTIME_DIR
+    # 就位（上轮迁完 + 分裂写入增量已被收尾合并）→ 无事可做，静默跳过。
+    # 不做这一步，之后每次启动都会把同名骨架文件当冲突重新警告一遍。
+    try:
+        pending = set(os.listdir(legacy_root)) - {"runtime"}
+        if not pending:
+            old_rt = os.path.join(legacy_root, "runtime")
+            pending = {
+                name for name in os.listdir(old_rt)
+                if not os.path.lexists(os.path.join(RUNTIME_DIR, name))
+            }
+    except OSError:
+        return None
+    if not pending:
+        return None
+    return legacy_root
+
+
 # ============================================================
 # import 期一次性副作用（保持单文件时的时机：先建目录、再配日志）
 # ============================================================
-os.makedirs(SAVE_FOLDER, exist_ok=True)
+_ensure_dir(DOWNLOAD_DIR, "媒体下载目录")
 # ------------------------------------------------------------
 # Chrome Agent V1（专用 Profile + CDP，2026-09-09 用户允许新建 Profile）。
 # Chrome ≥136 禁止在默认 user-data-dir 上开 remote debugging，专用 Profile
@@ -982,8 +1217,9 @@ CHROME_CDP_PORT = 9222
 # Chrome 一致：socks5://host:port 或 http://host:port。空 = 直连。
 CHROME_PROXY_SERVER = os.environ.get(
     "CHROME_PROXY", os.environ.get("TG_PROXY", "")).strip() or None
-# 下载落 <SAVE_FOLDER>/TG Chrome Download/（规格 21），随 TG_SAVE_FOLDER 变化
-CHROME_DOWNLOAD_DIR = os.path.join(SAVE_FOLDER, "TG Chrome Download")
+# 下载落 <DOWNLOAD_DIR>/TG Chrome Download/（规格 21），随 TG_DOWNLOAD_DIR 变化；
+# Chrome 媒体与普通下载同属 DOWNLOAD_DIR，只占一个子目录、命名行为不变
+CHROME_DOWNLOAD_DIR = os.path.join(DOWNLOAD_DIR, "TG Chrome Download")
 # Agent 专用 Profile（持久复用；绝不指向正常 Chrome 的 User Data）
 CHROME_PROFILE_DIR = os.path.expanduser("~/tg_chrome_agent_profile")
 # 允许使用 /chrome* 命令的 owner（tg_secrets.json chrome_agent.owner_id 可
@@ -1038,11 +1274,29 @@ CHROME_EVENTS_DEFAULT_GUID_TIMEOUT = 300
 # 最大事件处理器数量限制
 CHROME_EVENTS_MAX_HANDLERS = 100
 
-os.makedirs(RUNTIME_DIR, exist_ok=True)
+_ensure_dir(RUNTIME_DIR, "Runtime 运行数据目录")
 _migrated_runtime_files = _migrate_runtime_files()
+_legacy_root = _legacy_migration_root()
+_migrated_legacy = (
+    _migrate_legacy_data(_legacy_root) if _legacy_root else None)
 log.configure(LOG_FILE, LOG_RETENTION_DAYS)
 if _migrated_runtime_files:
     log.logger.info(
         "已把历史运行时文件迁入 runtime/ 目录："
         + "、".join(_migrated_runtime_files)
     )
+if _migrated_legacy:
+    s = _migrated_legacy
+    parts = []
+    if s["runtime"]:
+        parts.append(f"运行数据 {len(s['runtime'])} 项")
+    if s["scattered"]:
+        parts.append(f"散落运行时文件 {len(s['scattered'])} 项")
+    if s["media"]:
+        parts.append(f"媒体 {len(s['media'])} 项")
+    log.logger.info(
+        "✅ 旧数据根迁移完成：" + "、".join(parts)
+        + f"（{s['old_root']} → {DOWNLOAD_DIR} 与 {RUNTIME_DIR}）。"
+        "旧目录仍保留，请确认无误后手动删除。")
+    for _conflict in s["conflicts"]:
+        log.logger.warning(f"迁移冲突：{_conflict}")

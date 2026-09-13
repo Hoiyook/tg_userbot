@@ -62,7 +62,7 @@ from .config import (
     REPORT_INTERVAL_SECONDS,
     REPORT_PROGRESS_INTERVAL_SECONDS,
     REPORT_RESTART_DELAY_SECONDS,
-    SAVE_FOLDER,
+    DOWNLOAD_DIR,
     SECRETS_FILE,
     SESSION_NAME,
     SERVE_RECONNECT_BASE_DELAY,
@@ -1060,7 +1060,7 @@ async def main():
             "混淆(Obfuscated)" if CONNECTION_TYPE == "obfuscated" else "TLS(Full)"
         )
     )
-    logger.info(f"保存目录：{SAVE_FOLDER}")
+    logger.info(f"保存目录：{DOWNLOAD_DIR}")
     logger.info(f"日志文件：{LOG_FILE}")
     logger.info(
         f"监听范围：Saved Messages + 白名单 {len(state.WHITELIST_CHATS)} 个 chat"
@@ -1161,7 +1161,7 @@ async def main():
             state.bot_client = None
             state.BOT_ID = None
 
-    if os.access(SAVE_FOLDER, os.W_OK):
+    if os.access(DOWNLOAD_DIR, os.W_OK):
         logger.info("✅ 保存目录可访问")
     else:
         if IS_TERMUX:

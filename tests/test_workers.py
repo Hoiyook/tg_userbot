@@ -711,9 +711,9 @@ class ContentDedupHitTest(unittest.IsolatedAsyncioTestCase):
         self.fake_message.voice = None
         self.fake_message.document = None
 
-        self.source_dir = os.path.join(config.SAVE_FOLDER, "内容判重来源")
+        self.source_dir = os.path.join(config.DOWNLOAD_DIR, "内容判重来源")
         # 目录级隔离：三个测试共用落盘目录，先清掉上一个测试的落盘文件。
-        # 路径必须用 config.SAVE_FOLDER（进程级共享、首个 import 的测试模块
+        # 路径必须用 config.DOWNLOAD_DIR（进程级共享、首个 import 的测试模块
         # 定下的那个临时目录），不能用本模块的 _TMP 拼——全量跑时两者不同。
         import shutil
         if os.path.isdir(self.source_dir):

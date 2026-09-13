@@ -6,8 +6,19 @@
 种顺序都会出现），入队前应等一小段宽限再取一次标注。
 """
 import asyncio
+import atexit
+import os
+import shutil
+import tempfile
 import unittest
 from unittest import mock
+
+# 必须在首个 tg_userbot import 之前把保存目录指到临时目录：config 的 import
+# 期有真实副作用（mkdir + 旧数据根迁移闸门），零配置裸 import 会以「桌面默认
+# 部署」形态创建真实 /Volumes/V1 子目录、甚至迁移真实 ~/Downloads/Nagram。
+_TMP = tempfile.mkdtemp(prefix="tg_userbot_test_")
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
+os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import app
 

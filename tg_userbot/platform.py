@@ -113,7 +113,7 @@ def build_url_record(kind, url, result, user_label=None):
         "final_name": compute_url_filename(
             result.title, created_at, label=user_label
         ),
-        # 落盘目录：SAVE_FOLDER/抖音（见 download._douyin_folder）
+        # 落盘目录：DOWNLOAD_DIR/抖音（见 download._douyin_folder）
         "source": PLATFORM_LINKS.get(kind, {}).get("label", kind),
         "source_link": None,
         "created_at": created_at.strftime("%Y-%m-%d %H:%M:%S"),

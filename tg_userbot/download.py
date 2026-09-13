@@ -29,7 +29,7 @@ from .config import (
     EXPORT_RACE_EXTRA_RETRIES,
     MAX_FILENAME_BYTES,
     PROGRESS_STEP,
-    SAVE_FOLDER,
+    DOWNLOAD_DIR,
 )
 from .log import logger
 from .history import append_history
@@ -51,8 +51,8 @@ _RESERVED_FINAL_PATHS = set()
 
 
 def _douyin_folder() -> str:
-    """本地解析的抖音视频落盘目录：SAVE_FOLDER/抖音。"""
-    return os.path.join(SAVE_FOLDER, "抖音")
+    """本地解析的抖音视频落盘目录：DOWNLOAD_DIR/抖音。"""
+    return os.path.join(DOWNLOAD_DIR, "抖音")
 
 
 def _make_http_client(timeout):
@@ -620,7 +620,7 @@ async def download_file(message, source_override=None, caption_override=None,
         # 日志展示用（与 final_filename 的计算共用同一套规则）
         original_filename = sanitize_filename(get_original_filename(message))
 
-        folder = os.path.join(SAVE_FOLDER, source)
+        folder = os.path.join(DOWNLOAD_DIR, source)
         os.makedirs(folder, exist_ok=True)
 
         # 最终路径做「进程内占位 + 磁盘重名」双保险：相册里多张图片共享同一

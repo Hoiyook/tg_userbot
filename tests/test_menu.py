@@ -126,7 +126,7 @@ class MenuTextTest(unittest.TestCase):
     def test_status_text_contains_folder(self):
         body = text.status_text()
         self.assertIn("TG Userbot", body)
-        self.assertIn(config.SAVE_FOLDER, body)
+        self.assertIn(config.DOWNLOAD_DIR, body)
 
     def test_wl_list_text_empty(self):
         self.assertIn("空", text.wl_list_text({}))
