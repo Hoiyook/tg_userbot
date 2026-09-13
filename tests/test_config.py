@@ -518,3 +518,51 @@ class TestLegacyMigrationGate(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestLegacyMigrationImportedAwareness(unittest.TestCase):
+    """闸门识别 .imported 归档标记：分店已导入归档后，旧根残留的同名
+    文件不得再被搬进新根（多进程闸门竞态——Chrome Agent 的 config import
+    也会跑闸门，可能在主进程分阶段归档后的窗口里搬入陈旧文件）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="gate_imported_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.old_root = os.path.join(self.tmp, "old")
+        self.new_rt = os.path.join(self.tmp, "new_rt")
+        os.makedirs(os.path.join(self.old_root, "runtime"))
+        os.makedirs(self.new_rt)
+
+    def _write(self, path, data=b"x"):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+
+    def test_skeleton_check_treats_imported_as_in_place(self):
+        """旧根只剩 runtime 文件、且新根已有对应 .imported → 闸门静默跳过。"""
+        self._write(os.path.join(self.old_root, "runtime",
+                                 "dedup_index.txt"), b"stale")
+        self._write(os.path.join(self.new_rt, "dedup_index.txt.imported"))
+        with patch.object(config, "RUNTIME_DIR", self.new_rt):
+            self.assertIsNone(config._legacy_migration_root(
+                env={}, is_termux=False, legacy_root=self.old_root))
+
+    def test_migrate_skips_files_with_imported_marker(self):
+        """_migrate_legacy_data 对已有 .imported 的目标跳过搬移（留在旧根）。"""
+        self._write(os.path.join(self.old_root, "runtime",
+                                 "dedup_index.txt"), b"stale")
+        self._write(os.path.join(self.old_root, "runtime",
+                                 "whitelist_config.json"), b"real")
+        self._write(os.path.join(self.new_rt, "dedup_index.txt.imported"))
+        summary = config._migrate_legacy_data(
+            self.old_root, os.path.join(self.tmp, "new_dl"), self.new_rt)
+        # 有 .imported 标记的：跳过，留在旧根，不进新根
+        self.assertFalse(os.path.exists(
+            os.path.join(self.new_rt, "dedup_index.txt")))
+        self.assertTrue(os.path.exists(
+            os.path.join(self.old_root, "runtime", "dedup_index.txt")))
+        self.assertNotIn("runtime/dedup_index.txt",
+                         [c.split(" ")[0] for c in summary["conflicts"]])
+        # 无标记的照常迁入
+        self.assertTrue(os.path.exists(
+            os.path.join(self.new_rt, "whitelist_config.json")))

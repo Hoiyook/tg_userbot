@@ -1148,6 +1148,13 @@ def _migrate_legacy_data(legacy_root, download_dir=None, runtime_dir=None):
             print(f"[迁移] {legacy_root} → {dst_dir}：{len(names)} 项",
                   flush=True)
 
+    def _already_imported(name, runtime_dir):
+        """新根已有 <名>.imported（该店已导入归档）→ 旧根残留是陈旧副本，
+        跳过搬移。防多进程闸门竞态：Chrome Agent / run.sh 助手的 config
+        import 也会跑闸门，可能在主进程分阶段归档后的窗口里把旧根残留
+        搬进已清空的槽位（2026-09-14 实测踩中）。"""
+        return os.path.exists(os.path.join(runtime_dir, name + ".imported"))
+
     try:
         entries = sorted(os.listdir(legacy_root))
     except OSError:
@@ -1160,6 +1167,8 @@ def _migrate_legacy_data(legacy_root, download_dir=None, runtime_dir=None):
             except OSError:
                 continue
             for child in children:
+                if _already_imported(child, runtime_dir):
+                    continue
                 moved, conflicts = _move_into(
                     os.path.join(src, child), runtime_dir)
                 _bucket(moved, "runtime", runtime_dir)
@@ -1210,6 +1219,8 @@ def _legacy_migration_root(env=None, is_termux=None, legacy_root=None):
             pending = {
                 name for name in os.listdir(old_rt)
                 if not os.path.lexists(os.path.join(RUNTIME_DIR, name))
+                and not os.path.lexists(
+                    os.path.join(RUNTIME_DIR, name + ".imported"))
             }
     except OSError:
         return None
