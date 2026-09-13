@@ -396,7 +396,7 @@ REPORT_LISTEN = True
 # WAL 依赖 mmap 共享内存、在该文件系统上可能不可用；真机上若探测到 WAL 回落，
 # 可把 DB 挪到应用私有目录。注意：**只允许主进程写**，Chrome Agent 进程绝不
 # 能开连接（见 runtime_db 的「不做 import 期连接」）。
-RUNTIME_DB_SCHEMA_VERSION = 3   # v3：checkpoints 加 chain（listen/wl 双游标）+ tasks 加 origin
+RUNTIME_DB_SCHEMA_VERSION = 4   # v4：+ download_tasks（下载队列持久化）
 # 单条写事务等锁的上限（毫秒）与 SQLITE_BUSY/LOCKED 的有限重试（规格 §39：
 # 记日志 → 短暂等待 → 有限次数重试，绝不无限循环、绝不因此崩掉主进程）。
 RUNTIME_DB_BUSY_TIMEOUT_MS = 5000
@@ -447,6 +447,15 @@ WHITELIST_SCAN_PAGE_SLEEP_SECONDS = 5.0   # 页间小睡：读请求摊开（风
 # /sql 诊断控制台（owner-only）的输出上限
 SQL_CONSOLE_MAX_ROWS = 20                 # 查询最多返回行数（超出提示用 LIMIT）
 SQL_CONSOLE_CELL_LIMIT = 48               # 单元格字符上限（截断带省略号）
+
+# /sh 命令行执行器（owner-only）：工作目录记忆文件 + 子进程超时
+SHELL_STATE_FILE = os.path.join(RUNTIME_DIR, "shell_state.json")
+SHELL_TIMEOUT_SECONDS = 30
+
+# /up 文件上传（owner-only）：单文件上限、进度编辑间隔、上传视图文件数
+TG_UPLOAD_MAX_BYTES = 2 * 1024 ** 3
+UPLOAD_PROGRESS_EDIT_SECONDS = 5.0
+UPLOAD_LIST_LIMIT = 8
 
 # 任务生命周期事件日志（JSONL，append-only 单行追加，写失败仅告警）：
 # 台账按 task_id 重建统计的数据源。每行一个事件
@@ -603,6 +612,10 @@ MENU_ACTIONS = (
     "listen_cancel",
     # SQL 模板：视图 / ➕ 新增（同名即覆盖）/ ▶️ 执行 / 🗑 删除
     "sqlt", "sqlt_add", "sqlt_run", "sqlt_del",
+    # 命令行（sh：视图 / 预设执行 / ✏️ 输入命令）与文件上传
+    # （up：视图 / 📄 最近文件带序号 / ✏️ 输入路径）
+    "sh", "sh_run", "sh_input",
+    "up", "up_file", "up_input",
 )
 
 
@@ -660,6 +673,12 @@ def save_douyin_cookie(value, path=None):
 # 重启后自动恢复执行。失败任务移入 retry 列表停靠，由用户手动重试。
 # ------------------------------------------------------------
 QUEUE_FILE = os.path.join(RUNTIME_DIR, "download_queue.json")
+# 队列持久化层（2026-09-13，任务书：下载队列 SQLite 化）：
+#   "sqlite" → Runtime DB 的 download_tasks 表，单行事务 write-through（默认）
+#   "json"   → 旧路径 download_queue.json 全量重写（一键回滚开关，不改代码）
+# 内存字典（state.QUEUE）在两种模式下都是唯一工作副本与读取面，区别只在
+# 「怎么存」；sqlite 模式下 DB 不可用自动回落 json 路径（见 queue._persist）。
+QUEUE_STORE = os.environ.get("TG_QUEUE_STORE", "sqlite").strip().lower() or "sqlite"
 
 # Telethon 的请求没有读超时：代理节点卡住时 get_messages 等请求会永久挂起，
 # 把信号量槽位占满、整条队列堵死。取消息步骤必须加外部超时。

@@ -26,6 +26,8 @@ from . import notify
 from . import download
 from . import naming
 from . import stats
+from . import runtime_db
+from . import config
 from .config import (
     AUTO_RETRY_BASE_DELAY,
     AUTO_RETRY_MAX_DELAY,
@@ -111,7 +113,7 @@ async def queue_del_task(index=None, record_id=None):
         state.QUEUE["tasks"] = [
             r for r in state.QUEUE["tasks"] if r.get("id") != record["id"]
         ]
-        save_queue(state.QUEUE)
+        _save_after_mutation(record, "delete")
     # 台账事件：取消在途 → CANCELLED；删排队中的 → REMOVED(manual)
     stats.emit_event(
         "CANCELLED" if cancelled else "REMOVED",
@@ -138,7 +140,11 @@ def is_retry_command(text):
 
 
 def load_queue(path=None):
-    """读取队列文件，返回 {"tasks": [...], "retry": [...]}；缺失/损坏返回空。"""
+    """读取队列文件，返回 {"tasks": [...], "retry": [...]}；缺失/损坏返回空。
+
+    仅 json 模式、DB 未就绪回落与一次性导入路径使用；启动装载入口是
+    load_queue_any。
+    """
     path = path or QUEUE_FILE
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -154,8 +160,82 @@ def load_queue(path=None):
         return {"tasks": [], "retry": []}
 
 
+def _archive_legacy_json(imported):
+    """把旧 download_queue.json 改名 .imported 保留（绝不删除，先例：
+    listen_state.json → .migrated）。imported=True 记 INFO、False 记 WARNING
+    （DB 有行时的冲突归档）。改名失败只告警，不影响装载。"""
+    if not os.path.exists(QUEUE_FILE):
+        return
+    archive = QUEUE_FILE + ".imported"
+    try:
+        os.replace(QUEUE_FILE, archive)
+    except OSError as e:
+        logger.warning(f"旧下载队列 JSON 归档失败（原样保留）：{e}")
+        return
+    try:
+        with open(archive, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        n_tasks = len(data.get("tasks") or [])
+        n_retry = len(data.get("retry") or [])
+    except Exception:
+        n_tasks = n_retry = -1
+    if imported:
+        logger.info(
+            f"🗄 旧下载队列 JSON 已导入并归档：tasks {n_tasks} / "
+            f"retry {n_retry} → {archive}")
+    else:
+        logger.warning(
+            f"🗄 download_tasks 表已有数据，忽略并归档旧队列 JSON"
+            f"（tasks {n_tasks} / retry {n_retry}）→ {archive}")
+
+
+def load_queue_any():
+    """启动装载入口（任务书 §7.2 决策树）。
+
+    sqlite 模式优先 DB：表有行 → DB 是权威，旧 JSON 归档（冲突 WARNING）；
+    表空 → 旧 JSON 非空则一次性导入（seq 按列表顺序、字段原样无损）后改名
+    .imported，导入失败回落 JSON 模式运行。json 模式 / DB 未就绪 / DB 读失败
+    → 沿用 load_queue() 读文件。返回 {"tasks": [...], "retry": [...]}，
+    记录不带任何 __ 前缀的装载元字段。
+    """
+    if config.QUEUE_STORE != "sqlite" or not state.RUNTIME_DB_READY:
+        return load_queue()
+    try:
+        rows = runtime_db.queue_load_all()
+    except runtime_db.DbUnavailable as e:
+        logger.warning(f"🗄 下载队列 DB 装载失败，本次回落 JSON 模式：{e}")
+        return load_queue()
+    if rows:
+        _archive_legacy_json(imported=False)
+        loaded = {"tasks": [], "retry": []}
+        for row in sorted(rows, key=lambda r: r.get("__seq", 0)):
+            rec = {k: v for k, v in row.items() if not str(k).startswith("__")}
+            bucket = "retry" if row.get("__state") == "RETRY" else "tasks"
+            loaded[bucket].append(rec)
+        return loaded
+    # 表空：一次性导入旧 JSON（历史任务不补发台账事件）
+    legacy = load_queue()
+    if legacy["tasks"] or legacy["retry"]:
+        try:
+            for rec in legacy["tasks"]:
+                runtime_db.queue_insert(rec, "QUEUED")
+            for rec in legacy["retry"]:
+                runtime_db.queue_insert(rec, "RETRY")
+        except Exception as e:
+            logger.warning(
+                f"🗄 旧下载队列导入失败（JSON 原样保留，本次按 JSON 模式"
+                f"运行，重启重试）：{type(e).__name__}: {e}")
+            return legacy
+        _archive_legacy_json(imported=True)
+        return legacy
+    if os.path.exists(QUEUE_FILE + ".imported"):
+        logger.info("🗄 旧下载队列此前已导入（.imported 在档），队列为空")
+    return legacy
+
+
 def save_queue(queue, path=None):
-    """原子写入队列文件（temp + os.replace）。"""
+    """原子写入队列文件（temp + os.replace）。**仅 json 模式与迁移导入路径
+    使用**；sqlite 模式的持久化走 _save_after_mutation 的单行事务。"""
     path = path or QUEUE_FILE
     try:
         temp_path = path + ".tmp"
@@ -164,6 +244,45 @@ def save_queue(queue, path=None):
         os.replace(temp_path, path)
     except Exception as e:
         logger.warning(f"保存下载队列失败：{e}")
+
+
+def _save_after_mutation(record, op):
+    """队列突变点统一持久化出口（任务书 §6：sqlite / json 双模式）。
+
+    内存字典（state.QUEUE）永远是权威工作副本：先由纯数据函数改内存，
+    这里只负责「怎么存」。sqlite 模式（QUEUE_STORE=sqlite 且 RUNTIME_DB_READY）
+    按 op 单行事务 write-through；json 模式 / DB 未就绪沿用 save_queue 全量
+    落盘。DB 写失败（DbUnavailable）→ 仅 WARNING：与 JSON 时代「save 失败
+    仅告警」逐字同构——内存为准、不回滚、不重试到死、绝不抛给下载链路；
+    也不临时回落 save_queue（防 JSON 与 DB 各存半套的分裂状态）。
+    op ∈ {"insert", "to_retry", "update_retry", "delete"}。
+    """
+    if config.QUEUE_STORE == "sqlite" and state.RUNTIME_DB_READY:
+        try:
+            if op == "insert":
+                runtime_db.queue_insert(record, "QUEUED")
+            elif op == "to_retry":
+                runtime_db.queue_move_to_retry(
+                    record["id"], record.get("attempts", 0),
+                    record.get("next_retry_at"))
+            elif op == "update_retry":
+                runtime_db.queue_update_retry(
+                    record["id"], record.get("attempts", 0),
+                    record.get("next_retry_at"))
+            elif op == "delete":
+                runtime_db.queue_delete(record["id"])
+            else:
+                logger.warning(f"未知队列持久化操作（已跳过落库）：{op}")
+                return
+        except runtime_db.DbUnavailable as e:
+            logger.warning(
+                f"🗄 下载队列持久化失败（本次变更以内存为准，可能未落盘）：{e}")
+            return
+        except Exception as e:
+            logger.warning(
+                f"🗄 下载队列持久化异常（内存为准）：{type(e).__name__}: {e}")
+            return
+    save_queue(state.QUEUE)
 
 
 def queue_enqueue(queue, record):
@@ -383,7 +502,7 @@ async def enqueue_and_start(record, src=None):
         # queue_enqueue 返回带 id 的副本，执行必须用这份副本，
         # 否则 execute_queued_task 按 id 收尾时对不上队列里的记录。
         record = queue_enqueue(state.QUEUE, record)
-        save_queue(state.QUEUE)
+        _save_after_mutation(record, "insert")
     # 台账事件：这里是媒体与 url 任务唯一的入队咽喉——白名单中转的
     # 「源消息→转发副本」也只在这里入队一次，天然保证一个逻辑任务一个
     # task_id（RECEIVED 仅媒体任务有，src 区分 收藏/中转/监听 供输入侧拆分）。
@@ -537,18 +656,21 @@ async def execute_queued_task(record):
                         r for r in state.QUEUE["tasks"]
                         if r.get("id") != record["id"]
                     ]
+                _save_after_mutation(record, "delete")
             else:
                 if in_retry:
                     queue_retry_failed(state.QUEUE, record)
                 else:
                     queue_fail_to_retry(state.QUEUE, record)
+                # 原位累加（已在 retry）不动列表位置；首败转 retry 追加到尾部
+                _save_after_mutation(
+                    record, "update_retry" if in_retry else "to_retry")
                 # 失败尝试单独计次：SUCCESS/REMOVED/CANCELLED 由各自发点发，
                 # 这里只发 RETRY（次数）+ FAILED（任务停在待重试的终态）
                 stats.emit_event("RETRY", task_id=record["id"],
                                  attempts=record.get("attempts", 0))
                 stats.emit_event("FAILED", task_id=record["id"],
                                  label=record.get("label"))
-            save_queue(state.QUEUE)
     finally:
         state.EXECUTING.discard(record["id"])
         clear_trace()

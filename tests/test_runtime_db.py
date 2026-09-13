@@ -648,7 +648,8 @@ class V3MigrationTest(unittest.TestCase):
 
     def test_v2_migrates_to_v3(self):
         self.assertTrue(runtime_db.init_db(self.path))
-        self.assertEqual(runtime_db.get_schema_version(), 3)
+        # v4 起目标版本是 4（+download_tasks）；v2→v3 的 chain/origin 步骤仍在此跑
+        self.assertEqual(runtime_db.get_schema_version(), 4)
         # 旧行归 listen 链；wl 链无游标
         self.assertEqual(
             runtime_db.get_listener_checkpoint(111, chain="listen"), 500)
@@ -662,7 +663,7 @@ class V3MigrationTest(unittest.TestCase):
     def test_migration_idempotent(self):
         self.assertTrue(runtime_db.init_db(self.path))
         self.assertTrue(runtime_db.init_db(self.path))
-        self.assertEqual(runtime_db.get_schema_version(), 3)
+        self.assertEqual(runtime_db.get_schema_version(), 4)
         self.assertEqual(
             runtime_db.get_listener_checkpoint(111, chain="listen"), 500)
 

@@ -175,6 +175,34 @@ _SCHEMA = (
     CREATE INDEX IF NOT EXISTS idx_listener_follow_due
     ON listener_follows (status, last_checked_at)
     """,
+    # ============================================================
+    # 下载队列持久化（2026-09-13，任务书：下载队列 SQLite 化）。
+    # 替代 runtime/download_queue.json 的「每次变更全量重写」：单行事务
+    # write-through，内存字典（state.QUEUE）仍是唯一工作副本与读取面。
+    # state 只有 QUEUED/RETRY 两态（终态即删行）——下载任务的执行是进程内的，
+    # 在途判定走内存 EXECUTING，不引入 listener 的 PROCESSING/租约。
+    # seq 是全局单调序号：装载时 ORDER BY seq 还原 tasks/retry 的列表顺序
+    # （展示与 /queue 3、/retry del 2 的序号语义都建立在它上面）。
+    # 除固定列外的一切字段（含未来新增的未知字段）都装 payload JSON，
+    # round-trip 必须逐字段无损。
+    # ============================================================
+    """
+    CREATE TABLE IF NOT EXISTS download_tasks (
+        id            TEXT PRIMARY KEY,
+        kind          TEXT NOT NULL,
+        state         TEXT NOT NULL,
+        seq           INTEGER NOT NULL,
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        next_retry_at REAL,
+        enqueued_at   INTEGER NOT NULL,
+        payload       TEXT NOT NULL
+    )
+    """,
+    # 装载顺序 + 启动日志的 count 查询都按 state 过滤
+    """
+    CREATE INDEX IF NOT EXISTS idx_download_tasks_state
+    ON download_tasks (state, seq)
+    """,
 )
 
 # SQLITE_BUSY / SQLITE_LOCKED 的典型文案（只用于判定是否值得重试）
@@ -458,6 +486,11 @@ def migrate() -> int:
         # v3 形状，这里探测到列已存在即为 no-op。
         _migrate_v3()
         logger.info("🗄 Runtime DB 迁移：v3（checkpoints.chain + tasks.origin）")
+    if version < 4:
+        # v3 → v4：新增 download_tasks（下载队列持久化）。纯建表，没有数据
+        # 迁移——上面的 CREATE IF NOT EXISTS 已覆盖；旧队列 JSON 由 queue.py
+        # 的启动导入负责（表空 + JSON 非空 → 一次性导入）。
+        logger.info("🗄 Runtime DB 迁移：v4（+ download_tasks 下载队列）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -1121,3 +1154,121 @@ def count_listener_follows(status=None):
             c, "SELECT COUNT(*) FROM listener_follows WHERE status=?",
             (status,)).fetchone(), "统计关注")
     return int(row[0])
+
+
+# ============================================================
+# 下载队列持久化（2026-09-13，任务书：下载队列 SQLite 化）
+# ============================================================
+# 内存字典（state.QUEUE）是唯一工作副本与读取面；本组函数只负责
+# write-through 持久化与启动装载。全部单行短事务，复用 _write/_read 的
+# BUSY 有限重试；DB 未初始化时抛 DbUnavailable——降级决策（回落 JSON）
+# 在 queue.py，本层绝不静默吞错。
+_QUEUE_FIXED_COLUMNS = ("id", "kind", "attempts", "next_retry_at")
+
+
+def _queue_payload(record):
+    """记录 → payload JSON：固定列之外的一切字段原样进 payload。"""
+    payload = {k: v for k, v in record.items() if k not in _QUEUE_FIXED_COLUMNS}
+    return _dumps(payload)
+
+
+def _queue_row_to_record(row):
+    """行 → 队列记录 dict：payload 展开平铺，列值覆盖 payload 同名字段，
+    另带 __state/__seq 供装载方分桶排序（QUEUED→tasks / RETRY→retry）。
+    payload 不是合法 JSON 或不是对象 → 抛 ValueError（queue_load_all 据此
+    跳过坏行），绝不把坏行洗成一条空记录混进队列。"""
+    raw = row["payload"]
+    try:
+        payload = json.loads(raw) if raw else {}
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"payload 不是合法 JSON：{e}") from e
+    if not isinstance(payload, dict):
+        raise ValueError(f"payload 不是对象（{type(payload).__name__}）")
+    rec = dict(payload)
+    rec["id"] = row["id"]
+    rec["kind"] = row["kind"]
+    rec["attempts"] = int(row["attempts"] or 0)
+    rec["next_retry_at"] = row["next_retry_at"]
+    rec["__state"] = row["state"]
+    rec["__seq"] = row["seq"]
+    return rec
+
+
+def queue_load_all():
+    """全部队列行按 seq 排序返回；坏 payload 行跳过 + WARNING（不崩装载）。"""
+
+    def read(conn):
+        out = []
+        for row in _execute(
+                conn, "SELECT id, kind, state, seq, attempts, next_retry_at, "
+                      "payload FROM download_tasks ORDER BY seq").fetchall():
+            try:
+                out.append(_queue_row_to_record(row))
+            except Exception as e:   # payload 展开异常等：一行坏不拖垮全部
+                logger.warning(
+                    f"🗄 下载队列坏行已跳过（id={row['id']}）：{e}")
+        return out
+
+    return _read(read, "装载下载队列")
+
+
+def _queue_max_seq(conn):
+    row = _execute(conn, "SELECT MAX(seq) FROM download_tasks").fetchone()
+    return int(row[0] or 0)
+
+
+def queue_insert(record, state="QUEUED", now=None):
+    """入队 write-through：seq = MAX(seq)+1（追加到该列表尾部）。"""
+    def do(conn):
+        _execute(conn,
+                 "INSERT INTO download_tasks(id, kind, state, seq, attempts, "
+                 "next_retry_at, enqueued_at, payload) "
+                 "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                 (record["id"], record.get("kind"), state,
+                  _queue_max_seq(conn) + 1, int(record.get("attempts", 0)),
+                  record.get("next_retry_at"), _now(now),
+                  _queue_payload(record)))
+    _write(do, f"下载队列入库（{record.get('id', '?')[:8]}）")
+
+
+def queue_move_to_retry(record_id, attempts, next_retry_at):
+    """fail_to_retry 对应：转 RETRY、累加次数、记退避到期、seq 追加到 retry 尾。"""
+    def do(conn):
+        _execute(conn,
+                 "UPDATE download_tasks SET state='RETRY', attempts=?, "
+                 "next_retry_at=?, seq=? WHERE id=?",
+                 (int(attempts), next_retry_at,
+                  _queue_max_seq(conn) + 1, record_id))
+    _write(do, f"下载队列转待重试（{record_id[:8]}）")
+
+
+def queue_update_retry(record_id, attempts, next_retry_at):
+    """retry_failed 对应：原位累加——只动 attempts/next_retry_at，**不动 seq**。"""
+    _write(lambda conn: _execute(
+        conn,
+        "UPDATE download_tasks SET attempts=?, next_retry_at=? WHERE id=?",
+        (int(attempts), next_retry_at, record_id)),
+        f"下载队列重试累加（{record_id[:8]}）")
+
+
+def queue_delete(record_id):
+    """成功/移除对应：按 id 删行。行不存在不报错（幂等）。"""
+    _write(lambda conn: _execute(
+        conn, "DELETE FROM download_tasks WHERE id=?", (record_id,)),
+        f"下载队列删行（{record_id[:8]}）")
+
+
+def queue_count():
+    """{"queued": n, "retry": m}（键小写，任务书 §5 契约）：启动日志与
+    迁移导入的判定用。state 列存大写 'QUEUED'/'RETRY'，这里归一。"""
+    def read(conn):
+        counts = {"queued": 0, "retry": 0}
+        for row in _execute(
+                conn, "SELECT state, COUNT(*) FROM download_tasks "
+                      "GROUP BY state").fetchall():
+            key = str(row[0] or "").strip().lower()
+            if key in counts:
+                counts[key] = int(row[1])
+        return counts
+
+    return _read(read, "统计下载队列")

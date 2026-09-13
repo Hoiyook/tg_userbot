@@ -5,10 +5,14 @@ build_main_menu_text 为菜单头部；各 *_menu_buttons 依运行态 state.QUE
 state.WHITELIST_CHATS 在**调用时**读取（菜单每次展示都取最新状态）。
 Button 为 Telethon 类型（telethon.Button），import 期无副作用。
 """
+import os
+
 from telethon import Button
 
 from . import state
 from . import config
+from . import shell
+from . import upload
 from .config import DOWNLOAD_CONCURRENCY_MAX, LOG_RETENTION_DAYS, MENU_ACTIONS
 
 
@@ -86,7 +90,9 @@ def main_menu_buttons():
         # 用户必须能明显区分两套系统）
         [Button.inline("📡 标签监听", encode_menu_data("listen")),
          Button.inline("🌐 Chrome 任务", encode_menu_data("chrome_tasks"))],
-        [Button.inline("📐 SQL模板", encode_menu_data("sqlt"))],
+        [Button.inline("📐 SQL模板", encode_menu_data("sqlt")),
+         Button.inline("🖥 命令行", encode_menu_data("sh"))],
+        [Button.inline("⬆️ 上传文件", encode_menu_data("up"))],
     ]
 
 
@@ -288,3 +294,39 @@ def thread_menu_buttons():
     ]
     rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
     return rows
+
+
+def sh_menu_buttons():
+    """🖥 命令行视图：预设命令（shell.PRESET_COMMANDS）+ 自定义输入 + 返回。"""
+    rows = [[Button.inline(label, encode_menu_data("sh_run", cmd))
+             for cmd, label in shell.PRESET_COMMANDS.items()]]
+    rows.append(
+        [Button.inline("✏️ 自定义命令", encode_menu_data("sh_input"))])
+    rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
+    return rows
+
+
+def up_menu_buttons(candidates):
+    """⬆️ 上传视图：文件按钮只带序号（candidates 已由调用方快照进
+    state.UP_CANDIDATES），路径放不进 64 字节回调数据。纯函数。"""
+    rows = []
+    for i, path in enumerate(candidates):
+        rows.append([Button.inline(
+            f"📄 {os.path.basename(path)}",
+            encode_menu_data("up_file", str(i)))])
+    rows.append([Button.inline("✏️ 输入路径", encode_menu_data("up_input"))])
+    rows.append([
+        Button.inline("🔄 刷新", encode_menu_data("up")),
+        Button.inline("🔙 返回主菜单", encode_menu_data("home")),
+    ])
+    return rows
+
+
+def up_view_text():
+    """⬆️ 上传视图正文：从哪找文件 + 当前目录。"""
+    return (
+        "⬆️ 上传文件到收藏夹\n\n"
+        f"📂 当前目录：\n{state.SHELL_CWD}\n\n"
+        "点文件直接上传；或 ✏️ 输入路径（相对路径基于当前目录，"
+        "支持 ~，带空格不必加引号）。"
+    )

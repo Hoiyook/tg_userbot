@@ -119,5 +119,18 @@ SQL_TEMPLATES = {}
 # 与其余输入窗口互斥，由 bot.open_input_window 统一开关。
 SQLT_INPUT_UNTIL = 0.0
 
+# /sh 命令行执行器（shell.py）：持久化工作目录（runtime/shell_state.json），
+# 启动时 load_shell_cwd() 恢复；/sh cd 切换时更新并落盘。
+SHELL_CWD = config.REPO_ROOT
+
+# /sh 与 /up 的「✏️ 输入」窗口（bot 菜单）：等待下一条文本的截止时刻
+# （monotonic）。与其余输入窗口互斥，由 bot.open_input_window 统一开关；
+# sh 窗口的文本当命令执行，up 窗口的文本当文件路径。
+SHELL_INPUT_UNTIL = 0.0
+UP_INPUT_UNTIL = 0.0
+# ⬆️ 上传视图打开时快照的最近文件列表（menu.up_menu_buttons 生成，按钮只带
+# 序号——回调数据限 64 字节放不下长路径；upload.candidate_at 上传前校验）。
+UP_CANDIDATES = []
+
 # CD2 进程句柄（仅防 GC 回收后台进程，无人读取）
 _CD2_PROC = None

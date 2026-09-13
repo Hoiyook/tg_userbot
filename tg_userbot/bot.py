@@ -9,6 +9,7 @@ DOWNLOAD_CONCURRENCY / WHITELIST_CHATS）；共享服务函数分布在 text / m
 queue / thread / whitelist / cleanup / cd2 模块，以模块对象调用。
 """
 import asyncio
+import os
 import time
 
 from telethon import Button
@@ -34,6 +35,8 @@ from . import caption_filter
 from . import wl_scan
 from . import sql_templates
 from . import runtime_db
+from . import shell
+from . import upload
 from . import commands
 from . import config
 from .config import DONE_DEFAULT_LINES, REPORT_STATUS_PREFIX
@@ -48,6 +51,8 @@ BOT_COMMANDS = (
     ("stats", "台账：今日转发/解析/成功/失败汇总"),
     ("find", "按关键字查一条媒体的下落"),
     ("progress", "查看进行中下载的实时进度"),
+    ("up", "上传文件到收藏夹：/up <路径>"),
+    ("sh", "命令行：执行 shell 命令，如 /sh ls"),
     ("queue", "查看下载队列"),
     ("retry", "查看待重试列表"),
     ("done", "查看最近下载记录"),
@@ -91,7 +96,8 @@ def open_input_window(kind):
 
     kind：\"cookie\" / \"find\" / \"add\"|\"del\"|\"test\"（Caption 清洗）
     / \"listen_chat\"|\"listen_tag\"|\"listen_target\"（标签监听向导）
-    / \"wl_since\"（白名单回补）。
+    / \"wl_since\"（白名单回补）/ \"sqlt\"（新增 SQL 模板）
+    / \"sh\"（命令行：文本当命令执行）/ \"up\"（上传：文本当文件路径）。
     """
     state.COOKIE_INPUT_UNTIL = 0.0
     state.FIND_INPUT_UNTIL = 0.0
@@ -101,6 +107,8 @@ def open_input_window(kind):
     state.LISTEN_INPUT_STEP = ""
     state.WL_INPUT_UNTIL = 0.0
     state.SQLT_INPUT_UNTIL = 0.0
+    state.SHELL_INPUT_UNTIL = 0.0
+    state.UP_INPUT_UNTIL = 0.0
     if kind == "cookie":
         state.COOKIE_INPUT_UNTIL = (
             time.monotonic() + config.COOKIE_INPUT_WINDOW_SECONDS
@@ -122,6 +130,16 @@ def open_input_window(kind):
     elif kind == "sqlt":
         # 「➕ 新增模板」窗口：一条文本 = 「<名字> <SQL>」（同名即覆盖）
         state.SQLT_INPUT_UNTIL = (
+            time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
+        )
+    elif kind == "sh":
+        # 「✏️ 自定义命令」窗口：一条文本 = 一条 shell 命令
+        state.SHELL_INPUT_UNTIL = (
+            time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
+        )
+    elif kind == "up":
+        # 「✏️ 输入路径」窗口：一条文本 = 一个文件路径
+        state.UP_INPUT_UNTIL = (
             time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
         )
     else:
@@ -203,6 +221,57 @@ async def handle_menu_action(action, arg, event):
             [Button.inline("🔙 返回模板", menu.encode_menu_data("sqlt"))],
             [Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
         ])
+    if action == "sh":
+        return shell.sh_view_text(), menu.sh_menu_buttons()
+    if action == "sh_run":
+        # 预设命令按钮：执行后结果拼回视图，按钮保留可连续执行
+        cmd = shell.PRESET_COMMANDS.get(arg or "")
+        if not cmd:
+            return "❌ 未知预设命令", menu.sh_menu_buttons()
+        out = await shell.command_reply(f"/sh {cmd}")
+        return (f"{out}\n\n──────\n\n{shell.sh_view_text()}",
+                menu.sh_menu_buttons())
+    if action == "sh_input":
+        open_input_window("sh")
+        return (
+            "✏️ 自定义命令\n\n"
+            "请发送一条 shell 命令（不必带 /sh 前缀）。\n"
+            "例：ls -la /Volumes/V1/downloads\n\n"
+            f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "发送 / 开头的命令可取消。",
+            menu.back_home_buttons(),
+        )
+    if action == "up":
+        # 打开视图这一刻快照最近文件：按钮只带序号，路径放不进回调数据
+        state.UP_CANDIDATES = upload.recent_files(state.SHELL_CWD)
+        return (menu.up_view_text(),
+                menu.up_menu_buttons(state.UP_CANDIDATES))
+    if action == "up_input":
+        open_input_window("up")
+        return (
+            "✏️ 输入路径上传\n\n"
+            "请发送文件路径（相对路径基于 /sh 工作目录，支持 ~，"
+            "带空格不必加引号）。\n\n"
+            f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "发送 / 开头的命令可取消。",
+            menu.back_home_buttons(),
+        )
+    if action == "up_file":
+        path, err = upload.candidate_at(arg)
+        if err:
+            return err, menu.up_menu_buttons(state.UP_CANDIDATES)
+        total = os.path.getsize(path)
+        logger.info(f"🤖 bot 菜单 /up：{path}")
+
+        async def _edit(text):
+            await event.edit(text)
+
+        await event.edit(upload.progress_text(path, 0, total))
+        ok, final = await upload.upload_with_progress(
+            state.client, path, _edit)
+        buttons = (menu.back_home_buttons() if ok
+                   else menu.up_menu_buttons(state.UP_CANDIDATES))
+        return final, buttons
     if action == "wl_add":
         if arg is None:
             return (
@@ -454,12 +523,14 @@ async def handle_menu_action(action, arg, event):
     if action == "retry_del":
         async with state.QUEUE_LOCK:
             before = len(state.QUEUE["retry"])
+            removed = next(
+                (r for r in state.QUEUE["retry"] if r.get("id") == arg), None)
             state.QUEUE["retry"] = [
                 r for r in state.QUEUE["retry"] if r.get("id") != arg
             ]
             removed_any = len(state.QUEUE["retry"]) != before
             if removed_any:
-                queue.save_queue(state.QUEUE)
+                queue._save_after_mutation(removed, "delete")
         return (
             ("✅ 已从待重试列表移除" if removed_any else "❌ 任务已不存在"),
             menu.back_home_buttons(),
@@ -545,6 +616,25 @@ async def bot_message_handler(event):
             return
         state.SQLT_INPUT_UNTIL = 0.0
 
+    # /sh 自定义命令窗口：一条文本 = 一条 shell 命令。注意**不能**用
+    # 「/ 开头即取消」的约定——绝对路径、/bin/ls 这样的命令本身就以 / 开头；
+    # 只有已注册命令（/status、/help…）才算取消。
+    if (state.SHELL_INPUT_UNTIL
+            and time.monotonic() < state.SHELL_INPUT_UNTIL):
+        if not _is_known_command(text):
+            state.SHELL_INPUT_UNTIL = 0.0
+            await _handle_sh_input(event, text)
+            return
+        state.SHELL_INPUT_UNTIL = 0.0
+
+    # /up 输入路径窗口：一条文本 = 一个文件路径（取消语义同上）。
+    if state.UP_INPUT_UNTIL and time.monotonic() < state.UP_INPUT_UNTIL:
+        if not _is_known_command(text):
+            state.UP_INPUT_UNTIL = 0.0
+            await _handle_up_input(event, text)
+            return
+        state.UP_INPUT_UNTIL = 0.0
+
     if from_id:
         chat_id, title = await whitelist.resolve_wl_target(
             state.bot_client, None, fwd
@@ -620,6 +710,53 @@ async def _handle_sqlt_input(event, text):
         await state.bot_client.send_message(
             state.MY_ID, sql_templates.list_text(),
             buttons=sql_templates.menu_buttons())
+
+
+def _is_known_command(text):
+    """是否已注册命令（/sh、/up 输入窗口的取消判据）。
+
+    不能用「/ 开头」判取消：绝对路径和 /bin/ls 这类输入本身以 / 开头。
+    按 BOT_COMMANDS 注册名 + help/start 判定（bot 对话能跑的就是这些）。
+    """
+    if not text.startswith("/"):
+        return False
+    head = text.split(None, 1)[0][1:].split("@")[0].lower()
+    return head in _KNOWN_COMMAND_NAMES
+
+
+_KNOWN_COMMAND_NAMES = frozenset(
+    [name for name, _ in BOT_COMMANDS] + ["help", "start"]
+)
+
+
+async def _handle_sh_input(event, text):
+    """命令行输入窗口的输入：一条文本 = 一条 shell 命令（/sh 同语义）。"""
+    await state.bot_client.send_message(
+        state.MY_ID, await shell.command_reply(f"/sh {text}"),
+        link_preview=False)
+
+
+async def _handle_up_input(event, text):
+    """上传输入窗口的输入：一条文本 = 一个文件路径（校验失败不传）。"""
+    path = upload.resolve_path(text)
+    ok, err = upload.validate_file(path)
+    if not ok:
+        await state.bot_client.send_message(state.MY_ID, err)
+        return
+    total = os.path.getsize(path)
+    logger.info(f"🤖 bot 菜单 /up：{path}")
+    status = await state.bot_client.send_message(
+        state.MY_ID, upload.progress_text(path, 0, total))
+
+    async def _update(progress):
+        try:
+            await status.edit(progress)
+        except Exception as e:
+            logger.warning(f"/up 进度更新失败（忽略）：{e}")
+
+    _done, final = await upload.upload_with_progress(
+        state.client, path, _update)
+    await status.edit(final)
 
 
 async def _handle_wl_since_input(event, text):

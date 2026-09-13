@@ -29,6 +29,7 @@ from . import wl_scan
 from . import queue
 from . import runtime_db
 from . import sql_templates
+from . import shell
 from . import reporter
 from . import stats
 from . import thread
@@ -1040,12 +1041,36 @@ async def main():
     caption_filter.load_caption_filter_config()
     listener.load_listen_config()
     sql_templates.load_sql_templates()
+    shell.load_shell_cwd()
     loaded = dedup.load_index()
     logger.info(f"🛡 去重索引已载入：{loaded} 条")
     state.WHITELIST_CHATS = whitelist.load_whitelist()
     state.DOWNLOAD_SEMAPHORE = AdjustableSemaphore(state.DOWNLOAD_CONCURRENCY)
     state.QUEUE_LOCK = asyncio.Lock()
-    state.QUEUE = queue.load_queue()
+    # Runtime DB：业务状态层（SQLite）。**必须在队列装载之前就绪**——
+    # load_queue_any 依 RUNTIME_DB_READY 决定走 download_tasks 表还是旧 JSON；
+    # 也必须在登录前就绪，后面的标签监听/Worker 启动都要用。初始化失败只
+    # 降级「DB 相关功能不工作」，绝不让整个 userbot 起不来。
+    if runtime_db.init_db():
+        state.RUNTIME_DB_READY = True
+        migrated = listener.migrate_legacy_state()
+        if migrated.get("chats") or migrated.get("tasks"):
+            logger.warning(
+                f"🗄 已从旧 listen_state.json 迁移：checkpoint {migrated['chats']} 个"
+                f" / 待续做任务 {migrated['tasks']} 条"
+                + (f"（跳过 {migrated['skipped']} 个已有游标）"
+                   if migrated.get("skipped") else "")
+                + ("，旧文件已改名 .migrated" if migrated.get("moved") else "")
+            )
+    else:
+        state.RUNTIME_DB_READY = False
+        logger.error(
+            "🗄 Runtime DB 不可用：标签监听不启动，下载队列回落 JSON 持久化"
+            "（其余功能不受影响）"
+        )
+    # 队列装载：sqlite 模式从 download_tasks 装载并一次性导入旧 JSON；
+    # json 模式 / DB 未就绪读 download_queue.json（见 queue.load_queue_any）
+    state.QUEUE = queue.load_queue_any()
     state.client.add_event_handler(new_message_handler, events.NewMessage())
 
     logger.info("=====================")
@@ -1088,25 +1113,7 @@ async def main():
     )
     logger.info("============================================")
 
-    # Runtime DB：标签监听的业务状态层（SQLite）。**必须在登录前就绪**，
-    # 后面的队列恢复/Worker 启动都要用。初始化失败只降级「标签监听不工作」，
-    # 绝不让整个 userbot 起不来。
-    if runtime_db.init_db():
-        state.RUNTIME_DB_READY = True
-        migrated = listener.migrate_legacy_state()
-        if migrated.get("chats") or migrated.get("tasks"):
-            logger.warning(
-                f"🗄 已从旧 listen_state.json 迁移：checkpoint {migrated['chats']} 个"
-                f" / 待续做任务 {migrated['tasks']} 条"
-                + (f"（跳过 {migrated['skipped']} 个已有游标）"
-                   if migrated.get("skipped") else "")
-                + ("，旧文件已改名 .migrated" if migrated.get("moved") else "")
-            )
-    else:
-        state.RUNTIME_DB_READY = False
-        logger.error(
-            "🗄 Runtime DB 不可用：标签监听本次不启动（下载等其余功能不受影响）"
-        )
+    # （Runtime DB 初始化已前移到队列装载之前——队列装载依赖 RUNTIME_DB_READY）
 
     await start_with_retry(state.client)
 

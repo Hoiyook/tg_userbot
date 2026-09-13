@@ -20,6 +20,7 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import state, config  # noqa: E402
 from tg_userbot import menu, text, thread, cleanup, cd2, whitelist, bot  # noqa: E402
+from tg_userbot import shell, upload as upload_mod  # noqa: E402
 
 
 class MenuDataCodecTest(unittest.TestCase):
@@ -975,3 +976,192 @@ class SqlTemplateMenuTest(unittest.TestCase):
 def menu_menu_buttons():
     from tg_userbot import sql_templates
     return sql_templates.menu_buttons()
+
+
+class ShUpMainMenuTest(unittest.TestCase):
+    """主菜单的 🖥 命令行 / ⬆️ 上传文件 入口与动作注册。"""
+
+    def test_main_menu_has_sh_and_up_entries(self):
+        labels = [(b.text, b.data)
+                  for row in menu.main_menu_buttons() for b in row]
+        texts = [t for t, _ in labels]
+        self.assertTrue(any("命令行" in t for t in texts))
+        self.assertTrue(any("上传文件" in t for t in texts))
+        actions = {menu.parse_menu_data(d)[0] for _, d in labels}
+        self.assertIn("sh", actions)
+        self.assertIn("up", actions)
+
+    def test_sh_up_actions_registered(self):
+        for action in ("sh", "sh_run", "sh_input",
+                       "up", "up_file", "up_input"):
+            self.assertIn(action, config.MENU_ACTIONS)
+
+
+class ShMenuViewTest(unittest.TestCase):
+    def test_preset_buttons_carry_command_keys(self):
+        rows = menu.sh_menu_buttons()
+        labels = [(b.text, b.data)
+                  for row in rows for b in row]
+        actions = [(menu.parse_menu_data(d)) for _, d in labels]
+        run_args = [arg for action, arg in actions if action == "sh_run"]
+        self.assertEqual(len(run_args), 3)
+        for arg in run_args:
+            self.assertIn(arg, shell.PRESET_COMMANDS)
+        self.assertTrue(any(action == "sh_input" for action, _ in actions))
+        self.assertTrue(any(action == "home" for action, _ in actions))
+
+
+class UpMenuViewTest(unittest.TestCase):
+    def test_file_buttons_carry_index(self):
+        rows = menu.up_menu_buttons(["/a/一.txt", "/a/二.bin"])
+        labels = [(b.text, b.data)
+                  for row in rows for b in row]
+        actions = [menu.parse_menu_data(d) for _, d in labels]
+        file_btns = [(arg, t) for (action, arg), (t, _) in
+                     zip(actions, labels) if action == "up_file"]
+        self.assertEqual(file_btns, [("0", "📄 一.txt"), ("1", "📄 二.bin")])
+        self.assertTrue(any(action == "up_input" for action, _ in actions))
+        self.assertTrue(any(action == "up" for action, _ in actions))
+        self.assertTrue(any(action == "home" for action, _ in actions))
+
+
+class ShUpMenuActionTest(unittest.IsolatedAsyncioTestCase):
+    """bot.handle_menu_action：sh / up / up_file 视图与上传动作。"""
+
+    async def asyncSetUp(self):
+        self.old = (state.MY_ID, state.SHELL_CWD, state.UP_CANDIDATES,
+                    state.SHELL_INPUT_UNTIL, state.UP_INPUT_UNTIL,
+                    state.client, state.bot_client)
+        state.MY_ID = 5452449426
+        state.SHELL_CWD = _TMP
+        state.UP_CANDIDATES = []
+        state.client = mock.MagicMock()
+        state.client.send_file = mock.AsyncMock()
+        state.bot_client = mock.MagicMock()
+        state.bot_client.send_message = mock.AsyncMock(
+            return_value=mock.MagicMock(edit=mock.AsyncMock()))
+        self._file = _make_file("menu_up.bin", b"456")
+
+    async def asyncTearDown(self):
+        (state.MY_ID, state.SHELL_CWD, state.UP_CANDIDATES,
+         state.SHELL_INPUT_UNTIL, state.UP_INPUT_UNTIL,
+         state.client, state.bot_client) = self.old
+
+    async def _press(self, action, arg=None, event=None):
+        return await bot.handle_menu_action(
+            action, arg, event or mock.MagicMock())
+
+    async def test_sh_view_shows_cwd_and_buttons(self):
+        text, buttons = await self._press("sh")
+        self.assertIn(state.SHELL_CWD, text)
+        flat = [menu.parse_menu_data(b.data) for row in buttons for b in row]
+        actions = {a for a, _ in flat}
+        self.assertIn("sh_run", actions)
+        self.assertIn("sh_input", actions)
+
+    async def test_up_view_snapshots_recent_files(self):
+        text, buttons = await self._press("up")
+        self.assertIn(state.SHELL_CWD, text)
+        self.assertEqual(
+            state.UP_CANDIDATES, upload_mod.recent_files(_TMP))
+        flat = [menu.parse_menu_data(b.data) for row in buttons for b in row]
+        self.assertIn("up_file", {a for a, _ in flat})
+
+    async def test_up_file_uploads_and_returns_receipt(self):
+        state.UP_CANDIDATES = [self._file]
+        # up_file 会原地编辑进度/回执：event.edit 必须是 async
+        event = mock.MagicMock()
+        event.edit = mock.AsyncMock()
+        text, _ = await self._press("up_file", "0", event=event)
+        state.client.send_file.assert_awaited_once()
+        self.assertEqual(state.client.send_file.await_args.args[0], "me")
+        self.assertIn("menu_up.bin", text)
+        self.assertIn("收藏夹", text)
+
+    async def test_up_file_stale_index_reports(self):
+        state.UP_CANDIDATES = [self._file]
+        text, _ = await self._press("up_file", "99")
+        self.assertIn("刷新", text)
+        state.client.send_file.assert_not_awaited()
+
+    async def test_sh_input_opens_window_closing_up(self):
+        await self._press("up_input")
+        self.assertGreater(state.UP_INPUT_UNTIL, 0)
+        await self._press("sh_input")
+        self.assertGreater(state.SHELL_INPUT_UNTIL, 0)
+        self.assertEqual(state.UP_INPUT_UNTIL, 0)
+
+    async def test_sh_window_runs_command(self):
+        state.SHELL_INPUT_UNTIL = time.monotonic() + 60
+        await bot.bot_message_handler(
+            _bot_event("echo menu-sh-ok"))
+        sent = state.bot_client.send_message.await_args_list
+        self.assertTrue(sent, "窗口文本应被当作命令执行并回复")
+        self.assertTrue(
+            any("menu-sh-ok" in str(c.kwargs.get("text") or
+                c.args[1] if len(c.args) > 1 else c.args[0])
+                for c in sent), sent)
+        self.assertEqual(state.SHELL_INPUT_UNTIL, 0.0)
+
+    async def test_slash_cancels_up_window(self):
+        state.UP_INPUT_UNTIL = time.monotonic() + 60
+        await bot.bot_message_handler(_bot_event("/help"))
+        self.assertEqual(state.UP_INPUT_UNTIL, 0.0)
+        state.client.send_file.assert_not_awaited()
+
+
+class ShUpInputWindowBotTest(unittest.IsolatedAsyncioTestCase):
+    """up 输入窗口：一条文本 = 文件路径，校验失败不上传。"""
+
+    async def asyncSetUp(self):
+        self.old = (state.MY_ID, state.SHELL_CWD, state.UP_INPUT_UNTIL,
+                    state.client, state.bot_client)
+        state.MY_ID = 5452449426
+        state.SHELL_CWD = _TMP
+        state.UP_INPUT_UNTIL = time.monotonic() + 60
+        state.client = mock.MagicMock()
+        state.client.send_file = mock.AsyncMock()
+        state.bot_client = mock.MagicMock()
+        state.bot_client.send_message = mock.AsyncMock(
+            return_value=mock.MagicMock(edit=mock.AsyncMock()))
+        self._file = _make_file("win_up.bin", b"789")
+
+    async def asyncTearDown(self):
+        (state.MY_ID, state.SHELL_CWD, state.UP_INPUT_UNTIL,
+         state.client, state.bot_client) = self.old
+
+    async def test_path_text_uploads(self):
+        await bot.bot_message_handler(_bot_event(self._file))
+        state.client.send_file.assert_awaited_once()
+        self.assertIn("win_up.bin",
+                      str(state.bot_client.send_message.await_args))
+
+    async def test_bad_path_reports_not_uploads(self):
+        await bot.bot_message_handler(_bot_event("/nonexistent_up_win_xyz"))
+        state.client.send_file.assert_not_awaited()
+        sent = str(state.bot_client.send_message.await_args)
+        self.assertIn("❌", sent)
+
+
+def _bot_event(text):
+    msg = mock.MagicMock()
+    msg.message = text
+    msg.fwd_from = None
+    ev = mock.MagicMock()
+    ev.out = False
+    ev.chat_id = state.MY_ID
+    ev.message = msg
+    # 窗口取消后文本会走 commands.handle_command 正常分发，需要 async reply
+    ev.reply = mock.AsyncMock()
+    return ev
+
+
+
+
+def _make_file(name, content=b"x", mtime=None):
+    path = os.path.join(_TMP, name)
+    with open(path, "wb") as f:
+        f.write(content)
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
