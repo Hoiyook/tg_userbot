@@ -38,6 +38,7 @@ import time
 
 from telethon.errors import (
     ChannelPrivateError,
+    ChatForwardsRestrictedError,
     ChatWriteForbiddenError,
     FloodWaitError,
     PeerIdInvalidError,
@@ -66,6 +67,7 @@ _LAST_SEND_AT = 0.0
 _PERMANENT_ERRORS = (
     ChatWriteForbiddenError,     # 无发送权限 / 被禁言
     ChannelPrivateError,         # 频道转私密 / 已被踢出
+    ChatForwardsRestrictedError, # 来源禁转（execute_task 有专门的直下回退）
     PeerIdInvalidError,          # 目标不存在 / 解析不到
     ValueError,                  # 目标 id 非法（我们自己的参数问题）
 )
@@ -309,13 +311,16 @@ async def execute_task(task):
             parent_caption = payload.get("parent_caption") or None
             source_name = payload.get("source_name") or None
             source_link = _source_link(messages[0], task["source_chat_id"])
+            # 台账输入侧来源随任务 origin 记账：wl 任务的副本算「中转」，
+            # 不再与用户手动转发混进「收藏」桶（listen 链行为不变）。
+            src = task.get("origin") or "listen"
             for copy in copies:
                 own_text = (getattr(copy, "message", "") or "").strip()
                 # 转发副本保留自己的说明；无文字的副本继承源侧读到的相册说明
                 # （否则相册里的图片会退化成 媒体类型_时间戳 命名）
                 cap = None if own_text else (caption or None)
                 try:
-                    await _enqueue_copy(copy, source_link, cap, "listen",
+                    await _enqueue_copy(copy, source_link, cap, src,
                                         parent_date, parent_caption,
                                         source_name)
                 except Exception as e:
@@ -331,6 +336,22 @@ async def execute_task(task):
     except asyncio.CancelledError:
         # 真取消（停服）：状态留给调用方 release_inflight 处理，原样上抛
         raise
+    except ChatForwardsRestrictedError as e:
+        # 来源禁转：永久错误。download=1 的收藏夹任务回退**直下原消息**——
+        # 媒体不丢，只丢收藏夹副本（白名单双通道规格 §6.1）。messages 在
+        # 上面的取消息步骤已拿到（禁转只可能发生在转发那一步）。
+        payload = task.get("payload") or {}
+        if task.get("target_type") == "saved_messages" and task.get("download"):
+            ok = await _fallback_direct_download(
+                task, messages, payload.get("source_name"))
+            err = ("来源禁转，已回退直下原消息（无收藏夹副本）"
+                   if ok else "来源禁转且直下回退也失败")
+            logger.warning(f"📡 任务 #{task_id} 来源禁转，已回退直下：{label}")
+        else:
+            err = f"{type(e).__name__}: {e}"
+            logger.error(f"📡 任务 #{task_id} 来源禁转（无回退语义）：{label}")
+        _safe(lambda: runtime_db.fail_listener_task(task_id, error=err))
+        return False
     except Exception as e:
         await _handle_failure(task, e)
         return False
@@ -362,6 +383,26 @@ def _safe(proc):
     except runtime_db.DbUnavailable as e:
         logger.error(f"📡 更新任务状态失败（租约到期后会恢复）：{e}")
         return None
+
+
+async def _fallback_direct_download(task, messages, source_name):
+    """来源禁转的回退：把**原消息**直接交给现有下载链路（不转发、无副本）。
+
+    enqueue_media 自带 dedup 与命名全链路；目录名用 payload 快照的
+    source_name（原消息没有 fwd_from 可解析，目录只能靠它）。
+    """
+    from . import app   # 函数内导入：与 _enqueue_copy 同理（顶层互相导入成环）
+    ok = True
+    for m in messages:
+        try:
+            await app.enqueue_media(
+                m, int(task["source_chat_id"]),
+                source_name or f"chat_{task['source_chat_id']}")
+        except Exception as e:
+            ok = False
+            logger.error(
+                f"📡 任务 #{task['id']} 直下回退失败（消息 {m.id}）：{e}")
+    return ok
 
 
 async def _handle_failure(task, exc):

@@ -36,6 +36,7 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from telethon.errors import (  # noqa: E402
     ChannelPrivateError,
+    ChatForwardsRestrictedError,
     ChatWriteForbiddenError,
     FloodWaitError,
     PeerIdInvalidError,
@@ -466,6 +467,87 @@ class MinIntervalTest(_WorkerTestCase):
 
     def tearDown(self):
         lw._LAST_SEND_AT = 0.0
+
+
+class WlOriginAndFallbackTest(_WorkerTestCase):
+    """origin=wl 任务：src 显式传 wl；来源禁转回退直下原消息（规格 §6.1）。"""
+
+    def _mk_wl_task(self, message_id=101, origin="wl"):
+        msg = FakeMessage(message_id, "标题")
+        state.client = FakeClient([msg])
+        rec = {
+            "message_id": message_id, "grouped_id": None,
+            "target_type": "saved_messages", "target_chat_id": None,
+            "download": 1,
+            "payload": {"member_ids": [message_id], "caption": "标题",
+                        "source_name": "测试频道"},
+        }
+        ids = runtime_db.enqueue_listener_tasks(SRC, [rec], origin=origin)
+        return runtime_db.get_listener_task(ids[0])
+
+    def _restricted(self):
+        # Telethon RPC 异常构造签名因版本而异，按本文件 _flood 先例用 __new__
+        return ChatForwardsRestrictedError.__new__(ChatForwardsRestrictedError)
+
+    def test_forwards_restricted_is_permanent(self):
+        self.assertEqual(lw.classify_error(self._restricted())[0], "permanent")
+
+    async def test_enqueue_copy_gets_task_origin_as_src(self):
+        task = self._mk_wl_task(origin="wl")
+        claimed = runtime_db.claim_listener_task()
+        ok = await lw.execute_task(claimed)
+        self.assertTrue(ok)
+        self.assertEqual(self.copies[0][3], "wl")
+
+    async def test_enqueue_copy_listen_task_keeps_listen_src(self):
+        task = self._mk_wl_task(origin="listen")
+        claimed = runtime_db.claim_listener_task()
+        ok = await lw.execute_task(claimed)
+        self.assertTrue(ok)
+        self.assertEqual(self.copies[0][3], "listen")
+
+    async def test_forwards_restricted_falls_back_direct(self):
+        task = self._mk_wl_task(origin="wl")
+        enqueued = []
+
+        async def fake_enqueue(message, chat_id, source_override, **kw):
+            enqueued.append((message.id, chat_id, source_override))
+
+        async def boom(*a, **kw):
+            raise self._restricted()
+        with mock.patch.object(lw, "_forward", boom), \
+                mock.patch("tg_userbot.app.enqueue_media", fake_enqueue):
+            ok = await lw.execute_task(runtime_db.claim_listener_task())
+        self.assertFalse(ok)                       # 任务算失败（无收藏夹副本）
+        self.assertEqual(enqueued, [(101, SRC, "测试频道")])
+        row = runtime_db.get_listener_task(task["id"])
+        self.assertEqual(row["status"], "FAILED")
+        self.assertIn("回退直下", row["last_error"])
+
+    async def test_forwards_restricted_chat_target_no_fallback(self):
+        msg = FakeMessage(102, "#a")
+        state.client = FakeClient([msg])
+        rec = {
+            "message_id": 102, "grouped_id": None,
+            "target_type": "chat", "target_chat_id": CHAT_A,
+            "download": 0, "payload": {"member_ids": [102], "caption": ""},
+        }
+        ids = runtime_db.enqueue_listener_tasks(SRC, [rec])
+        task = runtime_db.get_listener_task(ids[0])
+        enqueued = []
+
+        async def fake_enqueue(*a, **kw):
+            enqueued.append(a)
+
+        async def boom(*a, **kw):
+            raise self._restricted()
+        with mock.patch.object(lw, "_forward", boom), \
+                mock.patch("tg_userbot.app.enqueue_media", fake_enqueue):
+            ok = await lw.execute_task(runtime_db.claim_listener_task())
+        self.assertFalse(ok)
+        self.assertEqual(enqueued, [], "非 download 任务不回退直下")
+        self.assertEqual(
+            runtime_db.get_listener_task(task["id"])["status"], "FAILED")
 
 
 if __name__ == "__main__":
