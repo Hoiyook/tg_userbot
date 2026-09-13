@@ -382,6 +382,30 @@ class ReporterSupervisorTest(unittest.IsolatedAsyncioTestCase):
                 # 修好前：取消被吞、循环继续 → 这里会 TimeoutError
                 await asyncio.wait_for(task, timeout=2)
 
+    async def test_cancel_while_child_already_done_stops_supervisor(self):
+        """cancel 落在「子任务已 done」的 wait 上也必须真的停（2026-09-13 僵尸回归）。
+
+        _Quick.run() 没有任何 await：create_task 后瞬间完成。此时外层
+        task.cancel() 落在 _await_child_task 的 asyncio.wait 上，子任务已经
+        done——旧实现用 task.done() 区分「子任务死」与「自己被取消」，于是把
+        这次取消误判成前者、吞掉后无限重启（实测 discover 环境下循环 4398+
+        次不停）。新实现以 ChildCancelledError 结构性区分，此用例必须停。
+        """
+        runs = []
+
+        class _Quick:
+            async def run(self):
+                runs.append(1)          # 无 await：瞬间 done
+
+        with mock.patch.object(app, "REPORT_RESTART_DELAY_SECONDS", 0.01):
+            task = asyncio.create_task(app._reporter_supervisor(_Quick()))
+            await asyncio.sleep(0.05)   # 先跑过若干轮重启循环
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                # 修好前：取消被吞、循环继续 → 这里会 TimeoutError
+                await asyncio.wait_for(task, timeout=2)
+        self.assertGreaterEqual(len(runs), 2)
+
     async def test_returns_when_run_ends_normally_while_stopping(self):
         class _Idle:
             async def run(self):

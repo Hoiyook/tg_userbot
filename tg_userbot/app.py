@@ -229,6 +229,18 @@ async def _bot_keepalive():
             )
 
 
+class ChildCancelledError(asyncio.CancelledError):
+    """子任务被网络层取消（telethon 断线 cancel pending future）的专用标记。
+
+    `_await_child_task` 用它区分「子任务死了」与「调用方自己被取消（停服）」
+    ——两者在旧实现里都是裸 CancelledError，只能靠 `task.done()` 猜，而猜
+    会错：cancel 恰好落在「子任务已完成」的 wait 上时，旧 supervisor 把
+    外层取消误判成子任务死亡、吞掉后无限重启（2026-09-13 实测 discover
+    环境下 4398+ 次循环不停，任务成僵尸）。继承 CancelledError，外层代码
+    的 `except CancelledError` 语义不受影响。
+    """
+
+
 async def _await_child_task(task):
     """等子任务结束并原样抛出它的结局；**调用方被取消时不波及子任务**。
 
@@ -240,10 +252,14 @@ async def _await_child_task(task):
 
     ``asyncio.wait`` 只等它自己的内部 waiter，取消调用方不会波及子任务 ——
     判据这才立得住。与 ``netio.shielded`` 用的是同一个办法、同一个理由。
+
+    子任务以 cancelled 收场时抛 **ChildCancelledError**（裸 CancelledError
+    只可能是外层取消——``asyncio.wait`` 对子任务的取消是正常返回、不会往
+    上抛），调用方据此结构性分流，不再靠 task.done() 猜。
     """
     await asyncio.wait({task})
     if task.cancelled():
-        raise asyncio.CancelledError()
+        raise ChildCancelledError()
     exc = task.exception()
     if exc is not None:
         raise exc
@@ -270,28 +286,24 @@ async def _reporter_supervisor(instance):
         task = asyncio.create_task(instance.run())
         try:
             await _await_child_task(task)
+        except ChildCancelledError as e:
+            # 子任务被网络层取消（意外死亡）→ 重启。停服时不再重启，
+            # 且照旧以取消收场（重抛；ChildCancelledError 是其子类）。
+            if state.STOP_EVENT is not None and state.STOP_EVENT.is_set():
+                raise e
+            logger.error(
+                f"🤖 汇报任务被意外取消（非停服），{delay}s 后自动重启")
         except asyncio.CancelledError:
-            stopping = (state.STOP_EVENT is not None
-                        and state.STOP_EVENT.is_set())
+            # 裸取消只会是打给**本函数**的（停服，或外面直接 task.cancel()
+            # 这个守护任务）：cancel 可能落在 wait 上、子任务还在跑，收走它
+            # 再原样上抛——绝不吞掉，否则本任务就成了杀不掉的僵尸。
             if not task.done():
-                # 子任务还没结束就收到了取消 → 取消是打给**本函数**的（停服，
-                # 或外面直接 task.cancel() 这个守护任务）：把子任务一并收走，
-                # 然后**原样上抛**。
-                #
-                # 这里必须 raise，不能顺着往下走去重启：吞掉自己的取消会让
-                # 这个守护任务变成杀不掉的僵尸（外部 cancel 只有落在
-                # `asyncio.sleep(delay)` 那一行才生效）。判据能立住，全靠
-                # _await_child_task 用 asyncio.wait 而不是直接 await task。
                 task.cancel()
                 try:
                     await asyncio.wait({task})
                 except asyncio.CancelledError:
                     pass
-                raise
-            if stopping:
-                raise
-            logger.error(
-                f"🤖 汇报任务被意外取消（非停服），{delay}s 后自动重启")
+            raise
         except Exception:
             logger.exception(f"🤖 汇报任务异常结束，{delay}s 后自动重启")
         else:
