@@ -331,7 +331,9 @@ def _listener_task_stats(dates):
         from . import runtime_db
         since = int(datetime.combine(
             dates[0], datetime.min.time()).timestamp())
-        return runtime_db.get_listener_stats(since=since)
+        # 只统计 origin='listen'：📡 标签监听 分节不该把 wl（下载白名单
+        # 扫描/事件链）的任务算进来——那两链有自己的视图口径。
+        return runtime_db.get_listener_stats(since=since, origin="listen")
     except Exception:
         return None
 

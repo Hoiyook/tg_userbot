@@ -1290,9 +1290,10 @@ def view_text() -> str:
     else:
         lines.append("上轮扫描：尚未扫描")
     # 待执行/处理中/成败存量来自 SQLite（队列与 checkpoint 的真相所在），
-    # 读失败只影响这一行展示，绝不让视图整个报错。
+    # 读失败只影响这一行展示，绝不让视图整个报错。只统计 origin='listen'：
+    # 白名单双通道改造后 wl 链的任务有自己的 /wl 视图，不混进这里。
     try:
-        q = runtime_db.get_listener_stats()
+        q = runtime_db.get_listener_stats(origin="listen")
     except runtime_db.DbUnavailable:
         q = None
     if q and q["total"]:
