@@ -686,6 +686,12 @@ async def _fetch_new(chat_id, checkpoint):
     return await _complete_boundary_group(chat_id, msgs)
 
 
+# 公开别名：白名单扫描生产者（wl_scan）复用同一取消息路径（netio 收口、
+# 相册边界补齐都只有这一份实现）。
+fetch_newest_id = _fetch_newest_id
+fetch_new_messages = _fetch_new
+
+
 async def _complete_boundary_group(chat_id, msgs):
     """把被一轮条数上限切开的相册补完整。
 
@@ -795,6 +801,22 @@ def _build_tasks(chat_id, media, keys, download, caption, anchor, origin=None):
             "payload": dict(payload_base),
         })
     return out
+
+
+def build_saved_messages_task(chat_id, media, caption, origin=None):
+    """一个消息单元 → 收藏夹下载任务记录（白名单两条生产链共用）。
+
+    ``origin`` 的 source_name 缺失时兜底为**聊天标题**：来源禁转回退直下原
+    消息时副本不存在、没有 fwd_from 可解析，目录名只能靠 payload 里这个
+    字段；转发路径上它与副本 fwd_from 的解析结果一致，不冲突。
+    """
+    origin = dict(origin) if origin else {}
+    if not origin.get("source_name"):
+        origin["source_name"] = (
+            (state.WHITELIST_CHATS or {}).get(int(chat_id))
+            or f"chat_{int(chat_id)}")
+    return _build_tasks(chat_id, media, {("saved_messages", None)}, True,
+                        caption, min(m.id for m in media), origin)
 
 
 async def _scan_chat(chat_id, rules):

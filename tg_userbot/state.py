@@ -101,5 +101,14 @@ LISTEN_LAST_SCAN = None
 LISTEN_INPUT_UNTIL = 0.0
 LISTEN_INPUT_STEP = ""         # chat | tag | target
 
+# ============================================================
+# 下载白名单扫描生产者（wl_scan.py，白名单的停机补漏链）
+# ============================================================
+# 「⏪ 回补」输入窗口（/wl since 的菜单入口）：等待下一条文本的截止时刻
+# （monotonic）。与上面四个输入窗口互斥，由 bot.open_input_window 统一开关。
+WL_INPUT_UNTIL = 0.0
+# 白名单扫描最近一轮汇总快照（menu / reporter 只读展示），未扫过为 None。
+WL_LAST_SCAN = None
+
 # CD2 进程句柄（仅防 GC 回收后台进程，无人读取）
 _CD2_PROC = None
