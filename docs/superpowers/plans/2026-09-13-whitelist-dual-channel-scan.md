@@ -542,6 +542,9 @@ class WlScanTest(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(state, "RUNTIME_DB_READY", True),
             mock.patch.object(dedup, "should_skip",
                               lambda keys: (False, "")),
+            # 不让 FakeMsg（无 reply_to/fwd_from）走真实评论继承解析
+            mock.patch.object(wl_scan, "resolve_origin_snapshot",
+                              mock.AsyncMock(return_value=None)),
         ]
         for p in self._patches:
             p.start()
@@ -1118,13 +1121,16 @@ class WlOriginAndFallbackTest(unittest.IsolatedAsyncioTestCase):
         enqueued = []
 
         async def restricted(*a, **kw):
-            raise ChatForwardsRestrictedError()
+            # Telethon RPC 异常构造签名因版本而异，按本文件 _flood 先例用 __new__
+            raise ChatForwardsRestrictedError.__new__(
+                ChatForwardsRestrictedError)
 
         async def fake_enqueue(message, chat_id, source_override, **kw):
             enqueued.append((message.id, chat_id, source_override))
 
         async def boom(*a, **kw):
-            raise ChatForwardsRestrictedError()
+            raise ChatForwardsRestrictedError.__new__(
+                ChatForwardsRestrictedError)
         with mock.patch.object(lw, "_forward", boom), \
                 mock.patch("tg_userbot.app.enqueue_media", fake_enqueue), \
                 mock.patch.object(lw, "listener_fetch", self._fake_fetch):
@@ -1290,7 +1296,9 @@ class ParseWlSinceScanTest(unittest.TestCase):
     def test_parse_scan(self):
         self.assertEqual(whitelist.parse_wl_command("/wl scan"),
                          ("scan", None))
-        self.assertIsNone(whitelist.parse_wl_command("/wl scans"))
+        # 无法识别的子命令落 invalid（parse 只对非 /wl 文本返回 None）
+        self.assertEqual(whitelist.parse_wl_command("/wl scans"),
+                         ("invalid", None))
 ```
 
 1b. tests/test_commands.py 追加（沿用该文件的 FakeEvent 模式；需 init DB）：
@@ -1319,8 +1327,10 @@ class WlSinceScanCommandTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_scan_replies_summary(self):
         ev = FakeEvent()
+        empty = {"chats": 0, "failed_chats": 0, "scanned": 0, "created": 0,
+                 "duplicate": 0, "capped": 0}
         with mock.patch.object(wl_scan, "scan_all",
-                               mock.AsyncMock(return_value={"chats": 0})):
+                               mock.AsyncMock(return_value=dict(empty))):
             handled = await commands.handle_command(ev, "/wl scan")
         self.assertTrue(handled)
         self.assertIn("白名单扫描", ev.replies[0])
