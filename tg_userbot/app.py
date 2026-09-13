@@ -31,6 +31,7 @@ from . import runtime_db
 from . import sql_templates
 from . import shell
 from . import reporter
+from . import history
 from . import stats
 from . import thread
 from . import whitelist
@@ -1042,15 +1043,9 @@ async def main():
     listener.load_listen_config()
     sql_templates.load_sql_templates()
     shell.load_shell_cwd()
-    loaded = dedup.load_index()
-    logger.info(f"🛡 去重索引已载入：{loaded} 条")
-    state.WHITELIST_CHATS = whitelist.load_whitelist()
-    state.DOWNLOAD_SEMAPHORE = AdjustableSemaphore(state.DOWNLOAD_CONCURRENCY)
-    state.QUEUE_LOCK = asyncio.Lock()
-    # Runtime DB：业务状态层（SQLite）。**必须在队列装载之前就绪**——
-    # load_queue_any 依 RUNTIME_DB_READY 决定走 download_tasks 表还是旧 JSON；
-    # 也必须在登录前就绪，后面的标签监听/Worker 启动都要用。初始化失败只
-    # 降级「DB 相关功能不工作」，绝不让整个 userbot 起不来。
+    # Runtime DB：业务状态层（SQLite）。**必须在队列/去重索引装载之前
+    # 就绪**——load_queue_any / dedup.load_index 依它选 DB 或文件模式；
+    # 也必须在登录前就绪。初始化失败只降级，绝不让 userbot 起不来。
     if runtime_db.init_db():
         state.RUNTIME_DB_READY = True
         migrated = listener.migrate_legacy_state()
@@ -1065,9 +1060,16 @@ async def main():
     else:
         state.RUNTIME_DB_READY = False
         logger.error(
-            "🗄 Runtime DB 不可用：标签监听不启动，下载队列回落 JSON 持久化"
-            "（其余功能不受影响）"
+            "🗄 Runtime DB 不可用：标签监听不启动，队列/历史/去重索引回落"
+            "文件持久化（其余功能不受影响）"
         )
+    loaded = dedup.load_index()
+    logger.info(f"🛡 去重索引已载入：{loaded} 条")
+    state.WHITELIST_CHATS = whitelist.load_whitelist()
+    state.DOWNLOAD_SEMAPHORE = AdjustableSemaphore(state.DOWNLOAD_CONCURRENCY)
+    state.QUEUE_LOCK = asyncio.Lock()
+    # （Runtime DB 初始化已前移到去重索引装载之前——队列/历史/去重装载都
+    # 依赖它选 DB 或文件模式。）
     # 队列装载：sqlite 模式从 download_tasks 装载并一次性导入旧 JSON；
     # json 模式 / DB 未就绪读 download_queue.json（见 queue.load_queue_any）
     state.QUEUE = queue.load_queue_any()
@@ -1141,6 +1143,7 @@ async def main():
 
     # 任务事件日志裁剪（台账按 task_id 重建的数据源，保尾部控制体积）
     stats.migrate_and_trim_events()
+    history.migrate_history_to_db()
 
     # Chrome Agent 结果通知轮询（读 chrome_tasks.json 终态 → 通知收藏夹）
     asyncio.create_task(chrome_client.notify_loop())

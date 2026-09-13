@@ -206,7 +206,7 @@ class TestSchemaV3ToV4(QueueDbTestBase):
 
     def test_v3_migrates_to_v4(self):
         self.assertTrue(runtime_db.init_db(self.path))
-        self.assertEqual(runtime_db.get_schema_version(), 5)
+        self.assertEqual(runtime_db.get_schema_version(), 6)
         self.assertEqual(runtime_db.queue_count(),
                          {"queued": 0, "retry": 0})    # 空表可用
         # listener 数据在升级中原样保留
@@ -217,7 +217,7 @@ class TestSchemaV3ToV4(QueueDbTestBase):
     def test_migration_idempotent(self):
         self.assertTrue(runtime_db.init_db(self.path))
         self.assertTrue(runtime_db.init_db(self.path))
-        self.assertEqual(runtime_db.get_schema_version(), 5)
+        self.assertEqual(runtime_db.get_schema_version(), 6)
 
 
 class TestNoConnectionContract(QueueDbTestBase):

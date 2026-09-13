@@ -30,8 +30,8 @@ from datetime import date, datetime, timedelta
 
 from . import state
 from . import runtime_db
+from . import history
 from .config import (
-    DOWNLOAD_HISTORY_FILE,
     LOG_FILE,
     LOG_RETENTION_DAYS,
     TASK_EVENTS_FILE,
@@ -267,7 +267,7 @@ def collect_stats(days=1, today=None, log_path=None, history_path=None):
     today = today or date.today()
     days = max(1, min(days, LOG_RETENTION_DAYS))
     log_path = log_path or LOG_FILE
-    history_path = history_path or DOWNLOAD_HISTORY_FILE
+    # history_path 直通（None → history.iter_history_lines 双模式自选）
     dates = _window_dates(days, today)
 
     lines = _window_log_lines(dates, log_path)
@@ -285,17 +285,13 @@ def collect_stats(days=1, today=None, log_path=None, history_path=None):
     success_count = 0
     success_bytes = 0
     prefixes = {d.isoformat() for d in dates}
-    try:
-        with open(history_path, "r", encoding="utf-8",
-                  errors="replace") as f:
-            for line in f:
-                if line[:10] in prefixes and " | " in line:
-                    success_count += 1
-                    parts = line.split(" | ")
-                    success_bytes += parse_size(parts[3]) if len(parts) > 3 \
-                        else 0
-    except OSError:
-        pass
+    # history_path=None（生产）→ DB 在连走 download_history 表、否则默认
+    # 文件；显式 path（测试注入口）→ 永远读该文件。渲染行两路同格式。
+    for line in history.iter_history_lines(history_path):
+        if line[:10] in prefixes and " | " in line:
+            success_count += 1
+            parts = line.split(" | ")
+            success_bytes += parse_size(parts[3]) if len(parts) > 3 else 0
 
     return {
         "media_total": _count(lines, "📦 检测到可下载媒体"),
@@ -550,9 +546,9 @@ def stats_text(days=1, today=None, log_path=None, history_path=None,
     """
     days = max(1, min(days, LOG_RETENTION_DAYS))
     today = today or date.today()
-    # 命令/菜单入口不传路径：在这里统一落默认值（两种口径都要读日志）
+    # 命令/菜单入口不传路径：日志统一落默认值；history_path 直通 None
+    # （history.iter_history_lines 按 DB/文件双模式自选，显式 path 仍走文件）
     log_path = log_path or LOG_FILE
-    history_path = history_path or DOWNLOAD_HISTORY_FILE
     events = load_events(events_path)
     dates = _window_dates(days, today)
     prefixes = {d.isoformat() for d in dates}

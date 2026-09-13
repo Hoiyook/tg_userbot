@@ -211,7 +211,7 @@ class TestSchemaV4ToV5(EventsDbTestBase):
 
     def test_v4_migrates_to_v5(self):
         self.assertTrue(runtime_db.init_db(self.path))
-        self.assertEqual(runtime_db.get_schema_version(), 5)
+        self.assertEqual(runtime_db.get_schema_version(), 6)
         self.assertEqual(runtime_db.download_events_count(), 0)
         # Phase 1 的 download_tasks 原样保留
         self.assertEqual(runtime_db.queue_count(), {"queued": 1, "retry": 0})
@@ -219,7 +219,7 @@ class TestSchemaV4ToV5(EventsDbTestBase):
     def test_migration_idempotent(self):
         self.assertTrue(runtime_db.init_db(self.path))
         self.assertTrue(runtime_db.init_db(self.path))
-        self.assertEqual(runtime_db.get_schema_version(), 5)
+        self.assertEqual(runtime_db.get_schema_version(), 6)
 
 
 if __name__ == "__main__":

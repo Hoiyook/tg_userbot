@@ -59,22 +59,22 @@ def _dt(line):
 
 
 def _read_history_matches(kw, history_path):
-    """历史文件全量倒序命中（append-only，越靠后越新）。"""
+    """历史全量倒序命中（append-only，越靠后越新）。
+
+    history_path=None（生产）→ history.iter_history_lines 双模式
+    （DB 表优先/默认文件）；显式 path → 读该文件。渲染行两路同格式。"""
+    from . import history as history_mod  # 函数内引用：避免模块加载序问题
+    lines = history_mod.iter_history_lines(history_path)
     hits = []
-    try:
-        with open(history_path, "r", encoding="utf-8",
-                  errors="replace") as f:
-            for line in reversed(f.readlines()):
-                if kw not in line.lower() or " | " not in line:
-                    continue
-                parts = line.split(" | ")
-                if len(parts) > 3:
-                    hits.append(
-                        f"✅ 已下载 | {_dt(line)} | {_trim(parts[2])}"
-                        f" | {parts[3].strip()}"
-                    )
-    except OSError:
-        pass
+    for line in reversed(lines):
+        if kw not in line.lower() or " | " not in line:
+            continue
+        parts = line.split(" | ")
+        if len(parts) > 3:
+            hits.append(
+                f"✅ 已下载 | {_dt(line)} | {_trim(parts[2])}"
+                f" | {parts[3].strip()}"
+            )
     return hits
 
 
@@ -91,7 +91,8 @@ def find_media(keyword, today=None, log_path=None, history_path=None,
     kw = keyword.lower()
     today = today or date.today()
     log_path = log_path or LOG_FILE
-    history_path = history_path or DOWNLOAD_HISTORY_FILE
+    # history_path 直通 None（生产走 history 双模式：DB 表优先/默认文件）；
+    # 显式 path（测试注入口）永远读该文件
     if queue is None:
         queue = state.QUEUE or {"tasks": [], "retry": []}
 

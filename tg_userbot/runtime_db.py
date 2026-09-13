@@ -231,6 +231,25 @@ _SCHEMA = (
     CREATE INDEX IF NOT EXISTS idx_download_events_task
     ON download_events (task_id, id)
     """,
+    # ============================================================
+    # 下载历史（2026-09-14，Phase 3，schema v6）。替代
+    # runtime/download_history.txt：行格式
+    # `ts | 类型 | 文件名 | 大小 | 来源：xxx` 是全部消费方（/done、/find、
+    # 台账回退口径）的接口，行→列拆解只发生在写入/读出边界，渲染逐字符还原。
+    # 旧类型（统一链之前的 抖音/Instagram）原样保留；不合 5 段格式的行进
+    # raw 列兜底（零丢失）。无封顶（原文件同样无界）。
+    # ============================================================
+    """
+    CREATE TABLE IF NOT EXISTS download_history (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts        INTEGER,
+        kind      TEXT,
+        filename  TEXT,
+        size_text TEXT,
+        source    TEXT,
+        raw       TEXT
+    )
+    """,
 )
 
 # SQLITE_BUSY / SQLITE_LOCKED 的典型文案（只用于判定是否值得重试）
@@ -523,6 +542,10 @@ def migrate() -> int:
         # v4 → v5：新增 download_events（下载任务事件流）。纯建表；旧 JSONL
         # 由 stats.migrate_and_trim_events 的启动导入负责。
         logger.info("🗄 Runtime DB 迁移：v5（+ download_events 任务事件流）")
+    if version < 6:
+        # v5 → v6：新增 download_history（下载历史）。纯建表；旧 TXT 由
+        # history.migrate_history_to_db 的启动导入负责。
+        logger.info("🗄 Runtime DB 迁移：v6（+ download_history 下载历史）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -1412,3 +1435,68 @@ def download_events_trim(keep):
             (int(keep),))
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
     return _write(do, "裁剪任务事件")
+
+
+# ============================================================
+# 下载历史（2026-09-14，Phase 3，schema v6）
+# ============================================================
+# history.append_history/get_history_lines 的 DB 后端。渲染行
+# `ts | 类型 | 文件名 | 大小 | 来源：xxx` 是消费方接口：列拆解只在
+# 写入/读出边界发生，读出逐字符还原。不合 5 段格式的行进 raw 兜底。
+_HISTORY_TS_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _history_parse_record(record):
+    """渲染行 → 列 dict；不是 5 段（或 ts 不合法）→ {"raw": 原文} 兜底。"""
+    parts = str(record).split(" | ")
+    if len(parts) == 5 and parts[4].startswith("来源："):
+        try:
+            ts = int(time.mktime(time.strptime(parts[0], _HISTORY_TS_FMT)))
+        except ValueError:
+            return {"raw": record}
+        return {"ts": ts, "kind": parts[1], "filename": parts[2],
+                "size_text": parts[3], "source": parts[4]}
+    return {"raw": record}
+
+
+def _history_row_to_line(row):
+    if row["raw"]:
+        return row["raw"]
+    return " | ".join((_event_ts_str(row["ts"]), row["kind"],
+                       row["filename"], row["size_text"], row["source"]))
+
+
+def history_append_record(record):
+    """一行历史入库（append_history 的 DB 后端；raw 兜底零丢失）。"""
+    cols = _history_parse_record(record)
+    _write(lambda conn: _execute(
+        conn,
+        "INSERT INTO download_history(ts, kind, filename, size_text, "
+        "source, raw) VALUES(?, ?, ?, ?, ?, ?)",
+        (cols.get("ts"), cols.get("kind"), cols.get("filename"),
+         cols.get("size_text"), cols.get("source"), cols.get("raw"))),
+        "下载历史入库")
+
+
+def history_lines(n=None):
+    """渲染行列表（get_history_lines 的 DB 等价）：n=None 全量按 id 升序；
+    n=尾部 n 条（升序，与文件 tail 语义一致）。"""
+    def read(conn):
+        if n is None:
+            rows = _execute(
+                conn, "SELECT ts, kind, filename, size_text, source, raw "
+                      "FROM download_history ORDER BY id").fetchall()
+        else:
+            rows = list(reversed(_execute(
+                conn, "SELECT ts, kind, filename, size_text, source, raw "
+                      "FROM download_history ORDER BY id DESC LIMIT ?",
+                (int(n),)).fetchall()))
+        return [_history_row_to_line(r) for r in rows]
+
+    return _read(read, "读下载历史")
+
+
+def history_count():
+    return int(_read(lambda c: _execute(
+        c, "SELECT COUNT(*) FROM download_history").fetchone()[0],
+        "统计下载历史"))
