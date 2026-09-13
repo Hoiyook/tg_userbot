@@ -402,3 +402,34 @@ class ListenCommandTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WlSinceScanCommandTest(unittest.TestCase):
+    """/wl scan 与 /wl since 的命令分发（不联网；DB 不可达路径不碰库）。"""
+
+    def _run(self, cmd):
+        ev = FakeEvent()
+        ok = asyncio.run(commands.handle_command(ev, cmd))
+        return ok, ev.replies
+
+    def test_since_usage_reply(self):
+        ok, replies = self._run("/wl since")
+        self.assertTrue(ok)
+        self.assertIn("用法", replies[0])
+
+    def test_since_bad_chat_replies_error(self):
+        from tg_userbot import state
+        with mock.patch.object(state, "WHITELIST_CHATS", {}):
+            ok, replies = self._run("/wl since 1 88000")
+        self.assertTrue(ok)
+        self.assertIn("不在下载白名单", replies[0])
+
+    def test_scan_replies_summary(self):
+        from tg_userbot import wl_scan
+        empty = {"chats": 0, "failed_chats": 0, "scanned": 0, "created": 0,
+                 "duplicate": 0, "capped": 0}
+        with mock.patch.object(wl_scan, "scan_all",
+                               mock.AsyncMock(return_value=dict(empty))):
+            ok, replies = self._run("/wl scan")
+        self.assertTrue(ok)
+        self.assertIn("白名单扫描", replies[0])

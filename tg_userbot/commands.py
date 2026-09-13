@@ -21,6 +21,7 @@ from . import stats
 from . import finder
 from . import listener
 from . import caption_filter
+from . import wl_scan
 from .config import (
     BOT_USERNAME,
     DONE_DEFAULT_LINES,
@@ -170,9 +171,28 @@ async def handle_command(event, cmd_text):
             await event.reply(msg)
             return True
 
+        if action == "scan":
+            totals = await wl_scan.scan_all(manual=True)
+            await event.reply(wl_scan.summary_text(totals))
+            return True
+
+        if action == "since":
+            parts = (arg or "").split()
+            if len(parts) != 2:
+                await event.reply(
+                    "❌ 用法：/wl since <序号|@用户名|ID> <消息id>\n"
+                    "例：/wl since 1 88000 —— 从 #88000 之后开始回补")
+                return True
+            ok, msg = await wl_scan.since_checkpoint(
+                state.client, parts[0], parts[1])
+            await event.reply(msg)
+            if ok:
+                asyncio.create_task(wl_scan.scan_all(manual=True))
+            return True
+
         await event.reply(
-            "❌ 用法：/wl list | /wl add <ID或@用户名> | /wl del <ID或序号>"
-        )
+            "❌ 用法：/wl list | /wl add <ID或@用户名> | /wl del <ID或序号>\n"
+            "        /wl scan（立即扫描）| /wl since <聊天> <消息id>（回补）")
         return True
 
     if queue.is_queue_command(cmd_text):

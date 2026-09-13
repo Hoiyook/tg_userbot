@@ -98,24 +98,42 @@ def done_reply_text(n, keyword=None):
     return f"📜 最近 {len(shown)} 条下载记录：\n\n" + "\n".join(shown)
 
 
-def wl_list_text(chats=None):
+def wl_list_text(chats=None, scan_info=None, last_scan=None):
     """生成白名单列表文本（命令与 bot 菜单共用）。
 
-    保持「📋 下载白名单」字面前缀不变（/wl 回复靠前缀自动清理）。
+    scan_info：{chat_id: (checkpoint|None, 待执行任务数)}，来自
+    wl_scan.collect_scan_info()；last_scan：state.WL_LAST_SCAN 快照。
+    两者缺省时省略对应行（旧调用与测试兼容）。保持「📋 下载白名单」字面
+    前缀不变（/wl 回复靠前缀自动清理）。
     """
     chats = state.WHITELIST_CHATS if chats is None else chats
     if not chats:
         return (
             "📋 下载白名单：空\n\n"
-            "机制：白名单 chat 收到媒体会自动转发进收藏夹下载（副本保留）。\n"
+            "机制：白名单 chat 的媒体记为转发任务，由常驻 Worker 转发进"
+            "收藏夹下载（副本保留）。\n"
             "用法：/wl add <ID或@用户名>，或回复一条从目标 chat "
             "转发的消息后发送 /wl add"
         )
-    lines = [
-        f"{i}. {title} ({cid})"
-        for i, (cid, title) in enumerate(sorted(chats.items()), start=1)
-    ]
+    lines = []
+    for i, (cid, title) in enumerate(sorted(chats.items()), start=1):
+        lines.append(f"{i}. {title} ({cid})")
+        info = (scan_info or {}).get(cid)
+        if info:
+            ckpt, pending = info
+            state_parts = [
+                f"已扫至 #{ckpt}" if ckpt else "未扫描",
+                f"待执行 {pending} 条",
+            ]
+            lines.append("   " + " | ".join(state_parts))
+    head = ("📋 下载白名单：媒体记为转发任务，由常驻 Worker 转发进收藏夹"
+            "下载（副本保留）")
+    if last_scan:
+        head += (f"\n上轮扫描：{last_scan.get('ts', '-')} 检查 "
+                 f"{last_scan.get('scanned', 0)} 条 / 新建 "
+                 f"{last_scan.get('created', 0)} 条")
     return (
-        "📋 下载白名单：媒体自动转发进收藏夹下载（副本保留）\n\n"
-        + "\n".join(lines)
+        head + "\n\n" + "\n".join(lines) + "\n\n"
+        "回补停机漏掉的存量：/wl since <序号|@用户名|ID> <消息id>\n"
+        "立即扫描一轮：/wl scan"
     )

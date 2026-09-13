@@ -90,6 +90,10 @@ def parse_wl_command(text):
         return ("add", sub[len("add"):].strip())
     if sub.startswith("del"):
         return ("del", sub[len("del"):].strip())
+    if sub.startswith("since"):
+        return ("since", sub[len("since"):].strip())
+    if sub == "scan":
+        return ("scan", None)
     return ("invalid", None)
 
 

@@ -928,3 +928,15 @@ class BotHandlerIgnoresReporterTest(unittest.IsolatedAsyncioTestCase):
             await bot.bot_message_handler(
                 self._event("sessionid=abc; ttwid=xyz"))
         cookie.assert_awaited_once()
+
+
+class WlMenuButtonsTest(unittest.TestCase):
+
+    def test_wl_menu_has_since_and_scan(self):
+        p = mock.patch.object(state, "WHITELIST_CHATS", {})
+        p.start()
+        self.addCleanup(p.stop)
+        rows = menu.wl_menu_buttons()
+        labels = [b.text for row in rows for b in row]
+        self.assertTrue(any("回补" in t for t in labels))
+        self.assertTrue(any("立即扫描" in t for t in labels))

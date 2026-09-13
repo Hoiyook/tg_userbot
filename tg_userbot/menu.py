@@ -265,7 +265,11 @@ def cookie_menu_buttons():
 
 
 def wl_menu_buttons():
-    rows = [[Button.inline("➕ 添加", encode_menu_data("wl_add"))]]
+    rows = [
+        [Button.inline("➕ 添加", encode_menu_data("wl_add")),
+         Button.inline("⏪ 回补", encode_menu_data("wl_since"))],
+        [Button.inline("🔄 立即扫描", encode_menu_data("wl_scan"))],
+    ]
     for cid, title in sorted(state.WHITELIST_CHATS.items()):
         rows.append(
             [Button.inline(f"➖ {title}", encode_menu_data("wl_del", str(cid)))]

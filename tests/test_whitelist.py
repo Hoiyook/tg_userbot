@@ -198,5 +198,22 @@ class ResolveDownloadSourceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source, "转发频道")
 
 
+class ParseWlSinceScanTest(unittest.TestCase):
+    """/wl 新子命令：since（回补）与 scan（立即扫描）。"""
+
+    def test_parse_since(self):
+        self.assertEqual(whitelist.parse_wl_command("/wl since 1 88000"),
+                         ("since", "1 88000"))
+        self.assertEqual(whitelist.parse_wl_command("/wl since"),
+                         ("since", ""))
+
+    def test_parse_scan(self):
+        self.assertEqual(whitelist.parse_wl_command("/wl scan"),
+                         ("scan", None))
+        # 无法识别的子命令落 invalid（parse 只对非 /wl 文本返回 None）
+        self.assertEqual(whitelist.parse_wl_command("/wl scans"),
+                         ("invalid", None))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,7 @@ from . import stats
 from . import finder
 from . import listener
 from . import caption_filter
+from . import wl_scan
 from . import commands
 from . import config
 from .config import DONE_DEFAULT_LINES, REPORT_STATUS_PREFIX
@@ -80,13 +81,14 @@ async def register_bot_commands(client):
 def open_input_window(kind):
     """开一个「等待下一条文本」的输入窗口，并关掉其它所有窗口。
 
-    同一时刻只允许一个窗口开着（cookie / 查询 / Caption 清洗 / 标签监听）：
-    窗口的判定是 if 顺序执行，若同时非零，排在前的会把本该给后者的文本吃掉——
-    cookie 排最前、代价也最重（一段 Caption 规则或标签会被当成抖音 cookie
-    存进 tg_secrets.json）。
+    同一时刻只允许一个窗口开着（cookie / 查询 / Caption 清洗 / 标签监听 /
+    白名单回补）：窗口的判定是 if 顺序执行，若同时非零，排在前的会把本该
+    给后者的文本吃掉——cookie 排最前、代价也最重（一段 Caption 规则或标签
+    会被当成抖音 cookie 存进 tg_secrets.json）。
 
     kind：\"cookie\" / \"find\" / \"add\"|\"del\"|\"test\"（Caption 清洗）
-    / \"listen_chat\"|\"listen_tag\"|\"listen_target\"（标签监听向导）。
+    / \"listen_chat\"|\"listen_tag\"|\"listen_target\"（标签监听向导）
+    / \"wl_since\"（白名单回补）。
     """
     state.COOKIE_INPUT_UNTIL = 0.0
     state.FIND_INPUT_UNTIL = 0.0
@@ -94,6 +96,7 @@ def open_input_window(kind):
     state.CAPTION_INPUT_MODE = ""
     state.LISTEN_INPUT_UNTIL = 0.0
     state.LISTEN_INPUT_STEP = ""
+    state.WL_INPUT_UNTIL = 0.0
     if kind == "cookie":
         state.COOKIE_INPUT_UNTIL = (
             time.monotonic() + config.COOKIE_INPUT_WINDOW_SECONDS
@@ -107,6 +110,11 @@ def open_input_window(kind):
             time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
         )
         state.LISTEN_INPUT_STEP = kind[len("listen_"):]
+    elif kind == "wl_since":
+        # 复用标签监听的窗口时长（120s）
+        state.WL_INPUT_UNTIL = (
+            time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
+        )
     else:
         state.CAPTION_INPUT_UNTIL = (
             time.monotonic() + config.CAPTION_INPUT_WINDOW_SECONDS
@@ -138,7 +146,23 @@ async def handle_menu_action(action, arg, event):
     if action == "done":
         return text.done_reply_text(DONE_DEFAULT_LINES), menu.back_home_buttons()
     if action == "wl":
-        return text.wl_list_text(), menu.wl_menu_buttons()
+        return (text.wl_list_text(scan_info=wl_scan.collect_scan_info(),
+                                  last_scan=state.WL_LAST_SCAN),
+                menu.wl_menu_buttons())
+    if action == "wl_since":
+        open_input_window("wl_since")
+        return (
+            "⏪ 回补白名单存量\n\n"
+            "请发送：<序号|@用户名|ID> <消息id>\n"
+            "例：1 88000 —— 把 1 号白名单聊天的扫描起点设为 #88000，"
+            "回补其后消息（受 Worker 节流控制，逐步转发）。\n\n"
+            f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "发送 / 开头的命令可取消。",
+            menu.back_home_buttons(),
+        )
+    if action == "wl_scan":
+        return (wl_scan.summary_text(await wl_scan.scan_all(manual=True)),
+                menu.wl_menu_buttons())
     if action == "wl_add":
         if arg is None:
             return (
@@ -465,6 +489,14 @@ async def bot_message_handler(event):
         state.LISTEN_INPUT_UNTIL = 0.0
         state.LISTEN_INPUT_STEP = ""
 
+    # 白名单回补等待窗口：普通文本当作「<聊天> <消息id>」（/ 开头退出窗口）。
+    if state.WL_INPUT_UNTIL and time.monotonic() < state.WL_INPUT_UNTIL:
+        if not text.startswith("/"):
+            state.WL_INPUT_UNTIL = 0.0
+            await _handle_wl_since_input(event, text)
+            return
+        state.WL_INPUT_UNTIL = 0.0
+
     if from_id:
         chat_id, title = await whitelist.resolve_wl_target(
             state.bot_client, None, fwd
@@ -524,6 +556,19 @@ async def _handle_find_input(event, text):
     await state.bot_client.send_message(
         state.MY_ID, finder.find_media(text), link_preview=False
     )
+
+
+async def _handle_wl_since_input(event, text):
+    """白名单回补窗口的输入：一行「<序号|@用户名|ID> <消息id>」。"""
+    parts = text.strip().split()
+    if len(parts) != 2:
+        await state.bot_client.send_message(
+            state.MY_ID, "❌ 格式：<序号|@用户名|ID> <消息id>，例：1 88000")
+        return
+    ok, msg = await wl_scan.since_checkpoint(state.client, parts[0], parts[1])
+    await state.bot_client.send_message(state.MY_ID, msg)
+    if ok:
+        asyncio.create_task(wl_scan.scan_all(manual=True))
 
 
 async def _handle_listen_input(step, text):
