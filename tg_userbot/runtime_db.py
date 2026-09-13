@@ -250,6 +250,21 @@ _SCHEMA = (
         raw       TEXT
     )
     """,
+    # ============================================================
+    # 去重索引（2026-09-14，Phase 4，schema v7）。替代
+    # runtime/dedup_index.txt：key/ts/filename 三列忠实映射
+    # `key	日期	文件名` 行（ts 保留原短格式纯信息字段）。内存 dict
+    # （state.DEDUP_INDEX）仍是判重热路径的唯一读取面——本表只负责持久化
+    # 与启动装载，同键重复行容忍（dict 后写胜，与文件时代一致）。
+    # ============================================================
+    """
+    CREATE TABLE IF NOT EXISTS dedup_index (
+        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        key      TEXT NOT NULL,
+        ts       TEXT,
+        filename TEXT
+    )
+    """,
 )
 
 # SQLITE_BUSY / SQLITE_LOCKED 的典型文案（只用于判定是否值得重试）
@@ -546,6 +561,10 @@ def migrate() -> int:
         # v5 → v6：新增 download_history（下载历史）。纯建表；旧 TXT 由
         # history.migrate_history_to_db 的启动导入负责。
         logger.info("🗄 Runtime DB 迁移：v6（+ download_history 下载历史）")
+    if version < 7:
+        # v6 → v7：新增 dedup_index（去重索引）。纯建表；旧 TXT 由
+        # dedup.load_index 的启动导入负责。
+        logger.info("🗄 Runtime DB 迁移：v7（+ dedup_index 去重索引）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -1500,3 +1519,43 @@ def history_count():
     return int(_read(lambda c: _execute(
         c, "SELECT COUNT(*) FROM download_history").fetchone()[0],
         "统计下载历史"))
+
+
+# ============================================================
+# 去重索引（2026-09-14，Phase 4，schema v7）
+# ============================================================
+# dedup.remember/load_index 的 DB 后端。三列忠实映射文件的
+# `key\t日期\t文件名` 行（ts 保留 "26-09-13 21:02" 短格式原样，纯信息）；
+# 同键重复行容忍（装载时 dict 后写胜）。
+def dedup_index_append(key, ts, filename):
+    """一行索引入库（remember 的 DB 后端）。"""
+    _write(lambda conn: _execute(
+        conn, "INSERT INTO dedup_index(key, ts, filename) VALUES(?, ?, ?)",
+        (key, ts, filename)), f"去重索引入库（{str(key)[:24]}）")
+
+
+def dedup_index_all():
+    """全量行按 id 升序 → [{"id","key","ts","filename"}]（装载用）。"""
+    def read(conn):
+        return [dict(r) for r in _execute(
+            conn, "SELECT id, key, ts, filename FROM dedup_index "
+                  "ORDER BY id").fetchall()]
+
+    return _read(read, "读去重索引")
+
+
+def dedup_index_count():
+    return int(_read(lambda c: _execute(
+        c, "SELECT COUNT(*) FROM dedup_index").fetchone()[0],
+        "统计去重索引"))
+
+
+def dedup_index_trim(keep):
+    """保尾 keep 行（启动裁剪），返回删除行数。"""
+    def do(conn):
+        cur = _execute(
+            conn, "DELETE FROM dedup_index WHERE id NOT IN "
+                  "(SELECT id FROM dedup_index ORDER BY id DESC LIMIT ?)",
+            (int(keep),))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    return _write(do, "裁剪去重索引")

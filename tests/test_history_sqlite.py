@@ -250,7 +250,7 @@ class TestSchemaV5ToV6(HistoryDbTestBase):
 
     def test_v5_migrates_to_v6(self):
         self.assertTrue(runtime_db.init_db(self.db_path))
-        self.assertEqual(runtime_db.get_schema_version(), 6)
+        self.assertEqual(runtime_db.get_schema_version(), 7)
         self.assertEqual(runtime_db.history_count(), 0)
         # 前序表原样
         self.assertEqual(runtime_db.queue_count(), {"queued": 0, "retry": 0})
@@ -259,7 +259,7 @@ class TestSchemaV5ToV6(HistoryDbTestBase):
     def test_migration_idempotent(self):
         self.assertTrue(runtime_db.init_db(self.db_path))
         self.assertTrue(runtime_db.init_db(self.db_path))
-        self.assertEqual(runtime_db.get_schema_version(), 6)
+        self.assertEqual(runtime_db.get_schema_version(), 7)
 
 
 if __name__ == "__main__":

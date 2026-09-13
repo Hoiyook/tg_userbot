@@ -28,6 +28,7 @@ from .config import (
     DEDUP_INDEX_FILE,
     DEDUP_MAX_ENTRIES,
 )
+from . import runtime_db
 from .log import logger
 from .naming import get_original_filename, is_meaningless_filename
 
@@ -177,17 +178,95 @@ def remember(keys, filename, size=None, now=None):
     for key in keys:
         if not key:
             continue
-        line = f"{key}\t{ts}\t{safe_name}\n"
-        try:
-            with open(DEDUP_INDEX_FILE, "a", encoding="utf-8") as f:
-                f.write(line)
-        except Exception as e:
-            logger.warning(f"写去重索引失败（不影响下载）：{e}")
+        if runtime_db.has_connection():
+            try:
+                runtime_db.dedup_index_append(key, ts, safe_name)
+            except Exception as e:
+                logger.warning(f"写去重索引失败（不影响下载）：{e}")
+        else:
+            try:
+                with open(DEDUP_INDEX_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"{key}\t{ts}\t{safe_name}\n")
+            except Exception as e:
+                logger.warning(f"写去重索引失败（不影响下载）：{e}")
+        # dict 更新无条件执行（写失败仅告警的语义，文件/DB 一致）
         state.DEDUP_INDEX[key] = {"date": ts, "filename": safe_name}
 
 
 def load_index():
-    """启动载入判重索引，返回载入条数；超上限裁剪保尾部（原子重写一次）。"""
+    """启动载入判重索引，返回载入条数；超上限裁剪保尾部。
+
+    DB 在连 → dedup_index 表（表空 + 旧文件非空 → 一次性导入后改名
+    .imported；表有行 → DB 赢、文件归档并 WARNING）；未连接 → 文件旧路径。
+    两条路的 dict 语义一致：同键后写胜、坏行跳过、超 DEDUP_MAX_ENTRIES
+    保尾部。"""
+    state.DEDUP_INDEX = {}
+    if runtime_db.has_connection():
+        return _load_index_db()
+    return _load_index_file()
+
+
+def _load_index_db():
+    try:
+        count = runtime_db.dedup_index_count()
+    except runtime_db.DbUnavailable as e:
+        logger.warning(f"读去重索引失败（DB），从空索引开始：{e}")
+        return 0
+    file_exists = os.path.exists(DEDUP_INDEX_FILE)
+    if count == 0 and file_exists:
+        try:
+            with open(DEDUP_INDEX_FILE, "r", encoding="utf-8") as f:
+                lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+        except OSError as e:
+            logger.warning(f"读旧去重索引失败（跳过导入）：{e}")
+            lines = []
+        if lines:
+            imported = 0
+            try:
+                for ln in lines:
+                    parts = ln.split("\t")
+                    if len(parts) < 3 or not parts[0]:
+                        continue
+                    runtime_db.dedup_index_append(
+                        parts[0], parts[1], "\t".join(parts[2:]))
+                    imported += 1
+            except Exception as e:
+                logger.warning(
+                    f"旧去重索引导入失败（文件原样保留，重启重试）："
+                    f"{type(e).__name__}: {e}")
+                return 0
+            archive = DEDUP_INDEX_FILE + ".imported"
+            try:
+                os.replace(DEDUP_INDEX_FILE, archive)
+                logger.info(
+                    f"🗄 旧去重索引已导入：{imported} 条"
+                    f"（原文件改名 .imported 保留）")
+            except OSError as e:
+                logger.warning(f"旧去重索引归档失败（原样保留）：{e}")
+            count = runtime_db.dedup_index_count()
+    elif count > 0 and file_exists:
+        archive = DEDUP_INDEX_FILE + ".imported"
+        try:
+            os.replace(DEDUP_INDEX_FILE, archive)
+            logger.warning(
+                f"dedup_index 表已有数据，忽略并归档旧索引文件 → {archive}")
+        except OSError as e:
+            logger.warning(f"旧去重索引归档失败（原样保留）：{e}")
+    rows = runtime_db.dedup_index_all()
+    if len(rows) > DEDUP_MAX_ENTRIES:
+        removed = runtime_db.dedup_index_trim(DEDUP_MAX_ENTRIES)
+        rows = rows[-DEDUP_MAX_ENTRIES:]
+        logger.info(f"去重索引超上限，已裁剪 {removed} 条"
+                    f"（保留最近 {DEDUP_MAX_ENTRIES} 条）")
+    for row in rows:
+        state.DEDUP_INDEX[row["key"]] = {
+            "date": row["ts"], "filename": row["filename"],
+        }
+    return len(rows)
+
+
+def _load_index_file():
+    """文件旧路径（DB 未连接时的回落，逻辑原样）。"""
     state.DEDUP_INDEX = {}
     try:
         with open(DEDUP_INDEX_FILE, "r", encoding="utf-8") as f:
