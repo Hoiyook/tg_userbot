@@ -568,7 +568,7 @@ async def _handle_wl_since_input(event, text):
     ok, msg = await wl_scan.since_checkpoint(state.client, parts[0], parts[1])
     await state.bot_client.send_message(state.MY_ID, msg)
     if ok:
-        asyncio.create_task(wl_scan.scan_all(manual=True))
+        wl_scan.spawn_scan()
 
 
 async def _handle_listen_input(step, text):

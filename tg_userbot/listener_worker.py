@@ -389,15 +389,19 @@ async def _fallback_direct_download(task, messages, source_name):
     """来源禁转的回退：把**原消息**直接交给现有下载链路（不转发、无副本）。
 
     enqueue_media 自带 dedup 与命名全链路；目录名用 payload 快照的
-    source_name（原消息没有 fwd_from 可解析，目录只能靠它）。
+    source_name（原消息没有 fwd_from 可解析，目录只能靠它）。相册的无文字
+    成员沿用 payload 里存的同组说明做命名（否则退化成 photo_时间戳）。
     """
     from . import app   # 函数内导入：与 _enqueue_copy 同理（顶层互相导入成环）
+    caption = (task.get("payload") or {}).get("caption") or ""
     ok = True
     for m in messages:
         try:
+            own_text = (getattr(m, "message", "") or "").strip()
             await app.enqueue_media(
                 m, int(task["source_chat_id"]),
-                source_name or f"chat_{task['source_chat_id']}")
+                source_name or f"chat_{task['source_chat_id']}",
+                album_caption=None if own_text else (caption or None))
         except Exception as e:
             ok = False
             logger.error(

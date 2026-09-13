@@ -160,10 +160,12 @@ async def scan_wl_chat(chat_id, nap=None):
             result["duplicate"] += len(ids) - created
         checkpoint = processed_upto
 
+        # 走到这里说明本轮读消息成功——聊天可达，失败降噪标记就地清除
+        #（背压不是聊天故障，也要清；失败路径在上面各自 return，不清）。
+        _clear_chat_failure(chat_id)
         if not budget_left:
             result["capped"] = True
             break
-        _clear_chat_failure(chat_id)
         if len(msgs) < page_size:
             break
         if page_no < pages - 1 and page_sleep > 0:
@@ -241,6 +243,19 @@ def _wl_queue_totals():
 
 def is_scanning() -> bool:
     return _SCANNING
+
+
+# 「回补/立即扫描」后台任务强引用（§35：asyncio 只对 Task 持弱引用，
+# 不持引用可能被 GC——命令与菜单的 fire-and-forget 扫描共用这里）。
+_SPAWNED_SCANS = set()
+
+
+def spawn_scan(manual=True):
+    """把一轮即时扫描挂成后台任务并保持强引用，返回该任务。"""
+    task = asyncio.create_task(scan_all(manual=manual))
+    _SPAWNED_SCANS.add(task)
+    task.add_done_callback(_SPAWNED_SCANS.discard)
+    return task
 
 
 # ============================================================

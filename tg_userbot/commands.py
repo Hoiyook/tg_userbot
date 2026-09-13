@@ -116,7 +116,9 @@ async def handle_command(event, cmd_text):
         logger.info(f"执行命令：/wl {action}")
 
         if action == "list":
-            await event.reply(text.wl_list_text())
+            await event.reply(text.wl_list_text(
+                scan_info=wl_scan.collect_scan_info(),
+                last_scan=state.WL_LAST_SCAN))
             return True
 
         if action == "add":
@@ -187,7 +189,7 @@ async def handle_command(event, cmd_text):
                 state.client, parts[0], parts[1])
             await event.reply(msg)
             if ok:
-                asyncio.create_task(wl_scan.scan_all(manual=True))
+                wl_scan.spawn_scan()
             return True
 
         await event.reply(
