@@ -25,6 +25,7 @@ from . import chrome_client
 from . import dedup
 from . import listener
 from . import listener_worker
+from . import wl_scan
 from . import queue
 from . import runtime_db
 from . import reporter
@@ -66,6 +67,7 @@ from .config import (
     SERVE_RECONNECT_BASE_DELAY,
     SERVE_RECONNECT_MAX_DELAY,
     TELEGRAM_AUTO_RECONNECT,
+    WHITELIST_SCAN_INTERVAL_SECONDS,
     AdjustableSemaphore,
 )
 from .log import logger
@@ -383,6 +385,28 @@ async def _listener_loop():
         await asyncio.sleep(delay)
 
 
+async def _whitelist_scan_loop():
+    """白名单扫描生产者后台循环：按 WHITELIST_SCAN_INTERVAL_SECONDS 补漏。
+
+    与标签监听是两套独立配置/游标（chain='wl'）；**不跟随 LISTEN_ENABLED**——
+    白名单没有总开关概念，/wl del 移除聊天即停。在线时事件生产者兜实时，
+    这里只负责补停机缺口，周期可以放宽。异常一律兜住；被 main 取消时以
+    CancelledError 收尾。
+    """
+    if not state.RUNTIME_DB_READY:
+        logger.warning("📋 白名单扫描循环未启动（Runtime DB 不可用）")
+        return
+    await asyncio.sleep(LISTEN_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            await wl_scan.scan_all()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            logger.error(f"📋 白名单扫描异常（{type(e).__name__}: {e}）")
+        await asyncio.sleep(WHITELIST_SCAN_INTERVAL_SECONDS)
+
+
 def _install_stop_handlers(stop_event):
     """把 SIGINT/SIGTERM 转成「设 STOP_EVENT 优雅退出」，接管 telethon 对
     KeyboardInterrupt 的吞并。
@@ -528,15 +552,18 @@ async def new_message_handler(event):
 
         # 入队持久化下载（重启不丢任务），不阻塞消息监听。
         # Saved Messages：直接入队下载原消息（不变）。
-        # 白名单 chat：先转发一份进 Saved Messages，再入队下载那份转发副本——
-        # Saved Messages 由此成为唯一下载入口；副本保留作记录/收藏。转发副本自带
-        # 「转发自」来源头（用户在收藏夹看得出处/落盘目录），目录下载时经 fwd_from
-        # 自动解析回原来源。转发失败（如来源禁转）由 relay_chat_media 回退直下原消息。
+        # 白名单 chat：媒体记为持久化转发任务（origin='wl'），由常驻 Worker
+        # 转发进收藏夹再入队下载那份转发副本——副本自带「转发自」来源头
+        # （用户在收藏夹看得出处/落盘目录），目录下载时经 fwd_from 自动解析
+        # 回原来源。来源禁转由 Worker 回退直下原消息；停机漏掉的由扫描
+        # 生产者按 wl 游标补。
         if is_me:
             asyncio.create_task(_enqueue_me(message))
         else:
+            # 白名单双通道（2026-09-13）：事件生产者只**记任务**，转发由
+            # listener_worker 受控执行；停机漏掉的由 wl 扫描生产者按游标补。
             asyncio.create_task(
-                relay_chat_media(message, event.chat_id, source_override)
+                record_whitelist_media(message, event.chat_id, source_override)
             )
 
     except Exception as e:
@@ -693,91 +720,56 @@ async def enqueue_media(message, chat_id, source_override, source_link=None,
     await queue.enqueue_and_start(record, src=src)
 
 
-async def relay_chat_media(message, origin_chat_id, source_override):
-    """白名单 chat 收到媒体 → 转发一份进 Saved Messages → 入队下载转发副本。
+# ============================================================
+# 白名单事件生产者：媒体事件 → 记持久化转发任务（转发归 listener_worker）
+# ============================================================
+async def record_whitelist_media(message, chat_id, source_override):
+    """白名单 chat 媒体事件 → 记持久化转发任务（origin='wl'）。
 
-    单条媒体即时转发（_relay_single）；带 grouped_id 的相册成员走整组协调
-    （_relay_album_member）：攒批到完整一组后用一次 forward_messages 转发，
-    让收藏夹里是「一个相册」而非 N 条散消息——更接近用户手动转发一组数据的
-    效果。下载侧行为不变：每个副本仍带系统「转发自 X」来源头（据此看得出处/
-    落盘目录，目录下载时经 fwd_from 自动解析回原来源）；已知代价是源消息若
-    带内联按钮，按钮会随转发进入副本（Telegram 禁止编辑被转发消息无法事后剥）。
+    事件生产者只「记录」，不转发（与标签监听 Scanner 同构）：任务落
+    listener_tasks，Worker 受控转发 + 入队下载。同一单元与扫描生产者并发
+    产生时由唯一索引兜底，双转发结构上不可能。DB 不可用回退直下原消息
+    （媒体不丢，只丢收藏夹副本——规格 §4.3）。
     """
     if getattr(message, "grouped_id", None):
-        await _relay_album_member(message, origin_chat_id, source_override)
+        await _record_album_member(message, chat_id, source_override)
     else:
-        await _relay_single(message, origin_chat_id, source_override)
+        await _record_single(message, chat_id, source_override)
 
 
-async def _relay_single(message, chat_id, source_override):
-    """单条媒体：转发进收藏夹 → 入队下载转发副本（整组回退的逐条单转同此）。
-
-    转发用裸 forward_to，不给 wait_for：一次相册 ~20 个成员并发转发会触发
-    Telegram 转发频率限制，Telethon 会按 FloodWait 自行等待后重试，wait_for
-    会把这种合法等待掐成超时、进而降级直下原消息——同一相册被劈到两个来源
-    目录。转发失败（如来源禁转）时仍回退直下原消息，功能不丢。
-
-    相册无自身文字的成员（图片等）：转发副本补不了 caption，于是转发前从源
-    chat 读同组说明（_maybe_album_caption），作为 album_caption 存进队列
-    记录，下载命名时套用——图片名是 `日期 相册说明 - 原名` 而非 photo_时间戳。
-    """
-    link = message_source_link(message, chat_id or message.chat_id)
-    album_caption = await _maybe_album_caption(message)
-    # 评论继承频道原帖命名：**从源消息**解析（比从转发副本解析少一跳回源）。
-    origin = await resolve_origin_snapshot(message)
-    try:
-        fwd = await _forward_to_me(message)
+async def _record_single(message, chat_id, source_override):
+    """单条媒体 → 一条收藏夹任务。"""
+    if wl_scan.all_members_dedup_hit([message]):
         logger.info(
-            f"📤 已把白名单媒体转发进收藏夹（新消息 ID={fwd.id}），"
-            "将下载该转发副本"
-        )
+            f"⏭️ 白名单媒体 {message.id} 已下载过（dedup 前置），不建转发任务")
+        return
+    origin = await resolve_origin_snapshot(message)
+    caption = (message.message or "").strip()
+    records = listener.build_saved_messages_task(
+        chat_id, [message], caption, origin)
+    try:
+        runtime_db.enqueue_listener_tasks(chat_id, records,
+                                          origin="wl", chain="wl")
+        logger.info(f"📋 白名单媒体已记任务：{chat_id} #{message.id}")
+    except runtime_db.DbUnavailable as e:
+        logger.warning(
+            f"📋 记白名单任务失败（DB 不可用），回退直下原消息 "
+            f"#{message.id}：{e}")
+        await _fallback_direct_download(message, chat_id, source_override,
+                                        origin)
+
+
+async def _fallback_direct_download(message, chat_id, source_override,
+                                    origin=None):
+    """回退直下原消息（DB 不可用；不转发、无收藏夹副本，媒体不丢）。"""
+    try:
         await enqueue_media(
-            fwd, state.MY_ID, _origin_folder(origin) or None, source_link=link,
-            album_caption=album_caption,
+            message, chat_id, _origin_folder(origin) or source_override,
             parent_date=_origin_date(origin),
             parent_caption=_origin_caption(origin),
         )
     except Exception as e:
-        logger.exception(
-            f"转发白名单媒体进收藏夹失败（{source_override}，msg_id="
-            f"{message.id}），回退直下原消息：{e}"
-        )
-        await enqueue_media(
-            message, chat_id, _origin_folder(origin) or source_override,
-            album_caption=album_caption,
-            parent_date=_origin_date(origin),
-            parent_caption=_origin_caption(origin),
-        )
-
-
-async def _forward_to_me(message):
-    """把单条消息转发到收藏夹并返回副本；转发频率限制时等待后重试。
-
-    不给外部 wait_for（见 relay_chat_media 说明）。Telethon 默认对 FloodWait
-    自动等待 ≤60s 后重试；超过阈值的 FloodWaitError 在这里自己等够 seconds
-    （上限 120s）再试，而不是直接降级——降级会把该成员落去白名单标题目录、
-    拆散整组相册。重试用尽或其它错误照常抛出，由调用方回退。
-    """
-    from telethon.errors import FloodWaitError
-
-    last_error = None
-    for attempt in range(1, 4):
-        try:
-            forwarded = await message.forward_to("me")
-        except FloodWaitError as e:
-            wait = min(int(getattr(e, "seconds", None) or 30), 120)
-            last_error = e
-            logger.warning(
-                f"转发触发频率限制，等待 {wait}s 后重试 "
-                f"（msg_id={message.id}，第 {attempt}/3 次）"
-            )
-            await asyncio.sleep(wait)
-            continue
-        forwarded = forwarded[0] if isinstance(forwarded, (list, tuple)) else forwarded
-        if forwarded is None:
-            raise RuntimeError("转发到 Saved Messages 未返回新消息")
-        return forwarded
-    raise last_error or RuntimeError(f"转发 {message.id} 多次被频率限制，放弃")
+        logger.exception(f"白名单媒体直下回退也失败（msg_id={message.id}）：{e}")
 
 
 # 找相册兄弟的窗口半径：Telegram 相册最多 10 个媒体且 id 连续，±10 足够。
@@ -877,32 +869,32 @@ def _take_me_label():
 
 
 # ============================================================
-# 相册整组转发协调
+# 白名单相册整组建任务协调
 # ============================================================
-# 相册到达白名单 chat 时是 N 条各自独立的媒体事件、共享 grouped_id。逐条即时
-# 转发会让收藏夹里是 N 条散消息；要变成「一个相册」，需把同组所有成员放进同
-# 一次 forward_messages 请求（服务端据此在目的地重组相册）。第一个成员事件
-# 到达后不立即转发，等一个攒批窗口让洪峰其余成员的事件落齐，再从源 chat 拉
-# 权威完整成员列表，一次性整组转发。与 caption 缓存同以 grouped_id 为键，
-# 单线程事件循环内访问、无需加锁。
-_ALBUM_DEBOUNCE_SECONDS = 1.5  # 攒批窗口：等洪峰其余成员事件落齐
-_ALBUM_SETTLE_SECONDS = 5.0    # 转发完成后保留协调条目的宽限（迟到成员直接忽略）
+# 相册到达白名单 chat 时是 N 条各自独立的媒体事件、共享 grouped_id。逐条建
+# 任务会让 Worker 逐条转发、收藏夹里是 N 条散消息；要变成「一个相册」，整组
+# 成员要放进**一条**任务（member_ids 进 payload，Worker 一次 forward 整组）。
+# 第一个成员事件到达后不立即建任务，等一个攒批窗口让洪峰其余成员的事件落齐，
+# 再从源 chat 拉权威完整成员列表，合成一条任务。与旧直转协调器同构，产出从
+# 「转发」变「任务」。单线程事件循环内访问、无需加锁。
+_WL_ALBUM_DEBOUNCE_SECONDS = 1.5  # 攒批窗口：等洪峰其余成员事件落齐
+_WL_ALBUM_SETTLE_SECONDS = 5.0    # 建任务完成后保留协调条目的宽限（迟到成员直接忽略）
 # key=(chat_id, grouped_id) → {"seen": {msg_id: msg}, "task": Task, "done": bool}
-_ALBUM_RELAY = {}
+_WL_ALBUM_TASKS = {}
 
 
-async def _relay_album_member(message, chat_id, source_override):
-    """相册成员事件：登记进组协调状态；首个成员负责起整组转发任务。"""
+async def _record_album_member(message, chat_id, source_override):
+    """相册成员事件：登记进组协调状态；首个成员负责起建任务协程。"""
     key = (chat_id, message.grouped_id)
-    st = _ALBUM_RELAY.get(key)
+    st = _WL_ALBUM_TASKS.get(key)
     if st is None:
-        st = _ALBUM_RELAY[key] = {"seen": {}, "task": None, "done": False}
+        st = _WL_ALBUM_TASKS[key] = {"seen": {}, "task": None, "done": False}
     if st["done"]:
-        return  # 整组已转发完；迟到的重复成员直接忽略，避免二次转发
+        return  # 整组已落盘；迟到的重复成员直接忽略（唯一索引双保险）
     st["seen"][message.id] = message
     if st["task"] is None:
         st["task"] = asyncio.create_task(
-            _relay_album_group(key, chat_id, source_override)
+            _record_album_group(key, chat_id, source_override)
         )
 
 
@@ -939,43 +931,14 @@ async def _fetch_album_members(chat_id, grouped_id, lo_id, hi_id):
         return []
 
 
-async def _forward_album_to_me(chat_id, members):
-    """整组转发进收藏夹：一次 forward_messages 返回副本列表（个别失败位为 None）。
-
-    不给外部 wait_for：一次请求若触发转发频率限制，Telethon 会按 FloodWait
-    自行等待 ≤60s 后重试；超过阈值自行等够 seconds（上限 120s）再试——降级成
-    逐条单转反而更易触频、拆组。
-    """
-    from telethon.errors import FloodWaitError
-
-    last_error = None
-    for attempt in range(1, 4):
-        try:
-            sent = await state.client.forward_messages(
-                "me", members, from_peer=chat_id
-            )
-            if isinstance(sent, (list, tuple)):
-                return list(sent)
-            return [sent]
-        except FloodWaitError as e:
-            wait = min(int(getattr(e, "seconds", None) or 30), 120)
-            last_error = e
-            logger.warning(
-                f"相册整组转发触发频率限制，等待 {wait}s 后重试 "
-                f"（第 {attempt}/3 次，{len(members)} 个成员）"
-            )
-            await asyncio.sleep(wait)
-    raise last_error or RuntimeError("相册整组转发多次被频率限制，放弃")
-
-
-async def _relay_album_group(key, chat_id, source_override):
-    """攒批窗口后整组转发：从源 chat 拉完整成员 → 一次 forward → 逐个入队。"""
+async def _record_album_group(key, chat_id, source_override):
+    """攒批窗口后整组建任务：拉权威成员 → dedup 前置 → 一条任务落盘。"""
     grouped_id = key[1]
     try:
-        await asyncio.sleep(_ALBUM_DEBOUNCE_SECONDS)
+        await asyncio.sleep(_WL_ALBUM_DEBOUNCE_SECONDS)
 
-        st = _ALBUM_RELAY.get(key)
-        if st is None:
+        st = _WL_ALBUM_TASKS.get(key)
+        if st is None or st["done"]:
             return
         seen_ids = list(st["seen"].keys())
         if not seen_ids:
@@ -985,73 +948,46 @@ async def _relay_album_group(key, chat_id, source_override):
             chat_id, grouped_id, min(seen_ids), max(seen_ids)
         )
         if not members:
-            # 拉不到权威列表（读源 chat 失败等）→ 用已登记成员逐条单转兜底
+            # 拉不到权威列表（读源 chat 失败等）→ 用已登记成员兜底建任务，
+            # 媒体不丢；缺失成员由扫描生产者按游标补。
+            members = [st["seen"][i] for i in sorted(seen_ids)]
             logger.warning(
-                f"相册整组转发：未能从源 chat 取到完整成员"
-                f"（grouped_id={grouped_id}，已登记 {len(seen_ids)} 个），改逐条单转"
-            )
-            await _fallback_relay_each(chat_id, source_override, st["seen"].values())
-            st["done"] = True
-            await asyncio.sleep(_ALBUM_SETTLE_SECONDS)
-            _ALBUM_RELAY.pop(key, None)
-            return
+                f"📋 相册建任务：未能从源 chat 取到完整成员"
+                f"（grouped_id={grouped_id}，已登记 {len(members)} 个）")
 
-        group_caption = pick_group_caption_text(members, grouped_id)
-        try:
-            copies = await _forward_album_to_me(chat_id, members)
-        except Exception as e:
-            logger.exception(
-                f"相册整组转发失败（{source_override}，grouped_id={grouped_id}，"
-                f"{len(members)} 个成员），回退逐条单转：{e}"
-            )
-            if group_caption:
-                _ALBUM_CAPTIONS[grouped_id] = group_caption  # 单转的无文字成员复用
-            await _fallback_relay_each(chat_id, source_override, members)
-            st["done"] = True
-            await asyncio.sleep(_ALBUM_SETTLE_SECONDS)
-            _ALBUM_RELAY.pop(key, None)
-            return
-
-        copies = [c for c in copies if c is not None]  # 个别失败位为 None 时跳过
-        ok = len(copies)
-        logger.info(
-            f"📤 已把相册整组转发进收藏夹（{len(members)} 个成员，成功 {ok} 个，"
-            f"新消息 ID={copies[0].id if ok else '-'}），将逐个下载转发副本"
-        )
-        link = message_source_link(members[0], chat_id)
-        # 整组共用一次解析（同一单元的目标一致），别 N 个成员各查一遍
-        origin = await resolve_origin_snapshot(members[0])
-        origin_caption = _origin_caption(origin)
-        for copy in copies:
-            # 转发保留挂说明成员自己的 caption；无文字副本沿用相册说明做命名
-            own_text = (copy.message or "").strip()
-            album_caption = None if own_text else (group_caption or None)
-            await enqueue_media(
-                copy, state.MY_ID, _origin_folder(origin), source_link=link,
-                album_caption=album_caption,
-                parent_date=_origin_date(origin),
-                parent_caption=origin_caption,
-            )
+        if wl_scan.all_members_dedup_hit(members):
+            logger.info(
+                f"📋 相册 {chat_id} 组 {grouped_id} 整组已下载过"
+                "（dedup 前置），不建转发任务")
+        else:
+            caption = pick_group_caption_text(members, grouped_id)
+            # 整组共用一次解析（同一单元的目标一致），别 N 个成员各查一遍
+            origin = await resolve_origin_snapshot(members[0])
+            records = listener.build_saved_messages_task(
+                chat_id, members, caption, origin)
+            try:
+                runtime_db.enqueue_listener_tasks(chat_id, records,
+                                                  origin="wl", chain="wl")
+                logger.info(
+                    f"📋 白名单相册已记任务：{chat_id} 组 {grouped_id}"
+                    f"（{len(members)} 个成员）")
+            except runtime_db.DbUnavailable as e:
+                logger.warning(
+                    f"📋 相册建任务失败（DB 不可用），逐条回退直下：{e}")
+                for m in members:
+                    await _fallback_direct_download(m, chat_id,
+                                                    source_override, origin)
 
         st["done"] = True
-        # 转发完保留协调条目一段宽限，迟到成员事件直接忽略；再摘除防积累
-        await asyncio.sleep(_ALBUM_SETTLE_SECONDS)
-        _ALBUM_RELAY.pop(key, None)
+        # 建完任务保留协调条目一段宽限，迟到成员事件直接忽略；再摘除防积累
+        await asyncio.sleep(_WL_ALBUM_SETTLE_SECONDS)
+        _WL_ALBUM_TASKS.pop(key, None)
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        logger.exception(f"相册整组转发流程异常（grouped_id={grouped_id}）：{e}")
-        st = _ALBUM_RELAY.get(key)
-        if st is not None and not st["done"]:
-            st["done"] = True
-        _ALBUM_RELAY.pop(key, None)
-
-
-async def _fallback_relay_each(chat_id, source_override, members):
-    """整组转发失败/不可行时逐条单转（旧行为），保证媒体不丢、收藏夹不空。"""
-    await asyncio.gather(
-        *(_relay_single(m, chat_id, source_override) for m in members),
-        return_exceptions=True,
-    )
+        logger.exception(f"相册建任务流程异常（grouped_id={grouped_id}）：{e}")
+        _WL_ALBUM_TASKS.pop(key, None)
 
 
 async def main():
@@ -1262,6 +1198,10 @@ async def main():
         if recovered:
             logger.warning(f"🗄 启动恢复：{recovered} 条租约过期的监听任务已回到待执行")
         listener_worker_task = listener_worker.start_worker()
+    # 白名单扫描生产者（停机补漏链）：与标签监听扫描并列的独立循环
+    wl_scan_task = None
+    if state.RUNTIME_DB_READY:
+        wl_scan_task = asyncio.create_task(_whitelist_scan_loop())
     # Runtime Reporter（只读观察者）：发启动通知 + 后台刷新状态面板
     reporter_instance, reporter_task = await _start_reporter()
 
@@ -1282,11 +1222,13 @@ async def main():
         # finally 里的 disconnect，随后以 CancelledError 收尾；bot 探活/重放
         # 扫描/Reporter 主循环同理。
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
-                  reporter_task, listener_task, listener_worker_task):
+                  reporter_task, listener_task, listener_worker_task,
+                  wl_scan_task):
             if t is not None:
                 t.cancel()
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
-                  reporter_task, listener_task, listener_worker_task):
+                  reporter_task, listener_task, listener_worker_task,
+                  wl_scan_task):
             if t is not None:
                 try:
                     await t

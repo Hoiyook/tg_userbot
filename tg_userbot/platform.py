@@ -1,9 +1,10 @@
 """平台链接流（抖音 / Instagram）：链接识别 + 本地解析优先 / 转发解析 bot。
 
 旧版「链接 → 平台对话 → 点按钮 → 平台自下」链路已删除：解析 bot 的私聊
-在下载白名单上，其回复的直发视频会由白名单转发流（app.relay_chat_media）
-自动转发进 Saved Messages → 走统一媒体下载（落转发来源目录，不再写
-Douyin/Instagram 子目录，也不再区分平台短命名）。本模块只负责：
+在下载白名单上，其回复的直发视频由白名单事件生产者（app.record_whitelist_media）
+记为转发任务、经 listener_worker 转发进 Saved Messages → 走统一媒体下载
+（落转发来源目录，不再写 Douyin/Instagram 子目录，也不再区分平台短命名）。
+本模块只负责：
 
   * 从消息文字提取抖音 / Instagram 链接（extract_*_urls，cleanup 与 app 复用）；
   * 桌面端（config.RESOLVER_ENABLED）抖音链接先走 resolver 本地解析，
