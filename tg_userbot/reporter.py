@@ -66,6 +66,7 @@ from .config import (
     REPORT_TO_BOT_CHAT,
     TASK_EVENTS_FILE,
 )
+from . import runtime_db
 from .log import logger
 
 # 关闭通知的最长等待（秒）：Telegram 不可用时也不能阻塞进程退出（规格 §28）
@@ -693,7 +694,16 @@ class Reporter:
     # ---------- 事件流增量读取（规格 §39） ----------
 
     def mark_event_cursor(self):
-        """把游标移到当前文件末尾：启动前的历史事件不再重复通知。"""
+        """把游标移到当前末尾：启动前的历史事件不再重复通知。
+
+        DB 模式 = download_events 当前 MAX(id)（rowid 单调，历史不重放）；
+        JSONL 模式 = 文件末尾字节偏移（旧路径原样）。"""
+        if runtime_db.has_connection():
+            try:
+                self._event_cursor = runtime_db.download_events_max_id()
+            except runtime_db.DbUnavailable:
+                self._event_cursor = 0
+            return
         self._event_cursor = self._event_file_size()
 
     def _event_file_size(self):
@@ -703,7 +713,25 @@ class Reporter:
             return 0
 
     async def poll_events(self):
-        """读取事件文件的新增行并派发通知（增量，不整文件重扫）。"""
+        """读取新增事件并派发通知（增量，不整文件重扫）。
+
+        DB 模式按 rowid 游标增量 SELECT（裁剪删旧不影响游标，无需重置）；
+        JSONL 模式按字节偏移（旧路径，含 trim 重写后 size 回退的重置补丁）。"""
+        if runtime_db.has_connection():
+            try:
+                events = runtime_db.download_events_since(
+                    self._event_cursor or 0)
+                # SELECT 与 MAX 之间无 await（同线程同步 SQL），无新插缝隙
+                if events:
+                    self._event_cursor = runtime_db.download_events_max_id()
+            except runtime_db.DbUnavailable:
+                return
+            if not events:
+                return
+            self._touch_activity()
+            self._stats_dirty = True      # 统计口径变了，下一轮重算
+            await self.dispatch_events(events)
+            return
         size = self._event_file_size()
         if self._event_cursor is None:
             self._event_cursor = size

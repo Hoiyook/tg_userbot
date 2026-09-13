@@ -29,6 +29,7 @@ import json
 from datetime import date, datetime, timedelta
 
 from . import state
+from . import runtime_db
 from .config import (
     DOWNLOAD_HISTORY_FILE,
     LOG_FILE,
@@ -70,15 +71,23 @@ def emit_event(ev, task_id=None, label=None, **extra):
         for key, value in extra.items():
             if value is not None:
                 rec[key] = value
-        with open(TASK_EVENTS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        if runtime_db.has_connection():
+            # DB 后端（Phase 2）：ts 存 epoch，其余进 payload；rec 的
+            # dict 形状（含 ts 本地串）只属于 JSONL 路径
+            payload = {k: v for k, v in rec.items()
+                       if k not in ("ts", "ev", "id")}
+            runtime_db.download_event_insert(
+                ev, task_id=task_id, payload=payload or None,
+                ts=int(datetime.now().timestamp()))
+        else:
+            with open(TASK_EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
         logger.warning(f"写任务事件失败（不影响下载）：{e}")
 
 
-def load_events(path=None):
-    """读取全部任务事件（坏行跳过、文件缺失返回空列表）。"""
-    path = path or TASK_EVENTS_FILE
+def _load_events_file(path):
+    """JSONL 文件读取（坏行跳过、文件缺失返回空列表）——文件模式专用。"""
     events = []
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -97,11 +106,37 @@ def load_events(path=None):
     return events
 
 
+def load_events(path=None):
+    """读取全部任务事件（坏行跳过），返回 rec dict 列表。
+
+    DB 在连且未显式传 path → download_events 表（dict 形状与 JSONL 逐字段
+    兼容，消费方无感）；未连接（测试环境 / init 失败）或显式传 path
+    （显式指定要读哪个文件——既有测试/诊断路径）→ JSONL 文件。"""
+    if path is None and runtime_db.has_connection():
+        try:
+            return runtime_db.download_events_all()
+        except runtime_db.DbUnavailable as e:
+            logger.warning(f"读任务事件失败（不影响下载）：{e}")
+            return []
+    return _load_events_file(path or TASK_EVENTS_FILE)
+
+
 def trim_event_file(path=None, max_events=None):
-    """启动裁剪：超上限保尾部、原子重写一次（与 dedup 索引同款）。"""
-    path = path or TASK_EVENTS_FILE
+    """启动裁剪：超上限保尾部（DB 在连 → 裁 download_events 表；
+    否则 JSONL 原子重写，与 dedup 索引同款）。"""
     max_events = max_events or TASK_EVENTS_MAX_EVENTS
-    events = load_events(path)
+    if runtime_db.has_connection():
+        try:
+            removed = runtime_db.download_events_trim(max_events)
+            if removed:
+                logger.info(
+                    f"任务事件超上限，已裁剪 {removed} 条"
+                    f"（保留最近 {max_events} 条）")
+        except runtime_db.DbUnavailable as e:
+            logger.warning(f"裁剪任务事件失败（下次启动再试）：{e}")
+        return
+    path = path or TASK_EVENTS_FILE
+    events = _load_events_file(path)
     if len(events) <= max_events:
         return
     kept = events[-max_events:]
@@ -114,6 +149,71 @@ def trim_event_file(path=None, max_events=None):
         logger.info(f"任务事件日志超上限，已裁剪保留最近 {len(kept)} 条")
     except Exception as e:
         logger.warning(f"裁剪任务事件日志失败（下次启动再试）：{e}")
+
+
+def _archive_events_file(imported):
+    """旧 task_events.jsonl 改名 .imported 保留（绝不删除）。"""
+    archive = TASK_EVENTS_FILE + ".imported"
+    try:
+        os.replace(TASK_EVENTS_FILE, archive)
+    except OSError as e:
+        logger.warning(f"旧任务事件文件归档失败（原样保留）：{e}")
+        return
+    if imported:
+        logger.info(f"历史任务事件已导入 Runtime DB 并归档 → {archive}")
+    else:
+        logger.warning(
+            f"download_events 表已有数据，忽略并归档旧事件文件 → {archive}")
+
+
+def migrate_and_trim_events():
+    """启动入口（app.main 调用，替代裸 trim_event_file）：
+    ① 旧 JSONL 一次性导入（表空 + 文件非空 → 导入后改名 .imported；
+    表有行 → DB 赢、文件归档并 WARNING；坏行/坏 ts 跳过计数；
+    失败 → 文件原样保留，新事件已流向 DB，可观测数据可接受）；
+    ② 按当前模式裁剪（DB → 裁表 / 文件 → 原子重写）。"""
+    if not runtime_db.has_connection():
+        trim_event_file()
+        return
+    try:
+        count = runtime_db.download_events_count()
+    except runtime_db.DbUnavailable as e:
+        logger.warning(f"任务事件存储不可用，跳过导入与裁剪：{e}")
+        return
+    file_exists = os.path.exists(TASK_EVENTS_FILE)
+    if count == 0 and file_exists:
+        legacy = _load_events_file(TASK_EVENTS_FILE)
+        if legacy:
+            imported = skipped = 0
+            try:
+                for rec in legacy:
+                    try:
+                        ts = runtime_db._event_epoch_from_str(rec.get("ts"))
+                    except (ValueError, TypeError):
+                        skipped += 1
+                        continue
+                    payload = {k: v for k, v in rec.items()
+                               if k not in ("ts", "ev", "id")}
+                    runtime_db.download_event_insert(
+                        rec.get("ev"), task_id=rec.get("id"),
+                        payload=payload or None, ts=ts)
+                    imported += 1
+            except Exception as e:
+                logger.warning(
+                    f"历史任务事件导入失败（文件原样保留，本次按文件模式"
+                    f"运行，重启重试）：{type(e).__name__}: {e}")
+                trim_event_file()
+                return
+            detail = f"，坏行跳过 {skipped}" if skipped else ""
+            logger.info(
+                f"🗄 历史任务事件已导入：{imported} 条{detail}"
+                f"（原文件改名 .imported 保留）")
+            _archive_events_file(imported=True)
+    elif count > 0 and file_exists:
+        _archive_events_file(imported=False)
+    elif count == 0 and os.path.exists(TASK_EVENTS_FILE + ".imported"):
+        logger.info("🗄 历史任务事件此前已导入（.imported 在档）")
+    trim_event_file()
 
 
 def parse_size(text):

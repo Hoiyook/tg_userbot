@@ -39,6 +39,7 @@ import os
 import re
 import sqlite3
 import time
+from datetime import datetime
 
 from . import config
 from .log import logger
@@ -202,6 +203,33 @@ _SCHEMA = (
     """
     CREATE INDEX IF NOT EXISTS idx_download_tasks_state
     ON download_tasks (state, seq)
+    """,
+    # ============================================================
+    # 下载任务事件流（2026-09-14，任务书：任务事件 SQLite 化 Phase 2）。
+    # 替代 runtime/task_events.jsonl：台账/对账（stats.rebuild_stats）与
+    # Reporter 通知的数据源。**与 listener 的 task_events 表是两套 ID 空间**
+    # （那边自增 id 外键 listener_tasks；这边 task_id 是下载任务 uuid），
+    # 绝不混用，故命名刻意错开。ts 存 epoch 秒（读出渲染回本地串）；task_id
+    # 可空（DEDUP_SKIPPED/LISTEN_SCAN/LISTEN_FAIL 等输入侧事件无任务）；
+    # **不建外键**（事件流是独立台账，避免先于任务行/任务删行被级联的边角）。
+    # rowid（id）单调递增 = Reporter 的增量游标；裁剪删旧行不影响游标语义。
+    # ============================================================
+    """
+    CREATE TABLE IF NOT EXISTS download_events (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts        INTEGER NOT NULL,
+        ev        TEXT NOT NULL,
+        task_id   TEXT,
+        payload   TEXT
+    )
+    """,
+    # 台账按窗口聚合（ts 区间扫描）与按任务对账（task_id, id）
+    """
+    CREATE INDEX IF NOT EXISTS idx_download_events_ts ON download_events (ts)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_download_events_task
+    ON download_events (task_id, id)
     """,
 )
 
@@ -491,6 +519,10 @@ def migrate() -> int:
         # 迁移——上面的 CREATE IF NOT EXISTS 已覆盖；旧队列 JSON 由 queue.py
         # 的启动导入负责（表空 + JSON 非空 → 一次性导入）。
         logger.info("🗄 Runtime DB 迁移：v4（+ download_tasks 下载队列）")
+    if version < 5:
+        # v4 → v5：新增 download_events（下载任务事件流）。纯建表；旧 JSONL
+        # 由 stats.migrate_and_trim_events 的启动导入负责。
+        logger.info("🗄 Runtime DB 迁移：v5（+ download_events 任务事件流）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -1272,3 +1304,111 @@ def queue_count():
         return counts
 
     return _read(read, "统计下载队列")
+
+
+# ============================================================
+# 下载任务事件流（2026-09-14，任务书：任务事件 SQLite 化 Phase 2）
+# ============================================================
+# stats.emit_event / stats.load_events 的 DB 后端。rec dict 形状是消费方
+# （rebuild_stats 纯函数、reporter 通知分发）的契约：ts 渲染回与 JSONL 逐
+# 字符一致的本地串、task_id 非空才有 "id" 键、payload 平铺、列值优先。
+_EVENT_TS_FMT = "%Y-%m-%d %H:%M:%S"
+_EVENT_REC_KEYS = ("ts", "ev", "id")
+
+
+def _event_epoch_from_str(ts_str):
+    """本地时间串 → epoch 秒；解析失败抛 ValueError（导入方跳过该行）。"""
+    return int(time.mktime(time.strptime(str(ts_str).strip(), _EVENT_TS_FMT)))
+
+
+def _event_ts_str(epoch):
+    """epoch → 本地时间串（datetime.fromtimestamp，与旧 JSONL 同格式）。"""
+    return datetime.fromtimestamp(int(epoch)).strftime(_EVENT_TS_FMT)
+
+
+def _event_row_to_rec(row):
+    """行 → rec dict（形状兼容的唯一定义点，任务书 §5.1）。"""
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"payload 不是合法 JSON：{e}") from e
+    if not isinstance(payload, dict):
+        raise ValueError(f"payload 不是对象（{type(payload).__name__}）")
+    rec = dict(payload)
+    rec["ts"] = _event_ts_str(row["ts"])
+    rec["ev"] = row["ev"]
+    if row["task_id"]:
+        rec["id"] = row["task_id"]
+    return rec
+
+
+def download_event_insert(ev, task_id=None, payload=None, ts=None):
+    """单行事件写入（emit_event 的 DB 后端）。ts=None 取当前时间。"""
+    if ts is None:
+        ts = int(time.time())
+    _write(lambda conn: _execute(
+        conn,
+        "INSERT INTO download_events(ts, ev, task_id, payload) "
+        "VALUES(?, ?, ?, ?)",
+        (int(ts), ev, task_id,
+         _dumps(payload) if payload else None)),
+        f"任务事件入库（{ev}）")
+
+
+def download_events_all():
+    """全量事件按 id 升序 → rec dict 列表（load_events 的 DB 等价）。
+    坏 payload 行跳过 + WARNING，不崩装载。"""
+    def read(conn):
+        out = []
+        for row in _execute(
+                conn, "SELECT id, ts, ev, task_id, payload "
+                      "FROM download_events ORDER BY id").fetchall():
+            try:
+                out.append(_event_row_to_rec(row))
+            except Exception as e:
+                logger.warning(f"🗄 事件坏行已跳过（id={row['id']}）：{e}")
+        return out
+
+    return _read(read, "装载任务事件")
+
+
+def download_events_since(last_id, limit=2000):
+    """id > last_id 的增量事件按序返回（reporter 游标读取）。"""
+    def read(conn):
+        out = []
+        for row in _execute(
+                conn, "SELECT id, ts, ev, task_id, payload "
+                      "FROM download_events WHERE id > ? "
+                      "ORDER BY id LIMIT ?", (int(last_id), int(limit))
+        ).fetchall():
+            try:
+                out.append(_event_row_to_rec(row))
+            except Exception as e:
+                logger.warning(f"🗄 事件坏行已跳过（id={row['id']}）：{e}")
+        return out
+
+    return _read(read, "增量读任务事件")
+
+
+def download_events_count():
+    return int(_read(lambda c: _execute(
+        c, "SELECT COUNT(*) FROM download_events").fetchone()[0],
+        "统计任务事件"))
+
+
+def download_events_max_id():
+    """当前最大 rowid（reporter 启动游标 = MAX(id)：历史事件不重放通知）。"""
+    return int(_read(lambda c: _execute(
+        c, "SELECT COALESCE(MAX(id), 0) FROM download_events").fetchone()[0],
+        "读任务事件游标"))
+
+
+def download_events_trim(keep):
+    """保尾 keep 条（台账封顶），返回删除行数；rowid 单调性不受影响。"""
+    def do(conn):
+        cur = _execute(
+            conn, "DELETE FROM download_events WHERE id NOT IN "
+                  "(SELECT id FROM download_events ORDER BY id DESC LIMIT ?)",
+            (int(keep),))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    return _write(do, "裁剪任务事件")

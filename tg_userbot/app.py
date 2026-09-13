@@ -1140,7 +1140,7 @@ async def main():
         logger.info(f"🔁 待重试列表：{len(state.QUEUE['retry'])} 个任务（手动重试）")
 
     # 任务事件日志裁剪（台账按 task_id 重建的数据源，保尾部控制体积）
-    stats.trim_event_file()
+    stats.migrate_and_trim_events()
 
     # Chrome Agent 结果通知轮询（读 chrome_tasks.json 终态 → 通知收藏夹）
     asyncio.create_task(chrome_client.notify_loop())
