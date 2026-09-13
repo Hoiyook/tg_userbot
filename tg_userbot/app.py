@@ -28,6 +28,7 @@ from . import listener_worker
 from . import wl_scan
 from . import queue
 from . import runtime_db
+from . import sql_templates
 from . import reporter
 from . import stats
 from . import thread
