@@ -31,6 +31,7 @@ from . import finder
 from . import listener
 from . import caption_filter
 from . import wl_scan
+from . import sql_templates
 from . import commands
 from . import config
 from .config import DONE_DEFAULT_LINES, REPORT_STATUS_PREFIX
@@ -97,6 +98,7 @@ def open_input_window(kind):
     state.LISTEN_INPUT_UNTIL = 0.0
     state.LISTEN_INPUT_STEP = ""
     state.WL_INPUT_UNTIL = 0.0
+    state.SQLT_INPUT_UNTIL = 0.0
     if kind == "cookie":
         state.COOKIE_INPUT_UNTIL = (
             time.monotonic() + config.COOKIE_INPUT_WINDOW_SECONDS
@@ -113,6 +115,11 @@ def open_input_window(kind):
     elif kind == "wl_since":
         # 复用标签监听的窗口时长（120s）
         state.WL_INPUT_UNTIL = (
+            time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
+        )
+    elif kind == "sqlt":
+        # 「➕ 新增模板」窗口：一条文本 = 「<名字> <SQL>」（同名即覆盖）
+        state.SQLT_INPUT_UNTIL = (
             time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
         )
     else:
@@ -163,6 +170,37 @@ async def handle_menu_action(action, arg, event):
     if action == "wl_scan":
         return (wl_scan.summary_text(await wl_scan.scan_all(manual=True)),
                 menu.wl_menu_buttons())
+    if action == "sqlt":
+        return (sql_templates.list_text(), sql_templates.menu_buttons())
+    if action == "sqlt_add":
+        open_input_window("sqlt")
+        return (
+            "📐 新增/覆盖 SQL 模板\n\n"
+            "请发送一行：<名字> <SQL>\n"
+            "例：待执行 SELECT status, COUNT(*) FROM listener_tasks "
+            "GROUP BY status\n\n"
+            "名字 ≤16 字符（中文/字母/数字/下划线）；同名即覆盖。\n"
+            f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "发送 / 开头的命令可取消。",
+            menu.back_home_buttons(),
+        )
+    if action == "sqlt_del":
+        ok, msg = sql_templates.delete(arg or "")
+        if not ok:
+            return (msg, sql_templates.menu_buttons())
+        return (f"🗑 {msg}", sql_templates.menu_buttons())
+    if action == "sqlt_run":
+        ok, result = sql_templates.execute_template(arg or "")
+        if not ok:
+            return (result, sql_templates.menu_buttons())
+        try:
+            body = text.format_sql_result(result)
+        except runtime_db.DbUnavailable as e:
+            body = f"{text.SQL_TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+        return (body, [
+            [Button.inline("🔙 返回模板", menu.encode_menu_data("sqlt"))],
+            [Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
+        ])
     if action == "wl_add":
         if arg is None:
             return (
@@ -497,6 +535,14 @@ async def bot_message_handler(event):
             return
         state.WL_INPUT_UNTIL = 0.0
 
+    # SQL 模板新增窗口：一条文本 = 「<名字> <SQL>」（同名即覆盖）。
+    if state.SQLT_INPUT_UNTIL and time.monotonic() < state.SQLT_INPUT_UNTIL:
+        if not text.startswith("/"):
+            state.SQLT_INPUT_UNTIL = 0.0
+            await _handle_sqlt_input(event, text)
+            return
+        state.SQLT_INPUT_UNTIL = 0.0
+
     if from_id:
         chat_id, title = await whitelist.resolve_wl_target(
             state.bot_client, None, fwd
@@ -556,6 +602,22 @@ async def _handle_find_input(event, text):
     await state.bot_client.send_message(
         state.MY_ID, finder.find_media(text), link_preview=False
     )
+
+
+async def _handle_sqlt_input(event, text):
+    """SQL 模板新增窗口的输入：一行「<名字> <SQL>」（同名即覆盖）。"""
+    parts = text.strip().split(None, 1)
+    if len(parts) != 2:
+        await state.bot_client.send_message(
+            state.MY_ID,
+            "❌ 格式：<名字> <SQL>，例：待执行 SELECT * FROM listener_tasks")
+        return
+    ok, msg = sql_templates.upsert(parts[0], parts[1])
+    await state.bot_client.send_message(state.MY_ID, msg)
+    if ok:
+        await state.bot_client.send_message(
+            state.MY_ID, sql_templates.list_text(),
+            buttons=sql_templates.menu_buttons())
 
 
 async def _handle_wl_since_input(event, text):

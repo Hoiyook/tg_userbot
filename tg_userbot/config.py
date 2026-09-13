@@ -286,6 +286,7 @@ CAPTION_FILTER_CONFIG_FILE = os.path.join(RUNTIME_DIR, "caption_filter.json")
 # enqueue_media → 下载队列 → dedup → 命名的整条链路，不新增第二套下载器。
 # ------------------------------------------------------------
 LISTEN_CONFIG_FILE = os.path.join(RUNTIME_DIR, "listen.json")
+SQL_TEMPLATES_FILE = os.path.join(RUNTIME_DIR, "sql_templates.json")
 LISTEN_STATE_FILE = os.path.join(RUNTIME_DIR, "listen_state.json")
 LISTEN_DEFAULT_INTERVAL_MINUTES = 1440     # 默认每天扫一次
 LISTEN_MIN_INTERVAL_MINUTES = 1
@@ -560,6 +561,8 @@ MENU_ACTIONS = (
     "listen_interval", "listen_interval_set", "listen_toggle",
     "listen_tgt", "listen_tgtadd", "listen_dl", "listen_save",
     "listen_cancel",
+    # SQL 模板：视图 / ➕ 新增（同名即覆盖）/ ▶️ 执行 / 🗑 删除
+    "sqlt", "sqlt_add", "sqlt_run", "sqlt_del",
 )
 
 

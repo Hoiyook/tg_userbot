@@ -940,3 +940,38 @@ class WlMenuButtonsTest(unittest.TestCase):
         labels = [b.text for row in rows for b in row]
         self.assertTrue(any("回补" in t for t in labels))
         self.assertTrue(any("立即扫描" in t for t in labels))
+
+
+class SqlTemplateMenuTest(unittest.TestCase):
+    """SQL 模板的菜单入口：主菜单按钮 + 模板视图按钮组。"""
+
+    def test_main_menu_has_sqlt_entry(self):
+        rows = menu.main_menu_buttons()
+        labels = [b.text for row in rows for b in row]
+        self.assertTrue(any("SQL模板" in t for t in labels))
+
+    def test_template_view_buttons(self):
+        import tg_userbot.state as s
+        p = mock.patch.object(s, "SQL_TEMPLATES",
+                              {"查任务": "SELECT 1", "备份": "SELECT 2"})
+        p.start()
+        self.addCleanup(p.stop)
+        rows = menu_menu_buttons()
+        labels = [(b.text, b.data) for row in rows for b in row]
+        texts = [t for t, _ in labels]
+        self.assertTrue(any("新增" in t for t in texts))
+        self.assertTrue(any("▶️ 查任务" == t for t in texts))
+        self.assertTrue(any("🗑" == t for t in texts))
+        # 回调数据不超 Telegram 64 字节上限（中文名 16 字符时）
+        raw = menu.encode_menu_data("sqlt_run", "模" * 16)
+        self.assertLessEqual(len(raw), 64)
+
+    def test_callback_payload_roundtrip_cjk(self):
+        raw = menu.encode_menu_data("sqlt_del", "模板A")
+        action, arg = menu.parse_menu_data(raw)
+        self.assertEqual((action, arg), ("sqlt_del", "模板A"))
+
+
+def menu_menu_buttons():
+    from tg_userbot import sql_templates
+    return sql_templates.menu_buttons()

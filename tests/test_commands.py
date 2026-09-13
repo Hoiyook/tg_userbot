@@ -498,3 +498,58 @@ class SqlResultRenderTest(unittest.TestCase):
                       text.format_sql_result({"kind": "done", "rowcount": 3}))
         self.assertIn("❌", text.format_sql_result(
             {"kind": "error", "message": "boom"}))
+
+class SqltCommandTest(unittest.TestCase):
+    """/sqlt 模板命令的分发（独立 DB 文件）。"""
+
+    def setUp(self):
+        from tg_userbot import config as cfg
+        from tg_userbot import runtime_db
+        import tg_userbot.state as s
+        self.dir = tempfile.mkdtemp(prefix="sqltcmd_", dir=_TMP)
+        p = mock.patch.object(cfg, "RUNTIME_DB_FILE",
+                              os.path.join(self.dir, "db.sqlite"))
+        p.start()
+        self.addCleanup(p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        self._saved = s.SQL_TEMPLATES
+        s.SQL_TEMPLATES = {"查任务": "SELECT 1 AS one"}
+        self.addCleanup(setattr, s, "SQL_TEMPLATES", self._saved)
+
+    def _run(self, cmd):
+        ev = FakeEvent()
+        ok = asyncio.run(commands.handle_command(ev, cmd))
+        return ok, ev.replies
+
+    def test_list(self):
+        ok, replies = self._run("/sqlt")
+        self.assertTrue(ok)
+        self.assertIn("查任务", replies[0])
+
+    def test_run_template(self):
+        ok, replies = self._run("/sqlt 查任务")
+        self.assertTrue(ok)
+        self.assertIn("📋 SQL", replies[0])
+        self.assertIn("one", replies[0])
+
+    def test_run_unknown_template(self):
+        ok, replies = self._run("/sqlt 没有的")
+        self.assertTrue(ok)
+        self.assertIn("没有", replies[0])
+
+    def test_add_run_del(self):
+        ok, replies = self._run("/sqlt add 新模板 SELECT 2 AS two")
+        self.assertTrue(ok)
+        self.assertIn("已保存", replies[0])
+        ok, replies = self._run("/sqlt 新模板")
+        self.assertIn("two", replies[0])
+        ok, replies = self._run("/sqlt del 新模板")
+        self.assertTrue(ok)
+        self.assertIn("已删除", replies[0])
+
+    def test_del_missing_replies_error(self):
+        ok, replies = self._run("/sqlt del 没有的")
+        self.assertTrue(ok)
+        self.assertIn("❌", replies[0])

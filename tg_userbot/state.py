@@ -110,5 +110,14 @@ WL_INPUT_UNTIL = 0.0
 # 白名单扫描最近一轮汇总快照（menu / reporter 只读展示），未扫过为 None。
 WL_LAST_SCAN = None
 
+# ============================================================
+# SQL 模板（sql_templates.py，/sql 诊断控制台的常用查询收藏）
+# ============================================================
+# 名字 → SQL 原文；配置归 JSON（runtime/sql_templates.json），启动时载入。
+SQL_TEMPLATES = {}
+# 「➕ 新增模板」输入窗口（菜单）：等待下一条文本的截止时刻（monotonic）。
+# 与其余输入窗口互斥，由 bot.open_input_window 统一开关。
+SQLT_INPUT_UNTIL = 0.0
+
 # CD2 进程句柄（仅防 GC 回收后台进程，无人读取）
 _CD2_PROC = None

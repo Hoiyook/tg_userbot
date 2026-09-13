@@ -23,6 +23,7 @@ from . import listener
 from . import caption_filter
 from . import wl_scan
 from . import runtime_db
+from . import sql_templates
 from .config import (
     BOT_USERNAME,
     DONE_DEFAULT_LINES,
@@ -220,6 +221,38 @@ async def handle_command(event, cmd_text):
             return True
         await event.reply(text.format_sql_result(result))
         logger.info(f"执行命令：/sql {arg[:80]}")
+        return True
+
+    if sql_templates.is_sqlt_command(cmd_text):
+        action, arg = sql_templates.parse_sqlt_command(cmd_text)
+        if action == "list":
+            await event.reply(sql_templates.list_text())
+            return True
+        if action == "add":
+            parts = (arg or "").split(None, 1)
+            if len(parts) != 2:
+                await event.reply(
+                    f"❌ 用法：/sqlt add <名字> <SQL>\n"
+                    "例：/sqlt add 待执行 SELECT * FROM listener_tasks")
+                return True
+            ok, msg = sql_templates.upsert(parts[0], parts[1])
+            await event.reply(msg)
+            return True
+        if action == "del":
+            ok, msg = sql_templates.delete(arg or "")
+            await event.reply(msg)
+            return True
+        # run：按名字执行模板（执行语义与 /sql 完全一致）
+        ok, result = sql_templates.execute_template(arg or "")
+        if not ok:
+            await event.reply(result)
+            return True
+        try:
+            await event.reply(text.format_sql_result(result))
+        except runtime_db.DbUnavailable as e:
+            await event.reply(
+                f"{text.SQL_TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}")
+        logger.info(f"执行命令：/sqlt {arg}")
         return True
 
     if queue.is_queue_command(cmd_text):

@@ -1038,6 +1038,7 @@ async def main():
     dedup.load_dedup_config()
     caption_filter.load_caption_filter_config()
     listener.load_listen_config()
+    sql_templates.load_sql_templates()
     loaded = dedup.load_index()
     logger.info(f"🛡 去重索引已载入：{loaded} 条")
     state.WHITELIST_CHATS = whitelist.load_whitelist()

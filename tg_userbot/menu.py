@@ -86,6 +86,7 @@ def main_menu_buttons():
         # 用户必须能明显区分两套系统）
         [Button.inline("📡 标签监听", encode_menu_data("listen")),
          Button.inline("🌐 Chrome 任务", encode_menu_data("chrome_tasks"))],
+        [Button.inline("📐 SQL模板", encode_menu_data("sqlt"))],
     ]
 
 
