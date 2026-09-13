@@ -433,3 +433,68 @@ class WlSinceScanCommandTest(unittest.TestCase):
             ok, replies = self._run("/wl scan")
         self.assertTrue(ok)
         self.assertIn("白名单扫描", replies[0])
+
+
+class SqlCommandTest(unittest.TestCase):
+    """/sql 命令分发（独立 DB 文件，不碰共享状态）。"""
+
+    def setUp(self):
+        from tg_userbot import config as cfg
+        from tg_userbot import runtime_db
+        self.dir = tempfile.mkdtemp(prefix="sqlcmd_", dir=_TMP)
+        p = mock.patch.object(cfg, "RUNTIME_DB_FILE",
+                              os.path.join(self.dir, "db.sqlite"))
+        p.start()
+        self.addCleanup(p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def _run(self, cmd):
+        ev = FakeEvent()
+        ok = asyncio.run(commands.handle_command(ev, cmd))
+        return ok, ev.replies
+
+    def test_usage_without_args(self):
+        ok, replies = self._run("/sql")
+        self.assertTrue(ok)
+        self.assertIn("用法", replies[0])
+
+    def test_select_reply_table(self):
+        ok, replies = self._run("/sql SELECT 1 AS one, 'x' AS v")
+        self.assertTrue(ok)
+        self.assertIn("📋 SQL", replies[0])
+        self.assertIn("one", replies[0])
+
+    def test_sql_error_reply(self):
+        ok, replies = self._run("/sql SELE 1")
+        self.assertTrue(ok)
+        self.assertIn("❌", replies[0])
+
+    def test_sql_reply_is_auto_cleaned(self):
+        from tg_userbot import cleanup, config as cfg
+        self.assertIn("📋 SQL", cfg.CLEAN_NOTIFICATION_PREFIXES)
+        msg = SimpleNamespace(
+            message="📋 SQL\none v\n----\n1 x",
+            file=None, photo=None, document=None, video=None, audio=None)
+        self.assertTrue(cleanup.is_cleanup_message(msg))
+
+
+class SqlResultRenderTest(unittest.TestCase):
+    """text.format_sql_result 的渲染纪律（截断/宽度/上限）。"""
+
+    def test_long_cell_truncated_and_none_shown(self):
+        from tg_userbot import text
+        r = {"kind": "rows", "columns": ["v", "w"],
+             "rows": [["x" * 200, None]], "more": False}
+        out = text.format_sql_result(r)
+        self.assertIn("…" , out)
+        self.assertIn("∅", out)
+        self.assertNotIn("x" * 48, out)
+
+    def test_write_and_error_shapes(self):
+        from tg_userbot import text
+        self.assertIn("影响 3 行",
+                      text.format_sql_result({"kind": "done", "rowcount": 3}))
+        self.assertIn("❌", text.format_sql_result(
+            {"kind": "error", "message": "boom"}))

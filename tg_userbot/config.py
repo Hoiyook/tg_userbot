@@ -376,7 +376,9 @@ LISTEN_WORKER_CONCURRENCY = 1
 LISTEN_WORKER_POLL_SECONDS = 2.0
 # 两条转发之间的最小间隔（秒）。**这不是 Telegram 官方安全阈值**，只是保守
 # 节流；真正的限流以服务端 FloodWait 返回值为最高优先级（规格 §32）。
-LISTEN_WORKER_MIN_FORWARD_INTERVAL_SECONDS = 1.5
+# 2026-09-13 从 1.5 调到 5：/wl since 回补了 ~5600 条历史任务（解析 bot 聊天），
+# 40 条/分钟持续数小时大概率吃 FloodWait；12 条/分钟更稳（用户定的）。
+LISTEN_WORKER_MIN_FORWARD_INTERVAL_SECONDS = 5.0
 # 任务租约：claim 后多久没写完结果就视为 Worker 崩溃，可被恢复重跑（规格 §24）。
 # 必须显著大于单次转发的正常耗时（含 FloodWait 等待之外的部分）。
 LISTEN_WORKER_LEASE_SECONDS = 600
@@ -400,6 +402,10 @@ LISTEN_FLOODWAIT_MAX_WAIT_SECONDS = 6 * 3600
 WHITELIST_SCAN_INTERVAL_SECONDS = 300     # 扫描周期（秒）
 WHITELIST_SCAN_PAGES_PER_ROUND = 10       # 每轮每聊天最多页数（页大小复用 LISTEN_MAX_MESSAGES_PER_SCAN）
 WHITELIST_SCAN_PAGE_SLEEP_SECONDS = 5.0   # 页间小睡：读请求摊开（风控）
+
+# /sql 诊断控制台（owner-only）的输出上限
+SQL_CONSOLE_MAX_ROWS = 20                 # 查询最多返回行数（超出提示用 LIMIT）
+SQL_CONSOLE_CELL_LIMIT = 48               # 单元格字符上限（截断带省略号）
 
 # 任务生命周期事件日志（JSONL，append-only 单行追加，写失败仅告警）：
 # 台账按 task_id 重建统计的数据源。每行一个事件
@@ -659,6 +665,8 @@ CLEAN_COMMANDS = {
 # 程序通知回复的前缀（以此开头的消息会被自动清理）
 CLEAN_NOTIFICATION_PREFIXES = (
     "🤖 Chrome",
+    # /sql 诊断控制台的回复
+    "📋 SQL",
     # /chrome_tasks 与 /chrome_cancel 的回复（任务取消功能）
     "🌐 Chrome 任务",
     "❌ 用法：/chrome_cancel",

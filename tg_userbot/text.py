@@ -6,6 +6,7 @@ status_text / progress_text / done_reply_text / wl_list_text 都是同步函数�
 format_size 来自 naming、get_history_lines 来自 history（均为纯叶子）。
 """
 from . import state
+from . import config
 from .config import LOG_FILE, SAVE_FOLDER
 from .history import get_history_lines
 from .naming import format_size
@@ -137,3 +138,54 @@ def wl_list_text(chats=None, scan_info=None, last_scan=None):
         "回补停机漏掉的存量：/wl since <序号|@用户名|ID> <消息id>\n"
         "立即扫描一轮：/wl scan"
     )
+
+
+SQL_TEXT_PREFIX = "📋 SQL"
+
+
+def _sql_cell(value, limit):
+    """单元格展示形态：None→∅，超长截断带省略号。"""
+    if value is None:
+        return "∅"
+    s = str(value)
+    return s if len(s) <= limit else s[: limit - 1] + "…"
+
+
+def format_sql_result(result):
+    """/sql 结果渲染：查询 → 对齐文本表；写 → 影响行数；错误 → 原文。
+
+    纯函数（runtime_db.execute_user_sql 的结果 dict → Telegram 文本）。
+    单元格截到 SQL_CONSOLE_CELL_LIMIT、宽表砍到 8 列、总长压到 3900 内
+    （Telegram 4096 上限留余量）。
+    """
+    if result.get("kind") == "error":
+        return f"{SQL_TEXT_PREFIX}\n❌ {result.get('message', '执行失败')}"
+    if result.get("kind") == "done":
+        n = int(result.get("rowcount", -1))
+        return (f"{SQL_TEXT_PREFIX}\n✅ 已执行（影响 {n} 行）" if n >= 0
+                else f"{SQL_TEXT_PREFIX}\n✅ 已执行")
+    columns = list(result.get("columns") or [])
+    rows = [list(r) for r in (result.get("rows") or [])]
+    if not columns:
+        return f"{SQL_TEXT_PREFIX}\n（无结果集）"
+    if len(columns) > 8:
+        columns = columns[:8] + ["…"]
+        rows = [r[:8] + ["…"] for r in rows]
+    limit = int(getattr(config, "SQL_CONSOLE_CELL_LIMIT", 48))
+    rows = [[_sql_cell(v, limit) for v in r] for r in rows]
+    widths = [len(str(c)) for c in columns]
+    for r in rows:
+        for i, v in enumerate(r):
+            widths[i] = min(max(widths[i], len(str(v))), 24)
+    lines = ["  ".join(str(c).ljust(widths[i])
+                       for i, c in enumerate(columns))]
+    lines.append("  ".join("-" * w for w in widths))
+    for r in rows:
+        lines.append("  ".join(str(v).ljust(widths[i])
+                               for i, v in enumerate(r)))
+    more = "（还有更多行，请用 LIMIT 收窄）" if result.get("more") else ""
+    out = (f"{SQL_TEXT_PREFIX}\n" + "\n".join(lines)
+           + f"\n共 {len(rows)} 行{more}")
+    if len(out) > 3900:
+        out = out[:3900] + "\n…（超长截断）"
+    return out

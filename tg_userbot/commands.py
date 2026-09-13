@@ -22,6 +22,7 @@ from . import finder
 from . import listener
 from . import caption_filter
 from . import wl_scan
+from . import runtime_db
 from .config import (
     BOT_USERNAME,
     DONE_DEFAULT_LINES,
@@ -31,6 +32,7 @@ from .config import (
     LOG_FILE,
     LOG_RETENTION_DAYS,
     SAVE_FOLDER,
+    SQL_CONSOLE_MAX_ROWS,
 )
 from .log import logger
 
@@ -197,6 +199,29 @@ async def handle_command(event, cmd_text):
             "        /wl scan（立即扫描）| /wl since <聊天> <消息id>（回补）")
         return True
 
+    if runtime_db.is_sql_command(cmd_text):
+        arg = cmd_text[len("/sql"):].strip()
+        if not arg:
+            await event.reply(
+                "📋 SQL 诊断控制台（owner-only，直接作用于 runtime DB）\n\n"
+                "用法：/sql <一条 SQL>\n"
+                "例：/sql SELECT * FROM listener_tasks ORDER BY id DESC "
+                f"LIMIT 5\n"
+                "    /sql PRAGMA table_info(listener_tasks)\n"
+                "    /sql SELECT * FROM listener_checkpoints\n"
+                "查询最多显示 "
+                f"{SQL_CONSOLE_MAX_ROWS} 行；写语句立即生效，无撤销；"
+                "病态慢查询会卡住程序，请勿对大表做无 LIMIT 的笛卡尔积。")
+            return True
+        try:
+            result = runtime_db.execute_user_sql(arg)
+        except runtime_db.DbUnavailable as e:
+            await event.reply(f"{text.SQL_TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}")
+            return True
+        await event.reply(text.format_sql_result(result))
+        logger.info(f"执行命令：/sql {arg[:80]}")
+        return True
+
     if queue.is_queue_command(cmd_text):
         parts = cmd_text.split(maxsplit=1)
         if len(parts) == 1:
@@ -349,6 +374,7 @@ async def handle_command(event, cmd_text):
             "/wl - 查看下载白名单\n"
             "/wl add @用户名 - 加入白名单（也可回复转发消息后 /wl add）\n"
             "/wl del ID或序号 - 移出白名单\n"
+            "/sql - SQL 诊断控制台：直接查询/检修 runtime DB\n"
             "/queue - 查看下载队列\n"
             "/queue del 序号 - 从队列移除任务\n"
             "/retry - 查看待重试列表\n"

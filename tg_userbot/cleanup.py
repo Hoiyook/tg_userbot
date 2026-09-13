@@ -16,6 +16,7 @@ import asyncio
 from . import state
 from . import netio
 from . import queue
+from . import runtime_db
 from . import thread
 from . import dedup
 from . import whitelist
@@ -155,6 +156,10 @@ def is_cleanup_message(message, include_persistent=False) -> bool:
 
         # /queue、/retry 指令（含子命令）
         if queue.is_queue_command(text) or queue.is_retry_command(text):
+            return True
+
+        # /sql 诊断控制台（命令与其「📋 SQL」回复都在清理白名单）
+        if runtime_db.is_sql_command(text):
             return True
 
         # /stats 指令（台账，含天数参数）

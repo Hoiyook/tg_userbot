@@ -723,3 +723,64 @@ class ChainAndOriginTest(_DbTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecuteUserSqlTest(_DbTestCase):
+    """/sql 诊断控制台的执行口：结果集/写/错误当结果/守卫。"""
+
+    def test_select_returns_columns_and_rows(self):
+        runtime_db.set_listener_checkpoint(111, 500, chain="wl")
+        r = runtime_db.execute_user_sql(
+            "SELECT source_chat_id, last_message_id FROM listener_checkpoints")
+        self.assertEqual(r["kind"], "rows")
+        self.assertEqual(r["columns"],
+                         ["source_chat_id", "last_message_id"])
+        self.assertEqual(r["rows"], [[111, 500]])
+        self.assertFalse(r["more"])
+
+    def test_select_row_cap_sets_more(self):
+        for i in range(1, 31):
+            runtime_db.set_listener_checkpoint(1000 + i, i, chain="wl")
+        r = runtime_db.execute_user_sql(
+            "SELECT last_message_id FROM listener_checkpoints")
+        self.assertEqual(len(r["rows"]), 20)
+        self.assertTrue(r["more"])
+
+    def test_cells_keep_native_values(self):
+        runtime_db.enqueue_listener_tasks(
+            SRC, [_task(message_id=1, payload=None, download=True)])
+        r = runtime_db.execute_user_sql(
+            "SELECT attempts, download FROM listener_tasks")
+        self.assertEqual(r["rows"], [[0, 1]], "执行口保留原生类型（截断是渲染层的事）")
+
+    def test_write_reports_rowcount(self):
+        r = runtime_db.execute_user_sql(
+            "UPDATE listener_follows SET last_error='x' WHERE id=-1")
+        self.assertEqual(r["kind"], "done")
+        self.assertEqual(r["rowcount"], 0)
+
+    def test_sql_errors_are_results_not_exceptions(self):
+        r = runtime_db.execute_user_sql("SELE 1")
+        self.assertEqual(r["kind"], "error")
+        self.assertTrue(r["message"])
+        r2 = runtime_db.execute_user_sql("SELECT 1; SELECT 2")
+        self.assertEqual(r2["kind"], "error", "多语句必须被拦")
+
+    def test_attach_rejected(self):
+        r = runtime_db.execute_user_sql(
+            "ATTACH DATABASE '/tmp/x.db' AS x")
+        self.assertEqual(r["kind"], "error")
+        self.assertIn("拒绝", r["message"])
+
+    def test_pragma_works(self):
+        r = runtime_db.execute_user_sql("PRAGMA table_info(listener_tasks)")
+        self.assertEqual(r["kind"], "rows")
+        self.assertTrue(any(row[1] == "origin" for row in r["rows"]))
+
+    def test_empty_statement(self):
+        self.assertEqual(runtime_db.execute_user_sql("  ")["kind"], "error")
+
+    def test_no_connection_raises(self):
+        runtime_db.close_db()
+        with self.assertRaises(runtime_db.DbUnavailable):
+            runtime_db.execute_user_sql("SELECT 1")

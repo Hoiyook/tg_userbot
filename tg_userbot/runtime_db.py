@@ -36,6 +36,7 @@
 """
 import json
 import os
+import re
 import sqlite3
 import time
 
@@ -933,6 +934,64 @@ def count_listener_tasks_for_chat(source_chat_id, origin=None):
     row = _read(lambda c: _execute(c, sql, tuple(params)).fetchone(),
                 "统计聊天待执行任务")
     return int(row[0])
+
+
+# ============================================================
+# /sql 诊断控制台（owner-only，直接作用于 runtime DB）
+# ============================================================
+# SQL 只在本模块（§33）——/sql 的执行口也在这里，命令层只做分发与渲染。
+_SQL_CMD_RE = re.compile(r"^/sql(?:\s|$)", re.IGNORECASE)
+
+
+def is_sql_command(text) -> bool:
+    """/sql 开头的命令（含裸命令）；/sqlite 不算。清理白名单同用此判定。"""
+    return bool(_SQL_CMD_RE.match(str(text or "").strip()))
+
+
+def execute_user_sql(sql, max_rows=None):
+    """执行 owner 输入的**一条** SQL，返回结果 dict（/sql 诊断控制台）。
+
+    返回三种形态：
+      {"kind": "rows", "columns": […], "rows": [[原生值…], …], "more": bool}
+      {"kind": "done", "rowcount": N}         # N=-1 = 语句不报告影响行数
+      {"kind": "error", "message": "…"}       # 语法/约束/多语句等——错误是
+                                              # **结果**不是故障，原样给用户看
+    单元格保留**原生值**（截断/None 形态是展示层 text.format_sql_result 的
+    事）；行数由 max_rows 封顶。权限全放开（用户 2026-09-13 定）：写语句
+    立即生效（isolation_level=None 的自动提交），无撤销；只有 ATTACH/DETACH
+    拒绝——它们会逃出当前库文件，破坏「单进程单库」前提。执行是同步的、
+    跑在事件循环里：正常诊断查询毫秒级；病态慢查询会卡循环，属接受的代价
+    （帮助文本已提示）。
+    """
+    if max_rows is None:
+        max_rows = int(config.SQL_CONSOLE_MAX_ROWS)
+    text = str(sql or "").strip()
+    if not text:
+        return {"kind": "error", "message": "空语句"}
+    head = text.split(None, 1)[0].strip(";(").lower()
+    if head in ("attach", "detach"):
+        return {"kind": "error",
+                "message": "拒绝 ATTACH/DETACH：诊断控制台只作用于当前库"}
+    conn = _conn()
+    try:
+        cur = conn.execute(text)
+    except sqlite3.Warning as e:
+        # 多语句拼接正是 sqlite3 用 Warning 拦的（"You can only execute one
+        # statement at a time"）——转成人话，不让它冒成异常
+        return {"kind": "error", "message": f"只允许一条语句：{e}"}
+    except sqlite3.Error as e:
+        return {"kind": "error", "message": f"{type(e).__name__}: {e}"}
+
+    if cur.description is not None:
+        columns = [d[0] for d in cur.description]
+        rows = [list(row) for row in cur.fetchmany(max_rows)]
+        more = cur.fetchone() is not None
+        logger.info(f"🗄 /sql 查询：{text[:200]!r} → 显示 {len(rows)} 行")
+        return {"kind": "rows", "columns": columns, "rows": rows,
+                "more": more}
+    rowcount = int(cur.rowcount)
+    logger.info(f"🗄 /sql 执行：{text[:200]!r} → rowcount={rowcount}")
+    return {"kind": "done", "rowcount": rowcount}
 
 
 # ============================================================
