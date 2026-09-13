@@ -355,7 +355,7 @@ REPORT_LISTEN = True
 RUNTIME_DB_FILE = os.environ.get(
     "TG_RUNTIME_DB", os.path.join(RUNTIME_DIR, "tg_userbot.db")
 )
-RUNTIME_DB_SCHEMA_VERSION = 2   # v2：+ listener_follows（评论跟进关注列表）
+RUNTIME_DB_SCHEMA_VERSION = 3   # v3：checkpoints 加 chain（listen/wl 双游标）+ tasks 加 origin
 # 单条写事务等锁的上限（毫秒）与 SQLITE_BUSY/LOCKED 的有限重试（规格 §39：
 # 记日志 → 短暂等待 → 有限次数重试，绝不无限循环、绝不因此崩掉主进程）。
 RUNTIME_DB_BUSY_TIMEOUT_MS = 5000
@@ -393,6 +393,13 @@ LISTEN_MAX_PENDING_TASKS = 1000
 # 不许固定等 60 秒）；只有离谱到超过这个上限（默认 6 小时）才截断并显著告警，
 # 免得一个异常返回值把 Worker 挂死且不留痕。
 LISTEN_FLOODWAIT_MAX_WAIT_SECONDS = 6 * 3600
+
+# ── 白名单扫描生产者（下载白名单的停机补漏链，2026-09-13）──
+# 白名单改成「事件生产者 + 扫描生产者 → 任务表 → Worker」双通道后，扫描链的
+# 节奏参数。在线时事件链兜实时，扫描只管补漏，周期可以放宽。
+WHITELIST_SCAN_INTERVAL_SECONDS = 300     # 扫描周期（秒）
+WHITELIST_SCAN_PAGES_PER_ROUND = 10       # 每轮每聊天最多页数（页大小复用 LISTEN_MAX_MESSAGES_PER_SCAN）
+WHITELIST_SCAN_PAGE_SLEEP_SECONDS = 5.0   # 页间小睡：读请求摊开（风控）
 
 # 任务生命周期事件日志（JSONL，append-only 单行追加，写失败仅告警）：
 # 台账按 task_id 重建统计的数据源。每行一个事件

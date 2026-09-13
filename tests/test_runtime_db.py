@@ -604,5 +604,122 @@ class ListenerStatsTest(_DbTestCase):
         self.assertEqual(runtime_db.get_listener_stats(since=4000)["total"], 1)
 
 
+# ============================================================
+# v3 迁移：checkpoint 加 chain、任务加 origin（白名单双通道，2026-09-13）
+# ============================================================
+class V3MigrationTest(unittest.TestCase):
+    """v2 旧库 → v3：chain 列 + origin 列；旧行归 listen；幂等可重跑。"""
+
+    def setUp(self):
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.path = os.path.join(_TMP, "v3_migrate.db")
+        if os.path.exists(self.path):
+            os.remove(self.path)
+        conn = sqlite3.connect(self.path)
+        conn.executescript("""
+            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE listener_checkpoints (
+                source_chat_id INTEGER PRIMARY KEY,
+                last_message_id INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL);
+            CREATE TABLE listener_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                grouped_id INTEGER,
+                target_type TEXT NOT NULL,
+                target_chat_id INTEGER,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_retry_at INTEGER,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                lease_until INTEGER,
+                last_error TEXT,
+                download INTEGER NOT NULL DEFAULT 0,
+                payload TEXT);
+            INSERT INTO schema_meta VALUES('schema_version', '2');
+            INSERT INTO listener_checkpoints VALUES(111, 500, 1000);
+        """)
+        conn.commit()
+        conn.close()
+
+    def test_v2_migrates_to_v3(self):
+        self.assertTrue(runtime_db.init_db(self.path))
+        self.assertEqual(runtime_db.get_schema_version(), 3)
+        # 旧行归 listen 链；wl 链无游标
+        self.assertEqual(
+            runtime_db.get_listener_checkpoint(111, chain="listen"), 500)
+        self.assertIsNone(runtime_db.get_listener_checkpoint(111, chain="wl"))
+        # origin 列生效：新插入的行默认 listen
+        ids = runtime_db.enqueue_listener_tasks(111, [_task(message_id=1)])
+        self.assertTrue(ids[0])
+        self.assertEqual(runtime_db.get_listener_task(ids[0])["origin"],
+                         "listen")
+
+    def test_migration_idempotent(self):
+        self.assertTrue(runtime_db.init_db(self.path))
+        self.assertTrue(runtime_db.init_db(self.path))
+        self.assertEqual(runtime_db.get_schema_version(), 3)
+        self.assertEqual(
+            runtime_db.get_listener_checkpoint(111, chain="listen"), 500)
+
+
+class ChainAndOriginTest(_DbTestCase):
+    """chain 游标互相独立；claim listen 优先；stats 按 origin 过滤。
+
+    继承 _DbTestCase（每用例独立 DB 文件）：claim/stats 用例会在任务表里
+    留下 PENDING/PROCESSING 存量，共享库会互相污染计数。
+    """
+
+    def test_chain_isolation(self):
+        runtime_db.set_listener_checkpoint(111, 500, chain="listen")
+        runtime_db.set_listener_checkpoint(111, 900, chain="wl")
+        self.assertEqual(
+            runtime_db.get_listener_checkpoint(111, chain="listen"), 500)
+        self.assertEqual(
+            runtime_db.get_listener_checkpoint(111, chain="wl"), 900)
+        # 回补只动 wl 游标，不波及 listen
+        runtime_db.set_listener_checkpoint(111, 501, chain="listen")
+        self.assertEqual(
+            runtime_db.get_listener_checkpoint(111, chain="wl"), 900)
+
+    def test_claim_prefers_listen_over_wl(self):
+        ids_wl = runtime_db.enqueue_listener_tasks(
+            SRC, [_task(message_id=1)], origin="wl")
+        ids_listen = runtime_db.enqueue_listener_tasks(
+            SRC, [_task(message_id=2)], origin="listen")
+        task = runtime_db.claim_listener_task()
+        self.assertEqual(task["id"], ids_listen[0],
+                         "listen 任务优先，尽管 id 更大")
+        runtime_db.complete_listener_task(task["id"])
+        task2 = runtime_db.claim_listener_task()
+        self.assertEqual(task2["id"], ids_wl[0])
+
+    def test_stats_origin_filter(self):
+        runtime_db.enqueue_listener_tasks(SRC, [_task(message_id=1)],
+                                          origin="wl")
+        runtime_db.enqueue_listener_tasks(SRC, [_task(message_id=2)])
+        self.assertEqual(runtime_db.get_listener_stats(origin="wl")["total"], 1)
+        self.assertEqual(
+            runtime_db.get_listener_stats(origin="listen")["total"], 1)
+        self.assertEqual(runtime_db.get_listener_stats()["total"], 2)
+
+    def test_count_pending_for_chat(self):
+        runtime_db.enqueue_listener_tasks(SRC, [_task(message_id=1)],
+                                          origin="wl")
+        runtime_db.enqueue_listener_tasks(CHAT_A, [_task(message_id=2)],
+                                          origin="wl")
+        runtime_db.enqueue_listener_tasks(SRC, [_task(message_id=3)])
+        self.assertEqual(
+            runtime_db.count_listener_tasks_for_chat(SRC, origin="wl"), 1)
+        self.assertEqual(
+            runtime_db.count_listener_tasks_for_chat(SRC), 2)
+        self.assertEqual(
+            runtime_db.count_listener_tasks_for_chat(CHAT_B, origin="wl"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

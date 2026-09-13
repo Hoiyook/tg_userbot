@@ -83,11 +83,15 @@ _SCHEMA = (
         value TEXT NOT NULL
     )
     """,
+    # v3 起：chain 区分 listen（标签监听）与 wl（下载白名单）两条独立游标。
+    # 同一聊天两边都在时互不干扰——/wl since 回补只倒退 wl 游标。
     """
     CREATE TABLE IF NOT EXISTS listener_checkpoints (
-        source_chat_id INTEGER PRIMARY KEY,
+        source_chat_id INTEGER NOT NULL,
+        chain TEXT NOT NULL DEFAULT 'listen',
         last_message_id INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (source_chat_id, chain)
     )
     """,
     """
@@ -107,7 +111,8 @@ _SCHEMA = (
         lease_until INTEGER,
         last_error TEXT,
         download INTEGER NOT NULL DEFAULT 0,
-        payload TEXT
+        payload TEXT,
+        origin TEXT NOT NULL DEFAULT 'listen'
     )
     """,
     # 唯一约束。**必须建在 COALESCE(target_chat_id, 0) 上**：SQLite 的 UNIQUE
@@ -389,6 +394,37 @@ def get_schema_version() -> int:
         return 0
 
 
+def _table_columns(conn, table):
+    return {r["name"] for r in _execute(
+        conn, f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_v3():
+    def do(conn):
+        if "chain" not in _table_columns(conn, "listener_checkpoints"):
+            _execute(conn, """
+                CREATE TABLE listener_checkpoints_v3 (
+                    source_chat_id INTEGER NOT NULL,
+                    chain TEXT NOT NULL DEFAULT 'listen',
+                    last_message_id INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (source_chat_id, chain)
+                )""")
+            _execute(conn,
+                     "INSERT INTO listener_checkpoints_v3 "
+                     "SELECT source_chat_id, 'listen', last_message_id, "
+                     "updated_at FROM listener_checkpoints")
+            _execute(conn, "DROP TABLE listener_checkpoints")
+            _execute(conn,
+                     "ALTER TABLE listener_checkpoints_v3 "
+                     "RENAME TO listener_checkpoints")
+        if "origin" not in _table_columns(conn, "listener_tasks"):
+            _execute(conn,
+                     "ALTER TABLE listener_tasks ADD COLUMN origin "
+                     "TEXT NOT NULL DEFAULT 'listen'")
+    _write(do, "迁移 v3（chain + origin）")
+
+
 def migrate() -> int:
     """建表 + 逐版本迁移，幂等、可重复执行、中途失败可重跑（§6）。
 
@@ -415,6 +451,12 @@ def migrate() -> int:
         # v1 → v2：新增 listener_follows（评论跟进关注列表）。纯建表，没有数据
         # 迁移——旧库补上这张空表即可，所以上面的 CREATE IF NOT EXISTS 就够了。
         logger.info("🗄 Runtime DB 迁移：v2（+ listener_follows 关注列表）")
+    if version < 3:
+        # v2 → v3：checkpoints 加 chain（旧库重建，旧行归 listen）、
+        # tasks 加 origin（ALTER，旧行落默认 'listen'）。新库建表时已是
+        # v3 形状，这里探测到列已存在即为 no-op。
+        _migrate_v3()
+        logger.info("🗄 Runtime DB 迁移：v3（checkpoints.chain + tasks.origin）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -424,36 +466,43 @@ def migrate() -> int:
 # ============================================================
 # checkpoint
 # ============================================================
-def get_listener_checkpoint(source_chat_id):
-    """取某个监听来源的 checkpoint；从未设过返回 None。
+def get_listener_checkpoint(source_chat_id, chain="listen"):
+    """取某条链的 checkpoint；从未设过返回 None。
 
-    None 与 0 语义不同：None = 还没建立过（首次添加监听要走「取当前最新 id」
-    的初始化路径），0 = 明确的「从头开始」。上层绝不能把 None 当成 0 用。
+    None 与 0 语义不同：None = 还没建立过，0 = 明确的「从头开始」。
+    chain：'listen'（标签监听）/ 'wl'（下载白名单扫描）。
     """
     row = _read(lambda c: _execute(
         c, "SELECT last_message_id FROM listener_checkpoints "
-           "WHERE source_chat_id=?", (int(source_chat_id),)).fetchone(),
+           "WHERE source_chat_id=? AND chain=?",
+        (int(source_chat_id), str(chain))).fetchone(),
         "读监听 checkpoint")
     return int(row[0]) if row else None
 
 
-def _write_checkpoint(conn, source_chat_id, last_message_id, now):
+def _write_checkpoint(conn, source_chat_id, last_message_id, now,
+                      chain="listen"):
     """写 checkpoint（独立函数：既是事务内的一个步骤，也是测试的注入点）。"""
     _execute(conn,
              "INSERT INTO listener_checkpoints"
-             "(source_chat_id, last_message_id, updated_at) VALUES(?,?,?) "
-             "ON CONFLICT(source_chat_id) DO UPDATE SET "
+             "(source_chat_id, chain, last_message_id, updated_at) "
+             "VALUES(?,?,?,?) "
+             "ON CONFLICT(source_chat_id, chain) DO UPDATE SET "
              "last_message_id=excluded.last_message_id, "
              "updated_at=excluded.updated_at",
-             (int(source_chat_id), int(last_message_id), int(now)))
+             (int(source_chat_id), str(chain), int(last_message_id),
+              int(now)))
 
 
-def set_listener_checkpoint(source_chat_id, last_message_id, now=None):
-    """单独写 checkpoint（初始化、人工重置用；扫描路径请用原子版本）。"""
+def set_listener_checkpoint(source_chat_id, last_message_id, now=None,
+                            chain="listen"):
+    """单独写某条链的 checkpoint（初始化、人工回补用；扫描路径请用原子版本）。"""
     now = _now(now)
     _write(lambda conn: _write_checkpoint(
-        conn, source_chat_id, last_message_id, now), "写监听 checkpoint")
-    logger.info(f"🗄 checkpoint 已写入：{source_chat_id} → {last_message_id}")
+        conn, source_chat_id, last_message_id, now, chain=chain),
+        "写监听 checkpoint")
+    logger.info(f"🗄 checkpoint 已写入：{source_chat_id}[{chain}] → "
+                f"{last_message_id}")
     return True
 
 
@@ -491,7 +540,8 @@ def _row_to_task(row):
     return rec
 
 
-def enqueue_listener_tasks(source_chat_id, tasks, checkpoint=None, now=None):
+def enqueue_listener_tasks(source_chat_id, tasks, checkpoint=None, now=None,
+                           chain="listen", origin="listen"):
     """把一批任务与 checkpoint **在同一个事务里**落盘（§13）。
 
     tasks: [{message_id, grouped_id, target_type, target_chat_id,
@@ -502,6 +552,9 @@ def enqueue_listener_tasks(source_chat_id, tasks, checkpoint=None, now=None):
         散消息）。整组成员 id 放在 ``payload["member_ids"]``。
     checkpoint: 非 None 时随事务一起推进。调用方传「本轮最后一个已处理消息的
       id」；**没有入队的消息不能传进来**（否则那些消息被永久跳过，§30）。
+    chain/origin: 写哪条链的 checkpoint（'listen'/'wl'）与任务来源标签
+      （'listen'=事件链 / 'wl'=白名单扫描链）——claim 时 listen 优先，stats
+      可按 origin 过滤；缺省即旧的事件链行为。
 
     返回与 tasks 等长的 id 列表，**重复任务（被唯一索引吃掉）位置为 None**。
     失败抛 DbUnavailable 且**整个事务回滚**——checkpoint 绝不先于任务落盘。
@@ -518,13 +571,13 @@ def enqueue_listener_tasks(source_chat_id, tasks, checkpoint=None, now=None):
                 "INSERT OR IGNORE INTO listener_tasks "
                 "(source_chat_id, message_id, grouped_id, target_type, "
                 " target_chat_id, status, attempts, created_at, download, "
-                " payload) VALUES(?,?,?,?,?,?,0,?,?,?)",
+                " payload, origin) VALUES(?,?,?,?,?,?,0,?,?,?,?)",
                 (source_chat_id, int(task["message_id"]),
                  task.get("grouped_id"), str(task["target_type"]),
                  (None if task.get("target_chat_id") is None
                   else int(task["target_chat_id"])),
                  STATUS_PENDING, now, 1 if task.get("download") else 0,
-                 _dumps(task.get("payload"))),
+                 _dumps(task.get("payload")), str(origin)),
             )
             if cur.rowcount:
                 task_id = cur.lastrowid
@@ -534,7 +587,8 @@ def enqueue_listener_tasks(source_chat_id, tasks, checkpoint=None, now=None):
             else:
                 ids.append(None)
         if checkpoint is not None:
-            _write_checkpoint(conn, source_chat_id, checkpoint, now)
+            _write_checkpoint(conn, source_chat_id, checkpoint, now,
+                              chain=chain)
         return ids
 
     ids = _write(do, "入队监听任务")
@@ -617,7 +671,8 @@ def claim_listener_task(now=None, lease_seconds=None):
     短事务：只在里面选一条 + 改状态，**Telegram API 调用绝不能进来**。
     可选范围：PENDING 且（无 next_retry_at 或已到期）。attempts 在这里 +1
     ——「尝试次数」的口径是「被领取执行的次数」，与下载队列一致。
-    领取按 id 升序（FIFO），保证同一批消息按发现顺序处理。
+    领取顺序：listen 优先于 wl（事件链兜实时，扫描链只补漏），同 origin
+    内按 id 升序（FIFO），保证同一批消息按发现顺序处理。
     """
     now = _now(now)
     if lease_seconds is None:
@@ -629,7 +684,7 @@ def claim_listener_task(now=None, lease_seconds=None):
             conn,
             "SELECT * FROM listener_tasks WHERE status=? "
             "AND (next_retry_at IS NULL OR next_retry_at<=?) "
-            "ORDER BY id LIMIT 1",
+            "ORDER BY (origin='wl'), id LIMIT 1",
             (STATUS_PENDING, now),
         ).fetchone()
         if row is None:
@@ -831,17 +886,26 @@ def get_task_events(task_id):
     return out
 
 
-def get_listener_stats(since=None, now=None):
-    """监听任务的状态分布（统计/对账用）。since = unix 秒，按 created_at 过滤。"""
-    if since is None:
-        rows = _read(lambda c: _execute(
-            c, "SELECT status, COUNT(*) AS n FROM listener_tasks "
-               "GROUP BY status").fetchall(), "统计监听任务")
-    else:
-        rows = _read(lambda c: _execute(
-            c, "SELECT status, COUNT(*) AS n FROM listener_tasks "
-               "WHERE created_at>=? GROUP BY status",
-            (int(since),)).fetchall(), "统计监听任务")
+def get_listener_stats(since=None, now=None, origin=None):
+    """监听任务的状态分布（统计/对账用）。
+
+    since = unix 秒，按 created_at 过滤；origin 过滤任务来源
+    ('listen'/'wl'，None = 全部)——台账的 📡 标签监听 分节只算 listen，
+    /wl 视图只算 wl。
+    """
+    where, params = [], []
+    if since is not None:
+        where.append("created_at>=?")
+        params.append(int(since))
+    if origin is not None:
+        where.append("origin=?")
+        params.append(str(origin))
+    sql = "SELECT status, COUNT(*) AS n FROM listener_tasks"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " GROUP BY status"
+    rows = _read(lambda c: _execute(c, sql, tuple(params)).fetchall(),
+                 "统计监听任务")
     # 键用小写（展示层友好），与状态常量一一对应
     key_of = {
         STATUS_PENDING: "pending",
@@ -856,6 +920,19 @@ def get_listener_stats(since=None, now=None):
         out[name] = out.get(name, 0) + int(row["n"])
     out["total"] = sum(out.values())
     return out
+
+
+def count_listener_tasks_for_chat(source_chat_id, origin=None):
+    """某聊天某来源的待执行（PENDING+PROCESSING）任务数（/wl 视图用）。"""
+    sql = ("SELECT COUNT(*) FROM listener_tasks WHERE source_chat_id=? "
+           "AND status IN (?,?)")
+    params = [int(source_chat_id), STATUS_PENDING, STATUS_PROCESSING]
+    if origin is not None:
+        sql += " AND origin=?"
+        params.append(str(origin))
+    row = _read(lambda c: _execute(c, sql, tuple(params)).fetchone(),
+                "统计聊天待执行任务")
+    return int(row[0])
 
 
 # ============================================================
