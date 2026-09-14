@@ -69,6 +69,22 @@ EV_LEASE_EXPIRED = "LEASE_EXPIRED"
 FOLLOW_ACTIVE = "ACTIVE"
 FOLLOW_EXPIRED = "EXPIRED"
 
+# Pawchive 帖子生命周期（schema v8）。与 listener 的状态集刻意错开：
+# MANUAL（有外链等人工处理）与 COMPLETED（彻底完成）是 pawchive 特有终态；
+# FAILED 不自动重试（Chrome 端已重试过 3 次），由 /paw retry 手动重投。
+PAW_POST_PENDING = "PENDING"
+PAW_POST_PROCESSING = "PROCESSING"
+PAW_POST_COMPLETED = "COMPLETED"
+PAW_POST_MANUAL = "MANUAL"
+PAW_POST_FAILED = "FAILED"
+PAW_POST_TERMINAL = (PAW_POST_COMPLETED, PAW_POST_MANUAL, PAW_POST_FAILED)
+
+# 文件级状态：SUBMITTED = 已交给 Chrome Agent（对账以 chrome_tasks.json 为准）
+PAW_FILE_PENDING = "PENDING"
+PAW_FILE_SUBMITTED = "SUBMITTED"
+PAW_FILE_DONE = "DONE"
+PAW_FILE_FAILED = "FAILED"
+
 
 class DbUnavailable(RuntimeError):
     """Runtime DB 本次操作不可用（等锁超限 / 非 BUSY 类 SQL 错误）。
@@ -264,6 +280,73 @@ _SCHEMA = (
         ts       TEXT,
         filename TEXT
     )
+    """,
+    # ============================================================
+    # Pawchive 扫描结果（2026-09-14，schema v8）。/paw plan 把创作者帖子
+    # 扫描结果按**帖子级**落库，由 pawchive_worker 以生命周期方式消费：
+    # PENDING →（claim 租约）PROCESSING → 附件直链逐条交给 Chrome Agent →
+    #   全部 DONE 且无外链 → COMPLETED（已完成）
+    #   全部 DONE 且有外链 → MANUAL（人工处理，外链清单在 ext_links）
+    #   Chrome 失败/取消   → FAILED（/paw retry 重投 PENDING）
+    # UNIQUE(service, creator_id, post_id)：重复 plan 幂等——已存在的帖子
+    # 整体跳过（状态与文件进度都不动），只有新帖子才入队。
+    # ============================================================
+    """
+    CREATE TABLE IF NOT EXISTS pawchive_posts (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        service      TEXT NOT NULL,
+        creator_id   TEXT NOT NULL,
+        creator_name TEXT,
+        post_id      TEXT NOT NULL,
+        title        TEXT,
+        published    TEXT,
+        post_url     TEXT,
+        subdir       TEXT,
+        status       TEXT NOT NULL,
+        ext_links    TEXT,
+        ext_count    INTEGER NOT NULL DEFAULT 0,
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        next_retry_at INTEGER,
+        lease_until  INTEGER,
+        created_at   INTEGER NOT NULL,
+        started_at   INTEGER,
+        completed_at INTEGER,
+        last_error   TEXT,
+        scan_batch   TEXT
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_pawchive_post_unique
+    ON pawchive_posts (service, creator_id, post_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_pawchive_post_pickup
+    ON pawchive_posts (status, next_retry_at)
+    """,
+    # 文件级进度：worker 重领帖子时只提交还差的那部分；chrome_task_id 是
+    # 与 chrome_tasks.json 对账的钥匙（Agent 终态 = 文件终态的唯一真相源）。
+    """
+    CREATE TABLE IF NOT EXISTS pawchive_files (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        post_row      INTEGER NOT NULL,
+        url           TEXT NOT NULL,
+        filename      TEXT,
+        status        TEXT NOT NULL,
+        chrome_task_id TEXT,
+        size_bytes    INTEGER,
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        error         TEXT,
+        updated_at    INTEGER,
+        FOREIGN KEY(post_row) REFERENCES pawchive_posts(id)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_pawchive_file_unique
+    ON pawchive_files (post_row, url)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_pawchive_file_pickup
+    ON pawchive_files (post_row, status)
     """,
 )
 
@@ -565,6 +648,11 @@ def migrate() -> int:
         # v6 → v7：新增 dedup_index（去重索引）。纯建表；旧 TXT 由
         # dedup.load_index 的启动导入负责。
         logger.info("🗄 Runtime DB 迁移：v7（+ dedup_index 去重索引）")
+    if version < 8:
+        # v7 → v8：新增 pawchive_posts / pawchive_files（Pawchive 扫描结果
+        # 生命周期）。纯建表，没有数据迁移——旧数据只有独立 CLI 脚本的
+        # manifest/CSV，不在 bot 数据域内，不做导入。
+        logger.info("🗄 Runtime DB 迁移：v8（+ pawchive_posts/pawchive_files）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -975,6 +1063,386 @@ def recover_expired_listener_tasks(now=None):
             f"🗄 检测到 {len(rows)} 条租约过期的在途任务（Worker 曾崩溃/被杀），"
             f"已恢复为待执行：{detail}"
             + (f" 等 {len(rows) - 5} 条" if len(rows) > 5 else "")
+        )
+    return len(rows)
+
+
+# ============================================================
+# Pawchive 扫描结果（schema v8）：帖子级生命周期 + 文件级进度。
+# /paw plan 落库 → pawchive_worker 领取 → Chrome Agent 下载 → 终态。
+# 命名与 listener 系列刻意分开（pawchive_* 前缀）：两套 ID 空间、两套
+# 状态机，绝不共用 task_events 表。
+# ============================================================
+def _row_to_pawchive_post(row):
+    if row is None:
+        return None
+    rec = dict(row)
+    rec["ext_links"] = _loads(rec.get("ext_links")) or []
+    return rec
+
+
+def enqueue_pawchive_posts(service, creator_id, creator_name, posts,
+                           scan_batch=None, now=None):
+    """一批帖子（含附件直链与外链）落库；**已存在的帖子整体跳过**（幂等）。
+
+    posts: [{post_id, title, published, post_url, subdir,
+             files: [{url, filename}], ext_links: [{domain, url, text}]}]
+    唯一索引 (service, creator_id, post_id) 吃掉重复：重复 plan 时已存在
+    帖子的状态与文件进度原样保留，只有新帖子才进 PENDING。
+    单事务：帖子与其文件要么一起进、要么都不进。返回 (created, skipped)。
+    """
+    service = str(service)
+    creator_id = str(creator_id)
+    now = _now(now)
+
+    def do(conn):
+        created = skipped = 0
+        for post in posts:
+            ext_links = post.get("ext_links") or []
+            cur = _execute(
+                conn,
+                "INSERT OR IGNORE INTO pawchive_posts "
+                "(service, creator_id, creator_name, post_id, title, published,"
+                " post_url, subdir, status, ext_links, ext_count, created_at,"
+                " scan_batch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (service, creator_id,
+                 (None if creator_name is None else str(creator_name)),
+                 str(post["post_id"]),
+                 (None if post.get("title") is None else str(post["title"])),
+                 (None if post.get("published") is None
+                  else str(post["published"])),
+                 (None if post.get("post_url") is None
+                  else str(post["post_url"])),
+                 (None if post.get("subdir") is None else str(post["subdir"])),
+                 PAW_POST_PENDING, _dumps(ext_links), len(ext_links), now,
+                 (None if scan_batch is None else str(scan_batch))),
+            )
+            if not cur.rowcount:
+                skipped += 1
+                continue
+            created += 1
+            post_row = cur.lastrowid
+            for f in post.get("files") or []:
+                if not f or not f.get("url"):
+                    continue  # 站点侧未给 path 的附件本来就无法下载
+                _execute(
+                    conn,
+                    "INSERT OR IGNORE INTO pawchive_files "
+                    "(post_row, url, filename, status, updated_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (post_row, str(f["url"]),
+                     (None if f.get("filename") is None
+                      else str(f["filename"])),
+                     PAW_FILE_PENDING, now),
+                )
+        return created, skipped
+
+    created, skipped = _write(do, "落库 Pawchive 扫描结果")
+    if created or skipped:
+        logger.info(
+            f"🗄 Pawchive 扫描落库：{creator_name}（{service}/{creator_id}）"
+            f" 新建 {created} 帖 | 已存在跳过 {skipped} 帖"
+        )
+    return created, skipped
+
+
+def pawchive_status_counts():
+    """各状态帖子计数（/paw status 视图）。"""
+    rows = _read(lambda c: _execute(
+        c, "SELECT status, COUNT(*) FROM pawchive_posts GROUP BY status"
+    ).fetchall(), "统计 Pawchive 帖子状态")
+    return {r[0]: int(r[1]) for r in rows}
+
+
+def get_pawchive_post(row_id):
+    row = _read(lambda c: _execute(
+        c, "SELECT * FROM pawchive_posts WHERE id=?", (int(row_id),)
+    ).fetchone(), "读 Pawchive 帖子")
+    return _row_to_pawchive_post(row)
+
+
+def list_pawchive_posts(status=None, limit=100):
+    """列帖子；status 给定时按 id 升序（领取顺序），否则按 id 降序（最新在前）。"""
+    if status:
+        rows = _read(lambda c: _execute(
+            c, "SELECT * FROM pawchive_posts WHERE status=? ORDER BY id "
+               "LIMIT ?", (str(status), int(limit))).fetchall(),
+            "列 Pawchive 帖子")
+    else:
+        rows = _read(lambda c: _execute(
+            c, "SELECT * FROM pawchive_posts ORDER BY id DESC LIMIT ?",
+            (int(limit),)).fetchall(), "列 Pawchive 帖子")
+    return [_row_to_pawchive_post(r) for r in rows]
+
+
+def claim_next_pawchive_post(now=None, lease_seconds=None):
+    """领一条 PENDING 帖子 → PROCESSING + 租约；没有则返回 None。
+
+    短事务：只选一条 + 改状态，网络/Chrome 调用绝不能进来。
+    attempts 口径与 listener 一致 = 被领取执行的次数。
+    """
+    now = _now(now)
+    if lease_seconds is None:
+        lease_seconds = int(config.PAWCHIVE_LEASE_SECONDS)
+    lease_until = now + max(60, int(lease_seconds))
+
+    def do(conn):
+        row = _execute(
+            conn,
+            "SELECT id FROM pawchive_posts WHERE status=? "
+            "AND (next_retry_at IS NULL OR next_retry_at<=?) "
+            "ORDER BY id LIMIT 1",
+            (PAW_POST_PENDING, now),
+        ).fetchone()
+        if row is None:
+            return None
+        # 带状态条件的 UPDATE：并发领取时输家 rowcount=0，绝不双跑。
+        cur = _execute(
+            conn,
+            "UPDATE pawchive_posts SET status=?, started_at=?, lease_until=?, "
+            "attempts=attempts+1 WHERE id=? AND status=?",
+            (PAW_POST_PROCESSING, now, lease_until,
+             row["id"], PAW_POST_PENDING),
+        )
+        if not cur.rowcount:
+            return None
+        return row["id"]
+
+    post_row = _write(do, "领取 Pawchive 帖子")
+    if post_row is None:
+        return None
+    post = get_pawchive_post(post_row)
+    logger.info(
+        f"🗄 Pawchive 领取帖子 #{post_row}：{post['creator_name']} "
+        f"{post['post_id']}（第 {post['attempts']} 次尝试）"
+    )
+    return post
+
+
+def renew_pawchive_lease(post_row, lease_seconds=None, now=None):
+    """续租：单帖处理可能持续数小时（大视频在 Chrome 端串行），必须周期续。"""
+    now = _now(now)
+    if lease_seconds is None:
+        lease_seconds = int(config.PAWCHIVE_LEASE_SECONDS)
+    lease_until = now + max(60, int(lease_seconds))
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE pawchive_posts SET lease_until=? WHERE id=? AND status=?",
+            (lease_until, int(post_row), PAW_POST_PROCESSING),
+        )
+        return bool(cur.rowcount)
+
+    return _write(do, "续 Pawchive 租约")
+
+
+def list_pawchive_files(post_row):
+    rows = _read(lambda c: _execute(
+        c, "SELECT * FROM pawchive_files WHERE post_row=? ORDER BY id",
+        (int(post_row),)).fetchall(), "列 Pawchive 文件")
+    return [dict(r) for r in rows]
+
+
+def mark_pawchive_file_submitted(file_id, chrome_task_id, now=None):
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE pawchive_files SET status=?, chrome_task_id=?, "
+            "attempts=attempts+1, error=NULL, updated_at=? WHERE id=?",
+            (PAW_FILE_SUBMITTED, str(chrome_task_id), now, int(file_id)),
+        )
+        return bool(cur.rowcount)
+
+    return _write(do, "标记 Pawchive 文件已提交")
+
+
+def mark_pawchive_file_done(file_id, size_bytes=None, now=None):
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE pawchive_files SET status=?, size_bytes=?, error=NULL, "
+            "updated_at=? WHERE id=?",
+            (PAW_FILE_DONE,
+             (None if size_bytes is None else int(size_bytes)),
+             now, int(file_id)),
+        )
+        return bool(cur.rowcount)
+
+    return _write(do, "标记 Pawchive 文件完成")
+
+
+def mark_pawchive_file_failed(file_id, error=None, now=None):
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE pawchive_files SET status=?, error=?, updated_at=? "
+            "WHERE id=?",
+            (PAW_FILE_FAILED,
+             (None if error is None else str(error)[:500]),
+             now, int(file_id)),
+        )
+        return bool(cur.rowcount)
+
+    return _write(do, "标记 Pawchive 文件失败")
+
+
+def mark_pawchive_file_pending(file_id, now=None):
+    """SUBMITTED/FAILED → PENDING（chrome task 失联时重投用）。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE pawchive_files SET status=?, chrome_task_id=NULL, "
+            "updated_at=? WHERE id=? AND status IN (?,?)",
+            (PAW_FILE_PENDING, now, int(file_id),
+             PAW_FILE_SUBMITTED, PAW_FILE_FAILED),
+        )
+        return bool(cur.rowcount)
+
+    return _write(do, "Pawchive 文件重投")
+
+
+def finalize_pawchive_post(post_row, status, error=None, now=None):
+    """终态流转：PROCESSING → COMPLETED / MANUAL / FAILED。"""
+    now = _now(now)
+    if status not in PAW_POST_TERMINAL:
+        raise ValueError(f"非法的 Pawchive 终态：{status}")
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE pawchive_posts SET status=?, completed_at=?, "
+            "lease_until=NULL, last_error=? WHERE id=? AND status=?",
+            (str(status), now,
+             (None if error is None else str(error)[:500]),
+             int(post_row), PAW_POST_PROCESSING),
+        )
+        return bool(cur.rowcount)
+
+    ok = _write(do, f"Pawchive 帖子终态 {status}")
+    if ok:
+        logger.info(f"🗄 Pawchive 帖子 #{post_row} → {status}")
+    else:
+        logger.warning(
+            f"🗄 Pawchive 帖子 #{post_row} 不在 PROCESSING，忽略终态 {status}")
+    return ok
+
+
+def postpone_pawchive_post(post_row, next_retry_at, error=None, now=None):
+    """暂时性失败：PROCESSING → PENDING + next_retry_at（退避重试）。
+
+    与 listener 的 retry_listener_task 同语义——同一行回 PENDING，不新增任务。
+    """
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE pawchive_posts SET status=?, next_retry_at=?, "
+            "lease_until=NULL, last_error=? WHERE id=? AND status=?",
+            (PAW_POST_PENDING, int(next_retry_at),
+             (None if error is None else str(error)[:500]),
+             int(post_row), PAW_POST_PROCESSING),
+        )
+        return bool(cur.rowcount)
+
+    return _write(do, "Pawchive 帖子转退避重试")
+
+
+def retry_pawchive_posts(row_ids=None, now=None):
+    """FAILED → PENDING（/paw retry）：文件级 FAILED 一并重投。
+
+    row_ids=None 表示重投全部失败帖子。
+    """
+    now = _now(now)
+
+    def do(conn):
+        if row_ids is None:
+            rows = _execute(
+                conn, "SELECT id FROM pawchive_posts WHERE status=?",
+                (PAW_POST_FAILED,)).fetchall()
+            targets = [r["id"] for r in rows]
+        else:
+            targets = [int(x) for x in row_ids]
+        count = 0
+        for pid in targets:
+            cur = _execute(
+                conn,
+                "UPDATE pawchive_posts SET status=?, next_retry_at=NULL, "
+                "lease_until=NULL WHERE id=? AND status=?",
+                (PAW_POST_PENDING, pid, PAW_POST_FAILED),
+            )
+            if not cur.rowcount:
+                continue
+            count += 1
+            _execute(
+                conn,
+                "UPDATE pawchive_files SET status=?, chrome_task_id=NULL, "
+                "updated_at=? WHERE post_row=? AND status=?",
+                (PAW_FILE_PENDING, now, pid, PAW_FILE_FAILED),
+            )
+        return count
+
+    count = _write(do, "重投 Pawchive 失败帖子")
+    if count:
+        logger.info(f"🗄 Pawchive 重投 {count} 条失败帖子")
+    return count
+
+
+def release_pawchive_post(post_row):
+    """PROCESSING → PENDING（优雅停机）。
+
+    文件状态原样保留：SUBMITTED 的文件由 worker 重领时先对账
+    chrome_tasks.json——终态就地吸收，失联（task 被裁剪/不存在）才重投。
+    """
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE pawchive_posts SET status=?, lease_until=NULL "
+            "WHERE id=? AND status=?",
+            (PAW_POST_PENDING, int(post_row), PAW_POST_PROCESSING),
+        )
+        return bool(cur.rowcount)
+
+    ok = _write(do, "释放 Pawchive 帖子")
+    if ok:
+        logger.info(f"🗄 Pawchive 帖子 #{post_row} 已放回待处理（优雅停机）")
+    return ok
+
+
+def recover_expired_pawchive_posts(now=None):
+    """租约过期的 PROCESSING → PENDING（worker 崩溃自愈，启动时先跑一次）。"""
+    now = _now(now)
+
+    def do(conn):
+        rows = _execute(
+            conn,
+            "SELECT id FROM pawchive_posts "
+            "WHERE status=? AND lease_until IS NOT NULL AND lease_until<?",
+            (PAW_POST_PROCESSING, now),
+        ).fetchall()
+        for row in rows:
+            _execute(
+                conn,
+                "UPDATE pawchive_posts SET status=?, lease_until=NULL, "
+                "last_error=? WHERE id=?",
+                (PAW_POST_PENDING, "lease expired", row["id"]),
+            )
+        return [dict(r) for r in rows]
+
+    rows = _write(do, "恢复过期租约的 Pawchive 帖子")
+    if rows:
+        logger.warning(
+            f"🗄 检测到 {len(rows)} 条租约过期的 Pawchive 帖子"
+            "（worker 曾崩溃/被杀），已恢复待处理"
         )
     return len(rows)
 

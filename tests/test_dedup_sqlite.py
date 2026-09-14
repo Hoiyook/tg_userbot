@@ -212,7 +212,7 @@ class TestSchemaV6ToV7(DedupDbTestBase):
 
     def test_v6_migrates_to_v7(self):
         self.assertTrue(runtime_db.init_db(self.db_path))
-        self.assertEqual(runtime_db.get_schema_version(), 7)
+        self.assertEqual(runtime_db.get_schema_version(), config.RUNTIME_DB_SCHEMA_VERSION)
         self.assertEqual(runtime_db.dedup_index_count(), 0)
         # 前序表原样
         self.assertEqual(runtime_db.history_count(), 0)
@@ -221,7 +221,7 @@ class TestSchemaV6ToV7(DedupDbTestBase):
     def test_migration_idempotent(self):
         self.assertTrue(runtime_db.init_db(self.db_path))
         self.assertTrue(runtime_db.init_db(self.db_path))
-        self.assertEqual(runtime_db.get_schema_version(), 7)
+        self.assertEqual(runtime_db.get_schema_version(), config.RUNTIME_DB_SCHEMA_VERSION)
 
 
 if __name__ == "__main__":

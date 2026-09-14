@@ -1,0 +1,720 @@
+"""Pawchive（pawchive.pw 归档站）—— 扫描 / 收藏对比 / 命令与菜单入口。
+
+数据流（与独立 CLI 脚本 ~/Documents/pawchive/pawchive.py 同源逻辑，落点不同）：
+
+    /paw plan <作者>
+      ↓ 同源 API：创作者解析 → 帖子分页（o=50）→ 收藏对比（可选 Cookie）→ 外链提取
+    帖子级落 SQLite（pawchive_posts/pawchive_files，schema v8，重复扫描幂等）
+      ↓ pawchive_worker 逐帖领取
+    附件直链交给 Chrome Agent 串行下载 → COMPLETED / MANUAL（有外链）/ FAILED
+
+站点结构（2026-09-14 实测）：
+    创作者   GET /api/v1/creators                  （q 参数无效→全量+本地过滤+缓存）
+    帖子列表 GET /api/v1/{svc}/user/{id}/posts?o=  公开，每页 50
+    收藏     GET /api/v1/account/favorites?type=post   需要 Cookie（Flask session）
+    直链     https://file.pawchive.pw/data/{path}?f=   公开，content-disposition
+             attachment（Chrome 打开即触发下载而非内嵌播放，worker 依赖这一点）
+
+阻塞 HTTP 一律经 ``asyncio.to_thread`` 下放线程：urllib 没有异步形态，而主循环
+上还跑着下载/通知/菜单，绝不能被 20MB 的创作者列表卡住。
+"""
+import asyncio
+import csv
+import html as html_mod
+import json
+import os
+import re
+import shutil
+import time
+import urllib.parse
+import urllib.request
+
+from telethon import Button
+
+from . import config
+from . import runtime_db
+from . import state
+from .log import logger
+
+TEXT_PREFIX = "🐾 Pawchive"
+
+_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) tg-userbot-pawchive/1.0"
+_PAGE = 50
+
+# 扫描是后台一次性工作：强引用集防 GC（asyncio 只对 Task 持弱引用）
+_SPAWNED_SCANS = set()
+
+
+# ============================================================
+# HTTP（阻塞层，调用方一律 asyncio.to_thread）
+# ============================================================
+# 强制直连：系统代理（socks5）会让 urllib 秒抛 ValueError，见 worker 同款注释
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _http_get_json(url, cookie=None, timeout=30, retries=4):
+    """GET 并解析 JSON；429/5xx/网络抖动按指数退避重试。
+
+    收藏接口单次可能 >30s（返回全量收藏帖子），调用方给足 timeout。
+    """
+    last = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url)
+            req.add_header("User-Agent", _UA)
+            if cookie:
+                req.add_header("Cookie", cookie)
+            with _DIRECT_OPENER.open(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                last = e
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise RuntimeError(f"HTTP {e.code}: {url}") from e
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            last = e
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"重试 {retries} 次仍失败：{url}（{last}）")
+
+
+# ============================================================
+# 创作者：全量缓存 + 本地过滤（站点 q 参数无效）
+# ============================================================
+def _cache_path():
+    return os.path.join(config.PAWCHIVE_DATA_DIR, "creators.json")
+
+
+def load_creators(refresh=False):
+    """全量创作者列表（约 20MB / 九万条），TTL 内读缓存。阻塞，放线程跑。"""
+    path = _cache_path()
+    if not refresh:
+        try:
+            age = time.time() - os.path.getmtime(path)
+            if age < config.PAWCHIVE_CREATORS_CACHE_TTL:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+    data = _http_get_json(f"{config.PAWCHIVE_API_BASE}/api/v1/creators",
+                          timeout=120)
+    os.makedirs(config.PAWCHIVE_DATA_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+    return data
+
+
+def search_creators(term, limit=5):
+    """按名字找创作者：先精确（大小写不敏感），再子串；热门优先。"""
+    term = str(term or "").strip().lower()
+    if not term:
+        return []
+    creators = load_creators()
+    exact = [c for c in creators if c.get("name", "").lower() == term]
+    if exact:
+        return exact[:limit]
+    fuzzy = [c for c in creators if term in c.get("name", "").lower()]
+    fuzzy.sort(key=lambda c: -c.get("favorited", 0))
+    return fuzzy[:limit]
+
+
+def resolve_creator(name):
+    """名字 → 创作者 dict（精确优先，否则取最热子串匹配）；找不到返回 None。"""
+    term = str(name or "").strip().lower()
+    if not term:
+        return None
+    creators = load_creators()
+    for c in creators:
+        if c.get("name", "").lower() == term:
+            return c
+    hits = [c for c in creators if term in c.get("name", "").lower()]
+    return max(hits, key=lambda c: c.get("favorited", 0)) if hits else None
+
+
+async def resolve_creator_async(name):
+    """resolve_creator 的异步包装（阻塞 HTTP 下放线程；bot 菜单窗口用）。"""
+    return await asyncio.to_thread(resolve_creator, name)
+
+
+# ============================================================
+# 帖子 / 收藏 / 外链
+# ============================================================
+def fetch_creator_posts(service, creator_id, cookie=None, progress=None):
+    """分页拉取创作者全部帖子（列表接口自带 attachments/file/content）。"""
+    posts, offset = [], 0
+    while True:
+        page = _http_get_json(
+            f"{config.PAWCHIVE_API_BASE}/api/v1/{service}/user/{creator_id}"
+            f"/posts?o={offset}", cookie=cookie)
+        posts.extend(page)
+        if progress:
+            progress(f"已拉取 {len(posts)} 条")
+        if len(page) < _PAGE:
+            return posts
+        offset += _PAGE
+
+
+def fetch_favorited_ids(cookie):
+    """当前账号收藏的全部帖子 id（Cookie 会话）。阻塞且慢（>30s 常态）。"""
+    favs = _http_get_json(
+        f"{config.PAWCHIVE_API_BASE}/api/v1/account/favorites?type=post",
+        cookie=cookie, timeout=180)
+    return {str(f["id"]) for f in favs}
+
+
+def extract_links(post):
+    """从帖子 content HTML 与 embed 字段提取站外链接（MEGA/网盘等）。
+
+    站内链接（pawchive.pw）剔除；同帖内按 URL 去重。MEGA 链接的解密密钥
+    绝大多数在 URL #fragment 里，原样保留即可打开。
+    """
+    links, seen = [], set()
+    for m in re.finditer(r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                         post.get("content") or "", re.S | re.I):
+        url = html_mod.unescape(m.group(1)).strip()
+        if not re.match(r"^https?://", url, re.I):
+            continue
+        host = urllib.parse.urlparse(url).netloc.lower()
+        if not host or host.endswith("pawchive.pw"):
+            continue
+        if url.lower() in seen:
+            continue
+        seen.add(url.lower())
+        text = re.sub(r"<[^>]+>", "", m.group(2) or "").strip()
+        links.append({"kind": "link", "domain": host,
+                      "url": url, "text": text[:200]})
+    embed = post.get("embed") or {}
+    if isinstance(embed, dict):
+        url = str(embed.get("url") or "")
+        if re.match(r"^https?://", url, re.I) and url.lower() not in seen:
+            seen.add(url.lower())
+            links.append({
+                "kind": "embed",
+                "domain": urllib.parse.urlparse(url).netloc.lower(),
+                "url": url, "text": (embed.get("subject") or "")[:200]})
+    return links
+
+
+def _file_entry(att):
+    """附件 → {url, filename}：直链指向 file 服务器原始文件（非缩略图）。"""
+    path = att["path"]
+    name = att.get("name") or os.path.basename(path)
+    qname = urllib.parse.quote(name)
+    return {"url": f"{config.PAWCHIVE_FILE_BASE}/data{path}?f={qname}",
+            "filename": name}
+
+
+def build_scan_records(creator, posts, faved_ids=None, scope="notfaved"):
+    """帖子列表 → 入库记录；只保留目标范围内**有可下载直链或有外链**的帖子。
+
+    faved_ids=None（无 Cookie）时范围判断跳过（scope=notfaved 退化为全部）。
+    没有直链也没有外链的帖子（纯文字/纯外站）不进生命周期——worker 对它
+    无事可做。subdir 决定 Chrome 落盘目录：
+    CHROME_DOWNLOAD_DIR/Pawchive/<作者>/<日期>_<帖子ID>_<标题>/
+    """
+    from .naming import sanitize_filename
+
+    creator_name = creator.get("name") or f"{creator['service']}/{creator['id']}"
+    records = []
+    for p in posts:
+        pid = str(p["id"])
+        if faved_ids is not None:
+            if scope == "notfaved" and pid in faved_ids:
+                continue
+            if scope == "faved" and pid not in faved_ids:
+                continue
+        files = [_file_entry(a) for a in (p.get("attachments") or [])
+                 if a and a.get("path")]
+        ext_links = extract_links(p)
+        if not files and not ext_links:
+            continue
+        title = p.get("title") or ""
+        date = (p.get("published") or "")[:10] or "unknown"
+        subdir = "Pawchive/{}/{}_{}_{}".format(
+            sanitize_filename(creator_name) or "creator",
+            date, pid, sanitize_filename(title)[:60] or "untitled")
+        records.append({
+            "post_id": pid,
+            "title": title,
+            "published": p.get("published") or "",
+            "post_url": (f"{config.PAWCHIVE_API_BASE}/{creator['service']}"
+                         f"/user/{creator['id']}/post/{pid}"),
+            "subdir": subdir,
+            "files": files,
+            "ext_links": ext_links,
+        })
+    return records
+
+
+# ============================================================
+# 扫描（后台任务）
+# ============================================================
+def _creator_label(creator):
+    return (creator.get("name")
+            or f"{creator.get('service')}/{creator.get('id')}")
+
+
+async def start_scan(creator, scope="notfaved"):
+    """后台扫描一个创作者并落库；立即返回，结果经 notify 汇报。"""
+    if state.PAW_SCAN_RUNNING is not None:
+        return (f"⏳ 已有扫描在进行（{state.PAW_SCAN_RUNNING}），"
+                "等它结束再发起（/paw status 看进度）")
+    state.PAW_SCAN_RUNNING = _creator_label(creator)
+    task = asyncio.create_task(_scan_and_notify(creator, scope))
+    _SPAWNED_SCANS.add(task)
+    task.add_done_callback(_SPAWNED_SCANS.discard)
+    return (f"🐾 开始扫描 {_creator_label(creator)}"
+            f"（范围：{'全部帖子' if scope == 'all' or not config.PAWCHIVE_COOKIE else '未收藏帖子'}）"
+            "，完成后通知。期间可 /paw status 看进度")
+
+
+async def _scan_and_notify(creator, scope):
+    """扫描主体：帖子分页 + 收藏对比 + 落库。异常只通知，不炸后台。"""
+    label = _creator_label(creator)
+    try:
+        cookie = config.PAWCHIVE_COOKIE or None
+        posts = await asyncio.to_thread(
+            fetch_creator_posts, creator["service"], creator["id"], cookie)
+        if cookie:
+            faved_ids = await asyncio.to_thread(fetch_favorited_ids, cookie)
+        else:
+            faved_ids = None
+        records = build_scan_records(creator, posts, faved_ids, scope)
+        created, skipped = runtime_db.enqueue_pawchive_posts(
+            creator["service"], str(creator["id"]), label, records,
+            scan_batch=time.strftime("%Y-%m-%d %H:%M:%S"))
+        n_files = sum(len(r["files"]) for r in records)
+        n_links = sum(len(r["ext_links"]) for r in records)
+        state.PAW_LAST_SCAN = {
+            "creator": label,
+            "scope": scope if faved_ids is not None else "all(无Cookie)",
+            "fetched": len(posts),
+            "created": created,
+            "skipped": skipped,
+            "files": n_files,
+            "links": n_links,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        summary = (
+            f"🐾 Pawchive 扫描完成：{label}\n"
+            f"拉取帖子 {len(posts)} | 新入队 {created}（跳过已存在 {skipped}）\n"
+            f"附件直链 {n_files} 个 | 站外链接 {n_links} 条")
+        if not cookie:
+            summary += "\n⚠️ 未配置 Cookie，本次按全部帖子处理（无法对比收藏）"
+        await notify_user(summary)
+    except Exception as e:
+        logger.exception(f"🐾 Pawchive 扫描失败：{label}")
+        await notify_user(f"❌ Pawchive 扫描失败（{label}）：{e}")
+    finally:
+        state.PAW_SCAN_RUNNING = None
+
+
+async def notify_user(text):
+    """统一通知出口（bot 控制面板对话）。函数内导入避免 app↔本模块成环。"""
+    from . import notify
+    await notify.notify_user(text)
+
+
+# ============================================================
+# 状态视图 / CSV
+# ============================================================
+_STATUS_LABELS = {
+    runtime_db.PAW_POST_PENDING: "⏳ 待处理",
+    runtime_db.PAW_POST_PROCESSING: "🔄 处理中",
+    runtime_db.PAW_POST_COMPLETED: "✅ 已完成",
+    runtime_db.PAW_POST_MANUAL: "👤 待人工",
+    runtime_db.PAW_POST_FAILED: "❌ 失败",
+}
+
+
+def _disk_free_gb():
+    try:
+        return shutil.disk_usage(config.CHROME_DOWNLOAD_DIR).free / 1024 ** 3
+    except OSError:
+        return None
+
+
+def status_text():
+    """/paw 与菜单的 📊 状态视图（只读聚合，无副作用）。"""
+    from . import chrome_client          # 函数内导入：保持模块导入轻量
+    from . import pawchive_worker
+
+    lines = [TEXT_PREFIX, ""]
+    if state.PAW_SCAN_RUNNING:
+        lines.append(f"🔄 正在扫描：{state.PAW_SCAN_RUNNING}")
+    try:
+        counts = runtime_db.pawchive_status_counts()
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if counts:
+        lines.append(" | ".join(
+            f"{_STATUS_LABELS.get(s, s)} {n}" for s, n in sorted(counts.items())))
+    else:
+        lines.append("（还没有扫描结果，/paw plan <作者名> 开始）")
+    if state.PAW_LAST_SCAN:
+        s = state.PAW_LAST_SCAN
+        lines.append(
+            f"上次扫描：{s['creator']}（{s['scope']}）→ 新入队 {s['created']}，"
+            f"直链 {s['files']}，外链 {s['links']}（{s['at']}）")
+
+    inflight = pawchive_worker.current_post_label()
+    if inflight:
+        lines.append(f"当前处理：{inflight}")
+    lines.append(
+        "Worker：" + pawchive_worker.worker_state_text()
+        + f" | Chrome Agent：{'运行中' if chrome_client.agent_running() else '未运行'}")
+    free = _disk_free_gb()
+    if free is not None:
+        lines.append(f"下载盘剩余：{free:.1f} GB（保护线 "
+                     f"{config.PAWCHIVE_MIN_FREE_GB:.0f} GB）")
+    lines += [
+        "",
+        "命令：/paw plan <作者>｜/paw search <词>｜/paw manual",
+        "/paw retry <ID|all>｜/paw pause｜/paw resume｜/paw csv <作者>",
+    ]
+    return "\n".join(lines)
+
+
+def paw_view_text():
+    """菜单 🐾 视图：状态正文 + 按钮组（build 时共用 status_text）。"""
+    return status_text()
+
+
+def menu_buttons():
+    """🐾 Pawchive 面板按钮组（覆盖全部 /paw 子命令）。"""
+    from . import pawchive_worker
+    from .menu import encode_menu_data   # 函数内导入避免 menu↔本模块成环
+
+    toggle = (Button.inline("▶️ 恢复处理", encode_menu_data("paw_resume"))
+              if pawchive_worker.paused()
+              else Button.inline("⏸ 暂停处理", encode_menu_data("paw_pause")))
+    return [
+        [Button.inline("🔄 刷新", encode_menu_data("paw")),
+         toggle],
+        [Button.inline("📥 扫描作者", encode_menu_data("paw_search")),
+         Button.inline("📄 导出CSV清单", encode_menu_data("paw_csv"))],
+        [Button.inline("👤 待人工处理", encode_menu_data("paw_manual")),
+         Button.inline("🔁 重投全部失败", encode_menu_data("paw_retry_all"))],
+        [Button.inline("🍪 设置 Cookie", encode_menu_data("paw_cookie"))],
+        [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
+    ]
+
+
+async def csv_reply(creator=None):
+    """导出最近扫描作者（或指定作者）的 CSV 清单并发收藏夹，返回回执文案。"""
+    if creator is None:
+        last = (state.PAW_LAST_SCAN or {}).get("creator")
+        creator = await resolve_creator_async(last) if last else None
+    if creator is None:
+        return f"{TEXT_PREFIX}\n❌ 还没有扫描过作者（先 📥 扫描作者 或 /paw plan <作者>）"
+    creator_name = _creator_label(creator)
+    try:
+        path, err = await asyncio.to_thread(
+            write_csv, creator["service"], str(creator["id"]), creator_name)
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if err:
+        return f"{TEXT_PREFIX}\n{err}"
+    await state.client.send_file("me", path)
+    logger.info(f"🐾 Pawchive CSV 已发收藏夹：{path}")
+    return f"{TEXT_PREFIX}\n📄 清单已发收藏夹：{os.path.basename(path)}"
+
+
+async def retry_all_reply():
+    """重投全部失败帖子（/paw retry all 的面板入口），返回回执文案。"""
+    try:
+        count = runtime_db.retry_pawchive_posts()
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    msg = f"🔁 已重投 {count} 条失败帖子" if count else "没有失败帖子需要重投"
+    return f"{TEXT_PREFIX}\n{msg}"
+
+
+def manual_text(limit=10):
+    """MANUAL（人工处理）视图：帖子直达链接 + 外链清单。"""
+    try:
+        posts = runtime_db.list_pawchive_posts(
+            status=runtime_db.PAW_POST_MANUAL, limit=limit)
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if not posts:
+        return f"{TEXT_PREFIX}\n👤 没有待人工处理的帖子（外链帖会在直链下完后出现在这里）"
+    lines = [f"{TEXT_PREFIX}：👤 待人工处理 {len(posts)} 帖", ""]
+    for p in posts:
+        lines.append(f"#{p['id']} {p['creator_name']}｜{(p['title'] or '')[:40]}")
+        lines.append(p["post_url"])
+        for l in (p.get("ext_links") or [])[:6]:
+            lines.append(f"  · [{l.get('domain')}] {l['url']}")
+        if len(p.get("ext_links") or []) > 6:
+            lines.append(f"  … 等 {len(p['ext_links']) - 6} 条外链见帖子页")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def pause_reply():
+    from . import pawchive_worker
+    msg = pawchive_worker.pause()
+    return f"{TEXT_PREFIX}\n{msg}"
+
+
+def resume_reply():
+    from . import pawchive_worker
+    msg = pawchive_worker.resume()
+    return f"{TEXT_PREFIX}\n{msg}"
+
+
+def write_csv(creator_service, creator_id, creator_name):
+    """从 SQLite 生成某作者的 CSV（附件直链 + 外链），返回文件路径或 (None, 错误)。
+
+    列与独立 CLI 脚本产出的记录一致；utf-8-sig 让 Excel 直接打开不乱码。
+    """
+    posts = [p for p in runtime_db.list_pawchive_posts(limit=100000)
+             if p["service"] == str(creator_service)
+             and p["creator_id"] == str(creator_id)]
+    if not posts:
+        return None, f"❌ 没有创作者 {creator_name} 的扫描记录（先 /paw plan）"
+    out_dir = os.path.join(config.DOWNLOAD_DIR, "Pawchive",
+                           creator_name or f"{creator_service}_{creator_id}")
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir,
+                        f"清单_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    rows = []
+    for p in sorted(posts, key=lambda x: x["id"], reverse=True):
+        for f in runtime_db.list_pawchive_files(p["id"]):
+            rows.append([p["creator_name"], p["service"], p["post_id"],
+                         p["published"], p["title"], p["post_url"],
+                         "附件", f["filename"] or "", f["url"],
+                         _STATUS_LABELS.get(p["status"], p["status"])])
+        for l in (p.get("ext_links") or []):
+            rows.append([p["creator_name"], p["service"], p["post_id"],
+                         p["published"], p["title"], p["post_url"],
+                         "外链", l.get("domain") or "", l["url"],
+                         _STATUS_LABELS.get(p["status"], p["status"])])
+    if len(rows) > config.PAWCHIVE_CSV_MAX_ROWS:
+        return None, (f"❌ 行数 {len(rows)} 超过上限 "
+                      f"{config.PAWCHIVE_CSV_MAX_ROWS}，请用独立 CLI 脚本导出")
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["作者", "平台", "帖子ID", "发布时间", "帖子标题",
+                    "帖子页面", "类型", "附件文件名/外链域名", "链接", "帖子状态"])
+        w.writerows(rows)
+    return path, None
+
+
+# ============================================================
+# 命令解析
+# ============================================================
+_PAW_CMD_RE = re.compile(r"^/paw(?:\s|$)", re.IGNORECASE)
+
+
+def is_paw_command(text) -> bool:
+    """/paw 开头（含裸命令）；/pawfoo 不算。"""
+    return bool(_PAW_CMD_RE.match(str(text or "").strip()))
+
+
+def parse_paw_command(text):
+    """/paw 子命令 → (action, arg)。裸 /paw = status（最常用的默认页）。"""
+    raw = str(text or "").strip()
+    body = raw[len("/paw"):].strip()
+    if not body:
+        return ("status", None)
+    head, _, rest = body.partition(" ")
+    head_l = head.lower()
+    if head_l in ("help", "status", "plan", "search", "retry", "pause",
+                  "resume", "manual", "cookie", "csv"):
+        return (head_l, rest.strip() or None)
+    return ("help", None)
+
+
+async def command_reply(event, cmd_text):
+    """/paw 命令入口（commands.py 薄分发到这里）。每个分支自行回帖。"""
+    action, arg = parse_paw_command(cmd_text)
+
+    if action == "help":
+        await event.reply(_help_text(), link_preview=False)
+        return
+    if action == "status":
+        await event.reply(status_text(), link_preview=False)
+        return
+    if action == "pause":
+        await event.reply(pause_reply(), link_preview=False)
+        return
+    if action == "resume":
+        await event.reply(resume_reply(), link_preview=False)
+        return
+    if action == "manual":
+        await event.reply(manual_text(), link_preview=False)
+        return
+    if action == "search":
+        await _reply_search(event, arg)
+        return
+    if action == "plan":
+        await _reply_plan(event, arg)
+        return
+    if action == "retry":
+        await _reply_retry(event, arg)
+        return
+    if action == "cookie":
+        await _reply_cookie(event, arg)
+        return
+    if action == "csv":
+        await _reply_csv(event, arg)
+        return
+    await event.reply(_help_text(), link_preview=False)
+
+
+def _help_text():
+    return (
+        f"{TEXT_PREFIX}\n\n"
+        "用法：\n"
+        "  /paw plan <作者名> [all] —— 扫描作者帖子入队（默认只收未收藏帖；"
+        "带 Cookie 才能对比收藏，all=全部）\n"
+        "  /paw search <关键词> —— 搜作者\n"
+        "  /paw manual —— 待人工处理的帖子（含外链清单）\n"
+        "  /paw retry <行ID|all> —— 失败帖子重投\n"
+        "  /paw pause / resume —— 暂停/恢复下载 worker\n"
+        "  /paw cookie <Cookie> —— 保存会话 Cookie（用于收藏对比）\n"
+        "  /paw csv <作者名> —— 导出直链清单 CSV 发到收藏夹\n"
+        "  /paw 或 /paw status —— 状态总览\n\n"
+        "下载由 Chrome Agent 串行执行，落盘 "
+        f"{config.CHROME_DOWNLOAD_DIR}/Pawchive/<作者>/<帖子>/"
+    )
+
+
+async def _reply_search(event, term):
+    if not term:
+        await event.reply(f"{TEXT_PREFIX}\n用法：/paw search <关键词>",
+                          link_preview=False)
+        return
+    try:
+        hits = await asyncio.to_thread(search_creators, term, 5)
+    except Exception as e:
+        await event.reply(f"{TEXT_PREFIX}\n❌ 搜索失败：{e}", link_preview=False)
+        return
+    if not hits:
+        await event.reply(
+            f"{TEXT_PREFIX}\n没有叫「{term}」的创作者（试试更短的词）",
+            link_preview=False)
+        return
+    state.PAW_SEARCH_CANDIDATES = {str(i): c for i, c in enumerate(hits, 1)}
+    lines = [f"{TEXT_PREFIX}：🔍 「{term}」匹配 {len(hits)} 个", ""]
+    buttons = []
+    for i, c in enumerate(hits, 1):
+        lines.append(
+            f"{i}. {c['name']}（{c['service']}，收藏 {c.get('favorited', 0)}）")
+        buttons.append([Button.inline(
+            f"📌 扫描 {c['name']}", encode_pick(i))])
+    lines += ["", "点按钮直接开始扫描（默认只收未收藏帖）。"]
+    from .menu import encode_menu_data
+    buttons.append([Button.inline("🔙 返回", encode_menu_data("paw"))])
+    await event.reply("\n".join(lines), buttons=buttons, link_preview=False)
+
+
+def encode_pick(index):
+    """搜索候选按钮的回调数据：只带序号（64 字节限内），候选存 state。"""
+    from .menu import encode_menu_data
+    return encode_menu_data("paw_pick", str(index))
+
+
+async def _reply_plan(event, arg):
+    if state.PAW_SCAN_RUNNING is not None:
+        await event.reply(
+            f"{TEXT_PREFIX}\n⏳ 已有扫描在进行（{state.PAW_SCAN_RUNNING}）",
+            link_preview=False)
+        return
+    scope = "notfaved"
+    parts = (arg or "").split()
+    if parts and parts[-1].lower() == "all":
+        scope = "all"
+        parts = parts[:-1]
+    name = " ".join(parts).strip()
+    if not name:
+        await event.reply(f"{TEXT_PREFIX}\n用法：/paw plan <作者名> [all]",
+                          link_preview=False)
+        return
+    try:
+        creator = await resolve_creator_async(name)
+    except Exception as e:
+        await event.reply(f"{TEXT_PREFIX}\n❌ 解析作者失败：{e}",
+                          link_preview=False)
+        return
+    if creator is None:
+        await event.reply(
+            f"{TEXT_PREFIX}\n没有叫「{name}」的创作者，先 /paw search <词>",
+            link_preview=False)
+        return
+    if not config.PAWCHIVE_COOKIE and scope == "notfaved":
+        scope = "all"   # 无 Cookie 无从对比，直接按全部处理（摘要里会提示）
+    msg = await start_scan(creator, scope)
+    await event.reply(f"{TEXT_PREFIX}\n{msg}", link_preview=False)
+
+
+async def _reply_retry(event, arg):
+    if not arg:
+        await event.reply(f"{TEXT_PREFIX}\n用法：/paw retry <行ID|all>",
+                          link_preview=False)
+        return
+    try:
+        if arg.lower() == "all":
+            count = runtime_db.retry_pawchive_posts()
+            await event.reply(f"{TEXT_PREFIX}\n🔁 已重投 {count} 条失败帖子",
+                              link_preview=False)
+            return
+        count = runtime_db.retry_pawchive_posts(row_ids=[int(arg)])
+        await event.reply(
+            f"{TEXT_PREFIX}\n🔁 已重投 #{arg}" if count
+            else f"{TEXT_PREFIX}\n❌ #{arg} 不在失败状态",
+            link_preview=False)
+    except ValueError:
+        await event.reply(f"{TEXT_PREFIX}\n❌ 行ID 须为数字（/paw status 查看）",
+                          link_preview=False)
+    except runtime_db.DbUnavailable as e:
+        await event.reply(f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}",
+                          link_preview=False)
+
+
+async def _reply_cookie(event, arg):
+    if arg:
+        err = config.save_pawchive_cookie(arg)
+        if err:
+            await event.reply(f"{TEXT_PREFIX}\n❌ {err}", link_preview=False)
+            return
+        await event.reply(
+            f"{TEXT_PREFIX}\n🍪 Cookie 已保存（{config.mask_douyin_cookie(arg)}）",
+            link_preview=False)
+        return
+    # 无参数：bot 对话里开输入窗口（与抖音 cookie 同款交互）
+    from . import bot as bot_mod
+    if state.bot_client is not None:
+        bot_mod.open_input_window("paw_cookie")
+        await event.reply(
+            f"{TEXT_PREFIX}\n🍪 请直接发送 Cookie 内容"
+            f"（{config.PAWCHIVE_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "发 / 开头的命令取消）",
+            link_preview=False)
+        return
+    await event.reply(f"{TEXT_PREFIX}\n用法：/paw cookie <Cookie 字符串>",
+                      link_preview=False)
+
+
+async def _reply_csv(event, arg):
+    name = (arg or "").strip()
+    try:
+        creator = await asyncio.to_thread(resolve_creator, name) if name else None
+    except Exception as e:
+        await event.reply(f"{TEXT_PREFIX}\n❌ 解析作者失败：{e}",
+                          link_preview=False)
+        return
+    if creator is None and state.PAW_LAST_SCAN:
+        # 缺省用最近一次扫描的作者
+        last = state.PAW_LAST_SCAN.get("creator")
+        creator = await asyncio.to_thread(resolve_creator, last) if last else None
+    if creator is None:
+        await event.reply(
+            f"{TEXT_PREFIX}\n用法：/paw csv <作者名>（先 /paw plan 扫描过）",
+            link_preview=False)
+        return
+    await event.reply(f"{TEXT_PREFIX}\n{await csv_reply(creator)}",
+                      link_preview=False)

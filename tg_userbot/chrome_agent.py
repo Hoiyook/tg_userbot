@@ -22,6 +22,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from .config import (
+    CHROME_HEADLESS,
     CHROME_AGENT_LOG_FILE,
     CHROME_AGENT_PID_FILE,
     CHROME_CANCEL_GUID_GRACE_SECONDS,
@@ -360,6 +361,9 @@ def launch_chrome_detached(binary, profile_dir, host, port, proxy_server=None):
         f"--remote-debugging-port={port}",
         f"--remote-debugging-address={host}",
     ]
+    if CHROME_HEADLESS:
+        # 新无头（Chrome 109+）：无窗口、不抢焦点，CDP 下载行为与有头一致
+        cmd.append("--headless=new")
     if proxy_server:
         cmd.append(f"--proxy-server={proxy_server}")
     return subprocess.Popen(

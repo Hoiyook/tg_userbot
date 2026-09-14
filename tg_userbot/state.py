@@ -135,5 +135,20 @@ UP_INPUT_UNTIL = 0.0
 # 序号——回调数据限 64 字节放不下长路径；upload.candidate_at 上传前校验）。
 UP_CANDIDATES = []
 
+# ============================================================
+# Pawchive（pawchive.py / pawchive_worker.py，schema v8）
+# ============================================================
+# 「🔍 搜作者」「🍪 Cookie」输入窗口（bot 菜单）：等待下一条文本的截止时刻
+# （monotonic）与窗口步骤。与其余输入窗口互斥，bot.open_input_window 统一开关。
+PAW_INPUT_UNTIL = 0.0
+PAW_INPUT_STEP = ""            # search | cookie
+# 🔍 搜索结果候选快照 {序号: creator dict}：回调数据 ≤64 字节装不下「名字+ID」
+# 组合，按钮只带序号；每次搜索整体覆盖（up 视图同款模式）。
+PAW_SEARCH_CANDIDATES = {}
+# 正在进行的 /paw plan 扫描的创作者摘要（None = 空闲）；/paw status 只读展示。
+PAW_SCAN_RUNNING = None
+# 最近一次扫描的汇总快照（status 视图展示），未扫过为 None。
+PAW_LAST_SCAN = None
+
 # CD2 进程句柄（仅防 GC 回收后台进程，无人读取）
 _CD2_PROC = None

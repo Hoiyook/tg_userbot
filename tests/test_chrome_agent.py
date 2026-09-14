@@ -447,6 +447,21 @@ class LaunchArgsTest(unittest.TestCase):
         self.assertNotIn("0.0.0.0", joined)
         self.assertNotIn("--proxy-server", joined)  # 缺省不带代理参数
 
+    def test_launch_args_headless_toggle(self):
+        """无头开关：默认加 --headless=new；关掉后不带。"""
+        with mock.patch.object(chrome_agent, "CHROME_HEADLESS", True), \
+                mock.patch.object(chrome_agent.subprocess, "Popen") as popen:
+            chrome_agent.launch_chrome_detached(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Users/x/tg_chrome_agent_profile", "127.0.0.1", 9222)
+        self.assertIn("--headless=new", " ".join(popen.call_args[0][0]))
+        with mock.patch.object(chrome_agent, "CHROME_HEADLESS", False), \
+                mock.patch.object(chrome_agent.subprocess, "Popen") as popen:
+            chrome_agent.launch_chrome_detached(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Users/x/tg_chrome_agent_profile", "127.0.0.1", 9222)
+        self.assertNotIn("--headless", " ".join(popen.call_args[0][0]))
+
     def test_launch_args_with_proxy(self):
         with mock.patch.object(chrome_agent.subprocess,
                                "Popen") as popen:

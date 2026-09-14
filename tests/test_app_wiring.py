@@ -23,8 +23,8 @@ class AppWiringSmokeTest(unittest.TestCase):
 
     def test_modules_referenced_by_main_are_imported(self):
         for name in ("sql_templates", "wl_scan", "listener", "listener_worker",
-                     "runtime_db", "reporter", "queue", "cleanup",
-                     "chrome_client", "workers", "thread", "dedup",
+                     "pawchive_worker", "runtime_db", "reporter", "queue",
+                     "cleanup", "chrome_client", "workers", "thread", "dedup",
                      "whitelist", "platform", "stats", "notify", "commands",
                      "bot", "state", "caption_filter"):
             self.assertTrue(hasattr(app, name),
@@ -32,7 +32,7 @@ class AppWiringSmokeTest(unittest.TestCase):
 
     def test_bot_module_wiring(self):
         for name in ("sql_templates", "wl_scan", "runtime_db",
-                     "MessageNotModifiedError"):
+                     "pawchive", "MessageNotModifiedError"):
             self.assertTrue(hasattr(bot, name),
                             f"bot.{name} 未导入——回调路径用到会 NameError")
 

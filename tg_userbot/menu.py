@@ -80,9 +80,8 @@ def main_menu_buttons():
          Button.inline("🧹 清理", encode_menu_data("clean"))],
         [Button.inline("🛡 去重", encode_menu_data("dedup")),
          Button.inline("🍪 抖音Cookie", encode_menu_data("cookie"))],
-        [Button.inline("🖥 启动CD2", encode_menu_data("cd2")),
-         Button.inline("🛑 停止CD2", encode_menu_data("cd2_stop"))],
-        [Button.inline("🗂 备份记录", encode_menu_data("bak")),
+        # CD2 的启动/停止/备份记录收进子菜单（2026-09-15 菜单合并）
+        [Button.inline("☁️ CD2 云盘", encode_menu_data("cd2_menu")),
          Button.inline("📊 台账", encode_menu_data("stats"))],
         [Button.inline("🔍 查询", encode_menu_data("find")),
          Button.inline("🧹 Caption 清洗", encode_menu_data("capf"))],
@@ -90,10 +89,54 @@ def main_menu_buttons():
         # 用户必须能明显区分两套系统）
         [Button.inline("📡 标签监听", encode_menu_data("listen")),
          Button.inline("🌐 Chrome 任务", encode_menu_data("chrome_tasks"))],
-        [Button.inline("📐 SQL模板", encode_menu_data("sqlt")),
-         Button.inline("🖥 命令行", encode_menu_data("sh"))],
-        [Button.inline("⬆️ 上传文件", encode_menu_data("up"))],
+        [Button.inline("📐 SQL模板", encode_menu_data("sqlt"))],
+        [Button.inline("🖥 命令行/上传", encode_menu_data("tools")),
+         Button.inline("🐾 Pawchive", encode_menu_data("paw"))],
     ]
+
+
+def cd2_menu_text():
+    """☁️ CD2 子菜单正文。"""
+    return (
+        "☁️ CD2 云盘\n\n"
+        "启动后媒体经 CloudDrive2 自动备份到 115；"
+        "备份记录展示最近 7 天的搬运日志。")
+
+
+def cd2_menu_buttons():
+    return [
+        [Button.inline("▶️ 启动 / 查状态", encode_menu_data("cd2")),
+         Button.inline("🛑 停止", encode_menu_data("cd2_stop"))],
+        [Button.inline("🗂 备份记录", encode_menu_data("bak"))],
+        [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
+    ]
+
+
+def tools_view_text():
+    """🖥 命令行/上传 合并工具箱正文（sh 与 up 两段拼接；up_view_text 同模块）。"""
+    return shell.sh_view_text() + "\n\n──────\n\n" + up_view_text()
+
+
+def tools_menu_buttons(candidates):
+    """🖥 命令行/上传 合并视图：预设命令 + 自定义 + 上传文件 + 输入路径。
+
+    candidates 与 up_menu_buttons 同约定（快照进 state.UP_CANDIDATES，按钮
+    只带序号）。
+    """
+    rows = [[Button.inline(label, encode_menu_data("sh_run", cmd))
+             for cmd, label in shell.PRESET_COMMANDS.items()]]
+    rows.append(
+        [Button.inline("✏️ 自定义命令", encode_menu_data("sh_input"))])
+    for i, path in enumerate(candidates):
+        rows.append([Button.inline(
+            f"📤 {os.path.basename(path)}",
+            encode_menu_data("up_file", str(i)))])
+    rows.append([
+        Button.inline("✏️ 输入上传路径", encode_menu_data("up_input")),
+        Button.inline("🔄 刷新", encode_menu_data("tools")),
+    ])
+    rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
+    return rows
 
 
 def chrome_menu_buttons(tasks):

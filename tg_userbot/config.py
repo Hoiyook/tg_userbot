@@ -396,7 +396,7 @@ REPORT_LISTEN = True
 # WAL 依赖 mmap 共享内存、在该文件系统上可能不可用；真机上若探测到 WAL 回落，
 # 可把 DB 挪到应用私有目录。注意：**只允许主进程写**，Chrome Agent 进程绝不
 # 能开连接（见 runtime_db 的「不做 import 期连接」）。
-RUNTIME_DB_SCHEMA_VERSION = 7   # v7：+ dedup_index（去重索引）
+RUNTIME_DB_SCHEMA_VERSION = 8   # v8：+ pawchive_posts/pawchive_files（扫描结果生命周期）
 # 单条写事务等锁的上限（毫秒）与 SQLITE_BUSY/LOCKED 的有限重试（规格 §39：
 # 记日志 → 短暂等待 → 有限次数重试，绝不无限循环、绝不因此崩掉主进程）。
 RUNTIME_DB_BUSY_TIMEOUT_MS = 5000
@@ -532,6 +532,11 @@ RESOLVER_TIMEOUT_SECONDS = 30
 # 缺省空串 → f2 请求大概率失败 → 自动降级 bot，不硬性要求配置。
 DOUYIN_COOKIE = _SECRET_CONFIG.get("douyin_cookie", "")
 
+# Pawchive（pawchive.pw）会话 cookie：/paw plan 对比收藏必需（帖子/文件
+# 直链本身公开、不需要它）。从 tg_secrets.json 的 pawchive_cookie 字段
+# 读取，缺省空串 → 清单照常生成、faved 全为 None，不硬性要求配置。
+PAWCHIVE_COOKIE = _SECRET_CONFIG.get("pawchive_cookie", "")
+
 # 抖音 Web 端通用请求头（f2 详情接口 + CDN 直链下载共用）。CDN 直链对
 # UA/Referer 敏感：裸请求（无 UA）会被 douyinvod 拒绝 403，下载必须带。
 DOUYIN_UA = (
@@ -616,6 +621,12 @@ MENU_ACTIONS = (
     # （up：视图 / 📄 最近文件带序号 / ✏️ 输入路径）
     "sh", "sh_run", "sh_input", "sh_ls",
     "up", "up_file", "up_input",
+    # Pawchive：视图（含状态） / 搜作者 / Cookie / 暂停 / 恢复 / 待人工 /
+    # 导出 CSV / 重投全部失败 / 搜索候选按钮（paw_pick 带序号）
+    "paw", "paw_status", "paw_search", "paw_cookie", "paw_pause",
+    "paw_resume", "paw_manual", "paw_pick", "paw_csv", "paw_retry_all",
+    # CD2 子菜单视图与「命令行/上传」合并工具箱视图
+    "cd2_menu", "tools",
 )
 
 
@@ -666,6 +677,45 @@ def save_douyin_cookie(value, path=None):
         return f"写入失败：{type(e).__name__}: {e}"
 
     DOUYIN_COOKIE = value
+    return None
+
+
+def save_pawchive_cookie(value, path=None):
+    """把 Pawchive 会话 cookie 写入 tg_secrets.json（原子替换）并更新内存值。
+
+    与 save_douyin_cookie 同款纪律：重新读盘保留其它字段；运行时动态读
+    config.PAWCHIVE_COOKIE 属性，同步更新后立即作用于下一次扫描。
+    返回错误文案，None=成功。
+    """
+    global PAWCHIVE_COOKIE
+    target = path or SECRETS_FILE
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except FileNotFoundError:
+        data = {}
+    except Exception:
+        return "tg_secrets.json 解析失败，拒绝覆盖（请手工修复该文件）"
+
+    value = str(value or "").strip()
+    data["pawchive_cookie"] = value
+
+    tmp_path = target + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, target)
+    except Exception as e:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return f"写入失败：{type(e).__name__}: {e}"
+
+    PAWCHIVE_COOKIE = value
     return None
 
 # ------------------------------------------------------------
@@ -1247,6 +1297,11 @@ CHROME_CDP_PORT = 9222
 # Chrome 一致：socks5://host:port 或 http://host:port。空 = 直连。
 CHROME_PROXY_SERVER = os.environ.get(
     "CHROME_PROXY", os.environ.get("TG_PROXY", "")).strip() or None
+# 无头模式：专用 Chrome 不弹窗口、不抢焦点（--headless=new，Chrome 109+ 的
+# 新无头与有头的 CDP/下载行为一致；旧 headless 不支持下载，勿用旧开关）。
+# TG_CHROME_HEADLESS=0 恢复有头（要盯着下载页面时用）。
+CHROME_HEADLESS = os.environ.get(
+    "TG_CHROME_HEADLESS", "1").strip().lower() not in ("0", "false", "off")
 # 下载落 <DOWNLOAD_DIR>/TG Chrome Download/（规格 21），随 TG_DOWNLOAD_DIR 变化；
 # Chrome 媒体与普通下载同属 DOWNLOAD_DIR，只占一个子目录、命名行为不变
 CHROME_DOWNLOAD_DIR = os.path.join(DOWNLOAD_DIR, "TG Chrome Download")
@@ -1303,6 +1358,40 @@ CHROME_MIN_PROGRESS_INTERVAL = 30
 CHROME_EVENTS_DEFAULT_GUID_TIMEOUT = 300
 # 最大事件处理器数量限制
 CHROME_EVENTS_MAX_HANDLERS = 100
+
+# ============================================================
+# Pawchive（pawchive.pw 归档站，2026-09-14）：扫描结果入 SQLite 生命周期
+# （pawchive_posts/pawchive_files，schema v8），附件直链交给 Chrome Agent
+# 串行下载。扫描数据放 RUNTIME_DIR/pawchive/，下载文件落 Chrome 的
+# CHROME_DOWNLOAD_DIR/<subdir>（不经普通下载队列）。
+# ============================================================
+PAWCHIVE_API_BASE = "https://pawchive.pw"
+PAWCHIVE_FILE_BASE = "https://file.pawchive.pw"
+# 全量创作者列表缓存（约 20MB，站点 q 参数无效→本地过滤），TTL 内不重拉
+PAWCHIVE_CREATORS_CACHE_TTL = 7 * 86400
+# Worker 无可领任务时的轮询间隔（秒）
+PAWCHIVE_WORKER_POLL_SECONDS = 2.0
+# 单帖处理租约（秒）：大视频在 Chrome 端串行，单帖可达数小时；
+# 等待期间 worker 每 PAWCHIVE_LEASE_RENEW_SECONDS 续一次租
+PAWCHIVE_LEASE_SECONDS = 3600
+PAWCHIVE_LEASE_RENEW_SECONDS = 60
+# 等 Chrome 任务终态的轮询间隔（秒）；Chrome Agent 自身每 1s 认领/上报
+PAWCHIVE_CHROME_POLL_SECONDS = 5.0
+# Chrome Agent 拉起失败/下载提交异常时的重试退避（秒）
+PAWCHIVE_AGENT_RETRY_SECONDS = 30
+# 磁盘保护线（GB）：CHROME_DOWNLOAD_DIR 所在卷剩余低于它 → 暂停 worker
+# 并通知，/paw resume 手动恢复
+PAWCHIVE_MIN_FREE_GB = 2.0
+# Cookie 输入窗口（秒）：/paw cookie 或菜单按钮后等下一条文本
+PAWCHIVE_INPUT_WINDOW_SECONDS = 120
+# /paw csv 单文件发收藏夹前的行数上限（保护 TG 消息/文件大小）
+PAWCHIVE_CSV_MAX_ROWS = 20000
+# 提交 Chrome 前先 HEAD 探测直链：404/410（站点侧缺文件/死链）直接标失败，
+# 不进 Chrome——否则死链没有下载事件，每条要烧满 CHROME_DOWNLOAD_TIMEOUT
+# （1800s）×3 次重试才判死（2026-09-14 实测某创作者 88% 附件是 404 死链）。
+PAWCHIVE_PRECHECK_HEAD = True
+# 扫描数据（创作者全量缓存 JSON，约 20MB）放 RUNTIME_DIR/pawchive/
+PAWCHIVE_DATA_DIR = os.path.join(RUNTIME_DIR, "pawchive")
 
 _ensure_dir(RUNTIME_DIR, "Runtime 运行数据目录")
 _migrated_runtime_files = _migrate_runtime_files()

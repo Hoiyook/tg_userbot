@@ -26,6 +26,7 @@ from . import runtime_db
 from . import sql_templates
 from . import shell
 from . import upload
+from . import pawchive
 from .config import (
     BOT_USERNAME,
     DONE_DEFAULT_LINES,
@@ -344,6 +345,12 @@ async def handle_command(event, cmd_text):
         logger.info(f"执行命令：/retry {parts[1] if len(parts) > 1 else ''}")
         return True
 
+    if pawchive.is_paw_command(cmd_text):
+        # Pawchive：扫描/收藏对比/Chrome 批量下载（解析与回复全在模块内）
+        logger.info(f"执行命令：{cmd_text[:60]}")
+        await pawchive.command_reply(event, cmd_text)
+        return True
+
     if chrome_client.is_chrome_dispatch(cmd_text):
         await chrome_client.handle_chrome_command(
             event, cmd_text,
@@ -426,6 +433,8 @@ async def handle_command(event, cmd_text):
             "/wl add @用户名 - 加入白名单（也可回复转发消息后 /wl add）\n"
             "/wl del ID或序号 - 移出白名单\n"
             "/sql - SQL 诊断控制台：直接查询/检修 runtime DB\n"
+            "/paw - Pawchive：扫描作者作品、收藏对比、Chrome 批量下载\n"
+            "/paw plan 作者名 - 扫描作者帖子入队（默认只收未收藏帖）\n"
             "/sh - 命令行：远程执行 shell 命令（黑名单拦截高危操作）\n"
             "/sh cd 目录 - 切换 /sh 的工作目录（会记住）\n"
             "/up 文件路径 - 上传文件到收藏夹（基于 /sh 工作目录）\n"

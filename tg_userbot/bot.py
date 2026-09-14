@@ -37,6 +37,7 @@ from . import sql_templates
 from . import runtime_db
 from . import shell
 from . import upload
+from . import pawchive
 from . import commands
 from . import config
 from .config import DONE_DEFAULT_LINES, REPORT_STATUS_PREFIX
@@ -68,6 +69,7 @@ BOT_COMMANDS = (
     ("chrome_tasks", "查看可取消的 Chrome 任务"),
     ("chrome_cancel", "取消 Chrome 任务：/chrome_cancel <序号>"),
     ("chrome", "用 Chrome 下载：/chrome <URL>"),
+    ("paw", "Pawchive：扫描作者作品、收藏对比、Chrome 批量下载"),
     ("clearmsg", "清理程序产生的消息"),
     ("help", "查看全部命令"),
 )
@@ -97,7 +99,8 @@ def open_input_window(kind):
     kind：\"cookie\" / \"find\" / \"add\"|\"del\"|\"test\"（Caption 清洗）
     / \"listen_chat\"|\"listen_tag\"|\"listen_target\"（标签监听向导）
     / \"wl_since\"（白名单回补）/ \"sqlt\"（新增 SQL 模板）
-    / \"sh\"（命令行：文本当命令执行）/ \"up\"（上传：文本当文件路径）。
+    / \"sh\"（命令行：文本当命令执行）/ \"up\"（上传：文本当文件路径）
+    / \"paw_search\"|\"paw_cookie\"（Pawchive：作者名 / Cookie）。
     """
     state.COOKIE_INPUT_UNTIL = 0.0
     state.FIND_INPUT_UNTIL = 0.0
@@ -109,6 +112,8 @@ def open_input_window(kind):
     state.SQLT_INPUT_UNTIL = 0.0
     state.SHELL_INPUT_UNTIL = 0.0
     state.UP_INPUT_UNTIL = 0.0
+    state.PAW_INPUT_UNTIL = 0.0
+    state.PAW_INPUT_STEP = ""
     if kind == "cookie":
         state.COOKIE_INPUT_UNTIL = (
             time.monotonic() + config.COOKIE_INPUT_WINDOW_SECONDS
@@ -142,6 +147,13 @@ def open_input_window(kind):
         state.UP_INPUT_UNTIL = (
             time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
         )
+    elif kind in ("paw_search", "paw_cookie"):
+        # Pawchive 窗口：search 的文本当作者名发起扫描，cookie 的文本存
+        # tg_secrets.json（掩码回显）
+        state.PAW_INPUT_UNTIL = (
+            time.monotonic() + config.PAWCHIVE_INPUT_WINDOW_SECONDS
+        )
+        state.PAW_INPUT_STEP = kind[len("paw_"):]
     else:
         state.CAPTION_INPUT_UNTIL = (
             time.monotonic() + config.CAPTION_INPUT_WINDOW_SECONDS
@@ -221,6 +233,51 @@ async def handle_menu_action(action, arg, event):
             [Button.inline("🔙 返回模板", menu.encode_menu_data("sqlt"))],
             [Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
         ])
+    if action == "paw":
+        return pawchive.paw_view_text(), pawchive.menu_buttons()
+    if action == "paw_status":
+        return pawchive.status_text(), pawchive.menu_buttons()
+    if action == "paw_search":
+        open_input_window("paw_search")
+        return (
+            "🔍 Pawchive 搜作者\n\n"
+            "请发送作者名字（或名字片段）。\n"
+            "例：SillyTeshii\n\n"
+            f"{config.PAWCHIVE_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "发送 / 开头的命令可取消。",
+            menu.back_home_buttons(),
+        )
+    if action == "paw_cookie":
+        open_input_window("paw_cookie")
+        return (
+            "🍪 设置 Pawchive Cookie\n\n"
+            "请直接发送 Cookie 内容（浏览器 DevTools → Application → "
+            "Cookies 里整段复制即可）。\n"
+            "用于 /paw plan 对比收藏；不设置也能扫描，只是无法区分已收藏。\n\n"
+            f"{config.PAWCHIVE_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "发送 / 开头的命令可取消。",
+            menu.back_home_buttons(),
+        )
+    if action == "paw_pause":
+        return pawchive.pause_reply(), pawchive.menu_buttons()
+    if action == "paw_resume":
+        return pawchive.resume_reply(), pawchive.menu_buttons()
+    if action == "paw_manual":
+        return pawchive.manual_text(), pawchive.menu_buttons()
+    if action == "paw_csv":
+        msg = await pawchive.csv_reply()
+        return (msg, pawchive.menu_buttons())
+    if action == "paw_retry_all":
+        msg = await pawchive.retry_all_reply()
+        return (msg, pawchive.menu_buttons())
+    if action == "paw_pick":
+        # 搜索结果按钮：arg 是序号，完整 creator 从 state 候选里取
+        # （回调数据 ≤64 字节装不下「名字+ID」组合）
+        creator = (state.PAW_SEARCH_CANDIDATES or {}).get(arg or "")
+        if not creator:
+            return ("❌ 搜索候选已失效，请重新 🔍 搜作者", pawchive.menu_buttons())
+        msg = await pawchive.start_scan(creator)
+        return (msg, pawchive.menu_buttons())
     if action == "sh":
         return shell.sh_view_text(), menu.sh_menu_buttons()
     if action == "sh_run":
@@ -336,12 +393,19 @@ async def handle_menu_action(action, arg, event):
         head = ("🤖 Chrome Agent 已停止\n\nChrome（含专用实例）保持运行，不受影响。"
                 if stopped else "ℹ️ Chrome Agent 未在运行")
         return f"{head}{_chrome_body_sep()}", _chrome_view_buttons()
+    if action == "cd2_menu":
+        return menu.cd2_menu_text(), menu.cd2_menu_buttons()
     if action == "cd2":
-        return await cd2.cd2_start_or_status(), menu.back_home_buttons()
+        return await cd2.cd2_start_or_status(), menu.cd2_menu_buttons()
     if action == "cd2_stop":
-        return await cd2.cd2_stop_or_status(), menu.back_home_buttons()
+        return await cd2.cd2_stop_or_status(), menu.cd2_menu_buttons()
     if action == "bak":
-        return cd2.backup_records_text(), menu.back_home_buttons()
+        return cd2.backup_records_text(), menu.cd2_menu_buttons()
+    if action == "tools":
+        # 打开视图这一刻快照最近文件（与 ⬆️ 上传视图同款约定）
+        state.UP_CANDIDATES = upload.recent_files(state.SHELL_CWD)
+        return menu.tools_view_text(), menu.tools_menu_buttons(
+            state.UP_CANDIDATES)
     if action == "stats":
         # 窗口天数随按钮参数（m:stats:<n>），非法/缺省回落今日；
         # 上限即日志保留天数（更早无数据）。
@@ -646,6 +710,17 @@ async def bot_message_handler(event):
             return
         state.UP_INPUT_UNTIL = 0.0
 
+    # Pawchive 输入窗口：按步骤当「作者名（发起扫描）」或「Cookie」。
+    if state.PAW_INPUT_UNTIL and time.monotonic() < state.PAW_INPUT_UNTIL:
+        if not text.startswith("/"):
+            step = state.PAW_INPUT_STEP
+            state.PAW_INPUT_UNTIL = 0.0
+            state.PAW_INPUT_STEP = ""
+            await _handle_paw_input(step, text)
+            return
+        state.PAW_INPUT_UNTIL = 0.0
+        state.PAW_INPUT_STEP = ""
+
     if from_id:
         chat_id, title = await whitelist.resolve_wl_target(
             state.bot_client, None, fwd
@@ -782,6 +857,38 @@ async def _handle_up_input(event, text):
     _done, final = await upload.upload_with_progress(
         state.client, path, _update)
     await status.edit(final)
+
+
+async def _handle_paw_input(step, text):
+    """Pawchive 输入窗口：search 的文本当作者名，cookie 的文本存密钥文件。"""
+    if step == "cookie":
+        err = config.save_pawchive_cookie(text)
+        if err:
+            await state.bot_client.send_message(state.MY_ID, f"❌ {err}")
+            return
+        await state.bot_client.send_message(
+            state.MY_ID,
+            f"🍪 Pawchive Cookie 已保存"
+            f"（{config.mask_douyin_cookie(text)}）",
+            link_preview=False)
+        return
+    # step == "search"：与 /paw plan 同款（含解析与去抖）
+    name = text.strip()
+    if not name:
+        await state.bot_client.send_message(
+            state.MY_ID, "❌ 作者名不能为空，请重新点 🔍 搜作者")
+        return
+    try:
+        creator = await pawchive.resolve_creator_async(name)
+    except Exception as e:
+        await state.bot_client.send_message(state.MY_ID, f"❌ 解析作者失败：{e}")
+        return
+    if creator is None:
+        await state.bot_client.send_message(
+            state.MY_ID, f"❌ 没有叫「{name}」的创作者，请重新搜索")
+        return
+    msg = await pawchive.start_scan(creator)
+    await state.bot_client.send_message(state.MY_ID, msg, link_preview=False)
 
 
 async def _handle_wl_since_input(event, text):

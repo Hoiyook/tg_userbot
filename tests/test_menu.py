@@ -68,7 +68,7 @@ class MenuTextTest(unittest.TestCase):
         texts = [b.text for row in menu.main_menu_buttons() for b in row]
         for label in ("📊 状态", "📈 进度", "📜 下载记录",
                       "📋 白名单", "🧵 并发", "🧹 清理",
-                      "🖥 启动CD2", "🛑 停止CD2", "🗂 备份记录"):
+                      "☁️ CD2 云盘", "🖥 命令行/上传", "🐾 Pawchive"):
             self.assertIn(label, texts)
 
     def test_main_menu_has_dedup_entry(self):
@@ -979,17 +979,29 @@ def menu_menu_buttons():
 
 
 class ShUpMainMenuTest(unittest.TestCase):
-    """主菜单的 🖥 命令行 / ⬆️ 上传文件 入口与动作注册。"""
+    """主菜单的 🖥 命令行/上传 合并入口与动作注册（2026-09-15 菜单合并）。"""
 
     def test_main_menu_has_sh_and_up_entries(self):
         labels = [(b.text, b.data)
                   for row in menu.main_menu_buttons() for b in row]
         texts = [t for t, _ in labels]
-        self.assertTrue(any("命令行" in t for t in texts))
-        self.assertTrue(any("上传文件" in t for t in texts))
+        # 两个入口已合并为一个「🖥 命令行/上传」（tools 子视图内保留 sh/up）
+        self.assertTrue(any("命令行/上传" in t for t in texts))
         actions = {menu.parse_menu_data(d)[0] for _, d in labels}
-        self.assertIn("sh", actions)
-        self.assertIn("up", actions)
+        self.assertIn("tools", actions)
+        self.assertNotIn("sh", actions)
+        self.assertNotIn("up", actions)
+
+    def test_tools_view_contains_sh_and_up(self):
+        """合并视图同时具备命令行与上传两组动作。"""
+        state.UP_CANDIDATES = []
+        rows = menu.tools_menu_buttons([])
+        actions = {menu.parse_menu_data(b.data)[0]
+                   for row in rows for b in row}
+        self.assertIn("sh_run", actions)
+        self.assertIn("sh_input", actions)
+        self.assertIn("up_input", actions)
+        self.assertIn("tools", actions)
 
     def test_sh_up_actions_registered(self):
         for action in ("sh", "sh_run", "sh_input",
