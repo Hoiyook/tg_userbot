@@ -860,7 +860,11 @@ async def _handle_up_input(event, text):
 
 
 async def _handle_paw_input(step, text):
-    """Pawchive 输入窗口：search 的文本当作者名，cookie 的文本存密钥文件。"""
+    """Pawchive 输入窗口：search 当作者名、cookie 存密钥文件、post 入队单帖。"""
+    if step == "post":
+        msg = await pawchive.post_reply_text(text.strip())
+        await state.bot_client.send_message(state.MY_ID, msg, link_preview=False)
+        return
     if step == "cookie":
         err = config.save_pawchive_cookie(text)
         if err:

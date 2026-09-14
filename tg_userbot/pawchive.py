@@ -164,6 +164,55 @@ def fetch_favorited_ids(cookie):
     return {str(f["id"]) for f in favs}
 
 
+def _normalize_single(data):
+    """站点接口差异：详情/资料可能包成单元素数组，归一化成 dict。"""
+    if isinstance(data, list) and data:
+        return data[0]
+    return data
+
+
+def fetch_creator_profile(service, creator_id):
+    """创作者资料（名字等，公开接口）——单帖下载用它补齐子目录命名。
+
+    注意走 /profile 子路径：`/user/{id}` 本身返回的是该作者最新一条帖子。
+    """
+    return _normalize_single(_http_get_json(
+        f"{config.PAWCHIVE_API_BASE}/api/v1/{service}/user/{creator_id}"
+        f"/profile", timeout=30))
+
+
+def fetch_post_detail(service, creator_id, post_id, cookie=None):
+    """单帖详情（公开接口）：attachments/file/content 与列表接口同构。
+
+    站点实现差异：详情可能包成单元素数组返回，这里归一化成 dict。
+    """
+    data = _http_get_json(
+        f"{config.PAWCHIVE_API_BASE}/api/v1/{service}/user/{creator_id}"
+        f"/post/{post_id}", cookie=cookie, timeout=30)
+    return _normalize_single(data)
+
+
+_POST_URL_RE = re.compile(
+    r"^https?://pawchive\.pw/(\w+)/user/(\d+)/post/(\d+)", re.I)
+
+
+def parse_post_ref(text):
+    """帖子引用 → (service, creator_id, post_id) 或 None。
+
+    支持两种输入：站点帖子 URL（含 service/创作者）；纯数字帖子 ID
+    （此时 service/创作者未知，返回 (None, None, id) 由调用方查库）。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    m = _POST_URL_RE.match(raw)
+    if m:
+        return (m.group(1).lower(), m.group(2), m.group(3))
+    if raw.isdigit():
+        return (None, None, raw)
+    return None
+
+
 def extract_links(post):
     """从帖子 content HTML 与 embed 字段提取站外链接（MEGA/网盘等）。
 
@@ -311,6 +360,83 @@ async def _scan_and_notify(creator, scope):
         state.PAW_SCAN_RUNNING = None
 
 
+async def post_reply_text(text):
+    """/paw post <URL|帖子ID> 的主体：入队单帖或重投已有失败帖，返回回执。
+
+    裸帖子 ID 只能在**已扫描入库**的帖子上工作（库里才有 service/创作者）；
+    URL 输入则随时可用（详情接口公开，创作者名即时补齐）。
+    """
+    ref = parse_post_ref(text)
+    if ref is None:
+        return (f"{TEXT_PREFIX}\n用法：/paw post <帖子URL 或 帖子ID>\n"
+                "例：/paw post https://pawchive.pw/patreon/user/1/post/2")
+    service, creator_id, post_id = ref
+
+    # 已入库的帖子：按状态分流（重扫不会复活它——这里提供显式入口）
+    existing = runtime_db.find_pawchive_posts_by_post_id(post_id)
+    if service is None:
+        if not existing:
+            return (f"{TEXT_PREFIX}\n❌ 帖子 {post_id} 不在已扫描记录里，"
+                    "且裸 ID 无法定位创作者——请粘贴完整帖子 URL")
+        if len(existing) > 1:
+            rows = "\n".join(
+                f"  · #{r['id']} {r['creator_name']}（{r['status']}）"
+                for r in existing)
+            return f"{TEXT_PREFIX}\n⚠️ 帖子 {post_id} 对应多条记录，请用 URL 精确指定：\n{rows}"
+        return _post_status_reply(existing[0])
+
+    # URL 输入：命中已入库记录同样按状态分流
+    for r in existing:
+        if r["service"] == service and r["creator_id"] == str(creator_id):
+            return _post_status_reply(r)
+
+    try:
+        detail = await asyncio.to_thread(
+            fetch_post_detail, service, creator_id, post_id, config.PAWCHIVE_COOKIE or None)
+        profile = None
+        try:
+            profile = await asyncio.to_thread(
+                fetch_creator_profile, service, creator_id)
+        except Exception as e:
+            logger.warning(f"🐾 创作者资料拉取失败（用 ID 代替名字）：{e}")
+    except Exception as e:
+        return f"{TEXT_PREFIX}\n❌ 帖子详情拉取失败：{e}"
+    creator_name = (profile or {}).get("name") or f"{service}/{creator_id}"
+    creator = {"service": service, "id": str(creator_id), "name": creator_name}
+    records = build_scan_records(creator, [detail], faved_ids=None, scope="all")
+    if not records:
+        return (f"{TEXT_PREFIX}\n该帖子没有可下载附件也没有外链（纯文字帖）。")
+    rec = records[0]
+    created, _skipped = runtime_db.enqueue_pawchive_posts(
+        service, str(creator_id), creator_name, [rec],
+        scan_batch="单帖 " + time.strftime("%Y-%m-%d %H:%M:%S"))
+    if created:
+        return (f"{TEXT_PREFIX}\n📌 帖子已入队：{creator_name} #{post_id}\n"
+                f"直链 {len(rec['files'])} 个（死链会被预检秒判）"
+                f"｜外链 {len(rec['ext_links'])} 条\n"
+                f"worker 将自动下载，落盘 {rec['subdir']}")
+    return _post_status_reply(runtime_db.find_pawchive_posts_by_post_id(post_id)[0])
+
+
+def _post_status_reply(row):
+    """已入库帖子的状态回执 + 对应动作提示。"""
+    st = row["status"]
+    label = _STATUS_LABELS.get(st, st)
+    head = f"{TEXT_PREFIX}\n帖子 #{row['id']}（{row['creator_name']}）状态：{label}"
+    if st == runtime_db.PAW_POST_FAILED:
+        n = runtime_db.retry_pawchive_posts(row_ids=[row["id"]])
+        if n:
+            return (head + "\n🔁 之前失败，已重投队列"
+                    "（死链文件会被预检再次跳过，其余文件重新下载）")
+    if st == runtime_db.PAW_POST_COMPLETED:
+        return head + "\n✅ 已下载完成，文件在 " + config.CHROME_DOWNLOAD_DIR
+    if st == runtime_db.PAW_POST_MANUAL:
+        return head + "\n👤 直链已下载，另有外链需人工处理：\n" + "\n".join(
+            f"  · [{l.get('domain')}] {l['url']}"
+            for l in (row.get("ext_links") or [])[:6])
+    return head
+
+
 async def notify_user(text):
     """统一通知出口（bot 控制面板对话）。函数内导入避免 app↔本模块成环。"""
     from . import notify
@@ -397,6 +523,7 @@ def menu_buttons():
          Button.inline("📄 导出CSV清单", encode_menu_data("paw_csv"))],
         [Button.inline("👤 待人工处理", encode_menu_data("paw_manual")),
          Button.inline("🔁 重投全部失败", encode_menu_data("paw_retry_all"))],
+        [Button.inline("📌 指定帖子下载", encode_menu_data("paw_post"))],
         [Button.inline("🍪 设置 Cookie", encode_menu_data("paw_cookie"))],
         [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
     ]
@@ -523,7 +650,7 @@ def parse_paw_command(text):
     head, _, rest = body.partition(" ")
     head_l = head.lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
-                  "resume", "manual", "cookie", "csv"):
+                  "resume", "manual", "cookie", "csv", "post"):
         return (head_l, rest.strip() or None)
     return ("help", None)
 
@@ -562,6 +689,9 @@ async def command_reply(event, cmd_text):
     if action == "csv":
         await _reply_csv(event, arg)
         return
+    if action == "post":
+        await event.reply(await post_reply_text(arg), link_preview=False)
+        return
     await event.reply(_help_text(), link_preview=False)
 
 
@@ -572,6 +702,7 @@ def _help_text():
         "  /paw plan <作者名> [all] —— 扫描作者帖子入队（默认只收未收藏帖；"
         "带 Cookie 才能对比收藏，all=全部）\n"
         "  /paw search <关键词> —— 搜作者\n"
+        "  /paw post <帖子URL|ID> —— 单独获取指定帖子的附件\n"
         "  /paw manual —— 待人工处理的帖子（含外链清单）\n"
         "  /paw retry <行ID|all> —— 失败帖子重投\n"
         "  /paw pause / resume —— 暂停/恢复下载 worker\n"

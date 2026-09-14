@@ -1175,6 +1175,14 @@ def list_pawchive_posts(status=None, limit=100):
     return [_row_to_pawchive_post(r) for r in rows]
 
 
+def find_pawchive_posts_by_post_id(post_id):
+    """按站点帖子 ID 找已入库的帖子行（可能跨创作者多条，通常 0/1 条）。"""
+    rows = _read(lambda c: _execute(
+        c, "SELECT * FROM pawchive_posts WHERE post_id=? ORDER BY id",
+        (str(post_id),)).fetchall(), "按帖子 ID 查 Pawchive 帖子")
+    return [_row_to_pawchive_post(r) for r in rows]
+
+
 def claim_next_pawchive_post(now=None, lease_seconds=None):
     """领一条 PENDING 帖子 → PROCESSING + 租约；没有则返回 None。
 

@@ -122,6 +122,25 @@ class BuildScanRecordsTest(unittest.TestCase):
         self.assertTrue(records[0]["subdir"].startswith("Pawchive/TestCreator/"))
 
 
+class ParsePostRefTest(unittest.TestCase):
+
+    def test_full_url(self):
+        ref = pawchive.parse_post_ref(
+            "https://pawchive.pw/patreon/user/152819670/post/169389311")
+        self.assertEqual(ref, ("patreon", "152819670", "169389311"))
+
+    def test_bare_id(self):
+        self.assertEqual(pawchive.parse_post_ref("169389311"),
+                         (None, None, "169389311"))
+
+    def test_garbage(self):
+        self.assertIsNone(pawchive.parse_post_ref("随便说说"))
+        self.assertIsNone(pawchive.parse_post_ref(""))
+        # 非 pawchive 站 URL 不算帖子引用
+        self.assertIsNone(pawchive.parse_post_ref(
+            "https://example.com/patreon/user/1/post/2"))
+
+
 class _DbTestCase(unittest.TestCase):
     """需要真实 DB 的用例（CSV 导出 / 命令回复）。"""
 
@@ -170,6 +189,70 @@ class CsvTest(_DbTestCase):
         path, err = pawchive.write_csv("patreon", "99", "Nobody")
         self.assertIsNone(path)
         self.assertIn("没有", err)
+
+
+class SinglePostTest(_DbTestCase):
+
+    def _run(self, coro):
+        import asyncio
+        return asyncio.run(coro)
+
+    def test_post_status_reply_failed_requeues(self):
+        """失败的帖子：_post_status_reply 自动重投并告知。"""
+        runtime_db.enqueue_pawchive_posts("patreon", "42", "C", [{
+            "post_id": "9", "title": "T", "published": "2026-01-01",
+            "post_url": "u", "subdir": "Pawchive/C/x",
+            "files": [{"url": "https://x/a.mp4", "filename": "a.mp4"}],
+            "ext_links": [],
+        }])
+        row = runtime_db.find_pawchive_posts_by_post_id("9")[0]
+        runtime_db.claim_next_pawchive_post(now=1000)
+        runtime_db.finalize_pawchive_post(
+            row["id"], runtime_db.PAW_POST_FAILED, error="下载超时")
+        row = runtime_db.find_pawchive_posts_by_post_id("9")[0]
+        msg = pawchive._post_status_reply(row)
+        self.assertIn("已重投", msg)
+        self.assertEqual(
+            runtime_db.get_pawchive_post(row["id"])["status"],
+            runtime_db.PAW_POST_PENDING)
+
+    def test_post_reply_url_enqueues_single(self):
+        """URL 输入：拉详情 → 单帖入队 PENDING，附件与外链齐全。"""
+        detail = {
+            "id": "777", "title": "单帖标题", "published": "2026-09-01T00:00:00",
+            "attachments": [{"name": "v.mp4", "path": "/vv/v.mp4"}],
+            "content": '<a href="https://mega.nz/x#k">M</a>', "embed": {},
+        }
+        profile = {"name": "SomeCreator"}
+        with mock.patch.object(pawchive, "fetch_post_detail",
+                               return_value=detail), \
+                mock.patch.object(pawchive, "fetch_creator_profile",
+                                  return_value=profile):
+            msg = self._run(pawchive.post_reply_text(
+                "https://pawchive.pw/fanbox/user/55/post/777"))
+        self.assertIn("已入队", msg)
+        row = runtime_db.find_pawchive_posts_by_post_id("777")[0]
+        self.assertEqual(row["status"], runtime_db.PAW_POST_PENDING)
+        self.assertEqual(row["creator_name"], "SomeCreator")
+        files = runtime_db.list_pawchive_files(row["id"])
+        self.assertEqual(len(files), 1)
+        self.assertIn("v.mp4", files[0]["url"])
+        self.assertEqual(len(row["ext_links"]), 1)
+
+    def test_post_reply_existing_completed(self):
+        """已完成的帖子：不重复入队，告知文件位置。"""
+        self._seed()
+        row = runtime_db.find_pawchive_posts_by_post_id("1")[0]
+        runtime_db.claim_next_pawchive_post(now=1000)
+        runtime_db.finalize_pawchive_post(
+            row["id"], runtime_db.PAW_POST_COMPLETED)
+        row = runtime_db.find_pawchive_posts_by_post_id("1")[0]
+        msg = pawchive._post_status_reply(row)
+        self.assertIn("已下载完成", msg)
+
+    def test_post_reply_bare_id_not_in_db(self):
+        msg = self._run(pawchive.post_reply_text("424242"))
+        self.assertIn("完整帖子 URL", msg)
 
 
 class _FakeEvent:
