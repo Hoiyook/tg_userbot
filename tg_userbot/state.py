@@ -127,6 +127,9 @@ SHELL_CWD = config.REPO_ROOT
 # （monotonic）。与其余输入窗口互斥，由 bot.open_input_window 统一开关；
 # sh 窗口的文本当命令执行，up 窗口的文本当文件路径。
 SHELL_INPUT_UNTIL = 0.0
+# ls 文件夹浏览的路径注册表 {hash8: 绝对路径}：回调数据 ≤64 字节装不下
+# 长路径，按钮只带 hash 键；FIFO 淘汰防无限增长
+LS_PATHS = {}
 UP_INPUT_UNTIL = 0.0
 # ⬆️ 上传视图打开时快照的最近文件列表（menu.up_menu_buttons 生成，按钮只带
 # 序号——回调数据限 64 字节放不下长路径；upload.candidate_at 上传前校验）。

@@ -19,7 +19,7 @@ from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from telethon.utils import get_peer_id
 
 from . import state
-from . import text
+from . import text as text_mod
 from . import menu
 from . import queue
 from . import dedup
@@ -164,16 +164,16 @@ async def handle_menu_action(action, arg, event):
     if action == "home":
         return menu.build_main_menu_text(), menu.main_menu_buttons()
     if action == "status":
-        return text.status_text(), menu.back_home_buttons()
+        return text_mod.status_text(), menu.back_home_buttons()
     if action == "progress":
-        return text.progress_text(), [
+        return text_mod.progress_text(), [
             [Button.inline("🔄 刷新", menu.encode_menu_data("progress")),
              Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
         ]
     if action == "done":
-        return text.done_reply_text(DONE_DEFAULT_LINES), menu.back_home_buttons()
+        return text_mod.done_reply_text(DONE_DEFAULT_LINES), menu.back_home_buttons()
     if action == "wl":
-        return (text.wl_list_text(scan_info=wl_scan.collect_scan_info(),
+        return (text_mod.wl_list_text(scan_info=wl_scan.collect_scan_info(),
                                   last_scan=state.WL_LAST_SCAN),
                 menu.wl_menu_buttons())
     if action == "wl_since":
@@ -214,7 +214,7 @@ async def handle_menu_action(action, arg, event):
         if not ok:
             return (result, sql_templates.menu_buttons())
         try:
-            body = text.format_sql_result(result)
+            body = text_mod.format_sql_result(result)
         except runtime_db.DbUnavailable as e:
             body = f"{text.SQL_TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
         return (body, [
@@ -230,7 +230,18 @@ async def handle_menu_action(action, arg, event):
             return "❌ 未知预设命令", menu.sh_menu_buttons()
         out = await shell.command_reply(f"/sh {cmd}")
         return (f"{out}\n\n──────\n\n{shell.sh_view_text()}",
-                menu.sh_menu_buttons())
+                _sh_buttons_for(cmd, out))
+    if action == "sh_ls":
+        # ls 浏览器：点目录按钮 = 进入该目录并重新 ls
+        path = shell.resolve_ls_dir(arg or "")
+        if not path:
+            return ("❌ 目录已失效（路径注册过期，请重新 ls）",
+                    menu.sh_menu_buttons())
+        if not shell.change_cwd(path):
+            return "❌ 目录不可访问", menu.sh_menu_buttons()
+        out = await shell.command_reply("/sh ls -la")
+        return (f"{out}\n\n──────\n\n{shell.sh_view_text()}",
+                _sh_buttons_for("ls -la", out))
     if action == "sh_input":
         open_input_window("sh")
         return (
@@ -676,7 +687,7 @@ async def bot_message_handler(event):
     logger.info(f"🤖 bot 菜单：owner 发送 {text[:30]!r}，显示主菜单")
     await state.bot_client.send_message(
         state.MY_ID,
-        menu.build_main_menu_text(),
+        text_mod.with_code_block(menu.build_main_menu_text()),
         buttons=menu.main_menu_buttons(),
     )
 
@@ -731,9 +742,23 @@ _KNOWN_COMMAND_NAMES = frozenset(
 
 async def _handle_sh_input(event, text):
     """命令行输入窗口的输入：一条文本 = 一条 shell 命令（/sh 同语义）。"""
+    out = await shell.command_reply(f"/sh {text}")
     await state.bot_client.send_message(
-        state.MY_ID, await shell.command_reply(f"/sh {text}"),
-        link_preview=False)
+        state.MY_ID, out, link_preview=False,
+        buttons=_sh_buttons_for(text, out))
+
+
+def _sh_buttons_for(cmd, out):
+    """ls 类命令的回复 → 目录按钮网格（⬆️ 上一级导航）+ 基础 sh 按钮。"""
+    dirs = shell.extract_ls_dirs(cmd, out, state.SHELL_CWD)
+    if not dirs:
+        return menu.sh_menu_buttons()
+    tokens = shell.register_ls_paths(dirs)
+    parent = os.path.dirname(state.SHELL_CWD.rstrip("/")) or "/"
+    up_token = (shell.register_ls_paths([parent])[0]
+                if parent != state.SHELL_CWD else None)
+    return (menu.sh_ls_buttons(list(zip(dirs, tokens)), up_token=up_token)
+            + menu.sh_menu_buttons())
 
 
 async def _handle_up_input(event, text):
@@ -875,10 +900,11 @@ async def bot_callback_handler(event):
     action, arg = menu.parse_menu_data(event.data)
     logger.info(f"🤖 bot 菜单回调：{action} {arg or ''}")
     try:
-        text, buttons = await handle_menu_action(action, arg, event)
-        if text is not None:
+        reply, buttons = await handle_menu_action(action, arg, event)
+        if reply is not None:
             await event.edit(
-                text, buttons=buttons, link_preview=False
+                text_mod.with_code_block(reply), buttons=buttons,
+                link_preview=False
             )
     except MessageNotModifiedError:
         # 重复点击生成相同内容（如钥匙串拒绝后连点两次同一导入按钮）：

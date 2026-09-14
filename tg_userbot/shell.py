@@ -108,15 +108,9 @@ def _handle_cd(tokens):
             f"📂 当前工作目录：\n{state.SHELL_CWD}\n"
             "用法：/sh cd <目录>"
         )
-    target = os.path.expanduser(tokens[1])
-    if not os.path.isabs(target):
-        target = os.path.join(state.SHELL_CWD, target)
-    target = os.path.realpath(target)
-    if not os.path.isdir(target):
+    if not change_cwd(tokens[1]):
         return f"❌ /sh cd：目录不存在：{tokens[1]}"
-    state.SHELL_CWD = target
-    _save_shell_cwd()
-    return f"📂 工作目录已切换：\n{target}"
+    return f"📂 工作目录已切换：\n{state.SHELL_CWD}"
 
 
 async def _run_subprocess(raw):
@@ -201,3 +195,90 @@ def _save_shell_cwd():
             json.dump({"cwd": state.SHELL_CWD}, f, ensure_ascii=False)
     except Exception as e:
         logger.warning(f"保存 /sh 工作目录失败：{e}")
+
+
+# ============================================================
+# ls 文件夹浏览器（2026-09-14）：ls 输出里的目录渲染成可点击按钮，
+# 点击 = change_cwd 进入 + 重新 ls——跑在 Telegram 里的迷你文件浏览器。
+# 回调数据 ≤64 字节装不下长路径：按钮只带 hash8 键，真实路径存
+# state.LS_PATHS（FIFO 淘汰）。
+# ============================================================
+_LS_PERM_RE = re.compile(r"^[dcb\-lps][rwxsStT\-+@]{9}")
+
+
+def parse_ls_entries(output):
+    """ls -la 输出 → 目录名列表（保序；文件/符号链接/坏行/./.. 排除）。"""
+    dirs = []
+    for line in output.splitlines():
+        if not _LS_PERM_RE.match(line):
+            continue
+        parts = line.split(None, 8)
+        if len(parts) < 9:
+            continue
+        name = parts[8]
+        if line[0] == "d" and name not in (".", ".."):
+            dirs.append(name)
+    return dirs
+
+
+def extract_ls_dirs(cmd_text, reply_text, cwd):
+    """命令是简单 ls → 从回复的围栏体解析目录并转绝对路径；否则 []。
+
+    base 目录：命令带路径操作数（如 ls -la /x）用它，否则用 cwd；
+    相对操作数按 cwd 拼。flags（-la -A…）不影响 base。"""
+    try:
+        tokens = shlex.split(cmd_text)
+    except ValueError:
+        return []
+    if not tokens or tokens[0] != "ls":
+        return []
+    operands = [t for t in tokens[1:] if not t.startswith("-")]
+    if operands:
+        base = os.path.expanduser(operands[-1])
+        if not os.path.isabs(base):
+            base = os.path.join(cwd, base)
+    else:
+        base = cwd
+    if reply_text.count("```") < 2:
+        return []
+    body = reply_text.split("```")[1].strip("\n")
+    return [
+        name if os.path.isabs(name) else os.path.join(base, name)
+        for name in parse_ls_entries(body)
+    ]
+
+
+def register_ls_paths(paths):
+    """路径 → hash8 回调键（FIFO 淘汰，上限 128），返回与入参对齐的键表。"""
+    import hashlib
+    tokens = []
+    for p in paths:
+        token = hashlib.md5(p.encode("utf-8")).hexdigest()[:8]
+        while len(state.LS_PATHS) >= 128:
+            state.LS_PATHS.pop(next(iter(state.LS_PATHS)))
+        state.LS_PATHS[token] = p
+        tokens.append(token)
+    return tokens
+
+
+def resolve_ls_dir(token):
+    """hash8 → 绝对路径；未注册或目录已不存在返回 None。"""
+    path = state.LS_PATHS.get(str(token or ""))
+    if path and os.path.isdir(path):
+        return path
+    return None
+
+
+def change_cwd(path):
+    """切换并持久化工作目录；目录不存在返回 False（不改动现状）。
+
+    相对路径基于当前 SHELL_CWD 解析（与 /sh cd 同语义）。"""
+    p = os.path.expanduser(str(path or ""))
+    if not os.path.isabs(p):
+        p = os.path.join(state.SHELL_CWD, p)
+    target = os.path.realpath(p)
+    if not os.path.isdir(target):
+        return False
+    state.SHELL_CWD = target
+    _save_shell_cwd()
+    return True

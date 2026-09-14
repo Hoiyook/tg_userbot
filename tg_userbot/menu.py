@@ -296,6 +296,29 @@ def thread_menu_buttons():
     return rows
 
 
+def sh_ls_buttons(dirs, up_token=None, home_token=None):
+    """ls 浏览器的目录按钮网格：2 个/行 + 可选导航行（⬆️ 上一级/🏠 根目录）。
+
+    dirs = [(显示名, hash8 回调键)]；回调数据 ≤64 字节由 hash8 保证。"""
+    rows = []
+    for i in range(0, len(dirs), 2):
+        row = []
+        for name, token in dirs[i:i + 2]:
+            label = "📁 " + (name if len(name) <= 26 else name[:25] + "…")
+            row.append(Button.inline(label, encode_menu_data("sh_ls", token)))
+        rows.append(row)
+    if up_token or home_token:
+        nav = []
+        if up_token:
+            nav.append(Button.inline("⬆️ 上一级",
+                                     encode_menu_data("sh_ls", up_token)))
+        if home_token:
+            nav.append(Button.inline("🏠 根目录",
+                                     encode_menu_data("sh_ls", home_token)))
+        rows.append(nav)
+    return rows
+
+
 def sh_menu_buttons():
     """🖥 命令行视图：预设命令（shell.PRESET_COMMANDS）+ 自定义输入 + 返回。"""
     rows = [[Button.inline(label, encode_menu_data("sh_run", cmd))

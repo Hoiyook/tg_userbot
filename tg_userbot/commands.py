@@ -40,19 +40,25 @@ from .config import (
 from .log import logger
 
 
+async def _reply(event, payload, **kwargs):
+    """指令回复统一出口：多行文本代码块化（首行前缀行留外，见
+    text.with_code_block）。全部 handle_command 分支的回复都走这里。"""
+    await event.reply(text.with_code_block(payload), **kwargs)
+
+
 async def handle_command(event, cmd_text):
     if cmd_text == "/status":
-        await event.reply(text.status_text())
+        await _reply(event, text.status_text())
         logger.info("执行命令：/status")
         return True
 
     if cmd_text == "/folder":
-        await event.reply(f"📁 保存目录：\n{DOWNLOAD_DIR}")
+        await _reply(event, f"📁 保存目录：\n{DOWNLOAD_DIR}")
         logger.info("执行命令：/folder")
         return True
 
     if cmd_text == "/logpath":
-        await event.reply(f"📋 日志文件：\n{LOG_FILE}")
+        await _reply(event, f"📋 日志文件：\n{LOG_FILE}")
         logger.info("执行命令：/logpath")
         return True
 
@@ -76,23 +82,23 @@ async def handle_command(event, cmd_text):
 
         if keyword is not None:
             # 模糊匹配：大小写不敏感的子串匹配，扫描全部历史
-            await event.reply(text.done_reply_text(n, keyword))
+            await _reply(event, text.done_reply_text(n, keyword))
             logger.info(f"执行命令：/done 关键词「{keyword}」")
             return True
 
-        await event.reply(text.done_reply_text(n))
+        await _reply(event, text.done_reply_text(n))
         logger.info(f"执行命令：/done {n}")
         return True
 
     if cmd_text == "/progress" or cmd_text == "/downloading":
-        await event.reply(text.progress_text())
+        await _reply(event, text.progress_text())
         logger.info(f"执行命令：/progress | 进行中 {len(state.ACTIVE_DOWNLOADS)} 个")
         return True
 
     if cmd_text == "/thread" or cmd_text.startswith("/thread "):
         parts = cmd_text.split(maxsplit=1)
         if len(parts) == 1:
-            await event.reply(
+            await _reply(event, 
                 f"🧵 当前并发下载数：{state.DOWNLOAD_CONCURRENCY}\n"
                 f"用法：/thread 3（{DOWNLOAD_CONCURRENCY_MIN}-{DOWNLOAD_CONCURRENCY_MAX}）\n"
                 "每条下载各占一条独立连接，n 路 ≈ n 倍单路速度"
@@ -100,18 +106,18 @@ async def handle_command(event, cmd_text):
             logger.info("执行命令：/thread（查询）")
             return True
         ok, msg = thread.apply_thread_limit(parts[1])
-        await event.reply(msg)
+        await _reply(event, msg)
         logger.info(f"执行命令：/thread {parts[1]} 成功={ok}")
         return True
 
     if dedup.is_dedup_command(cmd_text):
         parts = cmd_text.split(maxsplit=1)
         if len(parts) == 1:
-            await event.reply(dedup.status_text())
+            await _reply(event, dedup.status_text())
             logger.info("执行命令：/dedup（查询）")
             return True
         arg = parts[1].strip().lower()
-        await event.reply(dedup.set_enabled(arg == "on"))
+        await _reply(event, dedup.set_enabled(arg == "on"))
         logger.info(f"执行命令：/dedup {arg}")
         return True
 
@@ -121,7 +127,7 @@ async def handle_command(event, cmd_text):
         logger.info(f"执行命令：/wl {action}")
 
         if action == "list":
-            await event.reply(text.wl_list_text(
+            await _reply(event, text.wl_list_text(
                 scan_info=wl_scan.collect_scan_info(),
                 last_scan=state.WL_LAST_SCAN))
             return True
@@ -140,7 +146,7 @@ async def handle_command(event, cmd_text):
                     # 不带参数：从回复的转发消息里取来源 chat。
                     reply_id = event.message.reply_to_msg_id
                     if not reply_id:
-                        await event.reply(
+                        await _reply(event, 
                             "❌ /wl：请带参数（ID 或 @用户名），或回复一条"
                             "从目标 chat 转发的消息后发送 /wl add"
                         )
@@ -151,7 +157,7 @@ async def handle_command(event, cmd_text):
                     if not reply_msg or not getattr(
                         reply_msg, "fwd_from", None
                     ):
-                        await event.reply(
+                        await _reply(event, 
                             "❌ /wl：回复的消息不是转发的，取不到来源 chat"
                         )
                         return True
@@ -160,44 +166,44 @@ async def handle_command(event, cmd_text):
                     )
 
                 if chat_id is None:
-                    await event.reply(
+                    await _reply(event, 
                         f"❌ /wl：无法找到该 chat：{arg or '转发来源'}"
                     )
                     return True
                 ok, msg = whitelist.add_to_whitelist(chat_id, title)
-                await event.reply(msg)
+                await _reply(event, msg)
             except Exception as e:
                 logger.warning(f"/wl add 失败：{e}")
-                await event.reply(
+                await _reply(event, 
                     f"❌ /wl：无法找到该 chat：{arg or '转发来源'}"
                 )
             return True
 
         if action == "del":
             ok, msg = whitelist.del_from_whitelist(arg or "")
-            await event.reply(msg)
+            await _reply(event, msg)
             return True
 
         if action == "scan":
             totals = await wl_scan.scan_all(manual=True)
-            await event.reply(wl_scan.summary_text(totals))
+            await _reply(event, wl_scan.summary_text(totals))
             return True
 
         if action == "since":
             parts = (arg or "").split()
             if len(parts) != 2:
-                await event.reply(
+                await _reply(event, 
                     "❌ 用法：/wl since <序号|@用户名|ID> <消息id>\n"
                     "例：/wl since 1 88000 —— 从 #88000 之后开始回补")
                 return True
             ok, msg = await wl_scan.since_checkpoint(
                 state.client, parts[0], parts[1])
-            await event.reply(msg)
+            await _reply(event, msg)
             if ok:
                 wl_scan.spawn_scan()
             return True
 
-        await event.reply(
+        await _reply(event, 
             "❌ 用法：/wl list | /wl add <ID或@用户名> | /wl del <ID或序号>\n"
             "        /wl scan（立即扫描）| /wl since <聊天> <消息id>（回补）")
         return True
@@ -205,7 +211,7 @@ async def handle_command(event, cmd_text):
     if runtime_db.is_sql_command(cmd_text):
         arg = cmd_text[len("/sql"):].strip()
         if not arg:
-            await event.reply(
+            await _reply(event, 
                 "📋 SQL 诊断控制台（owner-only，直接作用于 runtime DB）\n\n"
                 "用法：/sql <一条 SQL>\n"
                 "例：/sql SELECT * FROM listener_tasks ORDER BY id DESC "
@@ -219,40 +225,40 @@ async def handle_command(event, cmd_text):
         try:
             result = runtime_db.execute_user_sql(arg)
         except runtime_db.DbUnavailable as e:
-            await event.reply(f"{text.SQL_TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}")
+            await _reply(event, f"{text.SQL_TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}")
             return True
-        await event.reply(text.format_sql_result(result))
+        await _reply(event, text.format_sql_result(result))
         logger.info(f"执行命令：/sql {arg[:80]}")
         return True
 
     if sql_templates.is_sqlt_command(cmd_text):
         action, arg = sql_templates.parse_sqlt_command(cmd_text)
         if action == "list":
-            await event.reply(sql_templates.list_text())
+            await _reply(event, sql_templates.list_text())
             return True
         if action == "add":
             parts = (arg or "").split(None, 1)
             if len(parts) != 2:
-                await event.reply(
+                await _reply(event, 
                     f"❌ 用法：/sqlt add <名字> <SQL>\n"
                     "例：/sqlt add 待执行 SELECT * FROM listener_tasks")
                 return True
             ok, msg = sql_templates.upsert(parts[0], parts[1])
-            await event.reply(msg)
+            await _reply(event, msg)
             return True
         if action == "del":
             ok, msg = sql_templates.delete(arg or "")
-            await event.reply(msg)
+            await _reply(event, msg)
             return True
         # run：按名字执行模板（执行语义与 /sql 完全一致）
         ok, result = sql_templates.execute_template(arg or "")
         if not ok:
-            await event.reply(result)
+            await _reply(event, result)
             return True
         try:
-            await event.reply(text.format_sql_result(result))
+            await _reply(event, text.format_sql_result(result))
         except runtime_db.DbUnavailable as e:
-            await event.reply(
+            await _reply(event, 
                 f"{text.SQL_TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}")
         logger.info(f"执行命令：/sqlt {arg}")
         return True
@@ -260,37 +266,37 @@ async def handle_command(event, cmd_text):
     if queue.is_queue_command(cmd_text):
         parts = cmd_text.split(maxsplit=1)
         if len(parts) == 1:
-            await event.reply(
+            await _reply(event, 
                 queue.format_queue_text(state.QUEUE), link_preview=False
             )
         elif parts[1].startswith("del "):
             try:
                 idx = int(parts[1].split(None, 1)[1])
             except (IndexError, ValueError):
-                await event.reply("❌ /queue del 用法：/queue del <序号>")
+                await _reply(event, "❌ /queue del 用法：/queue del <序号>")
                 return True
             # 执行中的任务先真正取消在途下载（task.cancel → 清半成品、归还
             # worker），再把记录移除；排队中的直接移除。
             ok, removed, cancelled = await queue.queue_del_task(index=idx)
             if ok:
                 verb = "🛑 已取消下载并移除" if cancelled else "✅ 已从队列移除"
-                await event.reply(f"{verb}：{removed.get('label', '')}")
+                await _reply(event, f"{verb}：{removed.get('label', '')}")
             else:
-                await event.reply("❌ /queue：序号无效，用 /queue 查看列表")
+                await _reply(event, "❌ /queue：序号无效，用 /queue 查看列表")
         else:
-            await event.reply("❌ 用法：/queue | /queue del <序号>")
+            await _reply(event, "❌ 用法：/queue | /queue del <序号>")
         logger.info(f"执行命令：/queue {parts[1] if len(parts) > 1 else ''}")
         return True
 
     if queue.is_retry_command(cmd_text):
         parts = cmd_text.split(maxsplit=1)
         if len(parts) == 1:
-            await event.reply(
+            await _reply(event, 
                 queue.format_retry_text(state.QUEUE), link_preview=False
             )
         elif parts[1].strip().lower() == "all":
             n = queue.retry_all()
-            await event.reply(
+            await _reply(event, 
                 f"🔁 已重放全部待重试任务：{n} 条" if n
                 else "🔁 待重试列表为空（或都在执行中）"
             )
@@ -300,25 +306,25 @@ async def handle_command(event, cmd_text):
             try:
                 idx = int(parts[1].split(None, 1)[1])
             except (IndexError, ValueError):
-                await event.reply("❌ /retry del 用法：/retry del <序号>")
+                await _reply(event, "❌ /retry del 用法：/retry del <序号>")
                 return True
             async with state.QUEUE_LOCK:
                 ok, removed = queue.queue_remove(state.QUEUE, "retry", idx)
                 if ok:
                     queue._save_after_mutation(removed, "delete")
             if ok:
-                await event.reply(
+                await _reply(event, 
                     f"✅ 已从待重试列表移除：{removed.get('label', '')}"
                 )
             else:
-                await event.reply(
+                await _reply(event, 
                     "❌ /retry：序号无效，用 /retry 查看列表"
                 )
         else:
             try:
                 idx = int(parts[1])
             except ValueError:
-                await event.reply(
+                await _reply(event, 
                     "❌ 用法：/retry | /retry all | /retry <序号> | /retry del <序号>"
                 )
                 return True
@@ -328,13 +334,13 @@ async def handle_command(event, cmd_text):
                     retry_list[idx - 1] if 1 <= idx <= len(retry_list) else None
                 )
             if record is None:
-                await event.reply("❌ /retry：序号无效，用 /retry 查看列表")
+                await _reply(event, "❌ /retry：序号无效，用 /retry 查看列表")
                 return True
             if record["id"] in state.EXECUTING:
-                await event.reply("⏳ 该任务正在执行中")
+                await _reply(event, "⏳ 该任务正在执行中")
                 return True
             queue.spawn_execute(record)
-            await event.reply(f"▶️ 已重新执行：{record.get('label', '')}")
+            await _reply(event, f"▶️ 已重新执行：{record.get('label', '')}")
         logger.info(f"执行命令：/retry {parts[1] if len(parts) > 1 else ''}")
         return True
 
@@ -351,28 +357,28 @@ async def handle_command(event, cmd_text):
             try:
                 days = int(parts[1])
             except ValueError:
-                await event.reply(
+                await _reply(event, 
                     f"❌ /stats：参数须为天数（1-{LOG_RETENTION_DAYS}），"
                     "如 /stats 3"
                 )
                 return True
         days = max(1, min(days, LOG_RETENTION_DAYS))
         logger.info(f"执行命令：/stats {days if days > 1 else ''}".rstrip())
-        await event.reply(stats.stats_text(days), link_preview=False)
+        await _reply(event, stats.stats_text(days), link_preview=False)
         return True
 
     parsed_caption = caption_filter.parse_caption_filter_command(cmd_text)
     if parsed_caption is not None:
         action, arg = parsed_caption
         logger.info(f"执行命令：/caption_filter {action}")
-        await event.reply(caption_filter.command_reply(action, arg))
+        await _reply(event, caption_filter.command_reply(action, arg))
         return True
 
     parsed_listen = listener.parse_listen_command(cmd_text)
     if parsed_listen is not None:
         action, arg = parsed_listen
         logger.info(f"执行命令：/listen {action}")
-        await event.reply(await listener.command_reply(action, arg),
+        await _reply(event, await listener.command_reply(action, arg),
                           link_preview=False)
         return True
 
@@ -381,12 +387,12 @@ async def handle_command(event, cmd_text):
         parts = cmd_text.split(maxsplit=1)
         keyword = parts[1].strip() if len(parts) > 1 else ""
         logger.info(f"执行命令：/find {keyword}")
-        await event.reply(finder.find_media(keyword), link_preview=False)
+        await _reply(event, finder.find_media(keyword), link_preview=False)
         return True
 
     if shell.is_shell_command(cmd_text):
         logger.info(f"执行命令：{cmd_text[:60]}")
-        await event.reply(await shell.command_reply(cmd_text),
+        await _reply(event, await shell.command_reply(cmd_text),
                           link_preview=False)
         return True
 
@@ -395,7 +401,7 @@ async def handle_command(event, cmd_text):
         return True
 
     if cmd_text == "/help":
-        await event.reply(
+        await _reply(event, 
             "📖 TG Userbot 命令\n\n"
             "/status - 查看运行状态\n"
             "/folder - 查看保存目录\n"
@@ -449,7 +455,7 @@ async def handle_command(event, cmd_text):
                 "已关闭" if state.CLEAR_INTERVAL_SECONDS <= 0
                 else cleanup.format_clear_interval(state.CLEAR_INTERVAL_SECONDS)
             )
-            await event.reply(
+            await _reply(event, 
                 f"⏱ 自动清理当前间隔：{current}\n用法：/setcleartime 1m\n"
                 "支持：30s、1m、2m、1h\n关闭：/setcleartime off"
             )
@@ -457,7 +463,7 @@ async def handle_command(event, cmd_text):
         try:
             seconds = cleanup.parse_clear_interval(parts[1])
         except ValueError:
-            await event.reply(
+            await _reply(event, 
                 "❌ 格式错误。示例：/setcleartime 1m、/setcleartime 2m、"
                 "/setcleartime 1h、/setcleartime off"
             )
@@ -466,7 +472,7 @@ async def handle_command(event, cmd_text):
         cleanup.save_clear_interval(seconds)
         if state.CLEAR_TIME_CHANGED is not None:
             state.CLEAR_TIME_CHANGED.set()
-        await event.reply(
+        await _reply(event, 
             "⏸ 自动清理已关闭。"
             if seconds == 0
             else f"✅ 自动清理间隔已设置为 {cleanup.format_clear_interval(seconds)}。"
@@ -483,7 +489,7 @@ async def handle_command(event, cmd_text):
             # 先回执再干活的避免「以为无效」。
             from_saved = getattr(event, "client", None) is state.client
 
-            await event.reply(
+            await _reply(event, 
                 "🧹 正在扫描收藏夹程序消息（最多 3000 条，约需 1 分钟）…\n"
                 "完成后会再回复结果。"
             )
@@ -499,7 +505,7 @@ async def handle_command(event, cmd_text):
 
             count = len(delete_ids) + (1 if from_saved else 0)
 
-            await event.reply(
+            await _reply(event, 
                 f"🧹 清理完成，共删除 {count} 条程序相关消息\n\n"
                 "已清理：抖音/IG 链接指令、程序通知、程序命令、/clearmsg 指令\n"
                 "收藏的媒体副本与普通收藏内容会保留。"
@@ -520,7 +526,7 @@ async def handle_command(event, cmd_text):
             logger.exception(f"/clearmsg 执行失败：{e}")
             # 如果清理过程中失败，至少尝试保留错误信息。
             try:
-                await event.reply(f"❌ 清理失败：{e}")
+                await _reply(event, f"❌ 清理失败：{e}")
             except Exception:
                 pass
 
@@ -528,7 +534,7 @@ async def handle_command(event, cmd_text):
 
     if cmd_text == "/clean":
         count = cleanup.clean_temp_files()
-        await event.reply(f"🧹 清理完成，共删除 {count} 个临时文件")
+        await _reply(event, f"🧹 清理完成，共删除 {count} 个临时文件")
         logger.info(f"执行命令：/clean | 删除 {count} 个临时文件")
         return True
 

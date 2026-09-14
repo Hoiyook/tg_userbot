@@ -614,7 +614,7 @@ MENU_ACTIONS = (
     "sqlt", "sqlt_add", "sqlt_run", "sqlt_del",
     # 命令行（sh：视图 / 预设执行 / ✏️ 输入命令）与文件上传
     # （up：视图 / 📄 最近文件带序号 / ✏️ 输入路径）
-    "sh", "sh_run", "sh_input",
+    "sh", "sh_run", "sh_input", "sh_ls",
     "up", "up_file", "up_input",
 )
 
