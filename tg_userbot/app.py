@@ -39,6 +39,7 @@ from . import platform
 from . import cleanup
 from . import bot
 from . import workers
+from . import pawchive_worker
 from .config import (
     API_HASH,
     API_ID,
@@ -223,8 +224,20 @@ async def _bot_keepalive():
         try:
             await start_with_retry(bot, bot_token=BOT_TOKEN)
             logger.info("🤖 bot 菜单已重新连接")
-        except (KeyboardInterrupt, asyncio.CancelledError):
+        except (KeyboardInterrupt, SystemExit):
             raise
+        except asyncio.CancelledError:
+            # telethon 断线会对 pending future 调 cancel()（网络层取消），
+            # CancelledError 会从 start_with_retry 内部穿到这里。与真取消
+            # 无法从异常本身区分，按 STOP_EVENT 结构性判定（与
+            # _main_serve/_reporter_supervisor 同款）：未停服 = 连接抖动，
+            # 吞掉继续守护；停服 = main 的真取消，原样上抛。
+            # 2026-09-14 实测：代理抖动期间一次网络层取消就把本守护打死
+            # （静默，无日志），bot 账号自此无人重连、面板永远 🔴。
+            if state.STOP_EVENT is not None and state.STOP_EVENT.is_set():
+                raise
+            logger.warning(
+                "🤖 bot 菜单重连被网络层取消（连接抖动），下轮探活重试")
         except Exception as e:
             logger.error(
                 f"🤖 bot 菜单重连失败（{type(e).__name__}: {e}），"
@@ -1226,6 +1239,14 @@ async def main():
     wl_scan_task = None
     if state.RUNTIME_DB_READY:
         wl_scan_task = asyncio.create_task(_whitelist_scan_loop())
+    # Pawchive worker（帖子生命周期 → Chrome Agent 批量下载）
+    pawchive_worker_task = None
+    if state.RUNTIME_DB_READY:
+        recovered_paw = pawchive_worker.recover_expired()
+        if recovered_paw:
+            logger.warning(
+                f"🗄 启动恢复：{recovered_paw} 条租约过期的 Pawchive 帖子已回到待处理")
+        pawchive_worker_task = pawchive_worker.start_worker()
     # Runtime Reporter（只读观察者）：发启动通知 + 后台刷新状态面板
     reporter_instance, reporter_task = await _start_reporter()
 
@@ -1247,12 +1268,12 @@ async def main():
         # 扫描/Reporter 主循环同理。
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task):
+                  wl_scan_task, pawchive_worker_task):
             if t is not None:
                 t.cancel()
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task):
+                  wl_scan_task, pawchive_worker_task):
             if t is not None:
                 try:
                     await t
@@ -1262,6 +1283,7 @@ async def main():
                     logger.exception("后台服务任务清理出错")
         # Worker 已在取消时把手上的任务放回 PENDING；这里兜底再释放一次
         listener_worker.release_inflight()
+        pawchive_worker.release_inflight()
         runtime_db.close_db()
         # 断开下载 worker 连接（尽力而为，不影响主客户端退出）
         try:
