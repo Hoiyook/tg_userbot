@@ -324,12 +324,71 @@ class DownloadOneHttpTest(_WorkerDbTestCase):
             self.assertEqual(fh.read(), b"hello-world")
 
     def test_size_mismatch_retries_then_fails(self):
-        """Content-Length 与实际不符：校验失败 → 重试耗尽 → failed。"""
+        """Content-Length 与实际不符：校验失败计入额度 → 耗尽 → failed。
+
+        撒谎的服务器不能靠无限续传迁就（可能永远差一截）。"""
         def handler(request):
             return httpx.Response(200, content=b"short",
                                   headers={"Content-Length": "100"})
         result, target, _ = self._run_download(handler)
         self.assertEqual(result[0], "failed")
+
+    def test_progress_made_disconnects_do_not_burn_retry_budget(self):
+        """任务书场景（2026-09-15 深夜 CDN 断流）：有进账的断流不消耗重试
+        额度——每尝试 +3 字节，连断 4 次仍未到上限，第 5 次给全量 → done。"""
+        state_n = {"n": 0}
+
+        def handler(request):
+            state_n["n"] += 1
+            if state_n["n"] <= 4:
+                # 断流：先给 300KB（要超过 iter_bytes 的 256KB 缓冲，字节才会
+                # 真正落到 .part）再掐——模拟 CDN 传输中途断
+                def stream():
+                    yield b"abc" * 100000
+                    raise httpx.RemoteProtocolError("peer closed")
+                return httpx.Response(206, content=stream())
+            return httpx.Response(200, content=b"abcdefghij")
+
+        post = _post()
+        f = {"id": 1, "url": "https://x/big.mp4", "filename": "big.mp4",
+             "status": runtime_db.PAW_FILE_PENDING}
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.Client
+        with mock.patch.object(worker.httpx, "Client",
+                               side_effect=lambda **kw: real_client(
+                                   transport=transport, **kw)), \
+                mock.patch.object(worker.time, "sleep",
+                                  new=lambda s: None):
+            result = asyncio.run(
+                asyncio.to_thread(worker._download_one, post, f,
+                                  lambda c, t: None))
+        self.assertEqual(result[0], "done")
+        self.assertGreaterEqual(state_n["n"], 5,
+                                "断流有进账不应消耗 3 次重试额度")
+
+    def test_no_progress_disconnects_exhaust_budget(self):
+        """无进账断流：3 次额度耗尽 → failed（不无限空转）。"""
+        state_n = {"n": 0}
+
+        def handler(request):
+            state_n["n"] += 1
+            raise httpx.RemoteProtocolError("peer closed")
+
+        post = _post()
+        f = {"id": 1, "url": "https://x/x.mp4", "filename": "x.mp4",
+             "status": runtime_db.PAW_FILE_PENDING}
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.Client
+        with mock.patch.object(worker.httpx, "Client",
+                               side_effect=lambda **kw: real_client(
+                                   transport=transport, **kw)), \
+                mock.patch.object(worker.time, "sleep",
+                                  new=lambda s: None):
+            result = asyncio.run(
+                asyncio.to_thread(worker._download_one, post, f,
+                                  lambda c, t: None))
+        self.assertEqual(result[0], "failed")
+        self.assertEqual(state_n["n"], worker._DOWNLOAD_ATTEMPTS)
 
     def test_existing_target_wrong_size_redownloads(self):
         """任务书 §8-A 反例：目标存在但大小不符（截断/损坏）→ 重新下载。"""

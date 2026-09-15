@@ -46,8 +46,13 @@ _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # 站点侧死链的失败标记（单一事实源在 runtime_db，retry 重投据此跳过死链）
 _MISSING_MARK = runtime_db.PAW_DEAD_LINK_MARK
 _DEAD_STATUS = (404, 410)
-# 单文件最大尝试次数与退避基数（秒）——对应原 Chrome 端的 3 次重试语义
+# 单文件重试策略（2026-09-15 深夜 CDN 断流爆发后强化）：
+#   _DOWNLOAD_ATTEMPTS = 无进展尝试的上限（连续 3 次一无所获才判 failed）
+#   _DOWNLOAD_TOTAL_CAP = 总尝试硬上限（有进展的断流不计入上限，但防死循环）
+# 断流（RemoteProtocolError 等）若本次尝试有字节进账（.part 变大）→ 不消耗
+# 重试额度，退避后从断点继续——大视频在抖动 CDN 上就是这样一段段搬完的。
 _DOWNLOAD_ATTEMPTS = 3
+_DOWNLOAD_TOTAL_CAP = 12
 
 # 正在处理的帖子行 id 集合；停机时全部放回 PENDING。
 _INFLIGHT = set()
@@ -241,8 +246,14 @@ def _download_one(post, f, progress):
     os.makedirs(os.path.dirname(target), exist_ok=True)
 
     last_err = None
-    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+    attempts = 0          # 无进展尝试计数（有进账的断流不计）
+    total_attempts = 0    # 总尝试硬上限（防服务端边给边断的死循环）
+    while True:
+        total_attempts += 1
+        if total_attempts > _DOWNLOAD_TOTAL_CAP:
+            break
         offset = os.path.getsize(part) if os.path.isfile(part) else 0
+        exc = None        # except as e 在块尾会被删除——捕获到变量再判定
         try:
             headers = {"User-Agent": "Mozilla/5.0 tg-userbot-pawchive"}
             if offset:
@@ -272,15 +283,33 @@ def _download_one(post, f, progress):
             os.replace(part, target)
             return ("done", size, None)
         except httpx.HTTPStatusError as e:
+            exc = e
             last_err = f"HTTP {e.response.status_code}"
             if e.response.status_code in _DEAD_STATUS:
                 return ("dead", None, last_err)
         except Exception as e:   # noqa: BLE001 —— 网络类错误统一重试
+            exc = e
             last_err = f"{type(e).__name__}: {e}"
-        logger.warning(
-            f"🐾 文件第 {attempt} 次尝试失败：{f['filename']}（{last_err}）"
-            + ("，退避后 .part 续传重试" if attempt < _DOWNLOAD_ATTEMPTS else ""))
-        time.sleep(min(30, 5 * attempt))
+        gained = os.path.getsize(part) - offset if os.path.isfile(part) else 0
+        progressed = gained > 0 and isinstance(
+            exc, (httpx.RemoteProtocolError, httpx.ReadError,
+                  ConnectionError, TimeoutError))
+        if progressed:
+            # 有进账的断流：不消耗重试额度，退避后从断点继续——
+            # 大视频在抖动 CDN 上就是这样一段段搬完的
+            logger.warning(
+                f"🐾 文件尝试中断但有进账（+{gained} bytes，"
+                f"累计 {os.path.getsize(part) if os.path.isfile(part) else 0}）："
+                f"{f['filename']}（{last_err}），退避后 .part 续传")
+        else:
+            attempts += 1
+            logger.warning(
+                f"🐾 文件第 {attempts} 次无进展尝试失败：{f['filename']}"
+                f"（{last_err}）"
+                + ("，退避后重试" if attempts < _DOWNLOAD_ATTEMPTS else ""))
+        if attempts >= _DOWNLOAD_ATTEMPTS:
+            break
+        time.sleep(min(30, 5 * (attempts or 1)))
     return ("failed", None, last_err)
 
 
