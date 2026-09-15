@@ -664,25 +664,65 @@ async def retry_all_reply():
     return f"{TEXT_PREFIX}\n{msg}"
 
 
-def manual_text(limit=10):
-    """MANUAL（人工处理）视图：帖子直达链接 + 外链清单。"""
+def manual_view(limit=10):
+    """MANUAL（人工处理）视图：文本（作者/日期/帖子/外链清单）+ 按钮行。
+
+    每帖一行按钮：✅ 完成（paw_done 回调，人工处理完外链后点它标记
+    COMPLETED）+ 🔗 原帖（URL 按钮，直接打开帖子）。"""
+    from .menu import encode_menu_data   # 函数内导入避免 menu↔本模块成环
     try:
         posts = runtime_db.list_pawchive_posts(
             status=runtime_db.PAW_POST_MANUAL, limit=limit)
     except runtime_db.DbUnavailable as e:
-        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+        return (f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}", [])
     if not posts:
-        return f"{TEXT_PREFIX}\n👤 没有待人工处理的帖子（外链帖会在直链下完后出现在这里）"
-    lines = [f"{TEXT_PREFIX}：👤 待人工处理 {len(posts)} 帖", ""]
+        return (f"{TEXT_PREFIX}\n👤 没有待人工处理的帖子"
+                "（外链帖会在直链下完后出现在这里）", [])
+    lines = [f"{TEXT_PREFIX}：👤 待人工处理 {len(posts)} 帖"
+             "（处理完外链点 ✅ 标记完成）", ""]
+    rows = []
     for p in posts:
-        lines.append(f"#{p['id']} {p['creator_name']}｜{(p['title'] or '')[:40]}")
+        date = (p.get("published") or "")[:10] or "unknown"
+        lines.append(f"#{p['id']} {p['creator_name']}｜{date}｜"
+                     f"{(p['title'] or '')[:40]}")
         lines.append(p["post_url"])
         for l in (p.get("ext_links") or [])[:6]:
             lines.append(f"  · [{l.get('domain')}] {l['url']}")
         if len(p.get("ext_links") or []) > 6:
             lines.append(f"  … 等 {len(p['ext_links']) - 6} 条外链见帖子页")
         lines.append("")
-    return "\n".join(lines)
+        row = [Button.inline(f"✅ 完成 #{p['id']}",
+                             encode_menu_data("paw_done", str(p["id"])))]
+        if p.get("post_url"):
+            row.append(Button.url("🔗 原帖", p["post_url"]))
+        rows.append(row)
+    return "\n".join(lines), rows
+
+
+def manual_text(limit=10):
+    """纯文本兼容形态（旧调用点）：只取 manual_view 的正文。"""
+    return manual_view(limit)[0]
+
+
+def mark_manual_done(arg):
+    """/paw done <#行id>：把 MANUAL 帖标成 COMPLETED（人工处理完外链）。
+
+    #42 / 42 两种写法都收；已完成的给幂等提示；不存在/非 MANUAL 报错。"""
+    raw = str(arg or "").lstrip("#").strip()
+    if not raw.isdigit():
+        return f"{TEXT_PREFIX}\n❌ 用法：/paw done <帖子行id>（/paw manual 里 # 后面的数字）"
+    try:
+        ok = runtime_db.complete_pawchive_manual_post(int(raw))
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if ok:
+        return (f"{TEXT_PREFIX}\n✅ #{raw} 外链帖已标记完成"
+                "（MANUAL → COMPLETED）")
+    row = runtime_db.get_pawchive_post_row(int(raw))
+    if row and row["status"] == runtime_db.PAW_POST_COMPLETED:
+        return f"{TEXT_PREFIX}\nℹ️ #{raw} 已经标记过了"
+    return f"{TEXT_PREFIX}\n❌ #{raw} 不存在或不是待人工状态（只允许 MANUAL → 完成）"
+
 
 
 def pause_reply():
@@ -755,7 +795,8 @@ def parse_paw_command(text):
     head, _, rest = body.partition(" ")
     head_l = head.lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
-                  "resume", "manual", "cookie", "csv", "post", "find"):
+                  "resume", "manual", "done", "cookie", "csv", "post",
+                  "find"):
         return (head_l, rest.strip() or None)
     return ("help", None)
 
@@ -777,7 +818,20 @@ async def command_reply(event, cmd_text):
         await event.reply(resume_reply(), link_preview=False)
         return
     if action == "manual":
-        await event.reply(manual_text(), link_preview=False)
+        view_text, buttons = manual_view()
+        await event.reply(view_text, buttons=buttons, link_preview=False)
+        return
+    if action == "done":
+        reply = mark_manual_done(arg)
+        view_text, buttons = manual_view()
+        await event.reply(f"{reply}\n\n{view_text}", buttons=buttons,
+                          link_preview=False)
+        return
+    if action == "paw_done":
+        reply = mark_manual_done(arg)
+        view_text, buttons = manual_view()
+        await event.reply(f"{reply}\n\n{view_text}", buttons=buttons,
+                          link_preview=False)
         return
     if action == "search":
         await _reply_search(event, arg)
@@ -812,7 +866,8 @@ def _help_text():
         "  /paw search <关键词> —— 搜作者\n"
         "  /paw post <帖子URL|ID> —— 单独获取指定帖子的附件\n"
         "  /paw find <关键词> —— 按名称查扫描记录与当前目录文件\n"
-        "  /paw manual —— 待人工处理的帖子（含外链清单）\n"
+        "  /paw manual —— 待人工处理的帖子（含外链清单与 ✅ 按钮）\n"
+        "  /paw done <行id> —— 外链人工处理完，标记该帖 COMPLETED\n"
         "  /paw retry <行ID|all> —— 失败帖子重投\n"
         "  /paw pause / resume —— 暂停/恢复下载 worker\n"
         "  /paw cookie <Cookie> —— 保存会话 Cookie（用于收藏对比）\n"

@@ -45,13 +45,16 @@ USAGE_TEXT = (
 )
 
 # 菜单 🖥 命令行视图的预设按钮（键 → 命令）：选 macOS / Termux 都安全的
+# 键 = **要执行的完整命令**（sh_run 按钮直接执行键），值 = 按钮显示文字。
+# 曾经键短值长（"ls": "ls -la"）+ find 用完整命令当键 → sh_run 取值拿到
+# 按钮文字当命令执行（/bin/sh: 🔎: command not found，2026-09-15）。
+# 语义统一后：按名称搜文件走 ✏️ 自定义命令（模板见 sh_view_text）。
 PRESET_COMMANDS = {
-    "ls": "ls -la",
-    "df": "df -h .",
+    "ls -la": "ls -la",
+    "df -h .": "df -h .",
     "uptime": "uptime",
-    # find 系列（2026-09-15 用户要求：终端命令行按名称查当前目录数据）
-    "find . -maxdepth 3 -type f | head -60": "🔎 find 当前目录文件",
-    "find . -maxdepth 3 -type d | head -40": "📁 find 子目录",
+    # find 递归查文件（2026-09-15 用户要求：两个 find 合并为一个递归查询）
+    "find . -maxdepth 3 -type f | head -60": "🔎 find 文件（递归）",
 }
 
 

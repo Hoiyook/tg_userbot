@@ -645,7 +645,8 @@ MENU_ACTIONS = (
     # Pawchive：视图（含状态） / 搜作者 / Cookie / 暂停 / 恢复 / 待人工 /
     # 导出 CSV / 重投全部失败 / 搜索候选按钮（paw_pick 带序号）
     "paw", "paw_status", "paw_search", "paw_cookie", "paw_pause",
-    "paw_resume", "paw_manual", "paw_pick", "paw_csv", "paw_retry_all",
+    "paw_resume", "paw_manual", "paw_done", "paw_pick", "paw_csv",
+    "paw_retry_all",
     "paw_post", "paw_find",
     # CD2 子菜单视图与「命令行/上传」合并工具箱视图
     "cd2_menu", "tools",

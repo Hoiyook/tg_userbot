@@ -304,9 +304,11 @@ async def handle_menu_action(action, arg, event):
     if action == "sh":
         return shell.sh_view_text(), menu.sh_menu_buttons()
     if action == "sh_run":
-        # 预设命令按钮：执行后结果拼回视图，按钮保留可连续执行
-        cmd = shell.PRESET_COMMANDS.get(arg or "")
-        if not cmd:
+        # 预设命令按钮：arg 本身就是**要执行的命令**（PRESET_COMMANDS 的键；
+        # 值只是显示文字）。此前 .get(arg) 取到按钮文字当命令执行 →
+        # /bin/sh: 🔎: command not found（2026-09-15）。
+        cmd = arg or ""
+        if cmd not in shell.PRESET_COMMANDS:
             return "❌ 未知预设命令", menu.sh_menu_buttons()
         out = await shell.command_reply(f"/sh {cmd}")
         return (f"{out}\n\n──────\n\n{shell.sh_view_text()}",

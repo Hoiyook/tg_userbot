@@ -323,3 +323,72 @@ class StatusCountsTest(_PawDbTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ManualDoneTest(_PawDbTestCase):
+    """外链人工处理闭环：MANUAL → COMPLETED 标记（幂等、防误标）。"""
+
+    def _enqueue_manual(self):
+        """预置一帖：1 直链 + 2 外链，按 worker 真实路径推到 MANUAL。
+
+        finalize 只接受 PROCESSING（终态流转守卫），先 claim 再 finalize。"""
+        created, _ = self.enqueue_two()          # 111/222 两条 PENDING
+        rows = runtime_db.list_pawchive_posts(limit=10)
+        target = next(r for r in rows if r["post_id"] == "222")
+        first = runtime_db.claim_next_pawchive_post()   # id 序先领 111
+        assert first and first["id"] != target["id"]
+        claimed = runtime_db.claim_next_pawchive_post()  # 再领 222
+        assert claimed and claimed["id"] == target["id"]
+        runtime_db.finalize_pawchive_post(
+            target["id"], runtime_db.PAW_POST_MANUAL)
+        return target
+
+    def test_complete_manual_post(self):
+        target = self._enqueue_manual()
+        self.assertTrue(
+            runtime_db.complete_pawchive_manual_post(target["id"]))
+        row = runtime_db.find_pawchive_posts_by_post_id("222")[0]
+        self.assertEqual(row["status"], runtime_db.PAW_POST_COMPLETED)
+        self.assertIsNotNone(row["completed_at"])
+
+    def test_double_complete_is_noop(self):
+        """重复标记：第二次返回 False（幂等友好）。"""
+        target = self._enqueue_manual()
+        self.assertTrue(runtime_db.complete_pawchive_manual_post(target["id"]))
+        self.assertFalse(
+            runtime_db.complete_pawchive_manual_post(target["id"]))
+
+    def test_non_manual_rejected(self):
+        """PENDING/PROCESSING 帖子不可直接标完成（防误触跳过下载）。"""
+        created, _ = self.enqueue_two()
+        rows = runtime_db.list_pawchive_posts(limit=10)
+        self.assertFalse(
+            runtime_db.complete_pawchive_manual_post(rows[0]["id"]))
+
+    def test_manual_view_has_buttons_and_date(self):
+        """manual_view：日期/外链进正文；每帖 ✅ + 🔗 按钮（≤64 字节）。"""
+        from tg_userbot import pawchive
+        target = self._enqueue_manual()
+        text, buttons = pawchive.manual_view()
+        self.assertIn("TestCreator", text)
+        self.assertIn("2026-09-13", text)        # 日期
+        self.assertIn("https://mega.nz/file/x#key", text)
+        flat = [b for row in buttons for b in row]
+        done = [b for b in flat if "✅" in b.text]
+        self.assertEqual(len(done), 1)           # 一帖一个完成按钮
+        self.assertLessEqual(len(done[0].data), 64)
+        self.assertTrue(any(getattr(b, "url", None) for b in flat))  # 🔗 原帖
+
+    def test_manual_view_empty(self):
+        from tg_userbot import pawchive
+        text, buttons = pawchive.manual_view()
+        self.assertIn("没有待人工处理", text)
+        self.assertEqual(buttons, [])
+
+    def test_mark_manual_done_by_arg(self):
+        """pawchive.mark_manual_done：#id/裸 id 均可；已完成的给幂等提示。"""
+        from tg_userbot import pawchive
+        target = self._enqueue_manual()
+        self.assertIn("✅", pawchive.mark_manual_done(f"#{target['id']}"))
+        self.assertIn("已经", pawchive.mark_manual_done(f"{target['id']}"))
+        self.assertIn("❌", pawchive.mark_manual_done("999999"))

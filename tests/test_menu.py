@@ -1016,11 +1016,28 @@ class ShMenuViewTest(unittest.TestCase):
                   for row in rows for b in row]
         actions = [(menu.parse_menu_data(d)) for _, d in labels]
         run_args = [arg for action, arg in actions if action == "sh_run"]
-        self.assertEqual(len(run_args), 5)   # ls/df/uptime/find×2
+        self.assertEqual(len(run_args), 4)   # ls -la / df / uptime / find
         for arg in run_args:
             self.assertIn(arg, shell.PRESET_COMMANDS)
         self.assertTrue(any(action == "sh_input" for action, _ in actions))
         self.assertTrue(any(action == "home" for action, _ in actions))
+
+    def test_every_preset_key_executes_without_error(self):
+        """回归（2026-09-15）：每个预设键就是可执行命令——曾把按钮文字当
+        命令执行，/bin/sh 报 🔎: command not found。"""
+        import asyncio
+
+        async def run_all():
+            outs = []
+            for cmd in shell.PRESET_COMMANDS:
+                outs.append(await shell.command_reply(f"/sh {cmd}"))
+            return outs
+
+        outs = asyncio.run(run_all())
+        for cmd, out in zip(shell.PRESET_COMMANDS, outs):
+            self.assertNotIn("❌ /sh", out, f"预设 {cmd!r} 执行报错")
+            self.assertNotIn("command not found", out, f"预设 {cmd!r} 执行报错")
+            self.assertNotIn("未知预设命令", out)
 
 
 class UpMenuViewTest(unittest.TestCase):

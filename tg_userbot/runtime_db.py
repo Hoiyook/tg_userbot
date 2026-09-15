@@ -1344,6 +1344,29 @@ def renew_pawchive_lease(post_row, lease_seconds=None, now=None):
     return _write(do, "续 Pawchive 租约")
 
 
+def get_pawchive_post_row(row_id):
+    """按行 id 取单帖（找不到返回 None）。"""
+    row = _read(lambda c: _execute(
+        c, "SELECT * FROM pawchive_posts WHERE id=?", (int(row_id),)
+    ).fetchone(), f"取 Pawchive 帖子（{row_id}）")
+    return _row_to_pawchive_post(row) if row else None
+
+
+def complete_pawchive_manual_post(post_row, now=None):
+    """外链人工处理完成：MANUAL → COMPLETED。
+
+    只允许从 MANUAL 流转（PENDING/PROCESSING 不能跳过下载直接标完成）；
+    已是 COMPLETED 返回 False（幂等友好）。返回是否发生流转。"""
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE pawchive_posts SET status=?, completed_at=?, "
+            "lease_until=NULL WHERE id=? AND status=?",
+            (PAW_POST_COMPLETED, _now(now), int(post_row), PAW_POST_MANUAL))
+        return cur.rowcount > 0
+    return _write(do, f"标记 Pawchive 外链帖完成（{post_row}）")
+
+
 def list_pawchive_files(post_row):
     rows = _read(lambda c: _execute(
         c, "SELECT * FROM pawchive_files WHERE post_row=? ORDER BY id",
