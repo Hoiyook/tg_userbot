@@ -331,6 +331,73 @@ class DownloadOneHttpTest(_WorkerDbTestCase):
         result, target, _ = self._run_download(handler)
         self.assertEqual(result[0], "failed")
 
+    def test_existing_target_wrong_size_redownloads(self):
+        """任务书 §8-A 反例：目标存在但大小不符（截断/损坏）→ 重新下载。"""
+        post = _post()
+        f = {"id": 1, "url": "https://file.pawchive.pw/data/a.mp4",
+             "filename": "a.mp4", "status": runtime_db.PAW_FILE_PENDING}
+        target = worker._target_path(post, "a.mp4")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as fh:
+            fh.write(b"truncated")   # 9 字节，远端是 11 字节
+
+        def handler(request):
+            return httpx.Response(200, content=b"hello-world")
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.Client
+        with mock.patch.object(worker, "_head_alive",
+                               return_value=(200, 11)), \
+                mock.patch.object(worker.httpx, "Client",
+                                  side_effect=lambda **kw: real_client(
+                                      transport=transport, **kw)), \
+                mock.patch.object(worker.time, "sleep",
+                                  new=lambda s: None):
+            result = asyncio.run(
+                asyncio.to_thread(worker._download_one, post, f,
+                                  lambda c, t: None))
+        self.assertEqual(result[0], "done")
+        self.assertEqual(result[1], 11)
+        with open(target, "rb") as fh:
+            self.assertEqual(fh.read(), b"hello-world")
+
+    def test_410_marked_dead(self):
+        def handler(request):
+            return httpx.Response(410, text="gone")
+        post = _post()
+        f = {"id": 1, "url": "https://x/gone.mp4", "filename": "gone.mp4",
+             "status": runtime_db.PAW_FILE_PENDING}
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.Client
+        with mock.patch.object(worker.httpx, "Client",
+                               side_effect=lambda **kw: real_client(
+                                   transport=transport, **kw)):
+            result = asyncio.run(
+                asyncio.to_thread(worker._download_one, post, f,
+                                  lambda c, t: None))
+        self.assertEqual(result[0], "dead")
+        self.assertIn("410", result[2])
+
+    def test_500_retries_then_failed_not_dead(self):
+        """任务书 §8-D：服务端错误可重试，耗尽后 failed（≠ 死链 dead）。"""
+        def handler(request):
+            return httpx.Response(500, text="boom")
+        post = _post()
+        f = {"id": 1, "url": "https://x/err.mp4", "filename": "err.mp4",
+             "status": runtime_db.PAW_FILE_PENDING}
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.Client
+        with mock.patch.object(worker.httpx, "Client",
+                               side_effect=lambda **kw: real_client(
+                                   transport=transport, **kw)), \
+                mock.patch.object(worker.time, "sleep",
+                                  new=lambda s: None):
+            result = asyncio.run(
+                asyncio.to_thread(worker._download_one, post, f,
+                                  lambda c, t: None))
+        self.assertEqual(result[0], "failed")
+        self.assertIn("500", result[2])
+
     def test_existing_target_same_size_skips(self):
         """目标已存在且远端大小一致 → 直接算完成，不发起下载。"""
         post = _post()

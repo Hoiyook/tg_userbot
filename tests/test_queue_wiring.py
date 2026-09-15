@@ -194,20 +194,38 @@ class TestJsonSwitch(_SqliteModeBase):
         fake_del.assert_not_called()
 
 
+async def _async_noop(*a, **k):
+    return None
+
+
 class TestDegradation(_SqliteModeBase):
     """测试 8：write-through 失败 → 仅告警，内存权威，绝不抛给下载链路。"""
 
-    async def test_db_failure_keeps_memory_and_warns(self):
+    async def test_db_failure_rolls_back_and_refuses(self):
+        """P0-1：DB 写失败 → 回滚内存、不 spawn、通知，返回 False。
+
+        旧契约（内存为准继续执行）会让「执行过的任务」在崩溃后蒸发——
+        2026-09-15 任务书判为 P0。新契约：未被持久化的任务绝不执行；
+        任务本体仍在 Telegram（收藏夹原件/源消息），上游有恢复路径。"""
         record = _record()
-        state.QUEUE["tasks"].append(record)
+        spawned = []
+
+        async def fake_spawn(rec):
+            spawned.append(rec)
+
         with mock.patch.object(runtime_db, "queue_insert",
                                side_effect=runtime_db.DbUnavailable("炸了")), \
-                self.assertLogs("tg_userbot", level="WARNING"):
-            await queue_mod.enqueue_and_start(record)
+                mock.patch.object(queue_mod, "spawn_execute",
+                                  side_effect=fake_spawn), \
+                mock.patch("tg_userbot.notify.notify_user",
+                           side_effect=_async_noop), \
+                self.assertLogs("tg_userbot", level="ERROR"):
+            ok = await queue_mod.enqueue_and_start(record)
         await asyncio.sleep(0)
-        # 内存变更保留（权威），没有 JSON 兜底写（防分裂状态）
-        self.assertEqual(len(state.QUEUE["tasks"]), 1)
+        self.assertFalse(ok, "持久化失败必须返回 False（未入队）")
+        self.assertEqual(len(state.QUEUE["tasks"]), 0, "内存必须回滚")
         self.assertEqual(self._db_ids(), [])
+        self.assertEqual(spawned, [], "未持久化的任务绝不允许执行")
 
     def test_load_falls_back_to_json_when_db_not_ready(self):
         state.RUNTIME_DB_READY = False

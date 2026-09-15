@@ -287,6 +287,9 @@ ME_LABEL_WINDOW_SECONDS = 5
 # 永不全量重写），启动时载入内存并只在启动裁剪到 DEDUP_MAX_ENTRIES 条
 # （保尾部，超限原子重写一次）。键：tg:<file_unique_id> / dyc:<aweme_id>。
 DEDUP_INDEX_FILE = os.path.join(RUNTIME_DIR, "dedup_index.txt")
+# DB 写失败时的判重键暂存（P1-1，2026-09-15）：remember 失败先落这里，
+# 启动 load_index 时补写进 DB（防「文件已下载、键没落库」的重启重复下载窗口）
+DEDUP_PENDING_FILE = os.path.join(RUNTIME_DIR, "dedup_pending.jsonl")
 DEDUP_CONFIG_FILE = os.path.join(RUNTIME_DIR, "dedup_config.json")
 DEDUP_MAX_ENTRIES = 10000
 
@@ -425,6 +428,8 @@ RUNTIME_DB_SYNCHRONOUS = (
 # ---- Listener Worker（规格 §27/§31/§32）----
 # 第一版并发固定 1：一次只发一条，配合下面的最小间隔做保守节流。
 LISTEN_WORKER_CONCURRENCY = 1
+# 转发副本入队失败后，对账器补建的间隔（秒）（P0-2，2026-09-15）
+LISTEN_ENQUEUE_RETRY_DELAY_SECONDS = 60
 # 没有可执行任务时的轮询间隔（秒）
 LISTEN_WORKER_POLL_SECONDS = 2.0
 # 两条转发之间的最小间隔（秒）。**这不是 Telegram 官方安全阈值**，只是保守

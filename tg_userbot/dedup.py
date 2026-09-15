@@ -27,6 +27,7 @@ from .config import (
     DEDUP_CONFIG_FILE,
     DEDUP_INDEX_FILE,
     DEDUP_MAX_ENTRIES,
+    DEDUP_PENDING_FILE,
 )
 from . import runtime_db
 from .log import logger
@@ -183,6 +184,9 @@ def remember(keys, filename, size=None, now=None):
                 runtime_db.dedup_index_append(key, ts, safe_name)
             except Exception as e:
                 logger.warning(f"写去重索引失败（不影响下载）：{e}")
+                # P1-1：DB 写失败先落 pending，启动 load_index 时补写进 DB——
+                # 否则此刻之后崩溃会留下「文件已下载、键没落库」的重复窗口
+                _append_pending(key, ts, safe_name)
         else:
             try:
                 with open(DEDUP_INDEX_FILE, "a", encoding="utf-8") as f:
@@ -191,6 +195,70 @@ def remember(keys, filename, size=None, now=None):
                 logger.warning(f"写去重索引失败（不影响下载）：{e}")
         # dict 更新无条件执行（写失败仅告警的语义，文件/DB 一致）
         state.DEDUP_INDEX[key] = {"date": ts, "filename": safe_name}
+
+
+def _append_pending(key, ts, filename):
+    """把 DB 写失败的键追加进 pending 文件（jsonl 单行，无锁纪律）。"""
+    try:
+        with open(DEDUP_PENDING_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"key": key, "ts": ts, "filename": filename},
+                               ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"写去重 pending 失败（该键可能需重新下载补键）：{e}")
+
+
+def _replay_pending():
+    """启动补写：把 pending 里的键逐条写进 DB，成功的行移出 pending。
+
+    全部成功 → 文件改名 .done 归档；部分失败 → 原文件只留失败行（重启再试）。
+    只在 DB 已连接时调用。
+    """
+    path = DEDUP_PENDING_FILE
+    if not os.path.isfile(path):
+        return 0
+    entries, remaining = [], []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    entries.append(json.loads(ln))
+                except ValueError:
+                    continue
+    except OSError as e:
+        logger.warning(f"读去重 pending 失败（重启再试）：{e}")
+        return 0
+    if not entries:
+        return 0
+    done = 0
+    for e in entries:
+        try:
+            runtime_db.dedup_index_append(e["key"], e.get("ts"),
+                                          e.get("filename"))
+            state.DEDUP_INDEX[e["key"]] = {
+                "date": e.get("ts"), "filename": e.get("filename")}
+            done += 1
+        except Exception as ex:
+            logger.warning(f"去重 pending 补写失败（保留重试）：{ex}")
+            remaining.append(e)
+    if remaining:
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                for e in remaining:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+    else:
+        try:
+            os.replace(path, path + ".done")
+            logger.info(f"🛡 去重 pending 已全部补写进 DB（{done} 条，归档 .done）")
+        except OSError:
+            pass
+    return done
 
 
 def load_index():
@@ -202,7 +270,13 @@ def load_index():
     保尾部。"""
     state.DEDUP_INDEX = {}
     if runtime_db.has_connection():
-        return _load_index_db()
+        count = _load_index_db()
+        # P1-1：补写 DB 写失败期间暂存的键（顺序在裁剪前——补写的键不该被
+        # 裁掉；超额由既有尾部裁剪统一兜底）
+        replayed = _replay_pending()
+        if replayed:
+            count += replayed
+        return count
     return _load_index_file()
 
 

@@ -507,14 +507,24 @@ async def _safe_fetch(fetch, peer, msg_id):
 # 转发 ~40 个文件时几十个取消息请求并发砸向同一群组触发 Telegram 限流。
 # asyncio 原语禁止 import 期创建（事件循环规则）→ 懒初始化。
 _FETCH_SEMAPHORE = None
+_FETCH_GATE_LOOP = None
 _LAST_FETCH_AT = 0.0
 
 
 def _fetch_gate():
-    global _FETCH_SEMAPHORE
-    if _FETCH_SEMAPHORE is None:
+    """并发闸（懒初始化 + 循环守卫）。
+
+    asyncio 原语禁止 import 期创建（事件循环规则）；且 Semaphore 首次
+    await 即绑定当前循环——测试套件里每个 IsolatedAsyncioTestCase 各有
+    独立循环，跨循环复用会永久挂起，故循环变了就重建（进程内生产环境
+    只有一个循环，守卫是零开销的）。
+    """
+    global _FETCH_SEMAPHORE, _FETCH_GATE_LOOP
+    loop = asyncio.get_running_loop()
+    if _FETCH_SEMAPHORE is None or _FETCH_GATE_LOOP is not loop:
         _FETCH_SEMAPHORE = asyncio.Semaphore(
             int(getattr(config, "ORIGIN_FETCH_CONCURRENCY", 3)))
+        _FETCH_GATE_LOOP = loop
     return _FETCH_SEMAPHORE
 
 

@@ -236,6 +236,9 @@ async def _enqueue_copy(copy, source_link, album_caption, src, parent_date=None,
                         parent_caption=None, source_name=None):
     """入队一份转发副本（走现有下载链路，不新增第二套下载器 §22）。
 
+    返回是否真正入队：False = 队列持久化失败未入队（P0-1），调用方据此把
+    任务留在 FORWARDED 交对账器补建。
+
     ``app`` 函数内导入：app 顶层 `from . import listener_worker`（要挂 Worker
     任务），模块级互相导入会成环。本模块只在发送路径上用到它。
 
@@ -244,7 +247,7 @@ async def _enqueue_copy(copy, source_link, album_caption, src, parent_date=None,
     Worker 不读 listen.json，也不该在这时候再去查一次原帖）。
     """
     from . import app
-    await app.enqueue_media(
+    return await app.enqueue_media(
         copy, state.MY_ID, source_name,
         source_link=source_link,
         album_caption=album_caption,
@@ -304,31 +307,27 @@ async def execute_task(task):
         )
 
         if is_saved and task.get("download"):
-            payload = task.get("payload") or {}
-            caption = payload.get("caption") or ""
-            # 评论继承到的频道原帖日期：扫描时快照进 payload，这里原样透传。
-            parent_date = payload.get("parent_date")
-            parent_caption = payload.get("parent_caption") or None
-            source_name = payload.get("source_name") or None
-            source_link = _source_link(messages[0], task["source_chat_id"])
-            # 台账输入侧来源随任务 origin 记账：wl 任务的副本算「中转」，
-            # 不再与用户手动转发混进「收藏」桶（listen 链行为不变）。
-            src = task.get("origin") or "listen"
-            for copy in copies:
-                own_text = (getattr(copy, "message", "") or "").strip()
-                # 转发副本保留自己的说明；无文字的副本继承源侧读到的相册说明
-                # （否则相册里的图片会退化成 媒体类型_时间戳 命名）
-                cap = None if own_text else (caption or None)
+            # P0-2：转发成功后先落持久化事实（FORWARDED + 副本 id），再入队
+            # 下载。此前「转发成功、入队失败 → 任务照标 SUCCESS」会让副本永远
+            # 没人下载；现在停在 FORWARDED 的任务由对账器补建入队，不重转发。
+            _safe(lambda: runtime_db.mark_listener_forwarded(
+                task_id, [c.id for c in copies]))
+            failed = await _enqueue_download_copies(task, messages, copies)
+            if failed:
+                delay = int(config.LISTEN_ENQUEUE_RETRY_DELAY_SECONDS)
+                _safe(lambda: runtime_db.mark_listener_enqueue_retry(
+                    task_id, failed, delay))
+                logger.warning(
+                    f"📡 任务 #{task_id} 有 {len(failed)} 个副本未入队，"
+                    f"{delay}s 后由对账器补建（不重新转发）：{failed}")
                 try:
-                    await _enqueue_copy(copy, source_link, cap, src,
-                                        parent_date, parent_caption,
-                                        source_name)
-                except Exception as e:
-                    # 转发已发生且成功：入队失败不该把任务判成失败（重跑会重复
-                    # 转发）。记错误即可——副本已躺在收藏夹，用户看得见。
-                    logger.exception(
-                        f"📡 任务 #{task_id} 副本入队失败（转发已完成，任务仍算成功）：{e}"
-                    )
+                    from . import notify
+                    await notify.notify_user(
+                        f"📡 {len(failed)} 个转发副本暂未能入队下载，"
+                        f"将在 {delay}s 后自动补建（任务 #{task_id}）")
+                except Exception:
+                    pass
+                return True   # 任务交给对账器；不算失败（失败会重转发）
 
         _safe(lambda: runtime_db.complete_listener_task(task_id))
         return True
@@ -383,6 +382,133 @@ def _safe(proc):
     except runtime_db.DbUnavailable as e:
         logger.error(f"📡 更新任务状态失败（租约到期后会恢复）：{e}")
         return None
+
+
+def _copy_enqueue_failed_ids(task, copies, results):
+    """本次入队尝试里失败的副本 id（results 与 copies 一一对应，True=成功）。"""
+    return [copy.id for copy, ok in zip(copies, results) if not ok]
+
+
+async def _enqueue_download_copies(task, messages, copies):
+    """把转发副本逐条入队下载；返回失败副本 id 列表（空 = 全部入队成功）。
+
+    execute_task 与对账器共用：caption 继承、来源标记、透传字段只写这一份。
+    """
+    payload = task.get("payload") or {}
+    caption = payload.get("caption") or ""
+    # 评论继承到的频道原帖日期：扫描时快照进 payload，这里原样透传。
+    parent_date = payload.get("parent_date")
+    parent_caption = payload.get("parent_caption") or None
+    source_name = payload.get("source_name") or None
+    source_link = (_source_link(messages[0], task["source_chat_id"])
+                   if messages else None)
+    # 台账输入侧来源随任务 origin 记账：wl 任务的副本算「中转」，
+    # 不再与用户手动转发混进「收藏」桶（listen 链行为不变）。
+    src = task.get("origin") or "listen"
+    failed = []
+    for copy in copies:
+        own_text = (getattr(copy, "message", "") or "").strip()
+        # 转发副本保留自己的说明；无文字的副本继承源侧读到的相册说明
+        # （否则相册里的图片会退化成 媒体类型_时间戳 命名）
+        cap = None if own_text else (caption or None)
+        try:
+            enqueued = await _enqueue_copy(copy, source_link, cap, src,
+                                           parent_date, parent_caption,
+                                           source_name)
+            if enqueued is False:
+                failed.append(copy.id)
+        except Exception as e:
+            # 入队抛错（判重以外的意外）：副本已躺在收藏夹，交给对账器补建。
+            logger.exception(
+                f"📡 任务 #{task.get('id')} 副本 {getattr(copy, 'id', '?')} "
+                f"入队异常：{e}")
+            failed.append(copy.id)
+    return failed
+
+
+async def _fetch_saved_copies(copy_ids):
+    """从收藏夹取回转发副本（P0-2 对账用）；带无进度看门狗（Telethon 请求
+    没有读超时，与 execute_task 取源消息同一套纪律）。"""
+    fetch = asyncio.ensure_future(
+        state.client.get_messages(state.MY_ID, ids=list(copy_ids)))
+    try:
+        try:
+            await asyncio.wait(
+                {fetch},
+                timeout=config.QUEUE_FETCH_TIMEOUT)
+        except asyncio.CancelledError:
+            if not fetch.done():
+                fetch.cancel()
+                try:
+                    await fetch
+                except asyncio.CancelledError:
+                    pass
+            raise
+        if not fetch.done():
+            fetch.cancel()
+            try:
+                await fetch
+            except asyncio.CancelledError:
+                pass
+            logger.error("⏰ 对账取副本超时，本轮跳过")
+            return None
+        return fetch.result()
+    except asyncio.TimeoutError:
+        return None
+
+
+async def reconcile_forwarded_tasks():
+    """P0-2 对账：补建「已转发但未入队」的下载任务（崩溃/DB 故障后恢复）。
+
+    FORWARDED + 到期（next_retry_at 为空或已到）的任务逐条处理：取回收藏夹
+    副本 → 复用 execute_task 同一套入队逻辑（dedup 天然幂等：已入队/已下载
+    的副本会被跳过且按成功处理）→ 全部入队成功补 SUCCESS；仍失败安排下一轮；
+    副本已删 → FAILED（人工 /wl since 或重扫可再触发）。
+    """
+    try:
+        tasks = runtime_db.list_listener_tasks_due_forwarded()
+    except runtime_db.DbUnavailable as e:
+        logger.error(f"📡 对账读取 FORWARDED 任务失败（本轮跳过）：{e}")
+        return 0
+    handled = 0
+    for task in tasks:
+        task_id = task["id"]
+        copy_ids = (task.get("payload") or {}).get("copy_msg_ids") or []
+        if not copy_ids:
+            # 没有副本事实可依（不该发生）：按失败落账，人工兜底
+            _safe(lambda: runtime_db.fail_listener_task(
+                task_id, error="FORWARDED 任务缺 copy_msg_ids"))
+            continue
+        if state.client is None:
+            return handled
+        copies = await _fetch_saved_copies(copy_ids)
+        if copies is None:
+            continue   # 取副本超时：下轮再试（next_retry_at 不动 = 立即到期）
+        missing = [cid for cid, c in zip(copy_ids, copies) if c is None]
+        alive = [c for c in copies if c is not None]
+        if not alive:
+            logger.warning(f"📡 对账任务 #{task_id} 的副本已全部删除，转 FAILED")
+            _safe(lambda: runtime_db.fail_listener_task(
+                task_id, error=f"转发副本已被删除：{missing}"))
+            handled += 1
+            continue
+        failed = await _enqueue_download_copies(task, alive, alive)
+        if missing:
+            logger.warning(
+                f"📡 对账任务 #{task_id} 有 {len(missing)} 个副本已删除"
+                f"（跳过）：{missing}")
+        if failed:
+            delay = int(config.LISTEN_ENQUEUE_RETRY_DELAY_SECONDS)
+            _safe(lambda: runtime_db.mark_listener_enqueue_retry(
+                task_id, failed, delay))
+            logger.warning(
+                f"📡 对账任务 #{task_id} 仍有 {len(failed)} 个副本未入队，"
+                f"{delay}s 后再试")
+            continue
+        _safe(lambda: runtime_db.complete_listener_task(task_id))
+        logger.info(f"📡 对账任务 #{task_id} 副本已全部补建入队（SUCCESS）")
+        handled += 1
+    return handled
 
 
 async def _fallback_direct_download(task, messages, source_name):
@@ -471,12 +597,18 @@ def _task_label(task):
 # 主循环
 # ============================================================
 async def run_once():
-    """跑一轮：恢复过期租约 + 领一条任务执行。返回本轮是否真的干了活。
+    """跑一轮：恢复过期租约 + 对账 FORWARDED + 领一条任务执行。
 
     Worker 不因为单条任务失败而退出（§42）：execute_task 自己吞掉异常，这里
     再兜一层防意外。
     """
     recover_expired()
+    try:
+        await reconcile_forwarded_tasks()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"📡 FORWARDED 对账异常（继续运行）：{e}")
     task = claim_next_task()
     if task is None:
         pause = paused_for()

@@ -628,6 +628,49 @@ async def download_file(message, source_override=None, caption_override=None,
         # 撞上同一个 final_path/.download（一方 os.replace 后，另一方报
         # 「临时文件不存在」）。先占位再下载可避免；串行时 os.path.exists
         # 兜底加 (1)(2)，语义与 naming.unique_path 一致。
+        # ------------------------------------------------------------
+        # 幂等恢复（2026-09-15，任务书 §7/场景 3）：上次下载已完成 os.replace
+        # 但进程在收尾（历史/去重/队列移除）前崩溃 → 重启重放任务时目标已
+        # 存在。声明大小可读且与现存文件一致 → 直接按成功收尾，绝不重新完整
+        # 下载。声明大小拿不到就不走捷径（保持原行为；重名经
+        # _reserve_final_path 加 (1)，绝不覆盖已有文件）。
+        # ------------------------------------------------------------
+        try:
+            _declared = message.file.size if message.file else None
+        except Exception:
+            _declared = None
+        _candidate = os.path.join(folder, final_filename)
+        if _declared and os.path.isfile(_candidate) \
+                and os.path.getsize(_candidate) == _declared:
+            actual_size = os.path.getsize(_candidate)
+            logger.info(
+                f"✅ 目标文件已存在且大小一致（上次下载后收尾前中断），"
+                f"跳过重新下载：{final_filename}")
+            if task_id:
+                stats.emit_event(
+                    "SUCCESS", task_id=task_id, bytes=actual_size,
+                    label=final_filename,
+                )
+            append_history(
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 普通 | "
+                f"{final_filename} | {format_size(actual_size)}"
+                f" | 来源：{source}"
+            )
+            dedup.remember(
+                dedup.media_keys(message), final_filename, actual_size,
+            )
+            try:
+                await notify.notify_user(
+                    "✅ 下载完成\n\n"
+                    f"来源：{source}\n"
+                    f"文件：{final_filename}\n"
+                    f"大小：{format_size(actual_size)}\n"
+                    "（检测到文件已存在，跳过重复下载）",
+                )
+            except Exception as e:
+                logger.warning(f"发送完成通知失败：{e}")
+            return True
+
         final_path = _reserve_final_path(folder, final_filename)
         temp_path = final_path + ".download"
 

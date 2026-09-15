@@ -52,6 +52,13 @@ STATUS_FAILED = "FAILED"
 STATUS_CANCELLED = "CANCELLED"
 TERMINAL_STATUSES = (STATUS_SUCCESS, STATUS_FAILED, STATUS_CANCELLED)
 
+# 转发已完成、下载副本入队未完成的中间态（2026-09-15，P0-2 对账）。
+# PROCESSING →（转发成功）FORWARDED →（副本全部入队）SUCCESS。
+# 停在 FORWARDED 的任务由 listener_worker 的对账器凭 payload.copy_msg_ids
+# 补建下载任务，**绝不重新转发**；不参与 claim（只领 PENDING）与租约恢复
+# （只恢复 PROCESSING）——它不是「执行中」，是「等对账」。
+STATUS_FORWARDED = "FORWARDED"
+
 # 事件类型（规格 §10）。命名与现有 stats 对齐（RECEIVED/QUEUED/RUNNING/RETRY/
 # SUCCESS/FAILED/CANCELLED/DEDUP_HIT），另加 LEASE_EXPIRED。
 # 注意：**这套事件只属于 listener 自己的任务生命周期**，与 stats 写进
@@ -920,15 +927,20 @@ def _target_label(task) -> str:
 
 
 def complete_listener_task(task_id, now=None, detail=None):
-    """任务成功：SUCCESS + completed_at（终态，不再被领取）。"""
+    """任务成功：SUCCESS + completed_at（终态，不再被领取）。
+
+    接受 PROCESSING（转发+入队一气呵成）与 FORWARDED（P0-2 对账器补建
+    完成入口队）两种来路。
+    """
     now = _now(now)
 
     def do(conn):
         cur = _execute(
             conn,
             "UPDATE listener_tasks SET status=?, completed_at=?, "
-            "lease_until=NULL, last_error=NULL WHERE id=? AND status=?",
-            (STATUS_SUCCESS, now, int(task_id), STATUS_PROCESSING),
+            "lease_until=NULL, last_error=NULL WHERE id=? AND status IN (?,?)",
+            (STATUS_SUCCESS, now, int(task_id),
+             STATUS_PROCESSING, STATUS_FORWARDED),
         )
         if cur.rowcount:
             _insert_event(conn, task_id, EV_SUCCESS, now, detail)
@@ -1065,6 +1077,74 @@ def recover_expired_listener_tasks(now=None):
             + (f" 等 {len(rows) - 5} 条" if len(rows) > 5 else "")
         )
     return len(rows)
+
+
+def mark_listener_forwarded(task_id, copy_msg_ids, now=None):
+    """转发成功后落持久化事实（P0-2）：status=FORWARDED + 副本 id 进 payload。
+
+    copy_msg_ids 是**收藏夹里转发副本**的消息 id 列表（对账器凭它取回副本
+    补建下载任务）。短事务；只允许 PROCESSING → FORWARDED。
+    """
+    now = _now(now)
+
+    def do(conn):
+        row = _execute(
+            conn, "SELECT payload FROM listener_tasks WHERE id=?",
+            (int(task_id),)).fetchone()
+        if row is None:
+            return False
+        payload = _loads(row["payload"]) or {}
+        payload["copy_msg_ids"] = [int(x) for x in (copy_msg_ids or []) if x]
+        cur = _execute(
+            conn,
+            "UPDATE listener_tasks SET status=?, lease_until=NULL, payload=? "
+            "WHERE id=? AND status=?",
+            (STATUS_FORWARDED, _dumps(payload), int(task_id),
+             STATUS_PROCESSING),
+        )
+        return bool(cur.rowcount)
+
+    return _write(do, "标记任务已转发（待下载入队）")
+
+
+def mark_listener_enqueue_retry(task_id, failed_ids, delay_seconds, now=None):
+    """副本入队失败：留在 FORWARDED，安排对账器 delay 后补建（**不重新转发**）。
+
+    failed_ids 记进 payload（排查用）；next_retry_at 复用既有列（对账器按它
+    挑到期任务，与 retry 语义无关——任务并没有回 PENDING）。
+    """
+    now = _now(now)
+
+    def do(conn):
+        row = _execute(
+            conn, "SELECT payload FROM listener_tasks WHERE id=?",
+            (int(task_id),)).fetchone()
+        if row is None:
+            return False
+        payload = _loads(row["payload"]) or {}
+        payload["enqueue_failed_ids"] = [int(x) for x in (failed_ids or []) if x]
+        cur = _execute(
+            conn,
+            "UPDATE listener_tasks SET next_retry_at=?, payload=? "
+            "WHERE id=? AND status=?",
+            (now + max(1, int(delay_seconds)), _dumps(payload),
+             int(task_id), STATUS_FORWARDED),
+        )
+        return bool(cur.rowcount)
+
+    return _write(do, "安排转发副本入队对账")
+
+
+def list_listener_tasks_due_forwarded(now=None, limit=10):
+    """列出对账到期的 FORWARDED 任务（next_retry_at 为空视作立即到期）。"""
+    now = _now(now)
+    rows = _read(lambda c: _execute(
+        c,
+        "SELECT * FROM listener_tasks WHERE status=? "
+        "AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY id LIMIT ?",
+        (STATUS_FORWARDED, now, int(limit))).fetchall(),
+        "列到期 FORWARDED 任务")
+    return [_row_to_task(r) for r in rows]
 
 
 # ============================================================

@@ -21,6 +21,7 @@
 """
 import asyncio
 import atexit
+import json
 import os
 import shutil
 import tempfile
@@ -34,6 +35,7 @@ _TMP = tempfile.mkdtemp(prefix="tg_userbot_dedup_test_")
 atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
+from tg_userbot import runtime_db  # noqa: E402
 from tg_userbot import state  # noqa: E402
 from tg_userbot import config  # noqa: E402
 from tg_userbot import dedup  # noqa: E402
@@ -544,3 +546,71 @@ class EnqueueMediaKeysTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DedupPendingTest(unittest.TestCase):
+    """P1-1（2026-09-15）：DB 写失败 → 键落 pending；启动 load_index 补写。
+
+    文件已下载、键没落库的窗口会在重启后造成重复下载——pending 机制把这个
+    窗口收窄到「DB 恢复前」，且补写是自动的、可归档追溯的（.done）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="dedup_pending_", dir=_TMP)
+        self.old_index = state.DEDUP_INDEX
+        state.DEDUP_INDEX = {}
+        self._db = mock.patch.object(runtime_db, "has_connection",
+                                     return_value=True)
+        self._db.start()
+        self._pending = mock.patch.object(
+            dedup, "DEDUP_PENDING_FILE",
+            os.path.join(self.tmp, "dedup_pending.jsonl"))
+        self._pending.start()
+        # 刻意**不用** mock.patch.stopall：它会把其他测试文件在 import 期
+        # 启动的全局补丁（如 follow/reply_inherit 的重试延迟归零）一并停掉，
+        # 污染整个套件（2026-09-15 实测：全量跑到 follow 时真实退避 30s×2
+        # 卡死 150s+）。只停自己启动的补丁。
+        self.addCleanup(self._db.stop)
+        self.addCleanup(self._pending.stop)
+        self.addCleanup(setattr, state, "DEDUP_INDEX", self.old_index)
+
+    def test_db_failure_writes_pending_and_replay_backfills(self):
+        """remember 遇 DB 故障：pending 落盘；DB 恢复后 load_index 自动补写。"""
+        with mock.patch.object(runtime_db, "dedup_index_append",
+                               side_effect=runtime_db.DbUnavailable("DB 炸了")):
+            dedup.remember("tg:lost-key", "丢失的键.mp4", 123)
+        # 内存仍更新（实时判重不缺）；pending 落盘
+        self.assertIn("tg:lost-key", state.DEDUP_INDEX)
+        self.assertTrue(os.path.exists(dedup.DEDUP_PENDING_FILE))
+        # DB 恢复：补写成功 → DB 有键、pending 归档
+        with mock.patch.object(runtime_db, "dedup_index_append",
+                               return_value=True) as append:
+            count = dedup.load_index()
+        self.assertGreaterEqual(count, 1)
+        append.assert_any_call("tg:lost-key", mock.ANY, "丢失的键.mp4")
+        self.assertFalse(os.path.exists(dedup.DEDUP_PENDING_FILE),
+                         "全部补写成功应归档")
+        self.assertTrue(os.path.exists(dedup.DEDUP_PENDING_FILE + ".done"))
+        self.assertIn("tg:lost-key", state.DEDUP_INDEX)
+
+    def test_replay_partial_failure_keeps_rest(self):
+        """部分键补写失败：失败行保留在 pending（重启再试）。"""
+        with open(dedup.DEDUP_PENDING_FILE, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"key": "tg:ok", "ts": "26-09-15",
+                                "filename": "ok.mp4"}) + "\n")
+            f.write(json.dumps({"key": "tg:bad", "ts": "26-09-15",
+                                "filename": "bad.mp4"}) + "\n")
+
+        def append_or_fail(key, ts, filename):
+            if key == "tg:bad":
+                raise runtime_db.DbUnavailable("仍不可用")
+            return True
+
+        with mock.patch.object(runtime_db, "dedup_index_append",
+                               side_effect=append_or_fail):
+            dedup.load_index()
+        with open(dedup.DEDUP_PENDING_FILE, encoding="utf-8") as f:
+            rest = f.read()
+        self.assertIn("tg:bad", rest)
+        self.assertNotIn("tg:ok", rest)
+        self.assertIn("tg:ok", state.DEDUP_INDEX)

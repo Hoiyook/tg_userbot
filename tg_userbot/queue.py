@@ -234,16 +234,21 @@ def load_queue_any():
 
 
 def save_queue(queue, path=None):
-    """原子写入队列文件（temp + os.replace）。**仅 json 模式与迁移导入路径
-    使用**；sqlite 模式的持久化走 _save_after_mutation 的单行事务。"""
+    """原子写入队列文件（temp + os.replace），返回是否成功。
+
+    **仅 json 模式、迁移导入路径与 sqlite 写失败后的入队门槛使用**；
+    sqlite 模式的常规持久化走 _save_after_mutation 的单行事务。
+    """
     path = path or QUEUE_FILE
     try:
         temp_path = path + ".tmp"
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(queue, f, ensure_ascii=False, indent=2)
         os.replace(temp_path, path)
+        return True
     except Exception as e:
         logger.warning(f"保存下载队列失败：{e}")
+        return False
 
 
 def _save_after_mutation(record, op):
@@ -491,18 +496,40 @@ def replay_due(now=None):
 # ------------------------------------------------------------
 
 async def enqueue_and_start(record, src=None):
-    """任务入队（持久化）并立即触发执行。
+    """任务入队（持久化）并立即触发执行。返回是否真正入队。
 
     src：台账「输入侧」来源标记，None 时按记录归属推断——``me``（收藏夹
     直发）/ ``wl``（下载白名单中转）。标签监听传入 ``listen``，让 /stats
     的「📥 输入事件」能把监听触发的下载单独数出来（监听转发进收藏夹的
     副本 chat_id 也是 MY_ID，不显式传就与用户手动转发混在一起）。
+
+    **持久化先行（2026-09-15，P0-1）**：落盘成功才允许进入执行态——
+    DB/json 写失败时回滚内存、**不 spawn**、通知用户，返回 False。这堵住了
+    「内存有任务、DB 没任务、任务已执行、崩溃后蒸发」的丢失窗口：任务本体
+    仍在 Telegram（收藏夹原件/白名单源消息/FORWARDED 副本），上游有恢复
+    路径。调用方应把 False 当「本次入队未发生」处理（监听侧转 FORWARDED
+    对账，见 listener_worker）。
     """
     async with state.QUEUE_LOCK:
         # queue_enqueue 返回带 id 的副本，执行必须用这份副本，
         # 否则 execute_queued_task 按 id 收尾时对不上队列里的记录。
         record = queue_enqueue(state.QUEUE, record)
-        _save_after_mutation(record, "insert")
+        if not _persist_new_record(record):
+            # 回滚内存（P0-1：不许出现「内存有、盘上无、照常执行」）
+            state.QUEUE["tasks"] = [
+                r for r in state.QUEUE["tasks"] if r.get("id") != record["id"]
+            ]
+            label = record.get("label") or record.get("url") or record["id"][:8]
+            logger.error(
+                f"🗄 下载任务持久化失败，已放弃入队（不执行）：{label}")
+            try:
+                from . import notify
+                await notify.notify_user(
+                    f"⚠️ 下载任务未能持久化，已放弃入队（防任务蒸发）：\n{label}\n"
+                    "消息本体仍在 Telegram，可重发该消息重试。")
+            except Exception:
+                pass
+            return False
     # 台账事件：这里是媒体与 url 任务唯一的入队咽喉——白名单中转的
     # 「源消息→转发副本」也只在这里入队一次，天然保证一个逻辑任务一个
     # task_id（RECEIVED 仅媒体任务有，src 区分 收藏/中转/监听 供输入侧拆分）。
@@ -515,6 +542,28 @@ async def enqueue_and_start(record, src=None):
     stats.emit_event("QUEUED", task_id=record["id"],
                      label=record.get("label"), kind=kind)
     spawn_execute(record)
+    return True
+
+
+def _persist_new_record(record):
+    """新任务落盘（P0-1 入队门槛）。调用方持有 QUEUE_LOCK；返回是否成功。
+
+    sqlite 模式：单行 INSERT 成功即持久（内存追加由调用方在成功后做）；
+    json 模式 / DB 未就绪：先追加内存再全量落盘（全量里含新任务才算成功，
+    失败则由调用方回滚内存）。"""
+    if config.QUEUE_STORE == "sqlite" and state.RUNTIME_DB_READY:
+        try:
+            runtime_db.queue_insert(record, "QUEUED")
+            return True
+        except runtime_db.DbUnavailable as e:
+            logger.error(f"🗄 队列 DB 写失败（任务未入队）：{e}")
+            return False
+        except Exception as e:
+            logger.error(
+                f"🗄 队列 DB 写异常（任务未入队）：{type(e).__name__}: {e}")
+            return False
+    # json 模式 / DB 未就绪：内存已由 queue_enqueue 追加，全量落盘即持久
+    return save_queue(state.QUEUE)
 
 
 async def _run_queued_task(record):

@@ -86,6 +86,14 @@ class FakeCopy(FakeMessage):
     pass
 
 
+async def _async_noop(*a, **k):
+    return None
+
+
+async def _async_true(*a, **k):
+    return True
+
+
 class FakeClient:
     """记录 forward/get_messages；可注入异常。"""
 
@@ -319,19 +327,49 @@ class ExecuteTaskTest(_WorkerTestCase):
         self.assertEqual(runtime_db.get_listener_task(ids[0])["status"],
                          "PENDING")
 
-    async def test_enqueue_failure_does_not_lose_forward(self):
-        """转发成功但入队抛错：任务仍算成功（转发已发生，重跑会重复转发）。"""
+    async def test_enqueue_failure_keeps_forwarded_for_reconcile(self):
+        """P0-2：转发成功但入队未发生（持久化失败）→ 停 FORWARDED 交对账器
+        补建，绝不重新转发；对账入队成功后补 SUCCESS。"""
         ids = self._seed([FakeMessage(101, "#a")])
+        task = runtime_db.claim_listener_task()
 
-        async def boom(*a, **k):
-            raise RuntimeError("入队炸了")
+        async def refuse(*a, **k):
+            return False   # 队列持久化失败：未入队
 
-        with mock.patch.object(lw, "_enqueue_copy", boom):
-            task = runtime_db.claim_listener_task()
+        with mock.patch.object(lw, "_enqueue_copy", side_effect=refuse), \
+                mock.patch("tg_userbot.notify.notify_user",
+                           side_effect=_async_noop):
             ok = await lw.execute_task(task)
-        self.assertTrue(ok)
+        self.assertTrue(ok)   # 任务交给对账器，不算失败（失败会重转发）
+        rec = runtime_db.get_listener_task(ids[0])
+        self.assertEqual(rec["status"], "FORWARDED")
+        self.assertEqual(rec["payload"]["copy_msg_ids"],
+                         [state.client._next_id])   # 副本 id 已持久化
+        # 对账：副本取回 + 入队恢复 → 补 SUCCESS，且不再转发。
+        # 入队失败路径安排了 60s 后再试——测试里把到期时间拨回去。
+        runtime_db._write(
+            lambda conn: conn.execute(
+                "UPDATE listener_tasks SET next_retry_at=1 "
+                "WHERE status='FORWARDED'"),
+            "测试：拨快对账到期时间")
+        forwards_before = len(state.client.forwards)
+        copy = FakeCopy(state.client._next_id, text="#a")
+
+        async def fetch_copies(ids):
+            return [copy]
+
+        with mock.patch.object(lw, "_fetch_saved_copies",
+                               side_effect=fetch_copies), \
+                mock.patch.object(lw, "_enqueue_copy",
+                                  side_effect=_async_true), \
+                mock.patch("tg_userbot.notify.notify_user",
+                           side_effect=_async_noop):
+            handled = await lw.reconcile_forwarded_tasks()
+        self.assertEqual(handled, 1)
         self.assertEqual(runtime_db.get_listener_task(ids[0])["status"],
                          "SUCCESS")
+        self.assertEqual(len(state.client.forwards), forwards_before,
+                         "对账绝不重新转发")
 
 
 class FloodWaitTest(_WorkerTestCase):

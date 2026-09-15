@@ -738,14 +738,16 @@ async def enqueue_media(message, chat_id, source_override, source_link=None,
             await notify.notify_user(notice)
         except Exception as e:
             logger.warning(f"发送重复媒体通知失败：{e}")
-        return
+        # 判重跳过 = 目标状态已达成（已下载或在途），对调用方按成功处理
+        return True
     record = _build_media_record(
         message, chat_id, source_override, source_link,
         album_caption, user_label, parent_date, parent_caption,
     )
     if keys:
         record["dedup_keys"] = keys  # 在途判重 + 成功后 remember 复用
-    await queue.enqueue_and_start(record, src=src)
+    # 返回是否真正入队（False = 持久化失败未入队，任务交上游恢复路径）
+    return await queue.enqueue_and_start(record, src=src)
 
 
 # ============================================================

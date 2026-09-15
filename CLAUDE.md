@@ -299,6 +299,15 @@ Telegram ──► listener.Scanner ──► SQLite 任务表 ──► listene
 
 单测 `tests/test_pawchive_db.py`（v8 迁移/幂等/claim 租约/终态流转/文件状态机/retry）、`tests/test_pawchive.py`（命令解析/外链提取（真实 MEGA 样本）/扫描记录过滤/CSV）、`tests/test_pawchive_worker.py`（Chrome 层全打桩：对账吸收/失联重投/终态通知/磁盘保护/纯外链帖直判 MANUAL）。
 
+**持久化可靠性强化（2026-09-15，任务书 `docs/plan/tg_userbot_持久化可靠性优化任务书_DeepSeek.md`）。** 四项经代码审计证实的风险点修复，原则「任务以 SQLite 为真相源；允许 At-least-once，但副作用幂等/可对账」：
+
+1. **P0-1 队列持久化先行**：`queue.enqueue_and_start` 重构为「落盘成功才入内存、才 spawn」——sqlite INSERT 失败（含 DbUnavailable/异常）→ 回滚内存、**不执行**、notify + 返回 False；json 模式 / DB 未就绪：内存追加后全量落盘，落盘失败同样回滚。堵住「DB 写失败仍执行 → 崩溃后任务蒸发」窗口（`_save_after_mutation` 对非 insert 操作保持宽容语义：delete/to_retry 失败 = at-least-once 重放，dedup 兜底）。调用方约定：`enqueue_media` 返回 bool（判重跳过=True 目标已达成）；`_enqueue_copy` 据此判定。
+2. **P0-2 转发→下载对账**：listener task 新增中间态 `FORWARDED`（`runtime_db.STATUS_FORWARDED`，TEXT 列无 schema 变更）——转发成功即 `mark_listener_forwarded(task_id, copy_ids)` 落持久事实（副本 id 进 payload）；副本入队失败 → `mark_listener_enqueue_retry`（留 FORWARDED + next_retry_at），**绝不重新转发**；`listener_worker.reconcile_forwarded_tasks()`（挂 run_once，每轮先对账）取回收藏夹副本复用同一套入队逻辑补建（dedup 幂等吸收已入队/已下载），全成→SUCCESS、副本已删→FAILED。崩溃/DB 故障后重启自动补偿。
+3. **P1-1 dedup pending**：`dedup.remember` DB 写失败 → 键落 `RUNTIME_DIR/dedup_pending.jsonl`；`load_index`（DB 模式）启动补写进 DB，全部成功归档 `.done`、部分失败保留重试——收窄「文件已下载、键没落库」的重启重复下载窗口。
+4. **§7 普通下载幂等**：`download_file` 在占位前检查「候选目标已存在且与消息声明大小一致」→ 直接按成功收尾（历史/去重/通知照走），不再无意义重下（崩溃于 os.replace 后、收尾前的场景）。
+
+配套：`tests/test_queue_wiring.py` 旧「DB 失败内存为准」契约测试改写为新契约（回滚+拒绝+不 spawn）；`tests/test_listener_worker.py` 新增 FORWARDED 对账用例；`tests/test_dedup.py` 新增 pending 2 项；`tests/test_pawchive_worker.py` 新增错误大小重下/410/500 三项。**坑**：测试里 `mock.patch.stopall` 会把其他文件 import 期启动的全局补丁一并停掉（dedup 的 cleanup 曾杀死 follow/reply_inherit 的重试延迟归零补丁，套件真实退避 30s×2 卡死）——补丁清理必须定点 stop，全仓库禁用 stopall。
+
 ## 磁盘回收：媒体经 CloudDrive2 自动搬到 115（外部配置）
 
 本地磁盘只留最近下载，**已完成的媒体**由 CloudDrive2（CD2，本机 WebDAV 端口 19798）的「备份」任务自动搬到 115 后删本地。这不是本仓库代码逻辑，是 CD2 侧的一次性运维配置，记录如下便于日后对照/排查：
