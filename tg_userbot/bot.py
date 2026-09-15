@@ -101,7 +101,8 @@ def open_input_window(kind):
     / \"listen_chat\"|\"listen_tag\"|\"listen_target\"（标签监听向导）
     / \"wl_since\"（白名单回补）/ \"sqlt\"（新增 SQL 模板）
     / \"sh\"（命令行：文本当命令执行）/ \"up\"（上传：文本当文件路径）
-    / \"paw_search\"|\"paw_cookie\"（Pawchive：作者名 / Cookie）。
+    / \"paw_search\"|\"paw_cookie\"|\"paw_post\"（Pawchive：作者名 / Cookie /
+    帖子 URL 或 ID）。
     """
     state.COOKIE_INPUT_UNTIL = 0.0
     state.FIND_INPUT_UNTIL = 0.0
@@ -148,9 +149,9 @@ def open_input_window(kind):
         state.UP_INPUT_UNTIL = (
             time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
         )
-    elif kind in ("paw_search", "paw_cookie"):
+    elif kind in ("paw_search", "paw_cookie", "paw_post"):
         # Pawchive 窗口：search 的文本当作者名发起扫描，cookie 的文本存
-        # tg_secrets.json（掩码回显）
+        # tg_secrets.json（掩码回显），post 的文本当帖子引用入队
         state.PAW_INPUT_UNTIL = (
             time.monotonic() + config.PAWCHIVE_INPUT_WINDOW_SECONDS
         )
@@ -271,6 +272,16 @@ async def handle_menu_action(action, arg, event):
     if action == "paw_retry_all":
         msg = await pawchive.retry_all_reply()
         return (msg, pawchive.menu_buttons())
+    if action == "paw_post":
+        open_input_window("paw_post")
+        return (
+            "📌 指定帖子下载\n\n"
+            "请发送帖子 URL（复制链接）或帖子数字 ID。\n"
+            "例：https://pawchive.pw/patreon/user/152819670/post/169389311\n\n"
+            f"{config.PAWCHIVE_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "发送 / 开头的命令可取消。",
+            pawchive.menu_buttons(),
+        )
     if action == "paw_pick":
         # 搜索结果按钮：arg 是序号，完整 creator 从 state 候选里取
         # （回调数据 ≤64 字节装不下「名字+ID」组合）
