@@ -832,7 +832,12 @@ def _sh_buttons_for(cmd, out):
     parent = os.path.dirname(state.SHELL_CWD.rstrip("/")) or "/"
     up_token = (shell.register_ls_paths([parent])[0]
                 if parent != state.SHELL_CWD else None)
-    return (menu.sh_ls_buttons(list(zip(dirs, tokens)), up_token=up_token)
+    # 按钮只显示当前目录下的条目名：全路径已经在正文/工作目录里，
+    # 26 字符截断后绝对路径恰好把目录名截掉（2026-09-15 用户反馈）。
+    # 导航不受影响——完整路径由 register_ls_paths 的 hash 键携带。
+    pairs = [(os.path.basename(p.rstrip("/")) or p, tok)
+             for p, tok in zip(dirs, tokens)]
+    return (menu.sh_ls_buttons(pairs, up_token=up_token)
             + menu.sh_menu_buttons())
 
 

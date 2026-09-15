@@ -210,6 +210,10 @@ class TestShLsCallbackFlow(unittest.IsolatedAsyncioTestCase):
         flat = [b for row in buttons for b in row]
         self.assertTrue(any("📁" in b.text for b in flat))   # 目录按钮
         self.assertTrue(any("⬆️" in b.text for b in flat))   # 上级导航
+        # 按钮只显示条目名，不带全路径（2026-09-15 用户反馈）
+        inner_btn = next(b for b in flat if "inner" in b.text)
+        self.assertNotIn(self.tmp, inner_btn.text)
+        self.assertTrue(any(b.text == "📁 inner" for b in flat))
 
     async def test_expired_token(self):
         from tg_userbot import bot
