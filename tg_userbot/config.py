@@ -642,7 +642,7 @@ MENU_ACTIONS = (
     # 导出 CSV / 重投全部失败 / 搜索候选按钮（paw_pick 带序号）
     "paw", "paw_status", "paw_search", "paw_cookie", "paw_pause",
     "paw_resume", "paw_manual", "paw_pick", "paw_csv", "paw_retry_all",
-    "paw_post",
+    "paw_post", "paw_find",
     # CD2 子菜单视图与「命令行/上传」合并工具箱视图
     "cd2_menu", "tools",
 )

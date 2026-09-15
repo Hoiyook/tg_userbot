@@ -1230,6 +1230,21 @@ def enqueue_pawchive_posts(service, creator_id, creator_name, posts,
     return created, skipped
 
 
+def search_pawchive_posts(term, limit=10):
+    """按关键词搜帖子（标题/作者，大小写不敏感子串匹配），新的在前。"""
+    like = f"%{str(term or '').strip()}%"
+    if like == "%%":
+        return []
+    rows = _read(lambda c: _execute(
+        c,
+        "SELECT * FROM pawchive_posts "
+        "WHERE LOWER(title) LIKE LOWER(?) OR LOWER(creator_name) LIKE LOWER(?) "
+        "ORDER BY id DESC LIMIT ?",
+        (like, like, int(limit))).fetchall(),
+        "按名称搜索 Pawchive 帖子")
+    return [_row_to_pawchive_post(r) for r in rows]
+
+
 def pawchive_status_counts():
     """各状态帖子计数（/paw status 视图）。"""
     rows = _read(lambda c: _execute(

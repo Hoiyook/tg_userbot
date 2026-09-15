@@ -101,8 +101,8 @@ def open_input_window(kind):
     / \"listen_chat\"|\"listen_tag\"|\"listen_target\"（标签监听向导）
     / \"wl_since\"（白名单回补）/ \"sqlt\"（新增 SQL 模板）
     / \"sh\"（命令行：文本当命令执行）/ \"up\"（上传：文本当文件路径）
-    / \"paw_search\"|\"paw_cookie\"|\"paw_post\"（Pawchive：作者名 / Cookie /
-    帖子 URL 或 ID）。
+    / \"paw_search\"|\"paw_cookie\"|\"paw_post\"|\"paw_find\"（Pawchive：
+    作者名 / Cookie / 帖子引用 / 查询关键词）。
     """
     state.COOKIE_INPUT_UNTIL = 0.0
     state.FIND_INPUT_UNTIL = 0.0
@@ -149,9 +149,10 @@ def open_input_window(kind):
         state.UP_INPUT_UNTIL = (
             time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
         )
-    elif kind in ("paw_search", "paw_cookie", "paw_post"):
+    elif kind in ("paw_search", "paw_cookie", "paw_post", "paw_find"):
         # Pawchive 窗口：search 的文本当作者名发起扫描，cookie 的文本存
-        # tg_secrets.json（掩码回显），post 的文本当帖子引用入队
+        # tg_secrets.json（掩码回显），post 的文本当帖子引用入队，
+        # find 的文本当关键词查询
         state.PAW_INPUT_UNTIL = (
             time.monotonic() + config.PAWCHIVE_INPUT_WINDOW_SECONDS
         )
@@ -278,6 +279,16 @@ async def handle_menu_action(action, arg, event):
             "📌 指定帖子下载\n\n"
             "请发送帖子 URL（复制链接）或帖子数字 ID。\n"
             "例：https://pawchive.pw/patreon/user/152819670/post/169389311\n\n"
+            f"{config.PAWCHIVE_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "发送 / 开头的命令可取消。",
+            pawchive.menu_buttons(),
+        )
+    if action == "paw_find":
+        open_input_window("paw_find")
+        return (
+            "🔎 按名称查询\n\n"
+            "请发送关键词：同时搜 Pawchive 扫描记录（标题/作者）"
+            "与当前 /sh 工作目录下的文件名。\n"
             f"{config.PAWCHIVE_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
             pawchive.menu_buttons(),
@@ -880,6 +891,10 @@ async def _handle_paw_input(step, text):
     """Pawchive 输入窗口：search 当作者名、cookie 存密钥文件、post 入队单帖。"""
     if step == "post":
         msg = await pawchive.post_reply_text(text.strip())
+        await state.bot_client.send_message(state.MY_ID, msg, link_preview=False)
+        return
+    if step == "find":
+        msg = await pawchive.find_reply(text.strip())
         await state.bot_client.send_message(state.MY_ID, msg, link_preview=False)
         return
     if step == "cookie":

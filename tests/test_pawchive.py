@@ -255,6 +255,47 @@ class SinglePostTest(_DbTestCase):
         self.assertIn("完整帖子 URL", msg)
 
 
+class FindReplyTest(_DbTestCase):
+    """/paw find：按名称查扫描记录 + /sh 当前目录下的文件。"""
+
+    def _run(self, coro):
+        import asyncio
+        return asyncio.run(coro)
+
+    def test_find_hits_db_and_files(self):
+        self._seed()
+        # 建一个含关键词的文件放到当前工作目录
+        from tg_userbot import state
+        workdir = os.path.join(self.dir, "work")
+        os.makedirs(workdir, exist_ok=True)
+        with open(os.path.join(workdir, "标题文件.mp4"), "wb") as f:
+            f.write(b"x")
+        old_cwd = state.SHELL_CWD
+        state.SHELL_CWD = workdir
+        try:
+            msg = self._run(pawchive.find_reply("标题"))
+        finally:
+            state.SHELL_CWD = old_cwd
+        self.assertIn("扫描记录", msg)
+        self.assertIn("Creator", msg)                  # DB 记录作者命中
+        self.assertIn("标题文件.mp4", msg)              # 文件命中
+
+    def test_find_no_match(self):
+        self._seed()
+        from tg_userbot import state
+        old = state.SHELL_CWD
+        state.SHELL_CWD = self.dir
+        try:
+            msg = self._run(pawchive.find_reply("不存在的词xyz"))
+        finally:
+            state.SHELL_CWD = old
+        self.assertIn("没有匹配", msg)
+
+    def test_parse_find(self):
+        self.assertEqual(pawchive.parse_paw_command("/paw find abc"),
+                         ("find", "abc"))
+
+
 class _FakeEvent:
     """最小 event 替身：capture reply。"""
 

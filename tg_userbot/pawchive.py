@@ -437,6 +437,63 @@ def _post_status_reply(row):
     return head
 
 
+def _search_local_files(term, root=None, max_results=15, max_depth=4):
+    """在 /sh 当前工作目录下按名称搜文件（深度/条数有界，跳过临时文件）。"""
+    import fnmatch
+    root = os.path.expanduser(root or state.SHELL_CWD)
+    if not os.path.isdir(root):
+        return None, []
+    hits, temp_suffixes = [], (".part", ".crdownload", ".download")
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = dirpath[len(root):].count(os.sep)
+        if depth >= max_depth:
+            dirnames[:] = []
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for name in filenames:
+            if name.startswith(".") or name.lower().endswith(temp_suffixes):
+                continue
+            if fnmatch.fnmatch(name.lower(), f"*{term.lower()}*"):
+                hits.append(os.path.join(dirpath, name))
+                if len(hits) >= max_results:
+                    return root, hits
+    return root, hits
+
+
+async def find_reply(term):
+    """/paw find <关键词>：按名称查 Pawchive 记录 + /sh 当前目录下的文件。"""
+    term = str(term or "").strip()
+    if not term:
+        return (f"{TEXT_PREFIX}\n用法：/paw find <关键词>\n"
+                "（搜已扫描的帖子标题/作者 + 当前 /sh 工作目录下的文件名）")
+    sections = [f'🐾 查询「{term}」', ""]
+
+    # 1) 库内记录
+    try:
+        rows = runtime_db.search_pawchive_posts(term, limit=10)
+    except runtime_db.DbUnavailable as e:
+        rows = []
+        sections.append(f"❌ Runtime DB 不可用：{e}")
+    if rows:
+        sections.append(f"📋 扫描记录（{len(rows)} 条）：")
+        for p in rows:
+            mark = _STATUS_LABELS.get(p["status"], p["status"])
+            sections.append(
+                f"  #{p['id']} {mark} {p['creator_name']}｜"
+                f"{(p['title'] or '')[:36]}")
+        sections.append("")
+
+    # 2) 当前目录下的文件（/sh 工作目录）
+    root, hits = await asyncio.to_thread(_search_local_files, term)
+    if root is None:
+        sections.append(f"📂 当前目录不存在：{state.SHELL_CWD}")
+    elif hits:
+        sections.append(f"📂 当前目录文件（{len(hits)} 个）：")
+        sections += [f"  {h}" for h in hits]
+    else:
+        sections.append(f"📂 当前目录（{root}）下没有匹配的文件")
+    return "\n".join(sections)
+
+
 async def notify_user(text):
     """统一通知出口（bot 控制面板对话）。函数内导入避免 app↔本模块成环。"""
     from . import notify
@@ -523,7 +580,8 @@ def menu_buttons():
          Button.inline("📄 导出CSV清单", encode_menu_data("paw_csv"))],
         [Button.inline("👤 待人工处理", encode_menu_data("paw_manual")),
          Button.inline("🔁 重投全部失败", encode_menu_data("paw_retry_all"))],
-        [Button.inline("📌 指定帖子下载", encode_menu_data("paw_post"))],
+        [Button.inline("📌 指定帖子下载", encode_menu_data("paw_post")),
+         Button.inline("🔎 按名称查询", encode_menu_data("paw_find"))],
         [Button.inline("🍪 设置 Cookie", encode_menu_data("paw_cookie"))],
         [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
     ]
@@ -656,7 +714,7 @@ def parse_paw_command(text):
     head, _, rest = body.partition(" ")
     head_l = head.lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
-                  "resume", "manual", "cookie", "csv", "post"):
+                  "resume", "manual", "cookie", "csv", "post", "find"):
         return (head_l, rest.strip() or None)
     return ("help", None)
 
@@ -698,6 +756,9 @@ async def command_reply(event, cmd_text):
     if action == "post":
         await event.reply(await post_reply_text(arg), link_preview=False)
         return
+    if action == "find":
+        await event.reply(await find_reply(arg), link_preview=False)
+        return
     await event.reply(_help_text(), link_preview=False)
 
 
@@ -709,6 +770,7 @@ def _help_text():
         "带 Cookie 才能对比收藏，all=全部）\n"
         "  /paw search <关键词> —— 搜作者\n"
         "  /paw post <帖子URL|ID> —— 单独获取指定帖子的附件\n"
+        "  /paw find <关键词> —— 按名称查扫描记录与当前目录文件\n"
         "  /paw manual —— 待人工处理的帖子（含外链清单）\n"
         "  /paw retry <行ID|all> —— 失败帖子重投\n"
         "  /paw pause / resume —— 暂停/恢复下载 worker\n"
