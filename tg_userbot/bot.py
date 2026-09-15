@@ -20,6 +20,7 @@ from telethon.utils import get_peer_id
 
 from . import state
 from . import text as text_mod
+from . import manual_links
 from . import menu
 from . import queue
 from . import dedup
@@ -269,6 +270,9 @@ async def handle_menu_action(action, arg, event):
         return pawchive.manual_view_full()
     if action == "paw_done":
         return pawchive.manual_done_reply(arg)
+    if action == "mlink_done":
+        view_text, buttons = await manual_links.done_reply(arg)
+        return view_text, buttons
     if action == "paw_csv":
         msg = await pawchive.csv_reply()
         return (msg, pawchive.menu_buttons())
@@ -784,6 +788,14 @@ async def bot_message_handler(event):
     if text.startswith("/"):
         if await commands.handle_command(event, text):
             return
+
+    # 非命令文本里带 http(s) 链接 → 手动外链台账（记录/查重），不回落主菜单
+    ext_urls = manual_links.extract_urls(text)
+    if ext_urls:
+        reply, buttons = manual_links.observe(ext_urls)
+        await state.bot_client.send_message(
+            state.MY_ID, reply, buttons=buttons, link_preview=False)
+        return
 
     # 任意文本（含 /start）→ 主菜单
     logger.info(f"🤖 bot 菜单：owner 发送 {text[:30]!r}，显示主菜单")

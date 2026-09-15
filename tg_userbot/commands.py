@@ -19,6 +19,7 @@ from . import whitelist
 from . import cleanup
 from . import stats
 from . import finder
+from . import manual_links
 from . import listener
 from . import caption_filter
 from . import wl_scan
@@ -401,6 +402,12 @@ async def handle_command(event, cmd_text):
         keyword = parts[1].strip() if len(parts) > 1 else ""
         logger.info(f"执行命令：/find {keyword}")
         await _reply(event, finder.find_media(keyword), link_preview=False)
+        return True
+
+    if cmd_text == "/links":
+        logger.info("执行命令：/links")
+        view_text, buttons = manual_links.links_view()
+        await _reply(event, view_text, buttons=buttons)
         return True
 
     if shell.is_shell_command(cmd_text):

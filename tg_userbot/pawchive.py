@@ -248,6 +248,22 @@ def _trim_url_tail(url):
     return url
 
 
+def find_completed_ext_link(url, limit=1000):
+    """查重第二数据源：该 URL 是否出现在某个 COMPLETED 帖子的外链里。
+
+    大小写不敏感精确匹配（用户重发同链接时大小写可能有出入）；返回
+    命中的帖子 dict（供通知里给 作者/#行id 上下文），没有则 None。"""
+    low = str(url or "").strip().lower()
+    if not low:
+        return None
+    for post in runtime_db.list_pawchive_posts(
+            status=runtime_db.PAW_POST_COMPLETED, limit=limit):
+        for l in (post.get("ext_links") or []):
+            if str(l.get("url") or "").strip().lower() == low:
+                return post
+    return None
+
+
 def extract_links(post):
     """从帖子 content HTML 与 embed 字段提取站外链接（MEGA/网盘等）。
 

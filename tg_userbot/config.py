@@ -415,7 +415,7 @@ REPORT_LISTEN = True
 # WAL 依赖 mmap 共享内存、在该文件系统上可能不可用；真机上若探测到 WAL 回落，
 # 可把 DB 挪到应用私有目录。注意：**只允许主进程写**，Chrome Agent 进程绝不
 # 能开连接（见 runtime_db 的「不做 import 期连接」）。
-RUNTIME_DB_SCHEMA_VERSION = 8   # v8：+ pawchive_posts/pawchive_files（扫描结果生命周期）
+RUNTIME_DB_SCHEMA_VERSION = 9   # v9：+ manual_links（手动外链台账）
 # 单条写事务等锁的上限（毫秒）与 SQLITE_BUSY/LOCKED 的有限重试（规格 §39：
 # 记日志 → 短暂等待 → 有限次数重试，绝不无限循环、绝不因此崩掉主进程）。
 RUNTIME_DB_BUSY_TIMEOUT_MS = 5000
@@ -646,6 +646,7 @@ MENU_ACTIONS = (
     # 导出 CSV / 重投全部失败 / 搜索候选按钮（paw_pick 带序号）
     "paw", "paw_status", "paw_search", "paw_cookie", "paw_pause",
     "paw_resume", "paw_manual", "paw_done", "paw_pick", "paw_csv",
+    "mlink_done",
     "paw_retry_all",
     "paw_post", "paw_find",
     # CD2 子菜单视图与「命令行/上传」合并工具箱视图
@@ -787,6 +788,7 @@ CLEAR_TIME_CONFIG_FILE = os.path.join(RUNTIME_DIR, "clear_time.json")
 # 需要自动清理的命令（精确匹配）
 CLEAN_COMMANDS = {
     "/status",
+    "/links",
     "/folder",
     "/logpath",
     "/help",
@@ -897,6 +899,8 @@ CLEAN_NOTIFICATION_PREFIXES = (
     "⚠️ Userbot 异常",
     "✅ 已恢复",
     "♻️ 自动重放",
+    # 手动外链台账（/links 与发送链接的记录回复）
+    "🔗 外链台账",
 )
 
 # 持久保留的程序通知（豁免自动清理，/clearmsg 的 include_persistent=True

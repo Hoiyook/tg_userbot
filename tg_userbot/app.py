@@ -32,6 +32,7 @@ from . import sql_templates
 from . import shell
 from . import reporter
 from . import history
+from . import manual_links
 from . import stats
 from . import thread
 from . import whitelist
@@ -221,23 +222,22 @@ async def _bot_keepalive():
         if bot.is_connected():
             continue
         logger.warning("🤖 bot 菜单连接已断开，尝试重连...")
+        # 重连放进子任务并用 _await_child_task 等待：telethon 断线会对
+        # pending future 调 cancel()（网络层取消），CancelledError 从
+        # start_with_retry 内部穿出——直接 await 的话与「外层取消（停服）」
+        # 无法区分，而吞掉又会吃掉同窗口到达的真取消（取消合并）。
+        # 2026-09-14 实测：代理抖动期间一次网络层取消就把本守护打死
+        # （静默，无日志），bot 账号自此无人重连、面板永远 🔴。
+        child = asyncio.create_task(
+            start_with_retry(bot, bot_token=BOT_TOKEN))
         try:
-            await start_with_retry(bot, bot_token=BOT_TOKEN)
+            await _await_child_task(child)
             logger.info("🤖 bot 菜单已重新连接")
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except asyncio.CancelledError:
-            # telethon 断线会对 pending future 调 cancel()（网络层取消），
-            # CancelledError 会从 start_with_retry 内部穿到这里。与真取消
-            # 无法从异常本身区分，按 STOP_EVENT 结构性判定（与
-            # _main_serve/_reporter_supervisor 同款）：未停服 = 连接抖动，
-            # 吞掉继续守护；停服 = main 的真取消，原样上抛。
-            # 2026-09-14 实测：代理抖动期间一次网络层取消就把本守护打死
-            # （静默，无日志），bot 账号自此无人重连、面板永远 🔴。
-            if state.STOP_EVENT is not None and state.STOP_EVENT.is_set():
-                raise
+        except ChildCancelledError:
             logger.warning(
                 "🤖 bot 菜单重连被网络层取消（连接抖动），下轮探活重试")
+        except asyncio.CancelledError:
+            raise   # 外层取消（停服）：原样上抛；子任务随进程退出收场
         except Exception as e:
             logger.error(
                 f"🤖 bot 菜单重连失败（{type(e).__name__}: {e}），"
@@ -549,6 +549,16 @@ async def new_message_handler(event):
                         message, douyin_urls, instagram_urls
                     )
                 )
+                return
+
+            # 非抖音/IG 的外链（MEGA/网盘等）→ 手动外链台账：登记（默认
+            # 未处理）+ 查重（台账历史 + Pawchive 已完成外链）。命中早退
+            # ——链接消息不是转发评论，不进标注捕获。
+            ext_urls = manual_links.extract_urls(text)
+            if ext_urls:
+                reply, buttons = manual_links.observe(ext_urls)
+                await event.reply(reply, buttons=buttons,
+                                  link_preview=False)
                 return
 
         # 判断是否是可下载媒体

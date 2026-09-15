@@ -359,6 +359,23 @@ _SCHEMA = (
     CREATE INDEX IF NOT EXISTS idx_pawchive_file_pickup
     ON pawchive_files (post_row, status)
     """,
+    # ============================================================
+    # 手动外链台账（2026-09-16，schema v9）。移动端自己找到的网盘链接
+    # 发进来登记（默认 PENDING 未处理），人工处理完手动标 DONE；再次
+    # 发送同链接时按 url_key 精确查重提示已处理。url_key 保留原始大小写
+    # （MEGA 解密键区分大小写，lower 会造成不同链接误判重复）。
+    # ============================================================
+    """
+    CREATE TABLE IF NOT EXISTS manual_links (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        url        TEXT NOT NULL,
+        url_key    TEXT NOT NULL UNIQUE,
+        host       TEXT,
+        status     TEXT NOT NULL DEFAULT 'PENDING',
+        created_at INTEGER NOT NULL,
+        done_at    INTEGER
+    )
+    """,
 )
 
 # SQLITE_BUSY / SQLITE_LOCKED 的典型文案（只用于判定是否值得重试）
@@ -664,6 +681,9 @@ def migrate() -> int:
         # 生命周期）。纯建表，没有数据迁移——旧数据只有独立 CLI 脚本的
         # manifest/CSV，不在 bot 数据域内，不做导入。
         logger.info("🗄 Runtime DB 迁移：v8（+ pawchive_posts/pawchive_files）")
+    if version < 9:
+        # v8 → v9：新增 manual_links（手动外链台账）。纯建表。
+        logger.info("🗄 Runtime DB 迁移：v9（+ manual_links 手动外链台账）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -2198,3 +2218,71 @@ def dedup_index_trim(keep):
             (int(keep),))
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
     return _write(do, "裁剪去重索引")
+
+
+# ============================================================
+# 手动外链台账（2026-09-16，schema v9）
+# ============================================================
+# manual_links 模块的存储层：url_key UNIQUE 承担查重（重复登记在 INSERT
+# 层被拒，调用方取回已有行报状态）；状态只有 PENDING/DONE 两态，终态
+# 不删行——台账的历史就是查重数据源。
+def manual_link_add(url, host=None, now=None):
+    """登记一条链接。返回 (state, row)：state ∈ {"new", "pending", "done"}，
+    row 为台账行（新增或已存在的同 url_key 行）。"""
+    key = str(url).strip()
+    def do(conn):
+        try:
+            _execute(
+                conn,
+                "INSERT INTO manual_links(url, url_key, host, status, "
+                "created_at) VALUES(?, ?, ?, 'PENDING', ?)",
+                (key, key, host, _now(now)))
+            row = _execute(
+                conn, "SELECT * FROM manual_links WHERE url_key=?",
+                (key,)).fetchone()
+            return ("new", dict(row))
+        except sqlite3.IntegrityError:
+            row = _execute(
+                conn, "SELECT * FROM manual_links WHERE url_key=?",
+                (key,)).fetchone()
+            return ("pending" if row["status"] == "PENDING" else "done",
+                    dict(row))
+    state, row = _write(do, f"外链台账登记（{key[:40]}）")
+    if state == "new":
+        pass
+    return state, row
+
+
+def manual_link_done(link_id, now=None):
+    """PENDING → DONE；已是 DONE 或不存在返回 False（幂等）。"""
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE manual_links SET status='DONE', done_at=? "
+            "WHERE id=? AND status='PENDING'",
+            (_now(now), int(link_id)))
+        return cur.rowcount > 0
+    return _write(do, f"外链台账标记完成（{link_id}）")
+
+
+def list_manual_links(status=None, limit=50):
+    """台账行列表：status=None 全量按 id 降序（最新在前）。"""
+    if status:
+        rows = _read(lambda c: _execute(
+            c, "SELECT * FROM manual_links WHERE status=? "
+               "ORDER BY id DESC LIMIT ?", (str(status), int(limit))
+        ).fetchall(), "列外链台账")
+    else:
+        rows = _read(lambda c: _execute(
+            c, "SELECT * FROM manual_links ORDER BY id DESC LIMIT ?",
+            (int(limit),)).fetchall(), "列外链台账")
+    return [dict(r) for r in rows]
+
+
+def count_manual_links(status=None):
+    if status:
+        return int(_read(lambda c: _execute(
+            c, "SELECT COUNT(*) FROM manual_links WHERE status=?",
+            (str(status),)).fetchone()[0], "统计外链台账"))
+    return int(_read(lambda c: _execute(
+        c, "SELECT COUNT(*) FROM manual_links").fetchone()[0], "统计外链台账"))

@@ -5,10 +5,10 @@ pending future 被网络层 cancel()，CancelledError 穿透 keepalive 的
 `except Exception`（真取消显式放行），守护任务静默死亡——bot 账号此后
 再无人重连，面板永远 🔴。
 
-契约：CancelledError 到达 keepalive 时按 `state.STOP_EVENT` 结构性区分——
-未停服 = telethon 网络层取消 → 吞掉并继续下轮探活；停服（main 真取消）→
-原样上抛。存活以「start_with_retry 被调用的次数」判定：被一次取消打死
-= 恒为 1；存活 = 继续调用。
+修复：重连放进子任务，用 app._await_child_task 等待（第五个坑的终结
+方案）——子任务被网络层取消 → ChildCancelledError → 吞掉继续探活；
+外层取消（停服）→ CancelledError → 原样上抛。存活以 start_with_retry
+的调用次数判定：被一次取消打死 = 恒 1；存活 = 继续调用。
 
     .venv/bin/python -m unittest tests.test_bot_keepalive -v
 """
@@ -42,38 +42,28 @@ class BotKeepaliveAliveTest(unittest.IsolatedAsyncioTestCase):
     def _restore(self):
         state.bot_client, state.STOP_EVENT = self._old
 
-    async def _run(self, stop=False, probe_count=3):
+    async def _run(self, probe_count=3):
         """跑 probe_count 轮探活后外部取消，返回 (结局, 调用次数)。
 
-        外部 task.cancel() 只在探活次数达标后发出——先于达标的
-        CancelledError 结局只能是「守护自己死了」。"""
+        首轮 start_with_retry 抛 CancelledError（模拟 telethon 网络层
+        取消）；后续轮正常成功。外部 task.cancel() 直接终止——结构性
+        修复下它必须能终止（吞掉的是子任务取消，不吞外层取消）。"""
         calls = {"n": 0}
 
         async def fake_start(client, bot_token=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise asyncio.CancelledError()   # 网络层取消（首轮）
-            if stop and calls["n"] == 2:
-                # 真实停服序列：SIGTERM 先置 STOP_EVENT，main 再取消任务
-                state.STOP_EVENT.set()
-                raise asyncio.CancelledError()
             await asyncio.sleep(0)               # 成功重连
 
         with mock.patch.object(app, "BOT_KEEPALIVE_INTERVAL", 0.005), \
                 mock.patch.object(app, "start_with_retry",
                                   side_effect=fake_start):
             task = asyncio.create_task(app._bot_keepalive())
-            for _ in range(probe_count * 20):
+            for _ in range(probe_count * 40):
                 await asyncio.sleep(0.01)
                 if calls["n"] >= probe_count:
                     break
-            else:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                return "died_early", calls["n"]
             task.cancel()
             try:
                 await task
@@ -82,7 +72,8 @@ class BotKeepaliveAliveTest(unittest.IsolatedAsyncioTestCase):
             return "finished", calls["n"]
 
     async def test_network_cancel_does_not_kill_keepalive(self):
-        outcome, calls = await self._run(stop=False, probe_count=3)
+        """首轮网络层取消被吞，守护继续探活（这是本修复的核心契约）。"""
+        outcome, calls = await self._run(probe_count=3)
         self.assertGreaterEqual(calls, 3,
                                 "一次网络层取消就把守护打死了")
         self.assertIn(outcome, ("cancelled", "finished"))
@@ -101,7 +92,7 @@ class BotKeepaliveAliveTest(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(app, "start_with_retry",
                                   side_effect=fake_start):
             task = asyncio.create_task(app._bot_keepalive())
-            for _ in range(60):
+            for _ in range(80):
                 await asyncio.sleep(0.01)
                 if calls["n"] >= 2:
                     break
@@ -112,12 +103,12 @@ class BotKeepaliveAliveTest(unittest.IsolatedAsyncioTestCase):
                 pass
         self.assertGreaterEqual(calls["n"], 2)
 
-    async def test_stop_event_set_reraises(self):
-        """停服（main 真取消，STOP_EVENT 已置位）→ CancelledError 上抛，
-        不再继续探活（调用次数停在 2：首轮网络取消 + 停服取消）。"""
-        outcome, calls = await self._run(stop=True, probe_count=2)
+    async def test_outer_cancel_terminates(self):
+        """外层取消（停服）→ 立即终止：结构性修复下吞掉的只有子任务取消，
+        不会再出现「cancel 被吞、任务杀不死」的僵尸。"""
+        outcome, calls = await self._run(probe_count=1)
         self.assertEqual(outcome, "cancelled")
-        self.assertEqual(calls, 2)
+        self.assertGreaterEqual(calls, 1)
 
 
 if __name__ == "__main__":
