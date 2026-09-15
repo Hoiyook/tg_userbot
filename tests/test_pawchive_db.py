@@ -392,3 +392,39 @@ class ManualDoneTest(_PawDbTestCase):
         self.assertIn("✅", pawchive.mark_manual_done(f"#{target['id']}"))
         self.assertIn("已经", pawchive.mark_manual_done(f"{target['id']}"))
         self.assertIn("❌", pawchive.mark_manual_done("999999"))
+
+
+class ManualPanelFlowTest(_PawDbTestCase):
+    """Pawchive 面板的待人工流程：paw_manual/paw_done 分支的（文本, 按钮）。"""
+
+    def _enqueue_manual(self):
+        created, _ = self.enqueue_two()
+        rows = runtime_db.list_pawchive_posts(limit=10)
+        target = next(r for r in rows if r["post_id"] == "222")
+        first = runtime_db.claim_next_pawchive_post()
+        assert first and first["id"] != target["id"]
+        claimed = runtime_db.claim_next_pawchive_post()
+        assert claimed and claimed["id"] == target["id"]
+        runtime_db.finalize_pawchive_post(
+            target["id"], runtime_db.PAW_POST_MANUAL)
+        return target
+
+    def test_manual_view_full_has_menu_buttons(self):
+        from tg_userbot import pawchive
+        self._enqueue_manual()
+        text, buttons = pawchive.manual_view_full()
+        self.assertIn("TestCreator", text)
+        flat = [b for row in buttons for b in row]
+        self.assertTrue(any("✅" in b.text for b in flat))
+        # 底部保留 Pawchive 面板按钮（返回面板/扫描作者等导航）
+        self.assertGreater(len(buttons), 2)
+
+    def test_manual_done_reply_edit_in_place(self):
+        """面板 ✅ 点击 → 标记完成 + 返回刷新后的视图（原地 edit 语义）。"""
+        from tg_userbot import pawchive
+        target = self._enqueue_manual()
+        text, buttons = pawchive.manual_done_reply(str(target["id"]))
+        self.assertIn("✅", text)
+        self.assertIn("没有待人工处理", text)     # 唯一的 MANUAL 帖已标完
+        # 空态也保留面板按钮（用户还能点回其他视图）
+        self.assertTrue(buttons)

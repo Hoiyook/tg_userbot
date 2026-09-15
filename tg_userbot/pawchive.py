@@ -141,8 +141,15 @@ async def resolve_creator_async(name):
 # ============================================================
 # 帖子 / 收藏 / 外链
 # ============================================================
-def fetch_creator_posts(service, creator_id, cookie=None, progress=None):
-    """分页拉取创作者全部帖子（列表接口自带 attachments/file/content）。"""
+def fetch_creator_posts(service, creator_id, cookie=None, progress=None,
+                        known_ids=None):
+    """分页拉取创作者帖子；**整页均已入库时提前停止**（增量扫描）。
+
+    帖子按发布时间倒序返回，故连续拉到"整页已知"即说明后面都是旧数据——
+    任何新帖（含站点补传的旧帖）都会让该页不全是已知而继续拉。已知集合
+    来自 pawchive_posts 唯一索引，正确性锚点仍是入库时的 INSERT OR IGNORE；
+    提前停止只是省请求，绝不影响完整性。known_ids=None 时全量分页（首扫）。
+    """
     posts, offset = [], 0
     while True:
         page = _http_get_json(
@@ -151,6 +158,12 @@ def fetch_creator_posts(service, creator_id, cookie=None, progress=None):
         posts.extend(page)
         if progress:
             progress(f"已拉取 {len(posts)} 条")
+        if known_ids is not None and page and all(
+                str(p["id"]) in known_ids for p in page):
+            logger.info(
+                f"🐾 整页均已入库（offset {offset}），增量扫描提前停止，"
+                f"共拉取 {len(posts)} 条")
+            return posts
         if len(page) < _PAGE:
             return posts
         offset += _PAGE
@@ -365,8 +378,17 @@ async def _scan_and_notify(creator, scope):
     label = _creator_label(creator)
     try:
         cookie = config.PAWCHIVE_COOKIE or None
+        # 增量扫描：预载已入库帖子 id，整页已知即提前停止（首扫为空集=全量）
+        try:
+            known_ids = await asyncio.to_thread(
+                runtime_db.pawchive_known_post_ids,
+                creator["service"], str(creator["id"]))
+        except runtime_db.DbUnavailable as e:
+            logger.warning(f"🐾 已知集预载失败（本次全量分页）：{e}")
+            known_ids = None
         posts = await asyncio.to_thread(
-            fetch_creator_posts, creator["service"], creator["id"], cookie)
+            fetch_creator_posts, creator["service"], creator["id"], cookie,
+            known_ids)
         if cookie:
             faved_ids = await asyncio.to_thread(fetch_favorited_ids, cookie)
         else:
@@ -697,6 +719,20 @@ def manual_view(limit=10):
             row.append(Button.url("🔗 原帖", p["post_url"]))
         rows.append(row)
     return "\n".join(lines), rows
+
+
+def manual_view_full(limit=10):
+    """面板 paw_manual 分支用：manual_view + 底部面板导航按钮。"""
+    view_text, rows = manual_view(limit)
+    return view_text, rows + menu_buttons()
+
+
+def manual_done_reply(arg):
+    """面板 ✅ 完成 / /paw done 共用：标记完成 + 返回刷新后的视图
+    （面板流程原地 edit，命令流程作为回复发出）。"""
+    reply = mark_manual_done(arg)
+    view_text, rows = manual_view()
+    return f"{reply}\n\n{view_text}", rows + menu_buttons()
 
 
 def manual_text(limit=10):

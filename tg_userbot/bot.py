@@ -266,7 +266,9 @@ async def handle_menu_action(action, arg, event):
     if action == "paw_resume":
         return pawchive.resume_reply(), pawchive.menu_buttons()
     if action == "paw_manual":
-        return pawchive.manual_text(), pawchive.menu_buttons()
+        return pawchive.manual_view_full()
+    if action == "paw_done":
+        return pawchive.manual_done_reply(arg)
     if action == "paw_csv":
         msg = await pawchive.csv_reply()
         return (msg, pawchive.menu_buttons())
