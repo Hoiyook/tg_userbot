@@ -63,6 +63,12 @@ _TASKS = set()
 _PAUSED = False
 _PAUSE_REASON = ""
 
+# 进度面板（主账号发 bot 对话、原地编辑；同 Runtime Reporter 模式）
+_PANEL_MSG_ID = None
+_PANEL_LAST_TEXT = None
+# 里程碑计数：自上次汇总以来各终态的帖子数
+_MILESTONE = {"completed": 0, "manual": 0, "failed": 0}
+
 
 # ============================================================
 # 暂停 / 状态
@@ -384,6 +390,8 @@ async def _finalize(post, files):
             runtime_db.finalize_pawchive_post(
                 post["id"], runtime_db.PAW_POST_FAILED, error=err)
             logger.warning(f"🐾 帖子全部为站点死链，标失败：{label}｜{title}")
+            _bump_milestone("failed")
+            await _milestone_notify_if_due()
             return
         err = f"{len(failed)}/{len(files)} 个文件下载失败"
         runtime_db.finalize_pawchive_post(
@@ -394,6 +402,8 @@ async def _finalize(post, files):
         for f in failed[:5]:
             lines.append(f"  · {f['filename']}：{(f.get('error') or '')[:80]}")
         await notify.notify_user("\n".join(lines))
+        _bump_milestone("failed")
+        await _milestone_notify_if_due()
         return
     ext_links = post.get("ext_links") or []
     if ext_links:
@@ -407,9 +417,13 @@ async def _finalize(post, files):
         if len(ext_links) > 8:
             lines.append(f"  … 等 {len(ext_links) - 8} 条（/paw manual 查看全部）")
         await notify.notify_user("\n".join(lines))
+        _bump_milestone("manual")
+        await _milestone_notify_if_due()
         return
     runtime_db.finalize_pawchive_post(post["id"], runtime_db.PAW_POST_COMPLETED)
     logger.info(f"🐾 帖子完成：{label}｜{title}（{len(files)} 个文件）")
+    _bump_milestone("completed")
+    await _milestone_notify_if_due()
 
 
 def _requeue_legacy_submitted(files):
@@ -423,6 +437,165 @@ def _requeue_legacy_submitted(files):
             runtime_db.mark_pawchive_file_pending(f["id"])
             f["status"] = runtime_db.PAW_FILE_PENDING
             f["chrome_task_id"] = None
+
+
+def _panel_progress_lines():
+    """进行中的 pawchive 下载明细（文件名 + 百分比 + 已下/总量）。"""
+    from .naming import format_size
+    lines = []
+    for info in list(state.ACTIVE_DOWNLOADS.values()):
+        if info.get("label") != "pawchive":
+            continue
+        name = (info.get("filename") or "")[:34]
+        total = info.get("total") or 0
+        done = info.get("downloaded") or 0
+        pct = info.get("percent")
+        if total:
+            lines.append(f"  ↓ {name} {pct}%（{format_size(done)} / {format_size(total)}）")
+        else:
+            lines.append(f"  ↓ {name} {format_size(done)}")
+    return lines
+
+
+def build_progress_text():
+    """🐾 进度面板正文：状态计数 + 进行中明细 + 磁盘（/paw status 同源）。"""
+    try:
+        counts = runtime_db.pawchive_status_counts()
+    except runtime_db.DbUnavailable as e:
+        return f"🐾 Pawchive 进度\n❌ Runtime DB 不可用：{e}"
+    labels = {
+        runtime_db.PAW_POST_PENDING: "⏳",
+        runtime_db.PAW_POST_PROCESSING: "🔄",
+        runtime_db.PAW_POST_COMPLETED: "✅",
+        runtime_db.PAW_POST_MANUAL: "👤",
+        runtime_db.PAW_POST_FAILED: "❌",
+    }
+    parts = [f"{labels.get(s, s)}{n}" for s, n in sorted(counts.items())]
+    lines = [f"🐾 Pawchive 进度（{time.strftime('%H:%M:%S')}）",
+             " ".join(parts) if counts else "（队列为空）"]
+    inflight = current_post_label()
+    if inflight:
+        lines.append(f"当前：{inflight}")
+    prog = _panel_progress_lines()
+    if prog:
+        lines += prog
+    free = _disk_free_gb()
+    if free is not None:
+        lines.append(f"磁盘剩余 {free:.1f} GB（保护线 "
+                     f"{config.PAWCHIVE_MIN_FREE_GB:.0f} GB）")
+    ms = _MILESTONE
+    if any(ms.values()):
+        lines.append(f"本期：✅{ms['completed']} 👤{ms['manual']} ❌{ms['failed']}")
+    return "\n".join(lines)
+
+
+async def netio_shielded_panel(proc):
+    """面板收发的 netio 收口（超时/网络层取消 → None），from . import netio
+    延迟到调用时以避免潜在环。"""
+    from . import netio
+    return await netio.shielded(proc, 30, "Pawchive 进度面板")
+
+
+async def _panel_send(text):
+    """主账号发面板消息到 bot 对话（bot 未配置则收藏夹），返回消息 id。"""
+    target = state.BOT_ID or "me"
+
+    async def _send():
+        return await state.client.send_message(target, text)
+
+    msg = await netio_shielded_panel(_send)
+    return getattr(msg, "id", None) if msg else None
+
+
+async def _panel_edit(text):
+    """原地编辑面板；返回 "ok" / "unchanged" / "invalid" / None。"""
+    from telethon.errors import MessageNotModifiedError
+    target = state.BOT_ID or "me"
+
+    async def _edit():
+        try:
+            await state.client.edit_message(
+                state.BOT_ID or "me", _PANEL_MSG_ID, text)
+            return "ok"
+        except MessageNotModifiedError:
+            return "unchanged"
+        except Exception as e:
+            # 类名或消息文本任一含 MessageIdInvalid 都按面板失效处理
+            # （Telethon 偶有包装变体，靠字符串兜底更稳）
+            if "MessageIdInvalid" in type(e).__name__ or \
+                    "MessageIdInvalid" in str(e):
+                return "invalid"
+            raise
+
+    return await netio_shielded_panel(_edit)
+
+
+async def _refresh_panel():
+    """刷新一轮面板：内容没变不编辑；失效重建；网络失败保留面板 id。"""
+    global _PANEL_MSG_ID, _PANEL_LAST_TEXT
+    text = build_progress_text()
+    if text == _PANEL_LAST_TEXT and _PANEL_MSG_ID is not None:
+        return True
+    if state.client is None:
+        return False
+    if _PANEL_MSG_ID is None:
+        _PANEL_MSG_ID = await _panel_send(text)
+        if _PANEL_MSG_ID is not None:
+            _PANEL_LAST_TEXT = text
+        return _PANEL_MSG_ID is not None
+    outcome = await _panel_edit(text)
+    if outcome == "ok":
+        _PANEL_LAST_TEXT = text
+        return True
+    if outcome == "invalid":
+        logger.info("🐾 进度面板消息已失效，下一轮重建")
+        _PANEL_MSG_ID = None
+    return False
+
+
+async def _panel_loop():
+    """进度面板循环：有活动内容变化就原地编辑（间隔 PAWCHIVE_PANEL_INTERVAL）。"""
+    interval = float(config.PAWCHIVE_PANEL_INTERVAL_SECONDS)
+    logger.info(f"🐾 Pawchive 进度面板已启动（每 {interval:.0f}s 刷新）")
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await _refresh_panel()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"🐾 进度面板刷新失败（下轮再试）：{e}")
+    except asyncio.CancelledError:
+        logger.info("🐾 Pawchive 进度面板停止")
+        raise
+
+
+def _bump_milestone(kind):
+    """终态计数 +1；攒够 PAWCHIVE_MILESTONE_POSTS 发一次汇总（异步部分由
+    调用方 await _milestone_notify_if_due()）。"""
+    _MILESTONE[kind] = _MILESTONE.get(kind, 0) + 1
+    due = sum(_MILESTONE.values()) >= int(
+        getattr(config, "PAWCHIVE_MILESTONE_POSTS", 50))
+    return due
+
+
+async def _milestone_notify_if_due():
+    due = sum(_MILESTONE.values()) >= int(
+        getattr(config, "PAWCHIVE_MILESTONE_POSTS", 50))
+    if not due:
+        return False
+    ms = dict(_MILESTONE)
+    for k in _MILESTONE:
+        _MILESTONE[k] = 0
+    try:
+        await notify.notify_user(
+            f"🐾 Pawchive 阶段汇总：✅完成 {ms['completed']} ｜"
+            f"👤待人工 {ms['manual']} ｜❌失败 {ms['failed']}"
+            "（/paw 看全局；/paw manual 看外链待办）")
+    except Exception as e:
+        logger.warning(f"🐾 里程碑汇总通知失败（忽略）：{e}")
+    return True
 
 
 async def _renew_lease_loop(post_row):
@@ -542,8 +715,11 @@ async def worker_loop():
 
 
 def start_worker():
-    """把 Worker 循环挂成后台任务并保持强引用，返回该任务。"""
+    """把 Worker 循环与进度面板挂成后台任务并保持强引用，返回 worker 任务。"""
     task = asyncio.create_task(worker_loop())
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
+    panel = asyncio.create_task(_panel_loop())
+    _TASKS.add(panel)
+    panel.add_done_callback(_TASKS.discard)
     return task

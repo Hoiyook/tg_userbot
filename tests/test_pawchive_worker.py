@@ -57,6 +57,9 @@ class _WorkerDbTestCase(unittest.IsolatedAsyncioTestCase):
         worker.resume()
         worker.release_inflight()
         self.addCleanup(worker.release_inflight)
+        # 里程碑计数复位（模块级全局，跨用例隔离）
+        for k in worker._MILESTONE:
+            worker._MILESTONE[k] = 0
         self._notifies = []      # worker 发出的帖子级通知
         self._downloads = []     # _download_one 收到的 (post, file)
         patches = [
@@ -231,6 +234,75 @@ class ProcessPostTest(_WorkerDbTestCase):
             runtime_db.get_pawchive_post(post["id"])["status"],
             runtime_db.PAW_POST_MANUAL)
         self.assertEqual(self._downloads, [])
+
+
+class PanelTest(_WorkerDbTestCase):
+    """进度面板：正文构建 / 原地编辑容错 / 里程碑汇总。"""
+
+    async def test_build_progress_text_contains_counts_and_disk(self):
+        self._seed_and_claim()
+        text = worker.build_progress_text()
+        self.assertIn("🔄1", text)
+        self.assertIn("磁盘剩余", text)
+
+    async def test_panel_edit_unchanged_and_invalid(self):
+        global _PANEL_MSG_ID
+        w = worker
+        # 直接驱动 _refresh_panel：首次创建 → 编辑不变 → 失效重建
+        sent, edited = [], []
+
+        class FakePanelClient:
+            async def send_message(self, target, text):
+                sent.append(text)
+
+                class M:
+                    id = 777
+                return M()
+
+            async def edit_message(self, target, mid, text):
+                edited.append((mid, text))
+                raise Exception("MessageIdInvalidError: boom")
+
+        old_client = state.client
+        state.client = FakePanelClient()
+        old_bot = state.BOT_ID
+        state.BOT_ID = 999
+        old_mid = w._PANEL_MSG_ID
+        old_last = w._PANEL_LAST_TEXT
+        try:
+            w._PANEL_MSG_ID = None
+            w._PANEL_LAST_TEXT = None
+            self.assertTrue(await w._refresh_panel())
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(w._PANEL_MSG_ID, 777)
+            # 同内容 → 跳过编辑
+            self.assertTrue(await w._refresh_panel())
+            self.assertEqual(len(edited), 0)
+            # 内容变化但消息失效 → 面板 id 重置（下轮重建）
+            runtime_db.enqueue_pawchive_posts(
+                "patreon", "42", "C", [_post("555")])
+            self.assertFalse(await w._refresh_panel())
+            self.assertIsNone(w._PANEL_MSG_ID)
+        finally:
+            state.client = old_client
+            state.BOT_ID = old_bot
+            w._PANEL_MSG_ID = old_mid
+            w._PANEL_LAST_TEXT = old_last
+
+    async def test_milestone_digest_and_reset(self):
+        self._seed_and_claim()
+        with mock.patch.object(config, "PAWCHIVE_MILESTONE_POSTS", 2):
+            self.assertFalse(await worker._milestone_notify_if_due())
+            worker._bump_milestone("completed")
+            self.assertFalse(await worker._milestone_notify_if_due())
+            worker._bump_milestone("manual")
+            self.assertTrue(await worker._milestone_notify_if_due())
+        self.assertEqual(len(self._notifies), 1)
+        self.assertIn("✅完成 1", self._notifies[0])
+        self.assertIn("👤待人工 1", self._notifies[0])
+        # 计数已复位
+        self.assertEqual(worker._MILESTONE,
+                         {"completed": 0, "manual": 0, "failed": 0})
 
 
 class PauseResumeTest(_WorkerDbTestCase):
