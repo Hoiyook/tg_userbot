@@ -213,11 +213,31 @@ def parse_post_ref(text):
     return None
 
 
+# URL 尾部粘连的全角标点/空白（ASCII 半角 ) ] 需配平判定，见 _trim_url_tail）
+_URL_TAIL_PUNCT = "。，、；：！？…】」』〉》＞\u3000 \t"
+
+
+def _trim_url_tail(url):
+    """剪掉正文里 URL 尾部粘连的标点（中文帖子 URL 后几乎总跟句读）。
+
+    全角标点直接剪；ASCII 的 ) ] 只在不成对时剪（保护 wiki 式 URL 内的
+    合法括号）。"""
+    url = url.rstrip(_URL_TAIL_PUNCT)
+    while url.endswith(")") and url.count(")") > url.count("("):
+        url = url[:-1]
+    while url.endswith("]") and url.count("]") > url.count("["):
+        url = url[:-1]
+    return url
+
+
 def extract_links(post):
     """从帖子 content HTML 与 embed 字段提取站外链接（MEGA/网盘等）。
 
     站内链接（pawchive.pw）剔除；同帖内按 URL 去重。MEGA 链接的解密密钥
     绝大多数在 URL #fragment 里，原样保留即可打开。
+
+    三个来源、kind 区分：link = <a href>；text = 剥标签后正文裸写的 URL
+    （尾部标点自动修剪）；embed = 帖子 embed 字段。
     """
     links, seen = [], set()
     for m in re.finditer(r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
@@ -234,6 +254,27 @@ def extract_links(post):
         text = re.sub(r"<[^>]+>", "", m.group(2) or "").strip()
         links.append({"kind": "link", "domain": host,
                       "url": url, "text": text[:200]})
+    # ② 纯文本补扫：剥掉 HTML 标签后，正文里裸写（未被 <a> 包裹）的 URL。
+    # href 在标签属性里随标签一起消失 → 与 ① 不会重复计数；<a> 锚点文本
+    # 恰好是同一 URL 时按 URL 去重兜住。
+    plain = html_mod.unescape(
+        re.sub(r"<[^>]+>", " ", post.get("content") or ""))
+    # 字符集按 RFC 3986 白名单：天然排除中文标点/汉字（URL 尾随句读不再
+    # 被吞进 URL），MEGA 的 #fragment 与 -_.~ 都在集内。
+    for m in re.finditer(
+            r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+", plain):
+        url = _trim_url_tail(m.group(0))
+        host = urllib.parse.urlparse(url).netloc.lower()
+        if not host or host.endswith("pawchive.pw"):
+            continue
+        low = url.lower()
+        if low in seen or any(u.startswith(low) for u in seen):
+            # 去重含前缀形态：<a href="…#key"> 锚点文本常是不带 key 的同链接
+            continue
+        seen.add(low)
+        links.append({"kind": "text", "domain": host,
+                      "url": url, "text": ""})
+
     embed = post.get("embed") or {}
     if isinstance(embed, dict):
         url = str(embed.get("url") or "")

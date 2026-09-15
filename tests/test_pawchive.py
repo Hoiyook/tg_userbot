@@ -68,6 +68,47 @@ class ExtractLinksTest(unittest.TestCase):
         # 站内链接不入清单；纯文本 KEY 不算链接（它不在 <a> 里）
         self.assertTrue(all("pawchive.pw" not in l["url"] for l in links))
 
+    def test_bare_url_in_plain_text(self):
+        """正文里裸写（无 <a> 包裹）的 URL 也要识别出来。"""
+        content = ("<p>备份：https://mega.nz/folder/abc#key123 备用。</p>")
+        links = pawchive.extract_links({"content": content, "embed": {}})
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0]["kind"], "text")
+        self.assertEqual(links[0]["domain"], "mega.nz")
+        self.assertEqual(links[0]["url"],
+                         "https://mega.nz/folder/abc#key123")
+
+    def test_bare_url_trailing_punctuation_trimmed(self):
+        """URL 后跟中文标点是常态，必须剪掉否则链接打不开。"""
+        content = "<p>https://mega.nz/file/x#k。备用：https://krakenfiles.com/a）</p>"
+        links = pawchive.extract_links({"content": content, "embed": {}})
+        urls = [l["url"] for l in links]
+        self.assertIn("https://mega.nz/file/x#k", urls)
+        self.assertIn("https://krakenfiles.com/a", urls)
+
+    def test_bare_url_dedup_with_anchor(self):
+        """<a> 的锚点文本若是同一 URL，剥标签后的裸扫按 URL 去重不重复计。"""
+        content = ('<p><a href="https://mega.nz/file/x#k">MEGA</a></p>')
+        links = pawchive.extract_links({"content": content, "embed": {}})
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0]["kind"], "link")
+
+    def test_bare_url_entity_unescaped(self):
+        content = "<p>https://example.com/f?a=1&amp;b=2 直接看</p>"
+        links = pawchive.extract_links({"content": content, "embed": {}})
+        self.assertEqual(links[0]["url"], "https://example.com/f?a=1&b=2")
+
+    def test_bare_pawchive_url_excluded(self):
+        content = "<p>原帖：https://pawchive.pw/patreon/user/1/post/2 看这里</p>"
+        self.assertEqual(
+            pawchive.extract_links({"content": content, "embed": {}}), [])
+
+    def test_bare_url_balanced_paren_kept(self):
+        """URL 内含成对括号（wiki 式）不能误剪。"""
+        content = "<p>见 https://example.com/a(b)c。</p>"
+        links = pawchive.extract_links({"content": content, "embed": {}})
+        self.assertEqual(links[0]["url"], "https://example.com/a(b)c")
+
     def test_embed_url_included(self):
         links = pawchive.extract_links({
             "content": "", "embed": {"url": "https://www.youtube.com/watch?v=x",
