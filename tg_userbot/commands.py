@@ -27,6 +27,7 @@ from . import sql_templates
 from . import shell
 from . import upload
 from . import pawchive
+from . import sources
 from .config import (
     BOT_USERNAME,
     DONE_DEFAULT_LINES,
@@ -345,6 +346,11 @@ async def handle_command(event, cmd_text):
         logger.info(f"执行命令：/retry {parts[1] if len(parts) > 1 else ''}")
         return True
 
+    if cmd_text == "/origin":
+        await _reply(event, sources.origin_failures_text())
+        logger.info("执行命令：/origin")
+        return True
+
     if pawchive.is_paw_command(cmd_text):
         # Pawchive：扫描/收藏对比/Chrome 批量下载（解析与回复全在模块内）
         logger.info(f"执行命令：{cmd_text[:60]}")
@@ -434,6 +440,7 @@ async def handle_command(event, cmd_text):
             "/wl del ID或序号 - 移出白名单\n"
             "/sql - SQL 诊断控制台：直接查询/检修 runtime DB\n"
             "/paw - Pawchive：扫描作者作品、收藏对比、Chrome 批量下载\n"
+            "/origin - 查看评论来源解析失败账本（可溯源）\n"
             "/paw plan 作者名 - 扫描作者帖子入队（默认只收未收藏帖）\n"
             "/sh - 命令行：远程执行 shell 命令（黑名单拦截高危操作）\n"
             "/sh cd 目录 - 切换 /sh 的工作目录（会记住）\n"

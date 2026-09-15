@@ -70,6 +70,7 @@ BOT_COMMANDS = (
     ("chrome_cancel", "取消 Chrome 任务：/chrome_cancel <序号>"),
     ("chrome", "用 Chrome 下载：/chrome <URL>"),
     ("paw", "Pawchive：扫描作者作品、收藏对比、Chrome 批量下载"),
+    ("origin", "查看评论来源解析失败账本（可溯源）"),
     ("clearmsg", "清理程序产生的消息"),
     ("help", "查看全部命令"),
 )

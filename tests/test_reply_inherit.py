@@ -44,6 +44,10 @@ from tg_userbot import runtime_db  # noqa: E402
 from tg_userbot import sources  # noqa: E402
 from tg_userbot import state  # noqa: E402
 
+# 取父消息失败的用例会触发来源解析的退避重试（30s×2）——测试里归零，
+# 只为套件速度；重试语义本身由 tests/test_origin_ledger.py 覆盖。
+mock.patch.object(config, "ORIGIN_RETRY_DELAY_SECONDS", 0).start()
+
 CHANNEL = -1001719225045      # 频道 A（原帖所在）
 GROUP = -1002143122455        # 讨论组 B
 MIRROR_ID = 679121            # 群内镜像帖（= 频道帖 88040 的副本）

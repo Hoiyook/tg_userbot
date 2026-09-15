@@ -360,6 +360,18 @@ LISTEN_STARTUP_DELAY_SECONDS = 20
 ORIGIN_MAX_HOPS = 5
 # 取父消息的网络超时（秒）：telethon 请求没有读超时，僵死连接会挂住入队路径。
 ORIGIN_FETCH_TIMEOUT_SECONDS = 30
+# ---- 评论继承的准确性保障（2026-09-15，突发转发限流事故）----
+# 实测：一次转发 ~40 个文件时，并发回源请求触发 Telegram 限流，16 个取消息
+# 超过 30s 保护超时 → 静默降级落错目录（祂录（3D区）群组/）。三层防线：
+# 1) 取消息全局限速（并发闸 + 最小间隔），从源头避免限流；
+# 2) 解析失败退避重试（数据准确性优先——宁可迟到下载也不落错目录）；
+# 3) 重试耗尽才降级，且**必须**写失败账本（origin_failures.jsonl）+ 通知，
+#    /origin 命令可查、可溯源。
+ORIGIN_FETCH_CONCURRENCY = 3          # 回源取消息的全局并发闸
+ORIGIN_FETCH_PACE_SECONDS = 0.4       # 相邻两次取消息的最小间隔（秒）
+ORIGIN_RETRY_ATTEMPTS = 3             # 整条上溯链的最大尝试次数
+ORIGIN_RETRY_DELAY_SECONDS = 30       # 相邻两次尝试的退避（秒）
+ORIGIN_FAILURES_FILE = os.path.join(RUNTIME_DIR, "origin_failures.jsonl")
 # --- 评论跟进（2026-09-12）---
 # 命中标签的帖子会进「关注列表」，之后按天跟进它的评论区并取回新出现的媒体
 # 评论（频道主/成员常把差分放在评论区）。**不是**扫群全量：每帖每次只发 1 次
@@ -835,6 +847,10 @@ CLEAN_NOTIFICATION_PREFIXES = (
     "❌ 正则表达式无效",
     "❌ 规则编号不存在",
     "❌ /caption_filter",
+    # /origin（来源解析失败账本）的命令与回复
+    "/origin",
+    "🕘 来源解析",
+    "🕘 没有来源解析失败记录",
     # /thread 的回复
     "🧵 当前并发下载数",
     "✅ 并发下载数已设置为",
