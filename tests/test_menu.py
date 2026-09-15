@@ -1016,7 +1016,7 @@ class ShMenuViewTest(unittest.TestCase):
                   for row in rows for b in row]
         actions = [(menu.parse_menu_data(d)) for _, d in labels]
         run_args = [arg for action, arg in actions if action == "sh_run"]
-        self.assertEqual(len(run_args), 3)
+        self.assertEqual(len(run_args), 5)   # ls/df/uptime/find×2
         for arg in run_args:
             self.assertIn(arg, shell.PRESET_COMMANDS)
         self.assertTrue(any(action == "sh_input" for action, _ in actions))

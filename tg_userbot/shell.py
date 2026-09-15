@@ -49,6 +49,9 @@ PRESET_COMMANDS = {
     "ls": "ls -la",
     "df": "df -h .",
     "uptime": "uptime",
+    # find 系列（2026-09-15 用户要求：终端命令行按名称查当前目录数据）
+    "find . -maxdepth 3 -type f | head -60": "🔎 find 当前目录文件",
+    "find . -maxdepth 3 -type d | head -40": "📁 find 子目录",
 }
 
 
@@ -58,6 +61,8 @@ def sh_view_text():
         "🖥 命令行\n\n"
         f"📂 当前工作目录：\n{state.SHELL_CWD}\n\n"
         "点按钮执行预设命令，或 ✏️ 输入自定义命令。\n"
+        "按名称搜文件（✏️ 里发，替换关键词）：\n"
+        'find . -iname \"*关键词\"\n'
         "（任意命令请直接在收藏夹发 /sh <命令>）"
     )
 
