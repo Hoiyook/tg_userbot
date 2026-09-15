@@ -552,10 +552,16 @@ async def csv_reply(creator=None):
 async def retry_all_reply():
     """重投全部失败帖子（/paw retry all 的面板入口），返回回执文案。"""
     try:
-        count = runtime_db.retry_pawchive_posts()
+        requeued, skipped = runtime_db.retry_pawchive_posts()
     except runtime_db.DbUnavailable as e:
         return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
-    msg = f"🔁 已重投 {count} 条失败帖子" if count else "没有失败帖子需要重投"
+    if requeued:
+        msg = f"🔁 已重投 {requeued} 条失败帖子"
+        if skipped:
+            msg += f"（跳过 {skipped} 条纯死链帖，重试无意义）"
+    else:
+        msg = "没有需要重投的失败帖子" + (
+            f"（{skipped} 条纯死链帖已跳过）" if skipped else "")
     return f"{TEXT_PREFIX}\n{msg}"
 
 
@@ -789,14 +795,20 @@ async def _reply_retry(event, arg):
         return
     try:
         if arg.lower() == "all":
-            count = runtime_db.retry_pawchive_posts()
-            await event.reply(f"{TEXT_PREFIX}\n🔁 已重投 {count} 条失败帖子",
-                              link_preview=False)
+            requeued, skipped = runtime_db.retry_pawchive_posts()
+            if requeued:
+                msg = f"🔁 已重投 {requeued} 条失败帖子"
+                if skipped:
+                    msg += f"（跳过 {skipped} 条纯死链帖，重试无意义）"
+            else:
+                msg = "没有需要重投的失败帖子" + (
+                    f"（{skipped} 条纯死链帖已跳过）" if skipped else "")
+            await event.reply(f"{TEXT_PREFIX}\n{msg}", link_preview=False)
             return
-        count = runtime_db.retry_pawchive_posts(row_ids=[int(arg)])
+        requeued, _skipped = runtime_db.retry_pawchive_posts(row_ids=[int(arg)])
         await event.reply(
-            f"{TEXT_PREFIX}\n🔁 已重投 #{arg}" if count
-            else f"{TEXT_PREFIX}\n❌ #{arg} 不在失败状态",
+            f"{TEXT_PREFIX}\n🔁 已重投 #{arg}" if requeued
+            else f"{TEXT_PREFIX}\n❌ #{arg} 不在失败状态（或全部是已确认死链）",
             link_preview=False)
     except ValueError:
         await event.reply(f"{TEXT_PREFIX}\n❌ 行ID 须为数字（/paw status 查看）",

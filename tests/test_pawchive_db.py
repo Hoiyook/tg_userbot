@@ -232,14 +232,82 @@ class FileLifecycleTest(_PawDbTestCase):
         runtime_db.mark_pawchive_file_failed(files[0]["id"], "boom")
         runtime_db.finalize_pawchive_post(
             p111["id"], runtime_db.PAW_POST_FAILED, error="1/1 失败")
-        count = runtime_db.retry_pawchive_posts()
-        self.assertEqual(count, 1)
+        requeued, skipped = runtime_db.retry_pawchive_posts()
+        self.assertEqual((requeued, skipped), (1, 0))
         self.assertEqual(
             runtime_db.get_pawchive_post(p111["id"])["status"],
             runtime_db.PAW_POST_PENDING)
         after = runtime_db.list_pawchive_files(p111["id"])[0]
         self.assertEqual(after["status"], runtime_db.PAW_FILE_PENDING)
         self.assertIsNone(after["chrome_task_id"])
+
+
+class RetrySkipsDeadLinksTest(_PawDbTestCase):
+    """用户要求（2026-09-15）：/paw retry 不重投已确认死链，只重投可恢复数据。
+
+    死链 = FAILED 且 error 以「站点缺文件(404)」开头。规则：
+    - 帖子重投时只把可恢复文件放回 PENDING，死链文件保持 FAILED；
+    - 纯死链帖（没有任何可恢复文件）整帖跳过、维持 FAILED；
+    - 重投帖子的备注写明跳过的死链数（/paw status 可见）。
+    """
+
+    def _seed_failed(self, files):
+        """入库 + 打成 FAILED 终态，返回帖子行。"""
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "42", "C", [{
+                "post_id": "99", "title": "T", "published": "2026-01-01",
+                "post_url": "u", "subdir": "Pawchive/C/99",
+                "files": files, "ext_links": [],
+            }])
+        row = runtime_db.find_pawchive_posts_by_post_id("99")[0]
+        runtime_db.claim_next_pawchive_post(now=1000)
+        seed_by_url = {f["url"]: f.get("seed_error") or "网络超时"
+                       for f in files}
+        for f in runtime_db.list_pawchive_files(row["id"]):
+            runtime_db.mark_pawchive_file_failed(
+                f["id"], error=seed_by_url.get(f["url"], "网络超时"))
+        runtime_db.finalize_pawchive_post(
+            row["id"], runtime_db.PAW_POST_FAILED, error="下载失败")
+        return row
+
+    def test_dead_file_stays_failed_on_retry(self):
+        row = self._seed_failed([
+            {"url": "https://x/dead.jpg", "filename": "dead.jpg",
+             "seed_error": runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404"},
+            {"url": "https://x/live.mp4", "filename": "live.mp4",
+             "seed_error": "下载超时"},
+        ])
+        requeued, skipped = runtime_db.retry_pawchive_posts()
+        self.assertEqual((requeued, skipped), (1, 0))
+        self.assertEqual(
+            runtime_db.get_pawchive_post(row["id"])["status"],
+            runtime_db.PAW_POST_PENDING)
+        by_url = {f["url"]: f for f in runtime_db.list_pawchive_files(row["id"])}
+        # 死链保持 FAILED（不进预检队列空转）；可恢复的放回 PENDING
+        self.assertEqual(by_url["https://x/dead.jpg"]["status"],
+                         runtime_db.PAW_FILE_FAILED)
+        self.assertIn("站点缺文件", by_url["https://x/dead.jpg"]["error"])
+        self.assertEqual(by_url["https://x/live.mp4"]["status"],
+                         runtime_db.PAW_FILE_PENDING)
+        # 备注写明跳过的死链数
+        self.assertIn("跳过 1 个已确认死链",
+                      runtime_db.get_pawchive_post(row["id"])["last_error"])
+
+    def test_all_dead_post_skipped_entirely(self):
+        row = self._seed_failed([
+            {"url": "https://x/d1.jpg", "filename": "d1.jpg",
+             "seed_error": runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404"},
+            {"url": "https://x/d2.jpg", "filename": "d2.jpg",
+             "seed_error": runtime_db.PAW_DEAD_LINK_MARK + " HTTP 410"},
+        ])
+        requeued, skipped = runtime_db.retry_pawchive_posts()
+        self.assertEqual((requeued, skipped), (0, 1))
+        self.assertEqual(
+            runtime_db.get_pawchive_post(row["id"])["status"],
+            runtime_db.PAW_POST_FAILED)   # 维持失败，不空转
+        self.assertTrue(all(
+            f["status"] == runtime_db.PAW_FILE_FAILED
+            for f in runtime_db.list_pawchive_files(row["id"])))
 
 
 class StatusCountsTest(_PawDbTestCase):

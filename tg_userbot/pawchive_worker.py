@@ -43,8 +43,8 @@ from .log import logger
 # 强制直连：系统代理（socks5）会让 urllib 秒抛 ValueError（2026-09-15 实测）
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-# 站点侧死链的失败标记（finalize 用它区分「不可行动的死链」与「值得重试的失败」）
-_MISSING_MARK = "站点缺文件(404)"
+# 站点侧死链的失败标记（单一事实源在 runtime_db，retry 重投据此跳过死链）
+_MISSING_MARK = runtime_db.PAW_DEAD_LINK_MARK
 _DEAD_STATUS = (404, 410)
 # 单文件最大尝试次数与退避基数（秒）——对应原 Chrome 端的 3 次重试语义
 _DOWNLOAD_ATTEMPTS = 3

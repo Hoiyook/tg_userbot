@@ -86,6 +86,10 @@ PAW_POST_MANUAL = "MANUAL"
 PAW_POST_FAILED = "FAILED"
 PAW_POST_TERMINAL = (PAW_POST_COMPLETED, PAW_POST_MANUAL, PAW_POST_FAILED)
 
+# 站点侧死链的失败标记前缀（worker 写入，retry 重投时据此跳过——死链
+# 重试一万次也是 404，不属于可恢复数据）
+PAW_DEAD_LINK_MARK = "站点缺文件(404)"
+
 # 文件级状态：SUBMITTED = 已交给 Chrome Agent（对账以 chrome_tasks.json 为准）
 PAW_FILE_PENDING = "PENDING"
 PAW_FILE_SUBMITTED = "SUBMITTED"
@@ -1446,9 +1450,13 @@ def postpone_pawchive_post(post_row, next_retry_at, error=None, now=None):
 
 
 def retry_pawchive_posts(row_ids=None, now=None):
-    """FAILED → PENDING（/paw retry）：文件级 FAILED 一并重投。
+    """FAILED → PENDING（/paw retry）：**只重投可恢复文件**。
 
-    row_ids=None 表示重投全部失败帖子。
+    已确认的站点死链（error 以 PAW_DEAD_LINK_MARK 开头的 FAILED 文件）保持
+    FAILED 不动——重试也是 404，重投它们只会空转一轮预检；纯死链帖子（一个
+    可恢复文件都没有）整帖跳过、维持 FAILED。
+
+    row_ids=None 表示处理全部失败帖子。返回 (重投帖子数, 跳过帖子数)。
     """
     now = _now(now)
 
@@ -1460,8 +1468,25 @@ def retry_pawchive_posts(row_ids=None, now=None):
             targets = [r["id"] for r in rows]
         else:
             targets = [int(x) for x in row_ids]
-        count = 0
+        requeued = skipped = 0
         for pid in targets:
+            files = _execute(
+                conn,
+                "SELECT id, status, error FROM pawchive_files "
+                "WHERE post_row=?",
+                (pid,),
+            ).fetchall()
+            # 可恢复 = 失败但非死链；已处 PENDING 的文件（崩溃态）也算
+            recoverable = [
+                r["id"] for r in files
+                if r["status"] == PAW_FILE_PENDING
+                or (r["status"] == PAW_FILE_FAILED
+                    and not (r["error"] or "").startswith(PAW_DEAD_LINK_MARK))
+            ]
+            if not files or not recoverable:
+                # 纯死链帖 / 无文件帖：没有可恢复数据，跳过
+                skipped += 1
+                continue
             cur = _execute(
                 conn,
                 "UPDATE pawchive_posts SET status=?, next_retry_at=NULL, "
@@ -1470,14 +1495,23 @@ def retry_pawchive_posts(row_ids=None, now=None):
             )
             if not cur.rowcount:
                 continue
-            count += 1
+            requeued += 1
+            dead = len(files) - len(recoverable)
+            marks = ",".join(str(i) for i in recoverable)
             _execute(
                 conn,
-                "UPDATE pawchive_files SET status=?, chrome_task_id=NULL, "
-                "updated_at=? WHERE post_row=? AND status=?",
-                (PAW_FILE_PENDING, now, pid, PAW_FILE_FAILED),
+                f"UPDATE pawchive_files SET status=?, chrome_task_id=NULL, "
+                f"updated_at=? WHERE id IN ({marks})",
+                (PAW_FILE_PENDING, now),
             )
-        return count
+            if dead:
+                # 死链留在原地的事实写进帖子备注，/paw status 可见
+                _execute(
+                    conn,
+                    "UPDATE pawchive_posts SET last_error=? WHERE id=?",
+                    (f"重投时跳过 {dead} 个已确认死链（不再重试）", pid),
+                )
+        return requeued, skipped
 
     count = _write(do, "重投 Pawchive 失败帖子")
     if count:

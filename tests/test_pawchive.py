@@ -286,7 +286,7 @@ class CommandReplyTest(_DbTestCase):
     def test_retry_all_empty(self):
         ev = _FakeEvent()
         self._run(pawchive.command_reply(ev, "/paw retry all"))
-        self.assertIn("0", ev.replies[0])
+        self.assertIn("没有需要重投", ev.replies[0])
 
     def test_status_with_db(self):
         self._seed()
