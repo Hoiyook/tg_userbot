@@ -163,6 +163,67 @@ class BuildScanRecordsTest(unittest.TestCase):
         self.assertTrue(records[0]["subdir"].startswith("Pawchive/TestCreator/"))
 
 
+class EarlyStopTest(unittest.TestCase):
+    """增量扫描：**连续两整页**均已入库 → 提前停止（防单页假象漏数据）；
+    混入新帖/首扫 → 继续；前提是绝不漏数据。"""
+
+    def _posts(self, ids):
+        return [{"id": str(i), "title": f"T{i}", "published": "2026-01-01",
+                 "attachments": [], "content": "", "embed": {}}
+                for i in ids]
+
+    def _run(self, pages, known):
+        """pages: 每页返回的帖子 id 列表；known: 预置已入库集合。"""
+        calls = []
+
+        def fake_get_json(url, cookie=None, timeout=30, retries=4):
+            offset = int(url.split("o=")[1])
+            calls.append(offset)
+            idx = offset // 50
+            return self._posts(pages[idx]) if idx < len(pages) else []
+
+        old_page, old_get = pawchive._PAGE, pawchive._http_get_json
+        pawchive._PAGE = 50
+        pawchive._http_get_json = fake_get_json
+        try:
+            posts = pawchive.fetch_creator_posts(
+                "patreon", "42", None, None, known_ids=known)
+        finally:
+            pawchive._PAGE, pawchive._http_get_json = old_page, old_get
+        return posts, calls
+
+    def test_two_consecutive_known_pages_stop(self):
+        # 连续两整页全已知 → 第 2 页后停止（2 个请求）
+        pages = [list(range(200, 250)), list(range(150, 200))]
+        posts, calls = self._run(pages,
+                                 known={str(i) for i in range(150, 250)})
+        self.assertEqual(len(posts), 100)
+        self.assertEqual(calls, [0, 50])
+
+    def test_single_known_page_not_enough(self):
+        """只有一页全已知 → 不停（防排序抖动漏数据），继续拉到短页。"""
+        pages = [list(range(200, 250)), list(range(150, 200))]
+        known = {str(i) for i in range(200, 250)}   # 仅第 1 页已知
+        posts, calls = self._run(pages, known=known)
+        self.assertEqual(len(posts), 100)   # 第2页含未知帖必须继续
+        self.assertEqual(calls, [0, 50, 100])  # 第3页为空页才自然停止
+
+    def test_page_with_new_post_continues(self):
+        # 第 1 页混入 1 个新帖 → 不能算全已知页，继续拉第 2 页
+        pages = [[300] + list(range(201, 250)), list(range(151, 201)), []]
+        known = {str(i) for i in range(151, 250)}
+        posts, calls = self._run(pages, known=known)
+        self.assertEqual(len(posts), 100)
+        self.assertEqual(calls, [0, 50, 100])
+
+    def test_first_scan_full_pagination(self):
+        # 首扫（known=None）：拉到短页为止
+        pages = [list(range(100, 150)), list(range(90, 100))]
+        posts, calls = self._run(pages, known=None)
+        self.assertEqual(len(posts), 60)
+        self.assertEqual(calls, [0, 50])
+
+
 class ParsePostRefTest(unittest.TestCase):
 
     def test_full_url(self):

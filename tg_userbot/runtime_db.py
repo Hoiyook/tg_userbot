@@ -1245,6 +1245,17 @@ def search_pawchive_posts(term, limit=10):
     return [_row_to_pawchive_post(r) for r in rows]
 
 
+def pawchive_known_post_ids(service, creator_id):
+    """某创作者已入库的全部站点帖子 id（集合）——扫描提前停止的判定源。"""
+    rows = _read(lambda c: _execute(
+        c,
+        "SELECT post_id FROM pawchive_posts "
+        "WHERE service=? AND creator_id=?",
+        (str(service), str(creator_id))).fetchall(),
+        "查 Pawchive 已入库帖子 id")
+    return {r["post_id"] for r in rows}
+
+
 def pawchive_status_counts():
     """各状态帖子计数（/paw status 视图）。"""
     rows = _read(lambda c: _execute(

@@ -145,12 +145,13 @@ def fetch_creator_posts(service, creator_id, cookie=None, progress=None,
                         known_ids=None):
     """分页拉取创作者帖子；**整页均已入库时提前停止**（增量扫描）。
 
-    帖子按发布时间倒序返回，故连续拉到"整页已知"即说明后面都是旧数据——
-    任何新帖（含站点补传的旧帖）都会让该页不全是已知而继续拉。已知集合
-    来自 pawchive_posts 唯一索引，正确性锚点仍是入库时的 INSERT OR IGNORE；
-    提前停止只是省请求，绝不影响完整性。known_ids=None 时全量分页（首扫）。
+    帖子按发布时间倒序返回；**连续两整页均已入库**才提前停止——单页假象
+    （站点排序抖动/补传插页）不会导致漏数据，任何未见过的帖子都会让扫描
+    继续。正确性锚点仍是入库时的 INSERT OR IGNORE 唯一索引；提前停止只是
+    省请求，绝不影响完整性。known_ids=None 时全量分页（首扫）。
     """
     posts, offset = [], 0
+    all_known_pages = 0
     while True:
         page = _http_get_json(
             f"{config.PAWCHIVE_API_BASE}/api/v1/{service}/user/{creator_id}"
@@ -160,10 +161,14 @@ def fetch_creator_posts(service, creator_id, cookie=None, progress=None,
             progress(f"已拉取 {len(posts)} 条")
         if known_ids is not None and page and all(
                 str(p["id"]) in known_ids for p in page):
-            logger.info(
-                f"🐾 整页均已入库（offset {offset}），增量扫描提前停止，"
-                f"共拉取 {len(posts)} 条")
-            return posts
+            all_known_pages += 1
+            if all_known_pages >= 2:
+                logger.info(
+                    f"🐾 连续 {all_known_pages} 整页均已入库（offset {offset}），"
+                    f"增量扫描提前停止，共拉取 {len(posts)} 条")
+                return posts
+        else:
+            all_known_pages = 0
         if len(page) < _PAGE:
             return posts
         offset += _PAGE
