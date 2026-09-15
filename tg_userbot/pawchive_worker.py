@@ -1,51 +1,56 @@
-"""Pawchive Worker —— 生命周期消费：领取帖子 → Chrome Agent 下载直链 → 终态。
+"""Pawchive Worker —— 生命周期消费：领取帖子 → 内置并发下载 → 终态。
 
-**扫描 ≠ 执行**的另一半（与 listener_worker 同构，但执行体是 Chrome Agent
-而不是 Telegram 转发）：
+**扫描 ≠ 执行**的另一半（与 listener_worker 同构，执行体是本进程的 httpx
+并发下载器，2026-09-15 起不再经 Chrome Agent——实测 Chrome 串行 + 代理路线
+吞吐 0.27~10MB/s 波动且单文件阻塞整队，直连并发吞吐高一个量级）：
 
     claim（短事务落 PROCESSING + 租约）
-      ↓  ← 事务到此结束，Chrome/文件操作一律在事务外
-    对账 SUBMITTED 文件的 chrome task（终态就地吸收；失联才重投）
+      ↓  ← 事务到此结束，网络/文件操作一律在事务外
+    死链预检（HEAD）：404/410 的直链直接标 FAILED——死链没有内容可下
       ↓
-    死链预检（HEAD）：404/410 的直链直接标 FAILED——死链没有下载事件，
-    进 Chrome 只会白烧 CHROME_DOWNLOAD_TIMEOUT×3（实测某创作者 88% 死链）
-      ↓
-    PENDING 文件逐条 add_request 交给 Chrome Agent（FIFO 串行下载）
-      ↓
-    轮询 chrome_tasks.json 等本帖全部终态（期间周期续租——大视频单帖可达数小时）
+    帖内附件并发下载（asyncio.gather + 共享 DOWNLOAD_SEMAPHORE 限流；
+    .part 断点续传、大小校验、3 次尝试、404/410 就地判死）
       ↓
     全 DONE 且无外链 → COMPLETED；有外链 → MANUAL（通知外链清单）；
     有 FAILED → FAILED（/paw retry 重投；全部是站点死链则只落库不通知）
 
-**为什么经 Chrome Agent 而不是下载队列**：用户指定用 Chrome 模块——直链挂到
-专用 Profile 的真实浏览器上下载，自带重试（3 次）、任务面板（/chrome_tasks）
-与取消（/chrome_cancel），且 pawchive 直链无需 Cookie，与 Agent 独立 profile
-天然兼容。代价是 Agent 串行 FIFO：大批量帖子注定是长流水，状态全在 SQLite 可查。
+落盘 `DOWNLOAD_DIR/Pawchive/<作者>/<日期>_<帖子ID>_<标题>/`（旧 Chrome 时代
+的产物在 `TG Chrome Download/Pawchive/`）。进度注册进 register_download
+（/progress 可见）；帖子级终态才是 worker 的通知面（COMPLETED 只记日志）。
 
-**通知粒度**：per-file 的结果通知由 chrome_client.notify_loop 发（提交时即
-mark_notified 屏蔽掉——1620 个文件就是 1620 条刷屏）；本 worker 只在帖子级
-终态通知：MANUAL / FAILED 必通知，COMPLETED 只记日志（/paw status 可查）。
+**直连纪律**：httpx trust_env=False + 空 ProxyHandler opener——系统/环境
+代理（socks5）urllib/httpx 都不友好，pawchive 直连可达且更快。
 
-**幂等性**：at-least-once。COMPLETED 写入前崩溃 → 租约到期 → 重领 → 文件级
-状态（DONE/SUBMITTED）保证已下载的不再重下；SUBMITTED 且 task 失联（Agent
-端终态任务被 trim）才重投，极端情况下可能多下一次，可接受。
+**幂等性**：at-least-once。DONE 写入前崩溃 → 租约到期 → 重领 → 已 DONE 的
+文件跳过；.part 续传 + 目标已存在且大小一致 → 跳过下载。
 """
 import asyncio
 import collections
+import os
 import shutil
 import time
+import urllib.error
 import urllib.request
 
-from . import chrome_agent
-from . import chrome_client
+import httpx
+
 from . import config
 from . import notify
 from . import runtime_db
 from . import state
 from .log import logger
 
-# 正在处理的帖子行 id（单并发）；停机时放回 PENDING。
-_INFLIGHT = None
+# 强制直连：系统代理（socks5）会让 urllib 秒抛 ValueError（2026-09-15 实测）
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# 站点侧死链的失败标记（finalize 用它区分「不可行动的死链」与「值得重试的失败」）
+_MISSING_MARK = "站点缺文件(404)"
+_DEAD_STATUS = (404, 410)
+# 单文件最大尝试次数与退避基数（秒）——对应原 Chrome 端的 3 次重试语义
+_DOWNLOAD_ATTEMPTS = 3
+
+# 正在处理的帖子行 id 集合；停机时全部放回 PENDING。
+_INFLIGHT = set()
 # 后台任务强引用（asyncio 只对 Task 持弱引用）
 _TASKS = set()
 
@@ -63,7 +68,8 @@ def pause(reason="手动暂停"):
     _PAUSED = True
     _PAUSE_REASON = str(reason)
     logger.warning(f"🐾 Pawchive worker 已暂停：{_PAUSE_REASON}")
-    return f"⏸ 已暂停处理（{_PAUSE_REASON}）。在途帖子会跑完当前状态，不再领新帖。/paw resume 恢复"
+    return (f"⏸ 已暂停处理（{_PAUSE_REASON}）。在途帖子会跑完当前状态，"
+            "不再领新帖。/paw resume 恢复")
 
 
 def resume():
@@ -85,22 +91,24 @@ def worker_state_text():
 
 
 def current_post_label():
-    """在途帖子的展示标签；没有在途 / DB 不可用返回 None。"""
-    if _INFLIGHT is None:
+    """在途帖子的展示标签；无 / DB 不可用返回 None。"""
+    if not _INFLIGHT:
         return None
     try:
-        post = runtime_db.get_pawchive_post(_INFLIGHT)
+        rows = [runtime_db.get_pawchive_post(r) for r in sorted(_INFLIGHT)]
     except runtime_db.DbUnavailable:
         return None
-    if post is None:
+    rows = [r for r in rows if r]
+    if not rows:
         return None
-    return (f"#{post['id']} {post['creator_name']} "
-            f"{(post['title'] or '')[:36]}")
+    return "；".join(
+        f"#{r['id']} {r['creator_name']} {(r['title'] or '')[:24]}"
+        for r in rows[:3])
 
 
 def _disk_free_gb():
     try:
-        return shutil.disk_usage(config.CHROME_DOWNLOAD_DIR).free / 1024 ** 3
+        return shutil.disk_usage(config.DOWNLOAD_DIR).free / 1024 ** 3
     except OSError:
         return None
 
@@ -118,24 +126,23 @@ def claim_next_post():
         logger.error(f"🐾 领取帖子失败（数据库不可用），本轮跳过：{e}")
         return None
     if post is not None:
-        global _INFLIGHT
-        _INFLIGHT = post["id"]
+        _INFLIGHT.add(post["id"])
     return post
 
 
 def release_inflight(post_row=None):
-    """把手上的帖子放回 PENDING（优雅停机，不等租约到期）。"""
-    global _INFLIGHT
-    row = post_row if post_row is not None else _INFLIGHT
-    if row is None:
-        return False
-    try:
-        ok = runtime_db.release_pawchive_post(row)
-    except runtime_db.DbUnavailable as e:
-        logger.error(f"🐾 停机释放帖子失败（租约到期后会自动恢复）：{e}")
-        ok = False
-    if _INFLIGHT == row:
-        _INFLIGHT = None
+    """把在途帖子放回 PENDING（优雅停机，不等租约到期）。
+
+    文件状态原样保留（SUBMITTED→PENDING 的迁移在下一轮 reconcile 做）。
+    """
+    rows = [post_row] if post_row is not None else sorted(_INFLIGHT)
+    ok = False
+    for row in rows:
+        try:
+            ok = runtime_db.release_pawchive_post(row) or ok
+        except runtime_db.DbUnavailable as e:
+            logger.error(f"🐾 停机释放帖子 #{row} 失败（租约到期会自动恢复）：{e}")
+    _INFLIGHT.difference_update(rows)
     return ok
 
 
@@ -149,51 +156,10 @@ def recover_expired():
 
 
 # ============================================================
-# 执行：提交 / 对账 / 等待终态
+# 死链预检（HTTP 在线程池跑，DB 写留在事件循环线程）
 # ============================================================
-def _ensure_agent():
-    """确保 Chrome Agent 进程在跑；没有就拉起（/chrome_start 同款）。"""
-    if chrome_client.agent_running():
-        return True, None
-    try:
-        chrome_client.spawn_agent()
-        logger.info("🐾 Pawchive worker 已自动拉起 Chrome Agent")
-        return True, None
-    except Exception as e:
-        return False, f"Chrome Agent 启动失败：{type(e).__name__}: {e}"
-
-
-def _absorb_terminal(file_row, task):
-    """把 Chrome 侧终态落到文件行：SUCCESS→DONE，FAILED/CANCELLED→FAILED。"""
-    if task.get("status") == "SUCCESS":
-        runtime_db.mark_pawchive_file_done(file_row["id"],
-                                           size_bytes=task.get("size_bytes"))
-        file_row["status"] = runtime_db.PAW_FILE_DONE
-        logger.info(
-            f"🐾 文件完成：{file_row['filename']}"
-            f"（{task.get('size_bytes') or '?'} bytes）")
-    else:
-        err = task.get("error") or task.get("status") or "unknown"
-        runtime_db.mark_pawchive_file_failed(file_row["id"], error=err)
-        file_row["status"] = runtime_db.PAW_FILE_FAILED
-        logger.warning(
-            f"🐾 文件失败：{file_row['filename']}（{err}）")
-
-
-# 站点侧死链的失败标记（finalize 用它区分「不可行动的死链」与「值得重试的失败」）
-_MISSING_MARK = "站点缺文件(404)"
-_DEAD_STATUS = (404, 410)
-
-
-# 强制直连的 opener：macOS 的 urllib 会读系统代理（Hiddify 常配 socks5，
-# urllib 不支持 socks5 直接 ValueError 秒败——2026-09-15 实测）。pawchive
-# 的文件/接口直连可达，绕开一切环境/系统代理，行为才可预测。
-_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-
 def _head_status(url, timeout=15):
     """HEAD 探测直链，返回 HTTP 状态码；网络异常返回 None（不预判）。"""
-    import urllib.error
     try:
         req = urllib.request.Request(url, method="HEAD")
         req.add_header("User-Agent", "Mozilla/5.0 tg-userbot-pawchive")
@@ -202,43 +168,15 @@ def _head_status(url, timeout=15):
     except urllib.error.HTTPError as e:
         return e.code
     except Exception as e:
-        # 异常不判死（临时网络抖动交给 Chrome），但类型要可见：
-        # 代理环境变量泄漏进 urllib 时是秒败，得靠这里现形
-        return "ERR:" + repr(e)[:100]
-
-
-def _reconcile_submitted(post, files):
-    """对账 SUBMITTED 文件：终态就地吸收；task 失联（被 trim/未认领）→
-    重投 PENDING。无网络调用，同步小文件 IO。
-
-    返回 Agent 队列里**还没开下**的 (file_row, task_id) 列表——调用方对它们
-    做死链预检（RUNNING/RETRY_WAIT 的已经在跑，不动）。
-    """
-    tasks_json = chrome_agent.load_tasks(config.CHROME_TASKS_FILE)
-    queued = []
-    for f in files:
-        if f["status"] != runtime_db.PAW_FILE_SUBMITTED:
-            continue
-        task = chrome_agent.get_task(tasks_json, f.get("chrome_task_id"))
-        if task is not None:
-            if task.get("status") in chrome_agent.TERMINAL_STATUSES:
-                _absorb_terminal(f, task)
-            elif task.get("status") == "PENDING":
-                queued.append((f, f["chrome_task_id"]))
-            # 其余（RUNNING/RETRY_WAIT）：继续等轮询
-            continue
-        runtime_db.mark_pawchive_file_pending(f["id"])
-        f["status"] = runtime_db.PAW_FILE_PENDING
-        logger.warning(f"🐾 文件 {f['filename']} 的 chrome task 失联，已重投")
-    return queued
+        # 异常不判死（临时网络抖动交给下载重试），但类型要可见
+        return "ERR:" + type(e).__name__
 
 
 def _head_dead_ids(targets):
     """并发 HEAD 一批 (file_row, url)，返回死链（404/410）的 file id 集合。
 
     纯 HTTP，在 to_thread 里跑；**绝不碰 runtime_db**（DB 连接属主线程，
-    sqlite3 的 check_same_thread 会拒绝跨线程使用）。网络异常不预判——
-    交给 Chrome 正常走（临时网络抖动不该把文件判死）。
+    sqlite3 的 check_same_thread 会拒绝跨线程使用）。
     """
     import concurrent.futures
 
@@ -246,8 +184,7 @@ def _head_dead_ids(targets):
         return set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         codes = list(ex.map(lambda t: _head_status(t[1]), targets))
-    summary = collections.Counter(
-        str(code) for code in codes)
+    summary = collections.Counter(str(code) for code in codes)
     logger.info(f"🐾 死链预检：{len(targets)} 个直链 → {dict(summary)}")
     return {t[0]["id"] for t, code in zip(targets, codes)
             if code in _DEAD_STATUS}
@@ -261,63 +198,145 @@ def _mark_dead(file_row, code=404):
     file_row["error"] = _MISSING_MARK
 
 
-def _submit_pending(post, files):
-    """把 PENDING 文件逐条提交给 Chrome Agent。返回提交条数。"""
-    submitted = 0
-    for f in files:
-        if f["status"] != runtime_db.PAW_FILE_PENDING:
-            continue
-        task_id = chrome_agent.new_task_id()
-        chrome_client.add_request(
-            task_id, f["url"], user_id=state.MY_ID, chat_id=state.MY_ID,
-            message_id=0, download_subdir=post.get("subdir"))
-        # 屏蔽 chrome_client.notify_loop 的逐文件通知：结果由本 worker 按
-        # 帖子级汇总（见模块 docstring 的通知粒度说明）
-        chrome_client.mark_notified(task_id)
-        runtime_db.mark_pawchive_file_submitted(f["id"], task_id)
-        f["status"] = runtime_db.PAW_FILE_SUBMITTED
-        f["chrome_task_id"] = task_id
-        submitted += 1
-        logger.info(
-            f"🐾 提交下载 [{task_id[:8]}] {f['filename']} → "
-            f"{post.get('subdir') or '(根目录)'}")
-    return submitted
+# ============================================================
+# 内置下载器（httpx 直连 + 并发）
+# ============================================================
+def _target_path(post, filename):
+    """落盘绝对路径：DOWNLOAD_DIR/<subdir=「Pawchive/作者/帖子」>/<文件名>。"""
+    from .naming import sanitize_filename
+    name = sanitize_filename(filename or "untitled")
+    return os.path.join(config.DOWNLOAD_DIR,
+                        post.get("subdir") or "Pawchive/unknown", name)
 
 
-async def _wait_files_terminal(post, files):
-    """轮询 chrome_tasks.json 直到本帖全部文件到终态；期间周期续租。"""
-    poll = float(config.PAWCHIVE_CHROME_POLL_SECONDS)
-    renew_every = float(config.PAWCHIVE_LEASE_RENEW_SECONDS)
-    last_renew = time.monotonic()
-    while True:
-        waiting = [f for f in files
-                   if f["status"] == runtime_db.PAW_FILE_SUBMITTED]
-        if not waiting:
-            return
-        if time.monotonic() - last_renew >= renew_every:
-            try:
-                runtime_db.renew_pawchive_lease(post["id"])
-            except runtime_db.DbUnavailable as e:
-                logger.error(f"🐾 续租失败（不影响本帖处理）：{e}")
-            last_renew = time.monotonic()
-        tasks_json = await asyncio.to_thread(
-            chrome_agent.load_tasks, config.CHROME_TASKS_FILE)
-        for f in waiting:
-            if f["status"] != runtime_db.PAW_FILE_SUBMITTED:
-                continue
-            task = chrome_agent.get_task(tasks_json, f.get("chrome_task_id"))
-            if task is not None and task.get("status") in chrome_agent.TERMINAL_STATUSES:
-                _absorb_terminal(f, task)
-        if all(f["status"] in (runtime_db.PAW_FILE_DONE,
-                               runtime_db.PAW_FILE_FAILED) for f in files):
-            return
-        await asyncio.sleep(poll)
+def _head_alive(url):
+    """直连 HEAD：返回 (status, content_length)；异常返回 (None, None)。"""
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        req.add_header("User-Agent", "Mozilla/5.0 tg-userbot-pawchive")
+        with _DIRECT_OPENER.open(req, timeout=15) as r:
+            n = r.headers.get("Content-Length")
+            return r.status, (int(n) if n else None)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except Exception:
+        return None, None
 
 
-def _notify_target():
-    return state.MY_ID
+def _download_one(post, f, progress):
+    """下载单个文件（在线程池里跑阻塞 IO）。
+
+    直连（不走代理——实测代理路线吞吐低一个量级且不稳定）；.part 断点
+    续传；大小校验；404/410 判死。返回 (终态, size, error)：
+    终态 ∈ {"done", "dead", "failed"}。
+    """
+    target = _target_path(post, f["filename"])
+    part = target + ".part"
+    # 目标已存在：与远端大小一致就跳过（重启/重投的幂等下载）
+    if os.path.isfile(target):
+        st, remote_len = _head_alive(f["url"])
+        if st == 200 and remote_len is not None \
+                and remote_len == os.path.getsize(target):
+            return ("done", remote_len, None)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+
+    last_err = None
+    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        offset = os.path.getsize(part) if os.path.isfile(part) else 0
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 tg-userbot-pawchive"}
+            if offset:
+                headers["Range"] = f"bytes={offset}-"
+            # trust_env=False：环境/系统代理（socks5）会让 httpx 直接不可用
+            with httpx.Client(
+                    timeout=httpx.Timeout(config.DOWNLOAD_IDLE_TIMEOUT),
+                    trust_env=False, follow_redirects=True) as client:
+                with client.stream("GET", f["url"], headers=headers) as resp:
+                    if resp.status_code in _DEAD_STATUS:
+                        return ("dead", None, f"HTTP {resp.status_code}")
+                    resp.raise_for_status()
+                    if offset and resp.status_code != 206:
+                        offset = 0   # 服务端不支持 Range，从头下
+                    length = resp.headers.get("Content-Length")
+                    total = offset + (int(length) if length else 0)
+                    got = offset
+                    mode = "ab" if offset else "wb"
+                    with open(part, mode) as fh:
+                        for chunk in resp.iter_bytes(256 * 1024):
+                            fh.write(chunk)
+                            got += len(chunk)
+                            progress(got, total)
+            size = os.path.getsize(part)
+            if total and size != total:
+                raise IOError(f"大小不符 got={size} expect={total}")
+            os.replace(part, target)
+            return ("done", size, None)
+        except httpx.HTTPStatusError as e:
+            last_err = f"HTTP {e.response.status_code}"
+            if e.response.status_code in _DEAD_STATUS:
+                return ("dead", None, last_err)
+        except Exception as e:   # noqa: BLE001 —— 网络类错误统一重试
+            last_err = f"{type(e).__name__}: {e}"
+        logger.warning(
+            f"🐾 文件第 {attempt} 次尝试失败：{f['filename']}（{last_err}）"
+            + ("，退避后 .part 续传重试" if attempt < _DOWNLOAD_ATTEMPTS else ""))
+        time.sleep(min(30, 5 * attempt))
+    return ("failed", None, last_err)
 
 
+async def _download_post_files(post, files):
+    """帖内附件并发下载（共享 DOWNLOAD_SEMAPHORE 限流），就地更新状态。
+
+    重名文件加前缀去重；进度经 register_download 的 did 上报（/progress）。
+    返回是否有下载失败。
+    """
+    from .download import register_download, unregister_download, update_download
+    from .naming import sanitize_filename
+
+    pending = [f for f in files if f["status"] == runtime_db.PAW_FILE_PENDING]
+    if not pending:
+        return False
+
+    seen = set()
+    for f in pending:
+        name = sanitize_filename(f["filename"] or "untitled")
+        if name.lower() in seen:
+            f["filename"] = f"dup_{f['id']}_{name}"
+        seen.add(name.lower())
+
+    async def one(f):
+        did = register_download(
+            "pawchive", f["filename"] or "untitled", None,
+            link=post.get("post_url"))
+        try:
+            def progress(current, total):
+                update_download(did, current, total)
+
+            status, size, err = await asyncio.to_thread(
+                _download_one, post, f, progress)
+            if status == "done":
+                runtime_db.mark_pawchive_file_done(f["id"], size_bytes=size)
+                f["status"] = runtime_db.PAW_FILE_DONE
+                logger.info(
+                    f"🐾 文件完成：{f['filename']}（{size or '?'} bytes）")
+            elif status == "dead":
+                _mark_dead(f)
+                logger.warning(f"🐾 死链（下载期 404/410）：{f['filename']}")
+            else:
+                runtime_db.mark_pawchive_file_failed(f["id"], error=err)
+                f["status"] = runtime_db.PAW_FILE_FAILED
+                f["error"] = err
+                logger.warning(f"🐾 文件失败：{f['filename']}（{err}）")
+        finally:
+            unregister_download(did)
+
+    await asyncio.gather(*(one(f) for f in pending))
+    return any(f["status"] == runtime_db.PAW_FILE_FAILED for f in files)
+
+
+# ============================================================
+# 终态
+# ============================================================
 async def _finalize(post, files):
     """终态流转 + 帖子级通知。COMPLETED 不发 TG 通知（/paw status 可查）。"""
     failed = [f for f in files if f["status"] == runtime_db.PAW_FILE_FAILED]
@@ -331,7 +350,6 @@ async def _finalize(post, files):
             and all((f.get("error") or "").startswith(_MISSING_MARK)
                     for f in failed))
         if all_missing:
-            # 全部是站点死链：不可行动（重试也一样 404），只落库不刷屏
             err = (f"{len(failed)}/{len(files)} 个文件是站点死链"
                    f"（{_MISSING_MARK}）")
             runtime_db.finalize_pawchive_post(
@@ -342,7 +360,8 @@ async def _finalize(post, files):
         runtime_db.finalize_pawchive_post(
             post["id"], runtime_db.PAW_POST_FAILED, error=err)
         lines = [f"❌ Pawchive 帖子失败：{label}｜{title}",
-                 post.get("post_url") or "", f"{err}（/paw retry {post['id']} 重投）"]
+                 post.get("post_url") or "",
+                 f"{err}（/paw retry {post['id']} 重投）"]
         for f in failed[:5]:
             lines.append(f"  · {f['filename']}：{(f.get('error') or '')[:80]}")
         await notify.notify_user("\n".join(lines))
@@ -364,6 +383,32 @@ async def _finalize(post, files):
     logger.info(f"🐾 帖子完成：{label}｜{title}（{len(files)} 个文件）")
 
 
+def _requeue_legacy_submitted(files):
+    """旧 Chrome 时代的 SUBMITTED 文件全部放回 PENDING（执行体切换迁移）。
+
+    chrome_task_id 清空：内置下载器不认 chrome task，活链接会重新下载；
+    已 DONE 的不动。
+    """
+    for f in files:
+        if f["status"] == runtime_db.PAW_FILE_SUBMITTED:
+            runtime_db.mark_pawchive_file_pending(f["id"])
+            f["status"] = runtime_db.PAW_FILE_PENDING
+            f["chrome_task_id"] = None
+
+
+async def _renew_lease_loop(post_row):
+    """单帖下载期间每 PAWCHIVE_LEASE_RENEW_SECONDS 续一次租。"""
+    try:
+        while True:
+            await asyncio.sleep(float(config.PAWCHIVE_LEASE_RENEW_SECONDS))
+            try:
+                runtime_db.renew_pawchive_lease(post_row)
+            except runtime_db.DbUnavailable as e:
+                logger.error(f"🐾 续租失败（不影响本帖处理）：{e}")
+    except asyncio.CancelledError:
+        raise
+
+
 async def process_post(post):
     """处理一条帖子（领到 PROCESSING 之后的全过程）。异常向上抛给 run_once。"""
     label = f"{post['creator_name']} #{post['id']}"
@@ -381,64 +426,51 @@ async def process_post(post):
             "清理空间后 /paw resume 继续。")
         return False
 
-    # 2) Chrome Agent 在跑（没跑就拉起；起不来按暂时性失败退避）
-    ok, err = _ensure_agent()
-    if ok:
-        ok = await chrome_client.wait_agent_up(30)
-        err = None if ok else "Chrome Agent 拉起后 30s 内未就绪"
-    if not ok:
-        delay = int(config.PAWCHIVE_AGENT_RETRY_SECONDS)
-        runtime_db.postpone_pawchive_post(
-            post["id"], int(time.time()) + delay, error=err)
-        logger.warning(f"🐾 {err}，帖子 {label} {delay}s 后重试")
-        await notify.notify_user(f"⚠️ Pawchive：{err}，稍后自动重试")
-        return False
-
-    # 3) 对账已提交 → 死链预检 → 提交存活文件
     files = runtime_db.list_pawchive_files(post["id"])
     if not files:
         # 没有直链（纯外链帖）：直接按外链判定终态
         await _finalize(post, files)
         return True
-    queued = _reconcile_submitted(post, files)
+
+    # 2) 旧 Chrome 时代的 SUBMITTED 放回 PENDING（执行体切换迁移）
+    _requeue_legacy_submitted(files)
+
+    # 3) 死链预检（HTTP 在线程池跑，DB 写留在本线程）
     if config.PAWCHIVE_PRECHECK_HEAD:
-        # 死链预检：PENDING + Agent 队列里未开下的 SUBMITTED 都查一遍。
-        # HTTP 在线程池跑；DB 写与取消请求留在本线程（DB 连接属主线程）。
-        # queued 的第二元是 chrome task_id 不是 URL——预检目标必须重新取 f["url"]
         targets = [(f, f["url"]) for f in files
                    if f["status"] == runtime_db.PAW_FILE_PENDING]
-        targets += [(f, f["url"]) for f, _tid in queued]
         dead_ids = await asyncio.to_thread(_head_dead_ids, targets)
-        for f, tid in queued:
-            if f["id"] in dead_ids:
-                ok, _ = chrome_client.request_cancel(tid)
-                if ok:
-                    _mark_dead(f)
-                    logger.warning(f"🐾 排队中的死链已取消：{f['filename']}")
         for f in files:
             if f["status"] == runtime_db.PAW_FILE_PENDING \
                     and f["id"] in dead_ids:
                 _mark_dead(f)
                 logger.warning(f"🐾 死链预检跳过：{f['filename']}")
-    _submit_pending(post, files)
 
-    # 4) 等本帖全部文件终态（期间续租），5) 终态流转
-    await _wait_files_terminal(post, files)
+    # 4) 并发下载 + 周期续租（单帖可能跑很久）
+    renew = asyncio.create_task(_renew_lease_loop(post["id"]))
+    try:
+        await _download_post_files(post, files)
+    finally:
+        renew.cancel()
+        try:
+            await renew
+        except asyncio.CancelledError:
+            pass
+
+    # 5) 终态流转
     await _finalize(post, files)
     return True
 
 
-# ============================================================
-# 主循环（克隆 listener_worker 的纪律）
-# ============================================================
 async def run_once():
-    """跑一轮：恢复过期租约 + 领一条帖子处理。返回本轮是否真的干了活。"""
+    """跑一轮：恢复过期租约 + 领一条帖子处理。返回本轮是否领到了帖子。"""
     recover_expired()
     post = claim_next_post()
     if post is None:
         return False
     try:
-        return await process_post(post)
+        await process_post(post)
+        return True
     except asyncio.CancelledError:
         # 停服：把手上的帖子放回待处理（文件级状态保证不重复下载）
         release_inflight(post["id"])
@@ -458,11 +490,10 @@ async def run_once():
 async def worker_loop():
     """常驻循环：有活就干，没活就按轮询间隔歇一会儿。"""
     logger.info(
-        f"🐾 Pawchive worker 已启动（轮询 "
+        f"🐾 Pawchive worker 已启动（内置并发下载器，轮询 "
         f"{config.PAWCHIVE_WORKER_POLL_SECONDS}s，租约 "
-        f"{config.PAWCHIVE_LEASE_SECONDS}s，Chrome 轮询 "
-        f"{config.PAWCHIVE_CHROME_POLL_SECONDS}s，磁盘保护线 "
-        f"{config.PAWCHIVE_MIN_FREE_GB}GB）")
+        f"{config.PAWCHIVE_LEASE_SECONDS}s，磁盘保护线 "
+        f"{config.PAWCHIVE_MIN_FREE_GB}GB，与 /thread 共享并发池）")
     poll = float(config.PAWCHIVE_WORKER_POLL_SECONDS)
     try:
         while True:
