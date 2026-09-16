@@ -215,3 +215,22 @@ class RegisteredCommandGuardTest(unittest.TestCase):
         for cmd in ("/wl", "/status", "/help", "/paw plan X", "/start"):
             self.assertTrue(app._is_registered_command(cmd),
                             f"{cmd} 应被判为注册命令")
+
+
+class HandlerWiringContractTest(unittest.TestCase):
+    """handler 层接线契约：评论捕获分支必须真的调用 _record_me_label。
+
+    2026-09-16 事故：调用行被并行编辑误删，handler 只剩日志行——
+    「记录待关联转发评论」照打但标注从未写入，整条目录模式/标注链静默
+    失效。用源码断言钉死「日志与调用必须同在」。
+
+    """
+
+    def test_capture_branch_calls_record(self):
+        import inspect
+        src = inspect.getsource(app)
+        self.assertIn("_record_me_label(text)", src)
+        # 日志行与调用行必须相邻出现（调用在日志之前）
+        self.assertLess(
+            src.index("_record_me_label(text)"),
+            src.index("记录待关联转发评论"))

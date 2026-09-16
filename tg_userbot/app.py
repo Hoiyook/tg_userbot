@@ -575,6 +575,7 @@ async def new_message_handler(event):
                 and not _is_registered_command(text)
                 and not cleanup.is_cleanup_message(message)
             ):
+                _record_me_label(text)
                 logger.info(f"🏷 记录待关联转发评论：\"{text}\"")
             else:
                 logger.info(
@@ -706,18 +707,15 @@ async def _enqueue_me(message):
     尾随评论一个落地机会；已有标注时不等待、立即继承。
     """
     user_label = _take_me_label()
-    logger.info(f"🏷 [诊断1] 媒体 {message.id} 首次取标：{user_label!r}")
     if user_label is None and ME_LABEL_GRACE_SECONDS > 0:
         await asyncio.sleep(ME_LABEL_GRACE_SECONDS)
         user_label = _take_me_label()
-        logger.info(f"🏷 [诊断2] 媒体 {message.id} 宽限后取标：{user_label!r}")
     if user_label:
         logger.info(f"🏷 媒体 {message.id} 继承转发评论标注：\"{user_label}\"")
     album_caption = await _maybe_album_caption(message)
     origin = await resolve_origin_snapshot(message)
     # 目录模式标注：/A#标注 → 标注拼 # 进文件名 + 落 原目录/A/（2026-09-16）
     user_label, source_subdir = split_label_subdir(user_label or "")
-    logger.info(f"🏷 [诊断3] 媒体 {message.id} 拆分：label={user_label!r} subdir={source_subdir!r}")
     await enqueue_media(
         message, state.MY_ID, _origin_folder(origin),
         album_caption=album_caption,
@@ -950,9 +948,6 @@ def split_label_subdir(text):
 def _record_me_label(text):
     """记住一条用户纯文本评论，作为随后到达媒体的待关联标注。"""
     global _ME_PENDING_LABEL, _ME_PENDING_LABEL_AT
-    import sys as _sys
-    caller = _sys._getframe(1).f_code.co_name
-    logger.info(f"🏷 [诊断R] 记录标注 {text!r}（来自 {caller}，monotonic={time.monotonic():.3f}）")
     _ME_PENDING_LABEL = text
     _ME_PENDING_LABEL_AT = time.monotonic()
 
@@ -963,14 +958,8 @@ def _take_me_label():
     if not _ME_PENDING_LABEL:
         return None
     if time.monotonic() - _ME_PENDING_LABEL_AT > ME_LABEL_WINDOW_SECONDS:
-        logger.info(
-            f"🏷 [诊断T] 取标时已过期清空（原值 {_ME_PENDING_LABEL!r}，"
-            f"记录于 {time.monotonic() - _ME_PENDING_LABEL_AT:.1f}s 前）")
         _ME_PENDING_LABEL = None
         return None
-    logger.info(
-        f"🏷 [诊断T] 取标命中 {_ME_PENDING_LABEL!r}"
-        f"（记录于 {time.monotonic() - _ME_PENDING_LABEL_AT:.1f}s 前）")
     return _ME_PENDING_LABEL
 
 
