@@ -196,5 +196,8 @@ def menu_buttons():
             Button.inline(f"▶️ {name}", encode_menu_data("cmdt_run", name)),
             Button.inline("🗑", encode_menu_data("cmdt_del", name)),
         ])
-    rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
+    rows.append([
+        Button.inline("🔙 返回工具箱", encode_menu_data("tools")),
+        Button.inline("🏠 返回主菜单", encode_menu_data("home")),
+    ])
     return rows

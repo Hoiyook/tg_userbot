@@ -123,9 +123,12 @@ def tools_menu_buttons(candidates):
     candidates 与 up_menu_buttons 同约定（快照进 state.UP_CANDIDATES，按钮
     只带序号）。
     """
-    rows = [[Button.inline(label, encode_menu_data("sh_run", cmd))
-             for cmd, label in shell.PRESET_COMMANDS.items()]]
-    rows += _template_buttons()
+    entries = [(label, encode_menu_data("sh_run", cmd))
+               for cmd, label in shell.PRESET_COMMANDS.items()]
+    entries += [(f"▶️ {name}", encode_menu_data("cmdt_run", name))
+                for name in cmd_templates.names()]
+    rows = [[Button.inline(text, data) for text, data in entries[i:i + 2]]
+            for i in range(0, len(entries), 2)]
     rows.append(
         [Button.inline("✏️ 自定义命令", encode_menu_data("sh_input"))])
     for i, path in enumerate(candidates):
@@ -368,14 +371,17 @@ def sh_ls_buttons(dirs, up_token=None, home_token=None):
 
 
 def sh_menu_buttons():
-    """🖥 命令行视图：预设命令 + 命令模板按钮 + 自定义输入 + 返回。
+    """🖥 命令行视图：预设命令与命令模板**同级**按钮网格 + 自定义输入。
 
-    命令模板按钮化（2026-09-15 用户要求）：新增模板后自动出现在本视图，
+    命令模板按钮化（2026-09-15 用户要求）：新增模板后自动出现在本网格，
     点了直接执行（cmdt_run 按名字走 /sh 全套纪律）。
     """
-    rows = [[Button.inline(label, encode_menu_data("sh_run", cmd))
-             for cmd, label in shell.PRESET_COMMANDS.items()]]
-    rows += _template_buttons()
+    entries = [(label, encode_menu_data("sh_run", cmd))
+               for cmd, label in shell.PRESET_COMMANDS.items()]
+    entries += [(f"▶️ {name}", encode_menu_data("cmdt_run", name))
+                for name in cmd_templates.names()]
+    rows = [[Button.inline(text, data) for text, data in entries[i:i + 2]]
+            for i in range(0, len(entries), 2)]
     rows.append(
         [Button.inline("✏️ 自定义命令", encode_menu_data("sh_input"))])
     rows.append([
@@ -386,12 +392,10 @@ def sh_menu_buttons():
 
 
 def _template_buttons():
-    """命令模板 → ▶️ 执行按钮行（每个模板一行；无模板返回空）。"""
-    rows = []
-    for name in cmd_templates.names():
-        rows.append([Button.inline(
-            f"▶️ {name}", encode_menu_data("cmdt_run", name))])
-    return rows
+    """命令模板 → ▶️ 执行按钮（每个模板一枚；无模板返回空）。"""
+    return [Button.inline(
+        f"▶️ {name}", encode_menu_data("cmdt_run", name))
+        for name in cmd_templates.names()]
 
 
 def up_menu_buttons(candidates):
