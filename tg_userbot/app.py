@@ -950,6 +950,9 @@ def split_label_subdir(text):
 def _record_me_label(text):
     """记住一条用户纯文本评论，作为随后到达媒体的待关联标注。"""
     global _ME_PENDING_LABEL, _ME_PENDING_LABEL_AT
+    import sys as _sys
+    caller = _sys._getframe(1).f_code.co_name
+    logger.info(f"🏷 [诊断R] 记录标注 {text!r}（来自 {caller}，monotonic={time.monotonic():.3f}）")
     _ME_PENDING_LABEL = text
     _ME_PENDING_LABEL_AT = time.monotonic()
 
@@ -960,8 +963,14 @@ def _take_me_label():
     if not _ME_PENDING_LABEL:
         return None
     if time.monotonic() - _ME_PENDING_LABEL_AT > ME_LABEL_WINDOW_SECONDS:
+        logger.info(
+            f"🏷 [诊断T] 取标时已过期清空（原值 {_ME_PENDING_LABEL!r}，"
+            f"记录于 {time.monotonic() - _ME_PENDING_LABEL_AT:.1f}s 前）")
         _ME_PENDING_LABEL = None
         return None
+    logger.info(
+        f"🏷 [诊断T] 取标命中 {_ME_PENDING_LABEL!r}"
+        f"（记录于 {time.monotonic() - _ME_PENDING_LABEL_AT:.1f}s 前）")
     return _ME_PENDING_LABEL
 
 
