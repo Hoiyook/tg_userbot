@@ -29,6 +29,7 @@ from . import shell
 from . import upload
 from . import pawchive
 from . import sources
+from . import cmd_templates
 from .config import (
     BOT_USERNAME,
     DONE_DEFAULT_LINES,
@@ -349,6 +350,31 @@ async def handle_command(event, cmd_text):
         logger.info(f"执行命令：/retry {parts[1] if len(parts) > 1 else ''}")
         return True
 
+    if cmd_templates.is_cmdt_command(cmd_text):
+        action, arg = cmd_templates.parse_cmdt_command(cmd_text)
+        logger.info(f"执行命令：/cmdt {action}")
+        if action in ("list", "help"):
+            await _reply(event, cmd_templates.list_text())
+            return True
+        if action == "add":
+            parts = (arg or "").split(None, 1)
+            if len(parts) != 2:
+                await _reply(event,
+                             "❌ 用法：/cmdt add <名字> <命令>")
+                return True
+            ok, msg = cmd_templates.upsert(parts[0], parts[1])
+            await _reply(event, msg)
+            return True
+        if action == "del":
+            ok, msg = cmd_templates.delete(arg or "")
+            await _reply(event, msg)
+            return True
+        if action == "run":
+            ok, result = await cmd_templates.execute(arg or "")
+            await _reply(event, result if ok else result)
+            return True
+        return True
+
     if cmd_text == "/origin":
         await _reply(event, sources.origin_failures_text())
         logger.info("执行命令：/origin")
@@ -457,6 +483,7 @@ async def handle_command(event, cmd_text):
             "/paw done 行id - 外链处理完，标记该帖 COMPLETED\n"
             "/paw - Pawchive：扫描作者作品、收藏对比、Chrome 批量下载\n"
             "/origin - 查看评论来源解析失败账本（可溯源）\n"
+            "/cmdt - 命令模板：保存/执行常用 shell 命令\n"
             "/paw plan 作者名 - 扫描作者帖子入队（默认只收未收藏帖）\n"
             "/sh - 命令行：远程执行 shell 命令（黑名单拦截高危操作）\n"
             "/sh cd 目录 - 切换 /sh 的工作目录（会记住）\n"

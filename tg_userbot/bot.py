@@ -35,6 +35,7 @@ from . import listener
 from . import caption_filter
 from . import wl_scan
 from . import sql_templates
+from . import cmd_templates
 from . import runtime_db
 from . import shell
 from . import upload
@@ -72,6 +73,7 @@ BOT_COMMANDS = (
     ("chrome", "用 Chrome 下载：/chrome <URL>"),
     ("paw", "Pawchive：扫描作者作品、收藏对比、Chrome 批量下载"),
     ("origin", "查看评论来源解析失败账本（可溯源）"),
+    ("cmdt", "命令模板：保存/执行常用 shell 命令"),
     ("clearmsg", "清理程序产生的消息"),
     ("help", "查看全部命令"),
 )
@@ -117,6 +119,7 @@ def open_input_window(kind):
     state.UP_INPUT_UNTIL = 0.0
     state.PAW_INPUT_UNTIL = 0.0
     state.PAW_INPUT_STEP = ""
+    state.CMDT_INPUT_UNTIL = 0.0
     if kind == "cookie":
         state.COOKIE_INPUT_UNTIL = (
             time.monotonic() + config.COOKIE_INPUT_WINDOW_SECONDS
@@ -150,7 +153,14 @@ def open_input_window(kind):
         state.UP_INPUT_UNTIL = (
             time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
         )
-    elif kind in ("paw_search", "paw_cookie", "paw_post", "paw_find"):
+    elif kind in ("paw_search", "paw_cookie", "paw_post", "paw_find",
+                  "cmdt_add"):
+        if kind == "cmdt_add":
+            # 「📜 命令模板」窗口：一条文本 = 「<名字> <命令>」（同名即覆盖）
+            state.CMDT_INPUT_UNTIL = (
+                time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
+            )
+            return
         # Pawchive 窗口：search 的文本当作者名发起扫描，cookie 的文本存
         # tg_secrets.json（掩码回显），post 的文本当帖子引用入队，
         # find 的文本当关键词查询
@@ -432,6 +442,26 @@ async def handle_menu_action(action, arg, event):
         return await cd2.cd2_stop_or_status(), menu.cd2_menu_buttons()
     if action == "bak":
         return cd2.backup_records_text(), menu.cd2_menu_buttons()
+    if action == "cmdt":
+        return cmd_templates.list_text(), cmd_templates.menu_buttons()
+    if action == "cmdt_add":
+        open_input_window("cmdt_add")
+        return (
+            "📜 新增/覆盖命令模板\n\n"
+            "请发送一行：<名字> <命令>\n"
+            "例：磁盘占用 du -sh * | sort -rh | head -20\n\n"
+            "名字 ≤16 字符（中文/字母/数字/下划线）；同名即覆盖；"
+            "执行走 /sh 全套纪律（黑名单/超时）。",
+            menu.tools_menu_buttons(state.UP_CANDIDATES),
+        )
+    if action == "cmdt_run":
+        ok, result = await cmd_templates.execute(arg or "")
+        if not ok:
+            return (result, cmd_templates.menu_buttons())
+        return (result, cmd_templates.menu_buttons())
+    if action == "cmdt_del":
+        ok, msg = cmd_templates.delete(arg or "")
+        return (msg, cmd_templates.menu_buttons())
     if action == "tools":
         # 打开视图这一刻快照最近文件（与 ⬆️ 上传视图同款约定）
         state.UP_CANDIDATES = upload.recent_files(state.SHELL_CWD)
@@ -752,6 +782,14 @@ async def bot_message_handler(event):
         state.PAW_INPUT_UNTIL = 0.0
         state.PAW_INPUT_STEP = ""
 
+    # 命令模板新增窗口：一条文本 = 「<名字> <命令>」（同名即覆盖）。
+    if state.CMDT_INPUT_UNTIL and time.monotonic() < state.CMDT_INPUT_UNTIL:
+        if not text.startswith("/"):
+            state.CMDT_INPUT_UNTIL = 0.0
+            await _handle_cmdt_input(text)
+            return
+        state.CMDT_INPUT_UNTIL = 0.0
+
     if from_id:
         chat_id, title = await whitelist.resolve_wl_target(
             state.bot_client, None, fwd
@@ -906,6 +944,22 @@ async def _handle_up_input(event, text):
     _done, final = await upload.upload_with_progress(
         state.client, path, _update)
     await status.edit(final)
+
+
+async def _handle_cmdt_input(text):
+    """命令模板新增窗口：一行「<名字> <命令>」（同名即覆盖）。"""
+    parts = text.strip().split(None, 1)
+    if len(parts) != 2:
+        await state.bot_client.send_message(
+            state.MY_ID,
+            "❌ 格式：<名字> <命令>，例：磁盘占用 du -sh * | sort -rh | head -20")
+        return
+    ok, msg = cmd_templates.upsert(parts[0], parts[1])
+    await state.bot_client.send_message(state.MY_ID, msg)
+    if ok:
+        await state.bot_client.send_message(
+            state.MY_ID, cmd_templates.list_text(),
+            buttons=cmd_templates.menu_buttons())
 
 
 async def _handle_paw_input(step, text):

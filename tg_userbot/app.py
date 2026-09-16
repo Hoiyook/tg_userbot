@@ -29,6 +29,7 @@ from . import wl_scan
 from . import queue
 from . import runtime_db
 from . import sql_templates
+from . import cmd_templates
 from . import shell
 from . import reporter
 from . import history
@@ -1122,6 +1123,7 @@ async def main():
     caption_filter.load_caption_filter_config()
     listener.load_listen_config()
     sql_templates.load_sql_templates()
+    cmd_templates.load_cmd_templates()
     shell.load_shell_cwd()
     # Runtime DB：业务状态层（SQLite）。**必须在队列/去重索引装载之前
     # 就绪**——load_queue_any / dedup.load_index 依它选 DB 或文件模式；

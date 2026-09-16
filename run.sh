@@ -208,6 +208,16 @@ do_stop() {
     fi
 }
 
+purge_pycache() {
+    # 清理 Python 字节码缓存（2026-09-16 事故根治）：并行编辑/git 操作曾让
+    # ~/Library/Caches/com.apple.python 下的 .pyc 失效校验错乱，进程加载
+    # 旧字节码运行旧代码——功能"不生效"但磁盘源码是对的，极难排查。
+    # 每次启动前清两处：仓库内 __pycache__ + 系统缓存中本仓库的镜像目录。
+    find "$DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+    rm -rf "$HOME/Library/Caches/com.apple.python$DIR" 2>/dev/null || true
+    echo "🧹 已清理 Python 字节码缓存（防陈旧 .pyc）"
+}
+
 do_start() {
     local value
     if [ -n "${TG_PROXY:-}" ]; then
@@ -225,6 +235,7 @@ do_start() {
     if pgrep_any_userbot; then
         echo "ℹ️  userbot 已在运行（PID $(userbot_pids | pids_text))，跳过"
     else
+        purge_pycache
         nohup "$PY" "$USERBOT_SCRIPT" >>"$RUNTIME_DIR/userbot.out" 2>&1 &
         disown 2>/dev/null || true
         sleep 2

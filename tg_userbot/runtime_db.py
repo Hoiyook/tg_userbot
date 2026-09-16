@@ -84,6 +84,10 @@ PAW_POST_PROCESSING = "PROCESSING"
 PAW_POST_COMPLETED = "COMPLETED"
 PAW_POST_MANUAL = "MANUAL"
 PAW_POST_FAILED = "FAILED"
+# 死链归档（2026-09-16）：FAILED 帖全是 404 死链（站点删档），批量移入
+# ARCHIVED 让 PENDING/MANUAL 的真实待办更清晰；post_id 仍占唯一索引，
+# 后续扫描自然去重不会复活。
+PAW_POST_ARCHIVED = "ARCHIVED"
 PAW_POST_TERMINAL = (PAW_POST_COMPLETED, PAW_POST_MANUAL, PAW_POST_FAILED)
 
 # 站点侧死链的失败标记前缀（worker 写入，retry 重投时据此跳过——死链
@@ -1381,6 +1385,18 @@ def get_pawchive_post_row(row_id):
         c, "SELECT * FROM pawchive_posts WHERE id=?", (int(row_id),)
     ).fetchone(), f"取 Pawchive 帖子（{row_id}）")
     return _row_to_pawchive_post(row) if row else None
+
+
+def archive_pawchive_failed(now=None):
+    """FAILED → ARCHIVED 批量归档（死链终态隔离），返回流转条数。"""
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE pawchive_posts SET status=?, lease_until=NULL, "
+            "completed_at=COALESCE(completed_at, ?) WHERE status=?",
+            (PAW_POST_ARCHIVED, _now(now), PAW_POST_FAILED))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    return _write(do, "归档 Pawchive FAILED 帖")
 
 
 def complete_pawchive_manual_post(post_row, now=None):

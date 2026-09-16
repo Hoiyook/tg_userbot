@@ -115,6 +115,10 @@ WL_LAST_SCAN = None
 # ============================================================
 # 名字 → SQL 原文；配置归 JSON（runtime/sql_templates.json），启动时载入。
 SQL_TEMPLATES = {}
+# 命令模板（cmd_templates.py，/cmdt）：名字 → shell 命令原文；启动时载入。
+CMD_TEMPLATES = {}
+# 「➕ 新增命令模板」输入窗口（bot 菜单）：与其它输入窗口互斥。
+CMDT_INPUT_UNTIL = 0.0
 # 「➕ 新增模板」输入窗口（菜单）：等待下一条文本的截止时刻（monotonic）。
 # 与其余输入窗口互斥，由 bot.open_input_window 统一开关。
 SQLT_INPUT_UNTIL = 0.0

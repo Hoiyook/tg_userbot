@@ -593,6 +593,7 @@ _STATUS_LABELS = {
     runtime_db.PAW_POST_COMPLETED: "✅ 已完成",
     runtime_db.PAW_POST_MANUAL: "👤 待人工",
     runtime_db.PAW_POST_FAILED: "❌ 失败",
+    runtime_db.PAW_POST_ARCHIVED: "🗄 已归档",
 }
 
 
@@ -756,6 +757,17 @@ def manual_done_reply(arg):
     return f"{reply}\n\n{view_text}", rows + menu_buttons()
 
 
+def archive_reply():
+    """/paw archive failed：把 FAILED 死链帖批量移入 ARCHIVED。"""
+    try:
+        n = runtime_db.archive_pawchive_failed()
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if n:
+        return f"{TEXT_PREFIX}\n🗄 已归档 {n} 个 FAILED 帖（死链不再干扰待办）"
+    return f"{TEXT_PREFIX}\nℹ️ 当前没有可归档的 FAILED 帖"
+
+
 def manual_text(limit=10):
     """纯文本兼容形态（旧调用点）：只取 manual_view 的正文。"""
     return manual_view(limit)[0]
@@ -852,7 +864,7 @@ def parse_paw_command(text):
     head, _, rest = body.partition(" ")
     head_l = head.lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
-                  "resume", "manual", "done", "cookie", "csv", "post",
+                  "resume", "manual", "done", "archive", "cookie", "csv",
                   "find"):
         return (head_l, rest.strip() or None)
     return ("help", None)
@@ -883,6 +895,9 @@ async def command_reply(event, cmd_text):
         view_text, buttons = manual_view()
         await event.reply(f"{reply}\n\n{view_text}", buttons=buttons,
                           link_preview=False)
+        return
+    if action == "archive":
+        await event.reply(archive_reply(), link_preview=False)
         return
     if action == "paw_done":
         reply = mark_manual_done(arg)
@@ -924,6 +939,7 @@ def _help_text():
         "  /paw post <帖子URL|ID> —— 单独获取指定帖子的附件\n"
         "  /paw find <关键词> —— 按名称查扫描记录与当前目录文件\n"
         "  /paw manual —— 待人工处理的帖子（含外链清单与 ✅ 按钮）\n"
+        "  /paw archive —— FAILED 死链帖批量归档（不占待办）\n"
         "  /paw done <行id> —— 外链人工处理完，标记该帖 COMPLETED\n"
         "  /paw retry <行ID|all> —— 失败帖子重投\n"
         "  /paw pause / resume —— 暂停/恢复下载 worker\n"

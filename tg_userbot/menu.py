@@ -135,6 +135,10 @@ def tools_menu_buttons(candidates):
         Button.inline("✏️ 输入上传路径", encode_menu_data("up_input")),
         Button.inline("🔄 刷新", encode_menu_data("tools")),
     ])
+    rows.append([
+        Button.inline("🔗 外链台账", encode_menu_data("mlink_view")),
+        Button.inline("📜 命令模板", encode_menu_data("cmdt")),
+    ])
     rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
     return rows
 
@@ -368,7 +372,10 @@ def sh_menu_buttons():
              for cmd, label in shell.PRESET_COMMANDS.items()]]
     rows.append(
         [Button.inline("✏️ 自定义命令", encode_menu_data("sh_input"))])
-    rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
+    rows.append([
+        Button.inline("📜 命令模板", encode_menu_data("cmdt")),
+        Button.inline("🔙 返回主菜单", encode_menu_data("home")),
+    ])
     return rows
 
 

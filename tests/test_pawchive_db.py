@@ -428,3 +428,49 @@ class ManualPanelFlowTest(_PawDbTestCase):
         self.assertIn("没有待人工处理", text)     # 唯一的 MANUAL 帖已标完
         # 空态也保留面板按钮（用户还能点回其他视图）
         self.assertTrue(buttons)
+
+
+class ArchiveFailedTest(_PawDbTestCase):
+    """#3：FAILED 死链归档 —— /paw archive failed 的存储层。"""
+
+    def _seed_mixed(self):
+        """111→FAILED，222 保持 PENDING（rows[0]=222 新在前、rows[1]=111）。"""
+        created, _ = self.enqueue_two()
+        rows = runtime_db.list_pawchive_posts(limit=10)
+        first = runtime_db.claim_next_pawchive_post()
+        assert first and first["id"] == rows[1]["id"]
+        runtime_db.finalize_pawchive_post(
+            rows[1]["id"], runtime_db.PAW_POST_FAILED, error="死链")
+        return rows
+
+    def test_archive_moves_only_failed(self):
+        rows = self._seed_mixed()
+        n = runtime_db.archive_pawchive_failed()
+        self.assertEqual(n, 1)
+        statuses = {r["id"]: r["status"] for r in
+                    runtime_db.list_pawchive_posts(limit=10)}
+        self.assertEqual(statuses[rows[1]["id"]], "ARCHIVED")   # 111 已归档
+        self.assertEqual(statuses[rows[0]["id"]], "PENDING")    # 222 不受影响
+
+    def test_archive_idempotent(self):
+        self._seed_mixed()
+        self.assertEqual(runtime_db.archive_pawchive_failed(), 1)
+        self.assertEqual(runtime_db.archive_pawchive_failed(), 0)
+
+    def test_archived_excluded_from_status_counts_of_active(self):
+        """ARCHIVED 是独立状态：status_counts 自然分组，面板标签需覆盖。"""
+        from tg_userbot import pawchive_worker
+        self.assertIn(runtime_db.PAW_POST_ARCHIVED, pawchive_worker._STATUS_LABELS)
+        from tg_userbot import pawchive
+        self.assertIn(runtime_db.PAW_POST_ARCHIVED, pawchive._STATUS_LABELS)
+
+
+class PawArchiveCommandTest(unittest.TestCase):
+    """/paw archive 子命令解析。"""
+
+    def test_parse_archive(self):
+        from tg_userbot import pawchive
+        self.assertEqual(pawchive.parse_paw_command("/paw archive"),
+                         ("archive", None))
+        self.assertEqual(pawchive.parse_paw_command("/paw archive failed"),
+                         ("archive", "failed"))

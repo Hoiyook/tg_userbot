@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shlex
+from datetime import datetime
 
 from . import config
 from . import state
@@ -107,6 +108,9 @@ async def _reply_for(raw, tokens):
     reason = _blacklisted_reason(raw, tokens)
     if reason:
         return f"❌ /sh：命令包含{reason}，已拒绝执行。"
+    if tokens[:2] == ["ls", "-la"] and len(tokens) == 2:
+        # 用户要求（2026-09-15）：ls -la 只展示 时间/大小/名称
+        return format_ls_listing(await _execute(raw))
     return await _execute(raw)
 
 
@@ -214,10 +218,70 @@ def _save_shell_cwd():
 _LS_PERM_RE = re.compile(r"^[dcb\-lps][rwxsStT\-+@]{9}")
 
 
+# 权限位后可能有 macOS 扩展标记（@ / +），长度可变 → {9,}
+_LS_LINE_RE = re.compile(
+    r"^([\-dl][rwxsStT+\-@]{9,})\s+\d+\s+\S+\s+\S+\s+(\d+)\s+"
+    r"((?:\w{3}\s+\d{1,2}\s+(?:\d{1,2}:\d{2})|\w{3}\s+\d{1,2}\s+\d{4}"
+    r"|\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}))\s+(.+?)\s*$")
+_LS_MONTHS = {"Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04",
+              "May": "05", "Jun": "06", "Jul": "07", "Aug": "08",
+              "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12"}
+
+
+def _normalize_ls_date(date_str):
+    """ls 的时间字段 → yyyy-mm-dd（近期文件无年份按当前年补齐）。"""
+    parts = date_str.split()
+    now = datetime.now()
+    if len(parts) == 3 and parts[0] in _LS_MONTHS:
+        mon = _LS_MONTHS[parts[0]]
+        day = parts[1].zfill(2)
+        year = now.year if ":" in parts[2] else parts[2]
+        return f"{year}-{mon}-{day}"
+    if len(parts) == 2:
+        return parts[0]          # GNU ls 已是 yyyy-mm-dd
+    return date_str
+
+
+def format_ls_listing(reply_text):
+    """`ls -la` 的围栏输出 → 精简视图（时间 yyyy-mm-dd / 大小 / 名称）。
+
+    只动展示层：目录名以「/」结尾标记（ls 文件夹浏览器的解析器认这个标记），
+    目录大小显示「—」（ls -la 的目录字节数是 inode 块大小，没有意义）。
+    解析不了的行原样保留（BSD/GNU ls 差异兜底）。
+    """
+    from .naming import format_size
+    if reply_text.count("```") < 2:
+        return reply_text
+    head, body, _tail = reply_text.split("```", 2)
+    lines = []
+    for line in body.splitlines():
+        if not line.strip() or line.strip().startswith("total"):
+            continue
+        m = _LS_LINE_RE.match(line)
+        if not m:
+            lines.append(line)
+            continue
+        perm, size, date, name = m.groups()
+        if name in (".", ".."):
+            continue
+        is_dir = perm.startswith("d")
+        size_text = "—" if is_dir else format_size(int(size))
+        display = name + "/" if is_dir else name
+        lines.append(f"{_normalize_ls_date(date)}  {size_text:>9}  {display}")
+    return (head.split("```")[0] + "```\n" + "\n".join(lines) + "\n```")
+
+
 def parse_ls_entries(output):
     """ls -la 输出 → 目录名列表（保序；文件/符号链接/坏行/./.. 排除）。"""
     dirs = []
     for line in output.splitlines():
+        # 精简视图格式：`yyyy-mm-dd  大小  名称/`（目录名以 / 结尾）
+        slim = re.match(r"^\d{4}-\d{2}-\d{2}\s+\S+\s+(.+?)\s*$", line)
+        if slim:
+            name = slim.group(1)
+            if name.endswith("/") and name != "/":
+                dirs.append(name.rstrip("/"))
+            continue
         if not _LS_PERM_RE.match(line):
             continue
         parts = line.split(None, 8)

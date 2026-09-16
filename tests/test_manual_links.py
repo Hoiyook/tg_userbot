@@ -157,3 +157,25 @@ class TestPawCompletedCheck(_MlinksDbBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PanelViewTest(_MlinksDbBase):
+    """#4：工具面板的 🔗 外链台账入口（mlink_view 动作）。"""
+
+    def test_tools_panel_has_ledger_button(self):
+        from tg_userbot import menu
+        rows = menu.tools_menu_buttons([])
+        flat = [b for row in rows for b in row]
+        led = [b for b in flat if "外链台账" in b.text]
+        self.assertEqual(len(led), 1)
+        self.assertLessEqual(len(led[0].data), 64)
+
+    async def test_mlink_view_action(self):
+        from tg_userbot import bot
+        manual_links.observe(["https://mega.nz/file/a#K1"])
+        text, buttons = await bot.handle_menu_action("mlink_view", None)
+        self.assertIn("外链台账", text)
+        self.assertIn("mega.nz", text)
+        # 带返回导航
+        flat = [b for row in buttons for b in row]
+        self.assertTrue(any("返回" in b.text for b in flat))

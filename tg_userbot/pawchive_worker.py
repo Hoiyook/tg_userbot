@@ -478,20 +478,24 @@ def _panel_progress_lines():
     return lines
 
 
+# 状态计数标签（进度面板与 /paw status 同源；ARCHIVED=死链归档）
+_STATUS_LABELS = {
+    runtime_db.PAW_POST_PENDING: "⏳",
+    runtime_db.PAW_POST_PROCESSING: "🔄",
+    runtime_db.PAW_POST_COMPLETED: "✅",
+    runtime_db.PAW_POST_MANUAL: "👤",
+    runtime_db.PAW_POST_FAILED: "❌",
+    runtime_db.PAW_POST_ARCHIVED: "🗄",
+}
+
+
 def build_progress_text():
     """🐾 进度面板正文：状态计数 + 进行中明细 + 磁盘（/paw status 同源）。"""
     try:
         counts = runtime_db.pawchive_status_counts()
     except runtime_db.DbUnavailable as e:
         return f"🐾 Pawchive 进度\n❌ Runtime DB 不可用：{e}"
-    labels = {
-        runtime_db.PAW_POST_PENDING: "⏳",
-        runtime_db.PAW_POST_PROCESSING: "🔄",
-        runtime_db.PAW_POST_COMPLETED: "✅",
-        runtime_db.PAW_POST_MANUAL: "👤",
-        runtime_db.PAW_POST_FAILED: "❌",
-    }
-    parts = [f"{labels.get(s, s)}{n}" for s, n in sorted(counts.items())]
+    parts = [f"{_STATUS_LABELS.get(s, s)}{n}" for s, n in sorted(counts.items())]
     lines = [f"🐾 Pawchive 进度（{time.strftime('%H:%M:%S')}）",
              " ".join(parts) if counts else "（队列为空）"]
     inflight = current_post_label()

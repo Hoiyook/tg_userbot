@@ -290,6 +290,8 @@ DEDUP_INDEX_FILE = os.path.join(RUNTIME_DIR, "dedup_index.txt")
 # DB 写失败时的判重键暂存（P1-1，2026-09-15）：remember 失败先落这里，
 # 启动 load_index 时补写进 DB（防「文件已下载、键没落库」的重启重复下载窗口）
 DEDUP_PENDING_FILE = os.path.join(RUNTIME_DIR, "dedup_pending.jsonl")
+# 命令模板（cmd_templates.py，/cmdt）：名字 → shell 命令原文
+CMD_TEMPLATES_FILE = os.path.join(RUNTIME_DIR, "command_templates.json")
 DEDUP_CONFIG_FILE = os.path.join(RUNTIME_DIR, "dedup_config.json")
 DEDUP_MAX_ENTRIES = 10000
 
@@ -645,10 +647,12 @@ MENU_ACTIONS = (
     # Pawchive：视图（含状态） / 搜作者 / Cookie / 暂停 / 恢复 / 待人工 /
     # 导出 CSV / 重投全部失败 / 搜索候选按钮（paw_pick 带序号）
     "paw", "paw_status", "paw_search", "paw_cookie", "paw_pause",
-    "paw_resume", "paw_manual", "paw_done", "paw_pick", "paw_csv",
-    "mlink_done",
+    "paw_resume", "paw_manual", "paw_done", "paw_archive", "paw_pick",
+    "paw_csv",
+    "mlink_done", "mlink_view",
     "paw_retry_all",
     "paw_post", "paw_find",
+    "cmdt", "cmdt_add", "cmdt_run", "cmdt_del",
     # CD2 子菜单视图与「命令行/上传」合并工具箱视图
     "cd2_menu", "tools",
 )
@@ -875,6 +879,9 @@ CLEAN_NOTIFICATION_PREFIXES = (
     "/origin",
     "🕘 来源解析",
     "🕘 没有来源解析失败记录",
+    # /cmdt（命令模板）的命令与回复
+    "/cmdt",
+    "📜 命令模板",
     # /thread 的回复
     "🧵 当前并发下载数",
     "✅ 并发下载数已设置为",
