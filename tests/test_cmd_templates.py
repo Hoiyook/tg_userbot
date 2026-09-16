@@ -130,6 +130,33 @@ class CmdtMenuTest(unittest.TestCase):
             for b in row:
                 self.assertLessEqual(len(b.data), 64)
 
+    def test_template_buttons_appear_in_sh_panel(self):
+        """用户要求：新增模板后，命令行面板自动生成执行按钮。"""
+        from tg_userbot import menu as menu_mod
+        cmd_templates.upsert("磁盘占用", "du -sh * | sort -rh | head -20")
+        rows = menu_mod.sh_menu_buttons()
+        flat = [b for row in rows for b in row]
+        btn = next(b for b in flat if b.text == "▶️ 磁盘占用")
+        action, arg = menu_mod.parse_menu_data(btn.data)
+        self.assertEqual((action, arg), ("cmdt_run", "磁盘占用"))
+        # 管理入口仍在
+        self.assertTrue(any("管理模板" in b.text for b in flat))
+        # 删模板后按钮消失
+        cmd_templates.delete("磁盘占用")
+        rows = menu_mod.sh_menu_buttons()
+        self.assertFalse(any("磁盘占用" in b.text
+                             for row in rows for b in row))
+
+    async def test_template_button_executes(self):
+        """▶️ 模板按钮 → cmdt_run → 真实执行命令。"""
+        cmd_templates.upsert("问好", "echo hi-template")
+        from tg_userbot import bot as bot_mod
+        ok, result = await cmd_templates.execute("问好")
+        self.assertTrue(ok)
+        self.assertIn("hi-template", result)
+        # bot 分支存在性：cmdt_run 已在 MENU_ACTIONS
+        self.assertIn("cmdt_run", config.MENU_ACTIONS)
+
     def test_view_text(self):
         state.CMD_TEMPLATES = {"磁盘": "du -sh *"}
         text = cmd_templates.list_text()

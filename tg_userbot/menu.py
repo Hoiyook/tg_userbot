@@ -11,6 +11,7 @@ from telethon import Button
 
 from . import state
 from . import config
+from . import cmd_templates
 from . import shell
 from . import upload
 from .config import DOWNLOAD_CONCURRENCY_MAX, LOG_RETENTION_DAYS, MENU_ACTIONS
@@ -125,6 +126,7 @@ def tools_menu_buttons(candidates):
     """
     rows = [[Button.inline(label, encode_menu_data("sh_run", cmd))
              for cmd, label in shell.PRESET_COMMANDS.items()]]
+    rows += _template_buttons()
     rows.append(
         [Button.inline("✏️ 自定义命令", encode_menu_data("sh_input"))])
     for i, path in enumerate(candidates):
@@ -367,15 +369,29 @@ def sh_ls_buttons(dirs, up_token=None, home_token=None):
 
 
 def sh_menu_buttons():
-    """🖥 命令行视图：预设命令（shell.PRESET_COMMANDS）+ 自定义输入 + 返回。"""
+    """🖥 命令行视图：预设命令 + 命令模板按钮 + 自定义输入 + 返回。
+
+    命令模板按钮化（2026-09-15 用户要求）：新增模板后自动出现在本视图，
+    点了直接执行（cmdt_run 按名字走 /sh 全套纪律）。
+    """
     rows = [[Button.inline(label, encode_menu_data("sh_run", cmd))
              for cmd, label in shell.PRESET_COMMANDS.items()]]
+    rows += _template_buttons()
     rows.append(
         [Button.inline("✏️ 自定义命令", encode_menu_data("sh_input"))])
     rows.append([
-        Button.inline("📜 命令模板", encode_menu_data("cmdt")),
+        Button.inline("📜 管理模板", encode_menu_data("cmdt")),
         Button.inline("🔙 返回主菜单", encode_menu_data("home")),
     ])
+    return rows
+
+
+def _template_buttons():
+    """命令模板 → ▶️ 执行按钮行（每个模板一行；无模板返回空）。"""
+    rows = []
+    for name in cmd_templates.names():
+        rows.append([Button.inline(
+            f"▶️ {name}", encode_menu_data("cmdt_run", name))])
     return rows
 
 

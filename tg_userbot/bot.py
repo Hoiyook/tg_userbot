@@ -280,6 +280,11 @@ async def handle_menu_action(action, arg, event):
         return pawchive.manual_view_full()
     if action == "paw_done":
         return pawchive.manual_done_reply(arg)
+    if action == "mlink_view":
+        view_text, rows = manual_links.links_view()
+        rows = rows + [[Button.inline(
+            "🔙 返回主菜单", menu.encode_menu_data("home"))]]
+        return view_text, rows
     if action == "mlink_done":
         view_text, buttons = await manual_links.done_reply(arg)
         return view_text, buttons
