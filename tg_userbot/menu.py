@@ -77,8 +77,7 @@ def main_menu_buttons():
          Button.inline("📋 白名单", encode_menu_data("wl"))],
         [Button.inline("📥 队列", encode_menu_data("queue")),
          Button.inline("🔁 待重试", encode_menu_data("retry"))],
-        [Button.inline("🧵 并发", encode_menu_data("thread")),
-         Button.inline("🧹 清理", encode_menu_data("clean"))],
+        [Button.inline("🧵 并发", encode_menu_data("thread"))],
         [Button.inline("🛡 去重", encode_menu_data("dedup")),
          Button.inline("🍪 抖音Cookie", encode_menu_data("cookie"))],
         # CD2 的启动/停止/备份记录收进子菜单（2026-09-15 菜单合并）

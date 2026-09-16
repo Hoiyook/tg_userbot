@@ -493,7 +493,7 @@ async def handle_command(event, cmd_text):
             "/retry - 查看待重试列表\n"
             "/retry 序号 - 重新执行某条失败任务\n"
             "/retry del 序号 - 从待重试列表移除\n"
-            "/clean - 清理 .download 临时文件\n"
+            "/clean - 清理 .download 临时文件（启动时自动清，一般无需手动）\n"
             "/clearmsg - 清理程序产生的命令、通知和链接指令\n"
             "/setcleartime 1m - 设置自动清理间隔\n"
             "/setcleartime off - 关闭自动清理\n"

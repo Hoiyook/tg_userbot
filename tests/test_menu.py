@@ -67,7 +67,7 @@ class MenuTextTest(unittest.TestCase):
     def test_main_menu_buttons_contain_all_entries(self):
         texts = [b.text for row in menu.main_menu_buttons() for b in row]
         for label in ("📊 状态", "📈 进度", "📜 下载记录",
-                      "📋 白名单", "🧵 并发", "🧹 清理",
+                      "📋 白名单", "🧵 并发",
                       "☁️ CD2 云盘", "🖥 命令行/上传", "🐾 Pawchive"):
             self.assertIn(label, texts)
 
