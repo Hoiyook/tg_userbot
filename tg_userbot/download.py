@@ -270,6 +270,7 @@ async def download_url_media(record):
     )
     folder = _douyin_folder()
     os.makedirs(folder, exist_ok=True)
+    last_err = None
 
     # 开下前先看直链签名寿命：临近/已过期就刷新，别让第一轮尝试烧在
     # 过期直链上。refreshed 标记「本执行已试过刷新」——之后 403 时不再
@@ -431,6 +432,7 @@ async def download_url_media(record):
                     raise
 
                 except httpx.HTTPStatusError as e:
+                    last_err = f"{type(e).__name__}: {e}"
                     status = (
                         e.response.status_code
                         if e.response is not None else None
@@ -463,6 +465,7 @@ async def download_url_media(record):
                     await asyncio.sleep(3)
 
                 except (ConnectionError, TimeoutError, OSError) as e:
+                    last_err = f"{type(e).__name__}: {e}"
                     logger.exception(
                         f"❌ 直链下载失败，尝试第 {attempt} 次"
                         f"（上限 {DOWNLOAD_RETRIES}）：{e}"
@@ -473,6 +476,7 @@ async def download_url_media(record):
                     await asyncio.sleep(3)
 
                 except Exception as e:
+                    last_err = f"{type(e).__name__}: {e}"
                     logger.exception(
                         f"❌ 直链下载出现未预期错误，尝试第 {attempt} 次"
                         f"（上限 {DOWNLOAD_RETRIES}）：{e}"
@@ -487,7 +491,9 @@ async def download_url_media(record):
                 await notify.notify_user(
                     "❌ 直链下载失败\n\n"
                     f"文件：{os.path.basename(final_path)}\n"
-                    f"请查看 download.log",
+                    f"原因：{netio.humanize_net_error(last_err)}\n"
+                    f"细节：{(last_err or '')[:140]}\n"
+                    "重试：/retry 查看待重试列表",
                 )
             except Exception:
                 pass
@@ -593,6 +599,7 @@ async def download_file(message, source_override=None, caption_override=None,
                         label_override=None, task_id=None, date_override=None,
                         parent_caption=None, source_subdir=None):
     async with state.DOWNLOAD_SEMAPHORE:
+        last_err = None
         source = await resolve_download_source(message, source_override)
         if source_subdir:
             # 目录模式标注（/A#x 或 /A）：落 = 原目录/子目录/。子目录已在
@@ -899,6 +906,7 @@ async def download_file(message, source_override=None, caption_override=None,
                     raise
 
                 except (ConnectionError, TimeoutError, OSError, RPCError) as e:
+                    last_err = f"{type(e).__name__}: {e}"
                     if isinstance(e, AuthBytesInvalidError):
                         # 跨 DC 首次授权导出竞态：失败在首字节前、秒级返回，重试极
                         # 便宜；上限放宽到 DOWNLOAD_RETRIES + EXPORT_RACE_EXTRA_
@@ -918,6 +926,7 @@ async def download_file(message, source_override=None, caption_override=None,
                     await _sleep_and_reconnect(worker)
 
                 except Exception as e:
+                    last_err = f"{type(e).__name__}: {e}"
                     logger.exception(
                         f"❌ 下载出现未预期错误，尝试第 {attempt} 次"
                         f"（上限 {DOWNLOAD_RETRIES}）：{e}"
@@ -934,7 +943,9 @@ async def download_file(message, source_override=None, caption_override=None,
                     "❌ 文件下载失败\n\n"
                     f"来源：{source}\n"
                     f"文件：{os.path.basename(final_path)}\n"
-                    f"请查看 download.log",
+                    f"原因：{netio.humanize_net_error(last_err)}\n"
+                    f"细节：{(last_err or '')[:140]}\n"
+                    "重试：把这条消息再转发一次即可重新下载",
                 )
             except Exception:
                 pass

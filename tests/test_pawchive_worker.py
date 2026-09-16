@@ -172,16 +172,20 @@ class FinalizeTest(_WorkerDbTestCase):
         self.assertEqual(len(self._notifies), 1)
         self.assertIn("https://mega.nz/x#k", self._notifies[0])
 
-    async def test_failed_notifies_with_retry_hint(self):
+    async def test_failed_notifies_with_humanized_reason(self):
+        """失败通知必须带人话原因（用户要求：不给日志原文）。"""
         post, files = self._seed_and_claim()
         for f in files:
             f["status"] = runtime_db.PAW_FILE_FAILED
-            f["error"] = "下载超时"
+            f["error"] = ("RemoteProtocolError: peer closed connection "
+                          "without sending complete message body")
         await worker._finalize(post, files)
         self.assertEqual(
             runtime_db.get_pawchive_post(post["id"])["status"],
             runtime_db.PAW_POST_FAILED)
         self.assertIn(f"/paw retry {post['id']}", self._notifies[0])
+        self.assertIn("连接被远端中断", self._notifies[0])
+        self.assertNotIn("RemoteProtocolError", self._notifies[0])
 
     async def test_all_dead_finalize_silent(self):
         """全部死链：帖子 FAILED 且不发通知（重试也一样 404，不可行动）。"""

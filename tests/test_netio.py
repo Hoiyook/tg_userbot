@@ -94,3 +94,19 @@ class ShieldedTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class HumanizeNetErrorTest(unittest.TestCase):
+    """网络错误人话化：通知直接给原因，技术细节留日志/DB。"""
+
+    def test_mapping(self):
+        from tg_userbot.netio import humanize_net_error as h
+        self.assertIn("远端中断", h("RemoteProtocolError: peer closed"))
+        self.assertIn("404", h("HTTP 404"))
+        self.assertIn("410", h("HTTP 410"))
+        self.assertIn("超时", h("httpx.ReadTimeout: timed out"))
+        self.assertIn("连接失败", h("httpx.ConnectError: refused"))
+        self.assertIn("不完整", h("OSError: 大小不符 got=5 expect=100"))
+        self.assertIn("5xx", h("HTTP 502 Bad Gateway"))
+        # 未知错误原样截断返回
+        self.assertEqual(h("奇怪的错"), "奇怪的错")
+        self.assertEqual(h(""), "未知错误")

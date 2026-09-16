@@ -35,6 +35,7 @@ import urllib.request
 import httpx
 
 from . import config
+from . import netio
 from . import notify
 from . import runtime_db
 from . import state
@@ -421,7 +422,8 @@ async def _finalize(post, files):
                  post.get("post_url") or "",
                  f"{err}（/paw retry {post['id']} 重投）"]
         for f in failed[:5]:
-            lines.append(f"  · {f['filename']}：{(f.get('error') or '')[:80]}")
+            reason = netio.humanize_net_error(f.get("error") or "")
+            lines.append(f"  · {f['filename']}：{reason}")
         await notify.notify_user("\n".join(lines))
         _bump_milestone("failed")
         await _milestone_notify_if_due()

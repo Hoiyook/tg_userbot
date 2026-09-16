@@ -71,3 +71,33 @@ async def shielded(proc, timeout, what):
         # 兜底：任何路径都不留孤儿子任务（未完成即取消）
         if not task.done():
             task.cancel()
+
+
+def humanize_net_error(err_text):
+    """把下载/网络报错的原文翻译成人话原因（通知直接可用）。
+
+    输入是异常原文（含类型名）；按特征词分类，匹配不到就原样截断返回。
+    只做展示层翻译，不改变任何重试/判死逻辑——技术原文始终在
+    download.log 与数据库 error 字段里可溯源。
+    """
+    t = str(err_text or "")
+    low = t.lower()
+    if "404" in t:
+        return "站点没有这个文件（404）"
+    if "410" in t:
+        return "文件已被站点删除（410）"
+    if ("peer closed" in low or "remoteprotocolerror" in low
+            or "incompletere" in low):
+        return "连接被远端中断（网络/CDN 不稳，已自动断点续传重试）"
+    if "timed out" in low or "timeout" in low:
+        return "下载超时（服务器长时间无响应）"
+    if "connection refused" in low or "connection reset" in low \
+            or "connecterror" in low:
+        return "网络连接失败（代理或服务端不可达）"
+    if "floodwait" in low:
+        return "Telegram 限流"
+    if "大小不符" in t or "incomplete" in low:
+        return "下载不完整（大小校验失败，服务端可能中途截断）"
+    if "http 5" in low:
+        return "服务器错误（5xx）"
+    return (t[:120] or "未知错误")
