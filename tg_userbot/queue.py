@@ -649,6 +649,8 @@ async def _run_queued_task(record):
             # 讨论组评论继承到的频道原帖日期（入队时快照的 ISO 串）。认不出就
             # 当没有——退回消息自身日期，绝不让一条坏记录把下载打死。
             date_override=naming.parse_date(record.get("parent_date")),
+            # 目录模式标注（/A#x）：落 = 原目录/子目录/（旧任务无此键 → None）
+            source_subdir=record.get("source_subdir"),
         )
     if kind == "url":
         # 本地解析链的 HTTP 直链下载：没有 Telegram 消息概念，直链/标题/

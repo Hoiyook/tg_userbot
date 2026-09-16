@@ -74,13 +74,15 @@ class _EnqueueMeHarness:
 
     def __init__(self):
         self.labels = []
+        self.subdirs = []
 
     def patch(self, grace):
         async def fake_enqueue(message, chat_id, source_override,
                                source_link=None, album_caption=None,
                                user_label=None, src=None, parent_date=None,
-                               parent_caption=None):
+                               parent_caption=None, source_subdir=None):
             self.labels.append(user_label)
+            self.subdirs.append(source_subdir)
 
         return mock.patch.multiple(
             "tg_userbot.app",
@@ -122,3 +124,81 @@ class MeLabelGraceTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SubdirLabelSplitTest(unittest.TestCase):
+    """目录模式标注：/A#标注 与 /A →（标注, 子目录）拆分。
+
+    解析规则（2026-09-16 用户需求）：
+      /A#标注 → 标注部分原样拼文件名（照常过 Caption 清洗），文件落
+                原目录/A/；
+      /A      → 无标注（不拼 #），文件落 原目录/A/；
+      /A/B    → 多级子目录 原目录/A/B/（B 在 A 下）；
+      普通评论 → 原语义不变（整条拼 #标注，落原目录）。
+    """
+
+    def test_dir_with_label(self):
+        self.assertEqual(app.split_label_subdir("/A#标注"),
+                         ("标注", "A"))
+
+    def test_dir_only(self):
+        self.assertEqual(app.split_label_subdir("/A"), ("", "A"))
+
+    def test_nested_dirs(self):
+        self.assertEqual(app.split_label_subdir("/A/B#x"),
+                         ("x", "A/B"))
+        self.assertEqual(app.split_label_subdir("/A/B"),
+                         ("", "A/B"))
+
+    def test_plain_label_unchanged(self):
+        """普通评论：返回 (原文, None)——None 表示不覆盖子目录。"""
+        self.assertEqual(app.split_label_subdir("自存"), ("自存", None))
+        self.assertEqual(app.split_label_subdir("#tag 标注"),
+                         ("#tag 标注", None))
+
+    def test_slash_only_is_plain(self):
+        """裸 '/'（无目录名）：不是目录模式，按普通评论处理。"""
+        self.assertEqual(app.split_label_subdir("/"), ("/", None))
+
+    def test_slash_dirname_sanitized(self):
+        """目录名里的非法字符清洗掉（/ 作分隔符保留，其余非法字符清）。"""
+        label, sub = app.split_label_subdir("/A:B#tag")
+        self.assertEqual(label, "tag")
+        self.assertEqual(sub, "AB".replace("AB", "AB") if False else
+                         app.sanitize_dirname("A:B"))
+        self.assertNotIn(":", sub)
+
+    def test_empty_dirname_is_plain(self):
+        """/#标注：目录名为空 → 不是目录模式（否则文件落原地且丢标注）。"""
+        self.assertEqual(app.split_label_subdir("/#标注"),
+                         ("/#标注", None))
+
+
+class SubdirEnqueueTest(unittest.IsolatedAsyncioTestCase):
+    """_enqueue_me：目录模式标注 → record.source_subdir + 干净的 user_label。"""
+
+    def setUp(self):
+        _reset()
+
+    def tearDown(self):
+        _reset()
+
+    async def test_record_gets_source_subdir(self):
+        captured = {}
+
+        async def fake_enqueue(message, chat_id, source_override,
+                               source_link=None, album_caption=None,
+                               user_label=None, src=None, parent_date=None,
+                               parent_caption=None, source_subdir=None):
+            captured["user_label"] = user_label
+            captured["subdir"] = source_subdir
+
+        app._record_me_label("/ wallpapers#城市夜景")
+        with mock.patch.multiple(
+                "tg_userbot.app",
+                ME_LABEL_GRACE_SECONDS=0,
+                _maybe_album_caption=mock.AsyncMock(return_value=""),
+                enqueue_media=fake_enqueue):
+            await app._enqueue_me(_fake_msg(2))
+        self.assertEqual(captured["user_label"], "城市夜景")
+        self.assertEqual(captured["subdir"], "wallpapers")

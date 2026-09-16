@@ -591,9 +591,13 @@ def unregister_download(did):
 
 async def download_file(message, source_override=None, caption_override=None,
                         label_override=None, task_id=None, date_override=None,
-                        parent_caption=None):
+                        parent_caption=None, source_subdir=None):
     async with state.DOWNLOAD_SEMAPHORE:
         source = await resolve_download_source(message, source_override)
+        if source_subdir:
+            # 目录模式标注（/A#x 或 /A）：落 = 原目录/子目录/。子目录已在
+            # 入队侧逐段 sanitize（app.sanitize_dirname），这里只做拼接。
+            source = source.rstrip("/") + "/" + str(source_subdir).strip("/")
         # 命名用 caption：消息自带文字优先；否则用调用方继承的相册同组说明
         # （转发副本无 caption，图片名靠它避免落到 媒体类型_时间戳 兜底名）
         # 这里只做「谁优先」的选择、取**原始**文本：清洗与 sanitize 统一由

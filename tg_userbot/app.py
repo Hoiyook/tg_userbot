@@ -714,18 +714,22 @@ async def _enqueue_me(message):
         logger.info(f"🏷 媒体 {message.id} 继承转发评论标注：\"{user_label}\"")
     album_caption = await _maybe_album_caption(message)
     origin = await resolve_origin_snapshot(message)
+    # 目录模式标注：/A#标注 → 标注拼 # 进文件名 + 落 原目录/A/（2026-09-16）
+    user_label, source_subdir = split_label_subdir(user_label or "")
     await enqueue_media(
         message, state.MY_ID, _origin_folder(origin),
         album_caption=album_caption,
-        user_label=user_label,
+        user_label=user_label or None,
         parent_date=_origin_date(origin),
         parent_caption=_origin_caption(origin),
+        source_subdir=source_subdir,
     )
 
 
 async def enqueue_media(message, chat_id, source_override, source_link=None,
                         album_caption=None, user_label=None, src=None,
-                        parent_date=None, parent_caption=None):
+                        parent_date=None, parent_caption=None,
+                        source_subdir=None):
     """把一条媒体消息入队下载（持久化，重启不丢任务）。
 
     source_link 显式传入时覆盖默认的来源链接；album_caption 为相册无文字
@@ -756,6 +760,10 @@ async def enqueue_media(message, chat_id, source_override, source_link=None,
     )
     if keys:
         record["dedup_keys"] = keys  # 在途判重 + 成功后 remember 复用
+    if source_subdir:
+        # 目录模式标注（/A#x）：落盘 = 原目录/source_subdir/...（payload
+        # 自由字段，旧任务无此键零影响）
+        record["source_subdir"] = source_subdir
     # 返回是否真正入队（False = 持久化失败未入队，任务交上游恢复路径）
     return await queue.enqueue_and_start(record, src=src)
 
@@ -888,6 +896,40 @@ async def _maybe_album_caption(message):
 # 访问，无需加锁。
 _ME_PENDING_LABEL = None     # 最近一条待关联的用户评论文本
 _ME_PENDING_LABEL_AT = 0.0   # 记录时刻的 time.monotonic()
+
+
+def sanitize_dirname(name):
+    """目录名清洗：去掉文件系统非法字符（/ 用作多级分隔符在拆分前已处理，
+    这里清洗单段）。空段返回 None（调用方跳过该段）。"""
+    cleaned = "".join(
+        c for c in str(name or "") if c not in '\\/:*?"<>|'
+    ).strip().rstrip(".")
+    return cleaned or None
+
+
+def split_label_subdir(text):
+    """手工转发评论的「目录模式」解析（2026-09-16 用户需求）。
+
+      /A#标注 → ("标注", "A")     标注照常拼 # 进文件名（过 Caption 清洗）
+      /A      → ("", "A")         无标注
+      /A/B#x  → ("x", "A/B")      多级子目录
+      其他    → (原文, None)      普通评论，原语义（整条拼 #，不覆盖目录）
+
+    返回 (user_label, source_subdir)；subdir=None 表示不覆盖。裸 '/' 或
+    '/#标注'（目录名为空）按普通评论处理，防止文件落原地却丢标注。"""
+    raw = str(text or "").strip()
+    if not raw.startswith("/") or len(raw) < 2:
+        return raw, None
+    body = raw[1:]
+    label = ""
+    if "#" in body:
+        body, _, label = body.partition("#")
+    parts = [sanitize_dirname(p) for p in body.split("/")]
+    parts = [p for p in parts if p]
+    if not parts:
+        return raw, None          # 目录名为空：按普通评论
+    subdir = "/".join(parts)
+    return (label.strip(), subdir) if label else ("", subdir)
 
 
 def _record_me_label(text):
