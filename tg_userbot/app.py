@@ -706,15 +706,18 @@ async def _enqueue_me(message):
     尾随评论一个落地机会；已有标注时不等待、立即继承。
     """
     user_label = _take_me_label()
+    logger.info(f"🏷 [诊断1] 媒体 {message.id} 首次取标：{user_label!r}")
     if user_label is None and ME_LABEL_GRACE_SECONDS > 0:
         await asyncio.sleep(ME_LABEL_GRACE_SECONDS)
         user_label = _take_me_label()
+        logger.info(f"🏷 [诊断2] 媒体 {message.id} 宽限后取标：{user_label!r}")
     if user_label:
         logger.info(f"🏷 媒体 {message.id} 继承转发评论标注：\"{user_label}\"")
     album_caption = await _maybe_album_caption(message)
     origin = await resolve_origin_snapshot(message)
     # 目录模式标注：/A#标注 → 标注拼 # 进文件名 + 落 原目录/A/（2026-09-16）
     user_label, source_subdir = split_label_subdir(user_label or "")
+    logger.info(f"🏷 [诊断3] 媒体 {message.id} 拆分：label={user_label!r} subdir={source_subdir!r}")
     await enqueue_media(
         message, state.MY_ID, _origin_folder(origin),
         album_caption=album_caption,
