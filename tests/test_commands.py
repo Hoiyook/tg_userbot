@@ -553,3 +553,30 @@ class SqltCommandTest(unittest.TestCase):
         ok, replies = self._run("/sqlt del 没有的")
         self.assertTrue(ok)
         self.assertIn("❌", replies[0])
+
+
+class Help2ContentTest(unittest.TestCase):
+    def _run(self, cmd):
+        ev = FakeEvent()
+        ok = asyncio.run(commands.handle_command(ev, cmd))
+        return ok, ev.replies
+
+    def test_help2_lists_tables_and_files(self):
+        ok, replies = self._run("/help2")
+        self.assertTrue(ok)
+        body = "\n".join(replies)
+        for token in ("数据库表", "配置文件", "download_tasks", "pawchive_posts",
+                      "manual_links", "listen.json", "tg_secrets.json"):
+            self.assertIn(token, body)
+
+    def test_help2_fits_one_message(self):
+        ok, replies = self._run("/help2")
+        self.assertLessEqual(len("\n".join(replies)), 4096)
+
+    def test_help2_not_matched_by_help(self):
+        """互不遮蔽：/help 不触发 help2，反之亦然。"""
+        ev = FakeEvent()
+        ok = asyncio.run(commands.handle_command(ev, "/help"))
+        self.assertTrue(ok)
+        body = "\n".join(ev.replies)
+        self.assertNotIn("数据库表", body)

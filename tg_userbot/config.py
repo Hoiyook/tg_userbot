@@ -804,6 +804,7 @@ REGISTERED_COMMAND_NAMES = frozenset({name for name in (
 # 需要自动清理的命令（精确匹配）
 CLEAN_COMMANDS = {
     "/status",
+    "/help2",
     "/links",
     "/folder",
     "/logpath",
@@ -920,6 +921,8 @@ CLEAN_NOTIFICATION_PREFIXES = (
     "♻️ 自动重放",
     # 手动外链台账（/links 与发送链接的记录回复）
     "🔗 外链台账",
+    # /help2 数据字典
+    "📖 TG Userbot 数据字典",
 )
 
 # 持久保留的程序通知（豁免自动清理，/clearmsg 的 include_persistent=True

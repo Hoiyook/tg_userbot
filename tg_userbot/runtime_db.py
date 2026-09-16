@@ -2302,3 +2302,11 @@ def count_manual_links(status=None):
             (str(status),)).fetchone()[0], "统计外链台账"))
     return int(_read(lambda c: _execute(
         c, "SELECT COUNT(*) FROM manual_links").fetchone()[0], "统计外链台账"))
+
+
+def list_tables():
+    """库内全部表名（sqlite_master，按名排序）——/help2 数据字典用。"""
+    return [r[0] for r in _read(
+        lambda c: _execute(
+            c, "SELECT name FROM sqlite_master WHERE type='table' "
+               "ORDER BY name").fetchall(), "列数据库表")]

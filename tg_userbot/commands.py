@@ -52,6 +52,57 @@ async def _reply(event, payload, **kwargs):
     await event.reply(text.with_code_block(payload), **kwargs)
 
 
+def _help2_text():
+    """数据字典：数据库表 + 运行目录配置文件的作用（/help2）。
+
+    表清单动态取自 sqlite_master（未来新增表自动出现），作用说明为静态
+    映射；未收录的表标注（未记录）。"""
+    lines = ["📖 TG Userbot 数据字典", ""]
+    lines.append("【数据库表】")
+    known_tables = {
+        "schema_meta": "schema 版本与元信息",
+        "listener_checkpoints": "监听/白名单扫描的消息游标（listen/wl 双链）",
+        "listener_tasks": "标签监听+白名单双通道的转发任务（origin 区分）",
+        "listener_follows": "评论跟进关注列表（命中帖按天跟进）",
+        "task_events": "listener 任务事件（自增 id，与下载事件无关）",
+        "download_tasks": "下载队列（QUEUED/RETRY，终态删行）",
+        "download_events": "下载任务事件流水（/stats 台账数据源，追加不改）",
+        "download_history": "下载历史（/done、/find 数据源）",
+        "dedup_index": "去重索引（tg:/dyc:/f:/c: 四类键）",
+        "pawchive_posts": "Pawchive 帖子生命周期（PENDING→PROCESSING→终态/ARCHIVED）",
+        "pawchive_files": "Pawchive 帖子附件文件状态（.part 续传）",
+        "manual_links": "手动外链台账（/links，发送链接即登记）",
+    }
+    try:
+        tables = sorted(runtime_db.list_tables())
+    except runtime_db.DbUnavailable:
+        tables = sorted(known_tables)
+        lines.append("（DB 未连接：以下为静态清单）")
+    for t in tables:
+        if t == "sqlite_sequence":
+            continue
+        lines.append(f"  {t}  ——  {known_tables.get(t, '（未记录）')}")
+    lines.append("")
+    lines.append("【运行目录配置文件】（RUNTIME_DIR）")
+    lines.append("  listen.json  ——  标签监听规则（/listen 维护）")
+    lines.append("  whitelist_config.json  ——  下载白名单（/wl 维护）")
+    lines.append("  thread_config.json  ——  并发下载数（/thread 维护）")
+    lines.append("  clear_time.json  ——  自动清理间隔（/setcleartime）")
+    lines.append("  dedup_config.json  ——  去重开关（/dedup）")
+    lines.append("  caption_filter.json  ——  Caption 命名清洗规则")
+    lines.append("  sql_templates.json  ——  SQL 查询模板（/sqlt）")
+    lines.append("  shell_state.json  ——  /sh 的工作目录（会记住）")
+    lines.append("  download_queue.json  ——  旧队列 JSON（仅 json 回滚模式用）")
+    lines.append("  *.imported  ——  已迁 DB 的旧文件归档（别删）")
+    lines.append("  download.log / chrome_agent.log / cd2_launch.log  ——  技术日志")
+    lines.append("  chrome_tasks/requests/cancel_requests.json  ——  Chrome IPC")
+    lines.append("  userbot.out / chrome_agent.out / *.pid  ——  启动输出与 PID")
+    lines.append("")
+    lines.append("【仓库根】tg_secrets.json  ——  密钥与 cookie（api_id / ")
+    lines.append("bot_token / douyin_cookie / pawchive_cookie / cd2 等）")
+    return "\n".join(lines)
+
+
 async def handle_command(event, cmd_text):
     if cmd_text == "/status":
         await _reply(event, text.status_text())
@@ -505,6 +556,11 @@ async def handle_command(event, cmd_text):
             f"🤖 按钮菜单：给 {BOT_USERNAME} 发任意消息，用按钮操作。"
         )
         logger.info("执行命令：/help")
+        return True
+
+    if cmd_text == "/help2":
+        logger.info("执行命令：/help2")
+        await _reply(event, _help2_text())
         return True
 
     if cmd_text.startswith("/setcleartime"):
