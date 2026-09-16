@@ -554,3 +554,52 @@ async def _noop(_):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ElapsedDisplayTest(unittest.TestCase):
+    """进度面板的「已处理时长」：格式化纯函数 + 当前帖行拼接。"""
+
+    def test_format_elapsed(self):
+        f = worker._fmt_elapsed
+        self.assertEqual(f(0), "0秒")
+        self.assertEqual(f(59), "59秒")
+        self.assertEqual(f(125), "2分05秒")
+        self.assertEqual(f(3725), "1时02分")
+        self.assertEqual(f(36000), "10时00分")
+
+    def test_negative_or_none(self):
+        f = worker._fmt_elapsed
+        self.assertEqual(f(None), "")
+        self.assertEqual(f(-5), "")
+
+
+class CurrentPostElapsedTest(_WorkerDbTestCase):
+    """current_post_label 带上「已处理 X」——用 started_at 计算时长。"""
+
+    def _claim_one(self):
+        post = _post(files=[{"url": "https://x/1.mp4",
+                             "filename": "1.mp4"}])
+        runtime_db.enqueue_pawchive_posts("patreon", "42", "Creator", [post])
+        claimed = runtime_db.claim_next_pawchive_post()
+        worker._INFLIGHT.add(claimed["id"])
+        self.addCleanup(worker._INFLIGHT.clear)
+        return claimed
+
+    def test_label_contains_elapsed(self):
+        self._claim_one()
+        label = worker.current_post_label()
+        self.assertIn("#", label)
+        # started_at 刚写入 → 已处理应在秒级（不含时/分）
+        self.assertIn("已处理", label)
+        self.assertIn("秒", label)
+
+    def test_started_at_hours_ago_shows_hours(self):
+        import time as _t
+        claimed = self._claim_one()
+        old = int(_t.time()) - 7200
+        runtime_db._write(
+            lambda c: runtime_db._execute(
+                c, "UPDATE pawchive_posts SET started_at=? WHERE id=?",
+                (old, claimed["id"])), "回拨 started_at")
+        label = worker.current_post_label()
+        self.assertIn("已处理 2时00分", label)

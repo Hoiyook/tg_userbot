@@ -101,8 +101,23 @@ def worker_state_text():
     return f"已暂停（{_PAUSE_REASON}）" if _PAUSED else "运行中"
 
 
+def _fmt_elapsed(seconds):
+    """已处理时长的人类可读形态：秒 → 秒/分秒/时分；None/负数返回空。"""
+    if seconds is None or seconds < 0:
+        return ""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}秒"
+    if seconds < 3600:
+        return f"{seconds // 60}分{seconds % 60:02d}秒"
+    return f"{seconds // 3600}时{(seconds % 3600) // 60:02d}分"
+
+
 def current_post_label():
-    """在途帖子的展示标签；无 / DB 不可用返回 None。"""
+    """在途帖子的展示标签；无 / DB 不可用返回 None。
+
+    每帖带「已处理 X」——从 claim 写入的 started_at 起算（帖级处理时长，
+    用户 2026-09-16 要求）。"""
     if not _INFLIGHT:
         return None
     try:
@@ -112,9 +127,15 @@ def current_post_label():
     rows = [r for r in rows if r]
     if not rows:
         return None
-    return "；".join(
-        f"#{r['id']} {r['creator_name']} {(r['title'] or '')[:24]}"
-        for r in rows[:3])
+    now = time.time()
+    parts = []
+    for r in rows[:3]:
+        elapsed = _fmt_elapsed(
+            now - r["started_at"] if r.get("started_at") else None)
+        tail = f"（已处理 {elapsed}）" if elapsed else ""
+        parts.append(f"#{r['id']} {r['creator_name']} "
+                     f"{(r['title'] or '')[:24]}{tail}")
+    return "；".join(parts)
 
 
 def _disk_free_gb():
