@@ -785,6 +785,18 @@ BOT_CHAT_KEEP_NOTIFICATIONS = 20
 DEFAULT_CLEAR_INTERVAL_SECONDS = 60
 CLEAR_TIME_CONFIG_FILE = os.path.join(RUNTIME_DIR, "clear_time.json")
 
+# 已注册命令名全集（/ 开头的输入判「是不是命令」用）：bot 按钮面板注册的
+# + 仅收藏夹跑的（CLEAN_COMMANDS 除斜杠）。评论捕获的目录模式标注（/A#x）
+# 以 / 开头但不是命令，靠这份名单区分（2026-09-16）。
+REGISTERED_COMMAND_NAMES = frozenset({name for name in (
+    "status", "stats", "find", "progress", "up", "sh", "queue", "retry",
+    "dedup",
+    "caption_filter", "listen", "wl", "sql", "sqlt", "paw", "origin",
+    "clean", "clearmsg", "setcleartime", "done", "thread", "folder",
+    "logpath", "links", "help", "start",
+)})
+
+
 # 需要自动清理的命令（精确匹配）
 CLEAN_COMMANDS = {
     "/status",

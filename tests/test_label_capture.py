@@ -202,3 +202,16 @@ class SubdirEnqueueTest(unittest.IsolatedAsyncioTestCase):
             await app._enqueue_me(_fake_msg(2))
         self.assertEqual(captured["user_label"], "城市夜景")
         self.assertEqual(captured["subdir"], "wallpapers")
+
+
+class RegisteredCommandGuardTest(unittest.TestCase):
+    """评论捕获守卫：/ 开头的目录模式要放行，真命令要拦。"""
+
+    def test_dir_mode_not_treated_as_command(self):
+        self.assertFalse(app._is_registered_command("/wallpapers#城市"))
+        self.assertFalse(app._is_registered_command("/wallpapers"))
+
+    def test_real_commands_still_excluded(self):
+        for cmd in ("/wl", "/status", "/help", "/paw plan X", "/start"):
+            self.assertTrue(app._is_registered_command(cmd),
+                            f"{cmd} 应被判为注册命令")

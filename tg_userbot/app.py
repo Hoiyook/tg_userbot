@@ -572,10 +572,9 @@ async def new_message_handler(event):
             if (
                 is_me
                 and text
-                and not text.startswith("/")
+                and not _is_registered_command(text)
                 and not cleanup.is_cleanup_message(message)
             ):
-                _record_me_label(text)
                 logger.info(f"🏷 记录待关联转发评论：\"{text}\"")
             else:
                 logger.info(
@@ -896,6 +895,19 @@ async def _maybe_album_caption(message):
 # 访问，无需加锁。
 _ME_PENDING_LABEL = None     # 最近一条待关联的用户评论文本
 _ME_PENDING_LABEL_AT = 0.0   # 记录时刻的 time.monotonic()
+
+
+def _is_registered_command(text):
+    """是否已注册命令（/wl、/status 等）——评论捕获的排除判据。
+
+    不能简单排除一切 '/' 开头：目录模式标注（/A#标注、/A/B）也以 / 开头。
+    按 config.REGISTERED_COMMAND_NAMES 的注册名判定（bot 面板 + 收藏夹
+    命令并集；bot._is_known_command 只含面板名单，会漏 /status 等纯收藏夹
+    命令——2026-09-16 测试抓出后改为并集常量）。"""
+    head = str(text or "").split(None, 1)[0][1:].split("@")[0].lower() \
+        if str(text or "").startswith("/") else ""
+    from . import config as config_mod
+    return head in config_mod.REGISTERED_COMMAND_NAMES
 
 
 def sanitize_dirname(name):
