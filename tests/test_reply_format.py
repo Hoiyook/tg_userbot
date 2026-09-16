@@ -9,6 +9,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录（config import 期
 # 有真实副作用，见 test_config 的基座说明）。
@@ -48,3 +49,32 @@ class TestWithCodeBlock(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCleanButtons(unittest.TestCase):
+    """空按钮列表 → None（telethon 发 [] 会被服务端 ReplyMarkupInvalid 拒收）。"""
+
+    def test_empty_list_becomes_none(self):
+        self.assertIsNone(text.clean_buttons([]))
+
+    def test_none_stays_none(self):
+        self.assertIsNone(text.clean_buttons(None))
+
+    def test_rows_pass_through(self):
+        rows = [["btn"]]
+        self.assertIs(text.clean_buttons(rows), rows)
+
+    def test_links_view_empty_reply_is_sendable(self):
+        """回归：空台账的 /links 空态不再携带空 markup（此前实际炸过）。"""
+        from tg_userbot import manual_links, runtime_db, config
+        import tempfile
+        d = tempfile.mkdtemp(dir=_TMP)
+        p = mock.patch.object(config, "RUNTIME_DB_FILE",
+                              os.path.join(d, "t.db"))
+        p.start()
+        self.addCleanup(p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        view_text, buttons = manual_links.links_view()
+        self.assertIsNone(text.clean_buttons(buttons))

@@ -557,7 +557,7 @@ async def new_message_handler(event):
             ext_urls = manual_links.extract_urls(text)
             if ext_urls:
                 reply, buttons = manual_links.observe(ext_urls)
-                await event.reply(reply, buttons=buttons,
+                await event.reply(reply, buttons=buttons or None,
                                   link_preview=False)
                 return
 

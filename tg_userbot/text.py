@@ -49,6 +49,13 @@ def progress_text():
     return "📊 当前下载进度：\n\n" + "\n".join(lines)
 
 
+def clean_buttons(rows):
+    """空按钮列表降级为 None：telethon 发 buttons=[] 会被服务端以
+    ReplyMarkupInvalid 拒收（2026-09-16 实测：/links 空态与标记完成后的
+    刷新视图因此全部「没反应」）。非空原样返回。"""
+    return rows or None
+
+
 def with_code_block(text):
     """指令回复统一代码块化：多行回复的首行（前缀行）留在围栏外——自动
     清理白名单按 startswith 匹配依赖它；其余正文包进 ``` 围栏（Telegram

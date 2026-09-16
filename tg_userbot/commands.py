@@ -46,6 +46,8 @@ from .log import logger
 async def _reply(event, payload, **kwargs):
     """指令回复统一出口：多行文本代码块化（首行前缀行留外，见
     text.with_code_block）。全部 handle_command 分支的回复都走这里。"""
+    if "buttons" in kwargs:
+        kwargs["buttons"] = text.clean_buttons(kwargs["buttons"])
     await event.reply(text.with_code_block(payload), **kwargs)
 
 
@@ -446,6 +448,13 @@ async def handle_command(event, cmd_text):
             "/wl add @用户名 - 加入白名单（也可回复转发消息后 /wl add）\n"
             "/wl del ID或序号 - 移出白名单\n"
             "/sql - SQL 诊断控制台：直接查询/检修 runtime DB\n"
+            "/sqlt - SQL 查询模板：常用查询存名字，一键执行\n"
+            "/find 关键词 - 媒体下落查询（队列+日志+全历史）\n"
+            "/links - 外链台账：自己登记的网盘链接（未处理清单）\n"
+            "   发送网盘链接给我即登记（默认未处理，重复发送会查重：\n"
+            "   命中台账历史或 Pawchive 已完成外链会提示已处理）\n"
+            "/paw manual - Pawchive 待人工帖（外链清单 + ✅ 完成按钮）\n"
+            "/paw done 行id - 外链处理完，标记该帖 COMPLETED\n"
             "/paw - Pawchive：扫描作者作品、收藏对比、Chrome 批量下载\n"
             "/origin - 查看评论来源解析失败账本（可溯源）\n"
             "/paw plan 作者名 - 扫描作者帖子入队（默认只收未收藏帖）\n"

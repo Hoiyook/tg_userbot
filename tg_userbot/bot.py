@@ -793,8 +793,7 @@ async def bot_message_handler(event):
     ext_urls = manual_links.extract_urls(text)
     if ext_urls:
         reply, buttons = manual_links.observe(ext_urls)
-        await state.bot_client.send_message(
-            state.MY_ID, reply, buttons=buttons, link_preview=False)
+        await _send_owner(reply, buttons)
         return
 
     # 任意文本（含 /start）→ 主菜单
@@ -804,6 +803,12 @@ async def bot_message_handler(event):
         text_mod.with_code_block(menu.build_main_menu_text()),
         buttons=menu.main_menu_buttons(),
     )
+
+async def _send_owner(text_body, buttons=None):
+    """bot 面板对话发送统一出口：空按钮列表降级 None。"""
+    await state.bot_client.send_message(
+        state.MY_ID, text_body,
+        buttons=text_mod.clean_buttons(buttons), link_preview=False)
 
 
 async def _handle_find_input(event, text):
@@ -1062,7 +1067,8 @@ async def bot_callback_handler(event):
         reply, buttons = await handle_menu_action(action, arg, event)
         if reply is not None:
             await event.edit(
-                text_mod.with_code_block(reply), buttons=buttons,
+                text_mod.with_code_block(reply),
+                buttons=text_mod.clean_buttons(buttons),
                 link_preview=False
             )
     except MessageNotModifiedError:
