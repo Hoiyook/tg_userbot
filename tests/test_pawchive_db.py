@@ -431,31 +431,42 @@ class ManualPanelFlowTest(_PawDbTestCase):
 
 
 class ArchiveFailedTest(_PawDbTestCase):
-    """#3：FAILED 死链归档 —— /paw archive failed 的存储层。"""
+    """#3：FAILED 死链归档 —— /paw archive failed 的存储层。
+
+    2026-09-17 语义收紧：**只归档纯死链帖**——含可恢复文件（PENDING，或
+    FAILED 且非死链）的帖子保持 FAILED，归档不得埋掉数据（用户决策）。
+    resurrect_archived_recoverable 是对历史误归档的一次性补救。
+    """
 
     def _seed_mixed(self):
-        """111→FAILED，222 保持 PENDING（rows[0]=222 新在前、rows[1]=111）。"""
+        """111→FAILED（死链），222→PENDING；archive 只归 111。"""
         created, _ = self.enqueue_two()
         rows = runtime_db.list_pawchive_posts(limit=10)
+        target = next(r for r in rows if r["post_id"] == "111")
         first = runtime_db.claim_next_pawchive_post()
-        assert first and first["id"] == rows[1]["id"]
+        assert first and first["id"] == target["id"]
+        files = runtime_db.list_pawchive_files(target["id"])
+        runtime_db.mark_pawchive_file_failed(
+            files[0]["id"], error=runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404")
         runtime_db.finalize_pawchive_post(
-            rows[1]["id"], runtime_db.PAW_POST_FAILED, error="死链")
+            target["id"], runtime_db.PAW_POST_FAILED, error="死链")
         return rows
 
     def test_archive_moves_only_failed(self):
         rows = self._seed_mixed()
-        n = runtime_db.archive_pawchive_failed()
-        self.assertEqual(n, 1)
+        target = next(r for r in rows if r["post_id"] == "111")
+        other = next(r for r in rows if r["post_id"] == "222")
+        n, kept = runtime_db.archive_pawchive_failed()
+        self.assertEqual((n, kept), (1, 0))
         statuses = {r["id"]: r["status"] for r in
                     runtime_db.list_pawchive_posts(limit=10)}
-        self.assertEqual(statuses[rows[1]["id"]], "ARCHIVED")   # 111 已归档
-        self.assertEqual(statuses[rows[0]["id"]], "PENDING")    # 222 不受影响
+        self.assertEqual(statuses[target["id"]], "ARCHIVED")
+        self.assertEqual(statuses[other["id"]], "PENDING")
 
     def test_archive_idempotent(self):
         self._seed_mixed()
-        self.assertEqual(runtime_db.archive_pawchive_failed(), 1)
-        self.assertEqual(runtime_db.archive_pawchive_failed(), 0)
+        self.assertEqual(runtime_db.archive_pawchive_failed(), (1, 0))
+        self.assertEqual(runtime_db.archive_pawchive_failed(), (0, 0))
 
     def test_archived_excluded_from_status_counts_of_active(self):
         """ARCHIVED 是独立状态：status_counts 自然分组，面板标签需覆盖。"""
@@ -463,6 +474,109 @@ class ArchiveFailedTest(_PawDbTestCase):
         self.assertIn(runtime_db.PAW_POST_ARCHIVED, pawchive_worker._STATUS_LABELS)
         from tg_userbot import pawchive
         self.assertIn(runtime_db.PAW_POST_ARCHIVED, pawchive._STATUS_LABELS)
+
+    def test_mixed_post_kept_from_archive(self):
+        """帖内含可恢复文件（FAILED 非死链）→ 整帖保持 FAILED 不归档。"""
+        runtime_db.enqueue_pawchive_posts("patreon", "42", "C", [{
+            "post_id": "99", "title": "混帖", "published": "2026-01-01",
+            "post_url": "u", "subdir": "Pawchive/C/99",
+            "files": [
+                {"url": "https://x/dead.jpg", "filename": "dead.jpg"},
+                {"url": "https://x/live.mp4", "filename": "live.mp4"},
+            ],
+            "ext_links": [],
+        }])
+        row = runtime_db.find_pawchive_posts_by_post_id("99")[0]
+        runtime_db.claim_next_pawchive_post(now=1000)
+        for f in runtime_db.list_pawchive_files(row["id"]):
+            err = (runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404"
+                   if "dead" in f["url"] else "网络超时")
+            runtime_db.mark_pawchive_file_failed(f["id"], error=err)
+        runtime_db.finalize_pawchive_post(
+            row["id"], runtime_db.PAW_POST_FAILED, error="混帖失败")
+        n, kept = runtime_db.archive_pawchive_failed()
+        self.assertEqual(kept, 1)
+        self.assertEqual(
+            runtime_db.get_pawchive_post(row["id"])["status"],
+            runtime_db.PAW_POST_FAILED)
+        # 重投可恢复文件：只有 live.mp4 回 PENDING，死链不动
+        requeued_files = runtime_db.retry_pawchive_posts(row_ids=[row["id"]])
+        self.assertEqual(requeued_files, (1, 0))
+        by_url = {f["url"]: f["status"]
+                  for f in runtime_db.list_pawchive_files(row["id"])}
+        self.assertEqual(by_url["https://x/dead.jpg"],
+                         runtime_db.PAW_FILE_FAILED)
+        self.assertEqual(by_url["https://x/live.mp4"],
+                         runtime_db.PAW_FILE_PENDING)
+
+
+class ResurrectArchivedTest(_PawDbTestCase):
+    """resurrect_archived_recoverable：对历史误归档的一次性补救。"""
+
+    def _seed_archived_mixed(self):
+        """造一个已归档但埋了可恢复文件的帖子（旧 bug 的产物形态）。"""
+        runtime_db.enqueue_pawchive_posts("patreon", "42", "C", [{
+            "post_id": "77", "title": "误归档帖", "published": "2026-01-01",
+            "post_url": "u", "subdir": "Pawchive/C/77",
+            "files": [
+                {"url": "https://x/dead.jpg", "filename": "dead.jpg"},
+                {"url": "https://x/resume.zip", "filename": "resume.zip"},
+            ],
+            "ext_links": [],
+        }])
+        row = runtime_db.find_pawchive_posts_by_post_id("77")[0]
+        runtime_db.claim_next_pawchive_post(now=1000)
+        for f in runtime_db.list_pawchive_files(row["id"]):
+            err = (runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404"
+                   if "dead" in f["url"] else "断流中断")
+            runtime_db.mark_pawchive_file_failed(f["id"], error=err)
+        runtime_db.finalize_pawchive_post(
+            row["id"], runtime_db.PAW_POST_FAILED, error="失败")
+        # 模拟旧 bug：整帖被归档（含可恢复文件）
+        runtime_db._write(
+            lambda conn: conn.execute(
+                "UPDATE pawchive_posts SET status='ARCHIVED' WHERE id=?",
+                (row["id"],)),
+            "模拟旧 bug 归档")
+        return row
+
+    def test_resurrect_requeues_recoverable_only(self):
+        row = self._seed_archived_mixed()
+        posts, files = runtime_db.resurrect_archived_recoverable()
+        self.assertEqual((posts, files), (1, 1))
+        self.assertEqual(
+            runtime_db.get_pawchive_post(row["id"])["status"],
+            runtime_db.PAW_POST_PENDING)
+        by_url = {f["url"]: f["status"]
+                  for f in runtime_db.list_pawchive_files(row["id"])}
+        self.assertEqual(by_url["https://x/resume.zip"],
+                         runtime_db.PAW_FILE_PENDING)
+        self.assertEqual(by_url["https://x/dead.jpg"],
+                         runtime_db.PAW_FILE_FAILED)
+        # 幂等：再跑一遍无事发生
+        self.assertEqual(runtime_db.resurrect_archived_recoverable(), (0, 0))
+
+    def test_pure_dead_archived_post_untouched(self):
+        """纯死链的归档帖保持 ARCHIVED（不被误救）。"""
+        runtime_db.enqueue_pawchive_posts("patreon", "42", "C", [{
+            "post_id": "88", "title": "纯死链", "published": "2026-01-01",
+            "post_url": "u", "subdir": "Pawchive/C/88",
+            "files": [{"url": "https://x/d.mp4", "filename": "d.mp4"}],
+            "ext_links": [],
+        }])
+        row = runtime_db.find_pawchive_posts_by_post_id("88")[0]
+        runtime_db.claim_next_pawchive_post(now=1000)
+        for f in runtime_db.list_pawchive_files(row["id"]):
+            runtime_db.mark_pawchive_file_failed(
+                f["id"], error=runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404")
+        runtime_db.finalize_pawchive_post(
+            row["id"], runtime_db.PAW_POST_FAILED, error="死链")
+        runtime_db.archive_pawchive_failed()
+        self.assertEqual(
+            runtime_db.get_pawchive_post(row["id"])["status"],
+            runtime_db.PAW_POST_ARCHIVED)
+        self.assertEqual(runtime_db.resurrect_archived_recoverable(), (0, 0))
+
 
 
 class PawArchiveCommandTest(unittest.TestCase):

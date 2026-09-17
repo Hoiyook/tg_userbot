@@ -758,13 +758,17 @@ def manual_done_reply(arg):
 
 
 def archive_reply():
-    """/paw archive failed：把 FAILED 死链帖批量移入 ARCHIVED。"""
+    """/paw archive failed：把 FAILED **死链帖**批量移入 ARCHIVED。
+    帖内含可恢复文件的保持 FAILED（归档不得埋掉数据，2026-09-17 用户决策）。"""
     try:
-        n = runtime_db.archive_pawchive_failed()
+        archived, kept = runtime_db.archive_pawchive_failed()
     except runtime_db.DbUnavailable as e:
         return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
-    if n:
-        return f"{TEXT_PREFIX}\n🗄 已归档 {n} 个 FAILED 帖（死链不再干扰待办）"
+    if archived:
+        msg = f"🗄 已归档 {archived} 个死链帖（不再干扰待办）"
+        if kept:
+            msg += f"；{kept} 帖含可恢复文件，保持 FAILED（/paw retry 重投）"
+        return f"{TEXT_PREFIX}\n{msg}"
     return f"{TEXT_PREFIX}\nℹ️ 当前没有可归档的 FAILED 帖"
 
 

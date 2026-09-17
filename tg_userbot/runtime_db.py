@@ -1399,15 +1399,88 @@ def get_pawchive_post_row(row_id):
 
 
 def archive_pawchive_failed(now=None):
-    """FAILED → ARCHIVED 批量归档（死链终态隔离），返回流转条数。"""
+    """FAILED → ARCHIVED 批量归档（死链终态隔离）。
+
+    **只归档死链帖**：帖内存在可恢复文件（PENDING，或 FAILED 且非死链）
+    的帖子保持 FAILED 不动——归档会冻结它们的数据（2026-09-17 用户决策：
+    归档不得埋掉可恢复数据）。返回 (归档帖数, 保留帖数)。
+    """
+    now = _now(now)
+
     def do(conn):
-        cur = _execute(
+        rows = _execute(
+            conn, "SELECT id FROM pawchive_posts WHERE status=?",
+            (PAW_POST_FAILED,)).fetchall()
+        archived = kept = 0
+        for r in rows:
+            pid = r["id"]
+            recoverable = _execute(
+                conn,
+                "SELECT COUNT(*) FROM pawchive_files WHERE post_row=? AND ("
+                "status=? OR (status=? AND (error IS NULL "
+                "OR error NOT LIKE ?)))",
+                (pid, PAW_FILE_PENDING, PAW_FILE_FAILED,
+                 PAW_DEAD_LINK_MARK + "%"),
+            ).fetchone()[0]
+            if recoverable:
+                kept += 1
+                continue
+            cur = _execute(
+                conn,
+                "UPDATE pawchive_posts SET status=?, lease_until=NULL, "
+                "completed_at=COALESCE(completed_at, ?) WHERE id=? AND "
+                "status=?",
+                (PAW_POST_ARCHIVED, now, pid, PAW_POST_FAILED))
+            if cur.rowcount:
+                archived += 1
+        return archived, kept
+
+    return _write(do, "归档 Pawchive FAILED 帖（死链帖）")
+
+
+def resurrect_archived_recoverable(now=None):
+    """一次性补救：已归档帖里**误埋的可恢复文件**（PENDING/FAILED 非死链）
+    所在帖子 → 重投 PENDING（连同其全部非死链文件）；纯死链帖保持 ARCHIVED。
+
+    死链文件不重投（重试也是 404）。返回 (重投帖数, 重投文件数)。
+    """
+    now = _now(now)
+
+    def do(conn):
+        rows = _execute(
             conn,
-            "UPDATE pawchive_posts SET status=?, lease_until=NULL, "
-            "completed_at=COALESCE(completed_at, ?) WHERE status=?",
-            (PAW_POST_ARCHIVED, _now(now), PAW_POST_FAILED))
-        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-    return _write(do, "归档 Pawchive FAILED 帖")
+            "SELECT DISTINCT p.id FROM pawchive_posts p JOIN pawchive_files f "
+            "ON f.post_row=p.id WHERE p.status=? AND f.status IN (?,?) AND "
+            "(f.error IS NULL OR f.error NOT LIKE ?)",
+            (PAW_POST_ARCHIVED, PAW_FILE_PENDING, PAW_FILE_FAILED,
+             PAW_DEAD_LINK_MARK + "%"),
+        ).fetchall()
+        posts_requeued = files_requeued = 0
+        for r in rows:
+            pid = r["id"]
+            cur = _execute(
+                conn,
+                "UPDATE pawchive_posts SET status=?, completed_at=NULL, "
+                "last_error=? WHERE id=? AND status=?",
+                (PAW_POST_PENDING, "重新投放误归档的可恢复文件",
+                 pid, PAW_POST_ARCHIVED),
+            )
+            if not cur.rowcount:
+                continue
+            posts_requeued += 1
+            cur2 = _execute(
+                conn,
+                "UPDATE pawchive_files SET status=?, chrome_task_id=NULL, "
+                "updated_at=? WHERE post_row=? AND status IN (?,?) AND "
+                "(error IS NULL OR error NOT LIKE ?)",
+                (PAW_FILE_PENDING, now, pid,
+                 PAW_FILE_PENDING, PAW_FILE_FAILED,
+                 PAW_DEAD_LINK_MARK + "%"),
+            )
+            files_requeued += cur2.rowcount or 0
+        return posts_requeued, files_requeued
+
+    return _write(do, "重投已归档帖中的可恢复文件")
 
 
 def complete_pawchive_manual_post(post_row, now=None):
