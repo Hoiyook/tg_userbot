@@ -39,6 +39,7 @@ from . import netio
 from . import notify
 from . import runtime_db
 from . import state
+from . import text as text_mod
 from .log import logger
 
 # 强制直连：系统代理（socks5）会让 urllib 秒抛 ValueError（2026-09-15 实测）
@@ -578,7 +579,7 @@ def _throttled_disconnect_warning():
 async def _refresh_panel():
     """刷新一轮面板：内容没变不编辑；失效重建；网络失败保留面板 id。"""
     global _PANEL_MSG_ID, _PANEL_LAST_TEXT
-    text = build_progress_text()
+    text = text_mod.with_code_block(build_progress_text())
     if text == _PANEL_LAST_TEXT and _PANEL_MSG_ID is not None:
         return True
     if state.client is None:

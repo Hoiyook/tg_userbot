@@ -13,6 +13,7 @@ Reporter 是**只读观察者**：本文件只验证「能否正确观察与展�
 """
 import asyncio
 import atexit
+import inspect
 import os
 import shutil
 import tempfile
@@ -976,3 +977,36 @@ class ListenEventDispatchTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PanelCodeBlockTest(unittest.TestCase):
+    """两个汇报面板统一代码框化（2026-09-17 用户要求）。
+
+    Status Panel 与 Pawchive 进度面板的正文都过 text.with_code_block——
+    首行（面板前缀）留外，正文进围栏可复制。
+    """
+
+    def test_status_panel_text_wrapped(self):
+        from tg_userbot import reporter, text as text_mod
+        src = inspect.getsource(reporter.Reporter._fit) \
+            if hasattr(reporter.Reporter, "_fit") else ""
+        # 面板编辑路径必须调用 with_code_block（源码契约，防误删——
+        # 同 HandlerWiringContractTest 的教训）
+        import inspect as _i
+        rep_src = _i.getsource(reporter)
+        self.assertIn("with_code_block", rep_src)
+
+    def test_paw_panel_text_wrapped(self):
+        from tg_userbot import pawchive_worker
+        import inspect as _i
+        src = _i.getsource(pawchive_worker)
+        self.assertIn("with_code_block", src)
+
+
+class UnifiedPanelIntervalTest(unittest.TestCase):
+    """两面板刷新周期统一（默认 60s）。"""
+
+    def test_intervals_match(self):
+        from tg_userbot import config
+        self.assertEqual(config.REPORT_INTERVAL_SECONDS,
+                         config.PAWCHIVE_PANEL_INTERVAL_SECONDS)

@@ -67,6 +67,7 @@ from .config import (
     TASK_EVENTS_FILE,
 )
 from . import runtime_db
+from . import text as text_mod
 from .log import logger
 
 # 关闭通知的最长等待（秒）：Telegram 不可用时也不能阻塞进程退出（规格 §28）
@@ -601,7 +602,8 @@ class Reporter:
             """把三种「非异常」结局转成哨兵值，其余交给收口兜住。"""
             try:
                 await client.edit_message(
-                    self.target, self.status_message_id, self._fit(text))
+                    self.target, self.status_message_id,
+                    self._fit(text_mod.with_code_block(text)))
                 return "ok"
             except MessageNotModifiedError:
                 return "unchanged"           # 内容没变 = 正常，不是错误
@@ -627,7 +629,7 @@ class Reporter:
         text = self.build_status_text(now=now)
         if self.status_message_id is None:
             # 消息 id 直接取 send_message 的返回值——不再多发一次请求去查
-            msg = await self._safe_send(text)
+            msg = await self._safe_send(text_mod.with_code_block(text))
             self.status_message_id = getattr(msg, "id", None)
             if self.status_message_id is not None:
                 logger.info(f"🤖 状态面板已创建（消息 id={self.status_message_id}，"

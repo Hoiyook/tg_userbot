@@ -949,7 +949,7 @@ PERSISTENT_NOTIFICATION_PREFIXES = (
 REPORT_ENABLED = True
 
 # Status Panel 常规刷新间隔（秒）。下载进行中另有更快的进度节奏。
-REPORT_INTERVAL_SECONDS = 300
+REPORT_INTERVAL_SECONDS = 60   # 与 Pawchive 进度面板统一（2026-09-17）
 # 有下载在跑时，面板按此间隔刷新（只在这些时候加密，空闲时回到常规间隔）
 REPORT_PROGRESS_ENABLED = True
 REPORT_PROGRESS_INTERVAL_SECONDS = 15
