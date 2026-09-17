@@ -318,6 +318,21 @@ class PanelTest(_WorkerDbTestCase):
                          {"completed": 0, "manual": 0, "failed": 0})
 
 
+class PanelGuardTest(unittest.TestCase):
+    """Pawchive 面板是主账号自产消息：bot 消息处理器不得当成 owner 指令
+    （2026-09-17 实测：每 60s 面板刷新误触发一次主菜单回复）。"""
+
+    def test_panel_text_starts_with_prefix(self):
+        self.assertTrue(worker.build_progress_text().startswith("🐾 Pawchive 进度"))
+
+    def test_bot_handler_ignores_panel_text(self):
+        from tg_userbot import bot as bot_mod
+        # 守卫在 bot_message_handler 前段：静态验证存在 startswith 判定
+        import inspect
+        src = inspect.getsource(bot_mod.bot_message_handler)
+        self.assertIn('"🐾 Pawchive 进度"', src)
+
+
 class InflightCleanupTest(_WorkerDbTestCase):
     """_INFLIGHT 泄漏修复（面板曾显示早已终态的帖子）：成功/失败/取消都要
     清在途标记；面板只显示仍处 PROCESSING 的帖子。"""

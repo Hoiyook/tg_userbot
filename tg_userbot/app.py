@@ -222,7 +222,10 @@ async def _bot_keepalive():
             return
         if bot.is_connected():
             continue
-        logger.warning("🤖 bot 菜单连接已断开，尝试重连...")
+        # 告警节流：代理抖动期避免「已断开/已恢复」刷屏（重连行为不变）
+        from .pawchive_worker import _throttled_disconnect_warning
+        if _throttled_disconnect_warning():
+            logger.warning("🤖 bot 菜单连接已断开，尝试重连…（抖动期同类告警 15 分钟内不重复）")
         # 重连放进子任务并用 _await_child_task 等待：telethon 断线会对
         # pending future 调 cancel()（网络层取消），CancelledError 从
         # start_with_retry 内部穿出——直接 await 的话与「外层取消（停服）」

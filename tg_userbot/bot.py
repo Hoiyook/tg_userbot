@@ -694,6 +694,10 @@ async def bot_message_handler(event):
     # 正好落在那 120 秒里，会被当成抖音 cookie 存下来。
     if text.startswith(REPORT_STATUS_PREFIX):
         return
+    # 🐾 Pawchive 进度面板：主账号发的自产内容，不是指令（否则每 60s 一次
+    # 面板刷新就回一次主菜单——2026-09-17 实测日志里成片的误触发）
+    if text.startswith("🐾 Pawchive 进度"):
+        return
 
     fwd = getattr(message, "fwd_from", None)
     from_id = getattr(fwd, "from_id", None) if fwd else None

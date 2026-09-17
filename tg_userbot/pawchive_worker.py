@@ -559,6 +559,22 @@ async def _panel_edit(text):
     return await netio_shielded_panel(_edit)
 
 
+_LAST_DISCONNECT_WARN = 0.0
+
+
+def _throttled_disconnect_warning():
+    """断连告警节流：代理抖动期 15 分钟最多一条（用户被「✅ 已恢复」刷屏）。
+
+    只影响日志/观感，不改变 keepalive 的重连行为。
+    """
+    global _LAST_DISCONNECT_WARN
+    now = time.monotonic()
+    if now - _LAST_DISCONNECT_WARN > 900:
+        _LAST_DISCONNECT_WARN = now
+        return True
+    return False
+
+
 async def _refresh_panel():
     """刷新一轮面板：内容没变不编辑；失效重建；网络失败保留面板 id。"""
     global _PANEL_MSG_ID, _PANEL_LAST_TEXT
