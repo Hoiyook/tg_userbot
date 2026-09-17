@@ -114,10 +114,31 @@ def observe(text, now=None):
     return "\n".join(lines), rows
 
 
-def links_view(limit=20):
-    """/links 视图：未处理清单（✅ 按钮逐条）+ 已完成计数。"""
+def links_view(limit=20, keyword=None):
+    """/links 视图：无参 = 未处理清单（✅ 按钮逐条）+ 已完成计数；
+    带关键词 = 搜索（备注或 URL 子串、大小写不敏感、含已完成——
+    按备注找回外链，2026-09-17 需求），命中行带终态标记与 ✅（未处理）。"""
     from .menu import encode_menu_data   # 函数内导入避免 menu↔本模块成环
     try:
+        if keyword and str(keyword).strip():
+            hits = runtime_db.search_manual_links(keyword, limit=limit)
+            if not hits:
+                return (f"{TEXT_PREFIX}：关键词「{keyword.strip()}」无匹配"
+                        "（搜备注与链接）", [])
+            lines = [f"{TEXT_PREFIX}：搜「{keyword.strip()}」命中 "
+                     f"{len(hits)} 条", ""]
+            rows = []
+            for row in hits:
+                mark = "✅ 已处理" if row["status"] == "DONE" else "⏳ 未处理"
+                lines.append(f"#{row['id']} {mark} [{row['host']}] "
+                             f"{row['url']}")
+                if row.get("note"):
+                    lines.append(f"📝 {row['note']}")
+                if row["status"] == "PENDING":
+                    rows.append([Button.inline(
+                        "✅ " + _short(row["url"]),
+                        encode_menu_data("mlink_done", str(row["id"])))])
+            return "\n".join(lines), rows
         pending = runtime_db.list_manual_links(
             status="PENDING", limit=limit)
     except runtime_db.DbUnavailable as e:
@@ -125,7 +146,8 @@ def links_view(limit=20):
     done_n = runtime_db.count_manual_links(status="DONE")
     if not pending:
         return (f"{TEXT_PREFIX}：未处理 0 条（已完成 {done_n} 条）\n"
-                "把网盘链接直接发给我即可登记。", [])
+                "把网盘链接直接发给我即可登记；/links 关键词 可按备注搜历史。",
+                [])
     lines = [f"{TEXT_PREFIX}：未处理 {len(pending)} 条（已完成 {done_n} 条）",
              ""]
     rows = []

@@ -483,9 +483,11 @@ async def handle_command(event, cmd_text):
         await _reply(event, finder.find_media(keyword), link_preview=False)
         return True
 
-    if cmd_text == "/links":
-        logger.info("执行命令：/links")
-        view_text, buttons = manual_links.links_view()
+    if cmd_text == "/links" or cmd_text.startswith("/links "):
+        parts = cmd_text.split(maxsplit=1)
+        keyword = parts[1].strip() if len(parts) > 1 else None
+        logger.info(f"执行命令：/links {keyword or ''}".rstrip())
+        view_text, buttons = manual_links.links_view(keyword=keyword)
         await _reply(event, view_text, buttons=buttons)
         return True
 
@@ -528,6 +530,7 @@ async def handle_command(event, cmd_text):
             "/sqlt - SQL 查询模板：常用查询存名字，一键执行\n"
             "/find 关键词 - 媒体下落查询（队列+日志+全历史）\n"
             "/links - 外链台账：自己登记的网盘链接（未处理清单）\n"
+            "/links 关键词 - 按备注/链接搜历史（含已处理）\n"
             "   发送网盘链接给我即登记（默认未处理，重复发送会查重：\n"
             "   命中台账历史或 Pawchive 已完成外链会提示已处理）\n"
             "/paw manual - Pawchive 待人工帖（外链清单 + ✅ 完成按钮）\n"

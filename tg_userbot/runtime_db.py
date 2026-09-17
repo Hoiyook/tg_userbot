@@ -2386,6 +2386,18 @@ def list_manual_links(status=None, limit=50):
     return [dict(r) for r in rows]
 
 
+def search_manual_links(keyword, limit=50):
+    """按关键词搜台账（备注或 URL 子串，大小写不敏感），全部状态含终态。
+
+    DONE 条目参与搜索——找回历史也是需求的一部分。"""
+    like = f"%{str(keyword or '').strip()}%"
+    rows = _read(lambda c: _execute(
+        c, "SELECT * FROM manual_links WHERE note LIKE ? COLLATE NOCASE "
+           "OR url LIKE ? COLLATE NOCASE ORDER BY id DESC LIMIT ?",
+        (like, like, int(limit))).fetchall(), "搜索外链台账")
+    return [dict(r) for r in rows]
+
+
 def count_manual_links(status=None):
     if status:
         return int(_read(lambda c: _execute(

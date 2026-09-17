@@ -248,3 +248,65 @@ class NoteSubmissionTest(_MlinksDbBase):
         self.assertEqual(
             manual_links.extract_urls("a https://x/f/1 b"),
             ["https://x/f/1"])
+
+
+class SearchByNoteTest(_MlinksDbBase):
+    """按备注关键词查外链（/links <关键词>，2026-09-17 用户需求）。"""
+
+    def _seed(self):
+        manual_links.observe("https://mega.nz/file/one#K1 鸣潮 4K 合集")
+        manual_links.observe("https://krakenfiles.com/two 日常备份")
+        manual_links.observe("https://mega.nz/file/three#K3 原神截图")
+        return {r["url"]: r for r in runtime_db.list_manual_links()}
+
+    def test_search_hits_note_substring(self):
+        self._seed()
+        text, buttons = manual_links.links_view(keyword="鸣潮")
+        self.assertIn("mega.nz/file/one", text)
+        self.assertIn("📝 鸣潮 4K 合集", text)
+        self.assertNotIn("krakenfiles.com/two", text)
+        self.assertNotIn("file/three", text)
+
+    def test_search_case_insensitive(self):
+        self._seed()
+        text, _ = manual_links.links_view(keyword="Mega")
+        # 无备注命中的 URL 大小写不敏感兜底（host 含 Mega → 命中两条 mega）
+        self.assertIn("file/one", text)
+        self.assertIn("file/three", text)
+
+    def test_search_also_matches_url(self):
+        """关键词同时匹配 URL 本身（不止备注）。"""
+        self._seed()
+        text, _ = manual_links.links_view(keyword="krakenfiles")
+        self.assertIn("krakenfiles.com/two", text)
+        self.assertNotIn("file/one", text)
+
+    def test_search_covers_done_entries(self):
+        """已完成条目也参与搜索（找回历史）。"""
+        self._seed()
+        one_id = next(r["id"] for r in runtime_db.list_manual_links()
+                      if "one" in r["url"])
+        runtime_db.manual_link_done(one_id)
+        text, _ = manual_links.links_view(keyword="鸣潮")
+        self.assertIn("已处理", text)          # 搜索视图显示终态标记
+        self.assertIn("file/one", text)
+
+    def test_search_no_hit(self):
+        self._seed()
+        text, _ = manual_links.links_view(keyword="不存在的词")
+        self.assertIn("无匹配", text)
+
+    def test_no_keyword_still_pending_only(self):
+        """无参数 = 原行为：未处理清单。"""
+        self._seed()
+        text, buttons = manual_links.links_view()
+        self.assertIn("未处理", text)
+        self.assertNotIn("krakenfiles.com/two 备份", text)  # 无备注行
+
+    def test_command_passes_keyword(self):
+        """/links <词> 分发：commands.py 把参数传进 links_view。"""
+        from tg_userbot import commands
+        import inspect
+        src = inspect.getsource(commands.handle_command)
+        self.assertIn('startswith("/links ")', src)
+        self.assertIn("keyword=keyword", src)
