@@ -125,7 +125,9 @@ def current_post_label():
         rows = [runtime_db.get_pawchive_post(r) for r in sorted(_INFLIGHT)]
     except runtime_db.DbUnavailable:
         return None
-    rows = [r for r in rows if r]
+    # 只显示仍在 PROCESSING 的：_INFLIGHT 可能短暂残留已终态的行
+    rows = [r for r in rows
+            if r and r["status"] == runtime_db.PAW_POST_PROCESSING]
     if not rows:
         return None
     now = time.time()
@@ -699,12 +701,14 @@ async def run_once():
         return False
     try:
         await process_post(post)
+        _INFLIGHT.discard(post["id"])   # 成功路径也清在途标记（旧实现泄漏）
         return True
     except asyncio.CancelledError:
         # 停服：把手上的帖子放回待处理（文件级状态保证不重复下载）
         release_inflight(post["id"])
         raise
     except Exception as e:
+        _INFLIGHT.discard(post["id"])
         logger.exception(f"🐾 帖子 #{post.get('id')} 执行时未预期异常：{e}")
         try:
             runtime_db.postpone_pawchive_post(
@@ -716,10 +720,35 @@ async def run_once():
         return False
 
 
+async def _spawn_post(post):
+    """单帖处理任务：成功/失败/取消都清在途标记；异常转退避不留死角。"""
+    try:
+        await process_post(post)
+    except asyncio.CancelledError:
+        release_inflight(post["id"])
+        raise
+    except Exception as e:
+        _INFLIGHT.discard(post["id"])
+        logger.exception(f"🐾 帖子 #{post.get('id')} 执行时未预期异常：{e}")
+        try:
+            runtime_db.postpone_pawchive_post(
+                post["id"],
+                int(time.time()) + int(config.PAWCHIVE_AGENT_RETRY_SECONDS),
+                error=f"未预期异常：{type(e).__name__}: {e}")
+        except runtime_db.DbUnavailable as db_err:
+            logger.error(f"🐾 帖子转退避失败（租约到期后会恢复）：{db_err}")
+
+
 async def worker_loop():
-    """常驻循环：有活就干，没活就按轮询间隔歇一会儿。"""
+    """常驻循环：**多帖并发**——在途帖数 < PAWCHIVE_MAX_INFLIGHT_POSTS 时
+    持续领取并 spawn；帖内文件并发由共享 DOWNLOAD_SEMAPHORE 总控。
+
+    单帖串行是 2026-09-16「一帖几小时」抱怨的根因之一：几百个文件的帖子
+    逐个爬，并发池吃不满。多帖在途让信号量始终有多路流在跑。
+    """
     logger.info(
-        f"🐾 Pawchive worker 已启动（内置并发下载器，轮询 "
+        f"🐾 Pawchive worker 已启动（内置并发下载器，多帖并发 ≤"
+        f"{config.PAWCHIVE_MAX_INFLIGHT_POSTS}，轮询 "
         f"{config.PAWCHIVE_WORKER_POLL_SECONDS}s，租约 "
         f"{config.PAWCHIVE_LEASE_SECONDS}s，磁盘保护线 "
         f"{config.PAWCHIVE_MIN_FREE_GB}GB，与 /thread 共享并发池）")
@@ -727,7 +756,18 @@ async def worker_loop():
     try:
         while True:
             try:
-                did = await run_once()
+                recover_expired()
+                spawned = 0
+                while len(_INFLIGHT) < int(
+                        config.PAWCHIVE_MAX_INFLIGHT_POSTS):
+                    post = claim_next_post()
+                    if post is None:
+                        break
+                    t = asyncio.create_task(_spawn_post(post))
+                    _TASKS.add(t)
+                    t.add_done_callback(_TASKS.discard)
+                    spawned += 1
+                did = spawned > 0
             except asyncio.CancelledError:
                 raise
             except Exception as e:

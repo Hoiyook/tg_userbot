@@ -60,6 +60,15 @@ class _WorkerDbTestCase(unittest.IsolatedAsyncioTestCase):
         # 里程碑计数复位（模块级全局，跨用例隔离）
         for k in worker._MILESTONE:
             worker._MILESTONE[k] = 0
+        # 续租循环打桩：测试里若把 asyncio.sleep 换成瞬时返回，该循环会变成
+        # 无间隔写库忙循环与主线程争锁（2026-09-17 实测 CPU 94% 卡死）——
+        # 直接不启动它；续租语义由 test_pawchive_db 单独覆盖
+        async def _no_renew(post_row):
+            return None
+        self._renew_patch = mock.patch.object(worker, "_renew_lease_loop",
+                                              new=_no_renew)
+        self._renew_patch.start()
+        self.addCleanup(self._renew_patch.stop)
         self._notifies = []      # worker 发出的帖子级通知
         self._downloads = []     # _download_one 收到的 (post, file)
         patches = [
@@ -307,6 +316,33 @@ class PanelTest(_WorkerDbTestCase):
         # 计数已复位
         self.assertEqual(worker._MILESTONE,
                          {"completed": 0, "manual": 0, "failed": 0})
+
+
+class InflightCleanupTest(_WorkerDbTestCase):
+    """_INFLIGHT 泄漏修复（面板曾显示早已终态的帖子）：成功/失败/取消都要
+    清在途标记；面板只显示仍处 PROCESSING 的帖子。"""
+
+    async def test_success_discards_inflight(self):
+        post, _ = self._seed_and_claim()
+        with self._patch_downloader(("done", 1, None)):
+            await worker.process_post(post)
+        self.assertNotIn(post["id"], worker._INFLIGHT)
+
+    async def test_panel_ignores_non_processing(self):
+        """面板「当前」只认 PROCESSING：已终态的残留行不再显示。"""
+        post, _ = self._seed_and_claim()
+        worker._INFLIGHT.add(post["id"])
+        runtime_db.finalize_pawchive_post(
+            post["id"], runtime_db.PAW_POST_MANUAL)
+        self.assertIsNone(worker.current_post_label())
+
+    async def test_multi_post_claim_up_to_limit(self):
+        """多帖并发：inflight < 上限时持续领取。"""
+        runtime_db.enqueue_pawchive_posts("patreon", "42", "C", [
+            _post(str(i)) for i in range(1, 6)])
+        claimed = [worker.claim_next_post() for _ in range(4)]
+        self.assertTrue(all(claimed))
+        self.assertEqual(len(worker._INFLIGHT), 4)
 
 
 class PauseResumeTest(_WorkerDbTestCase):
