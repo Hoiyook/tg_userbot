@@ -558,9 +558,8 @@ async def new_message_handler(event):
             # 非抖音/IG 的外链（MEGA/网盘等）→ 手动外链台账：登记（默认
             # 未处理）+ 查重（台账历史 + Pawchive 已完成外链）。命中早退
             # ——链接消息不是转发评论，不进标注捕获。
-            ext_urls = manual_links.extract_urls(text)
-            if ext_urls:
-                reply, buttons = manual_links.observe(ext_urls)
+            if manual_links.extract_urls(text):
+                reply, buttons = manual_links.observe(text)
                 await event.reply(reply, buttons=buttons or None,
                                   link_preview=False)
                 return

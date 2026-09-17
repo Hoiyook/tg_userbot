@@ -47,13 +47,31 @@ def _short(url, limit=40):
     return body if len(body) <= limit else body[:limit - 1] + "…"
 
 
-def observe(urls, now=None):
-    """登记一批链接并生成查重回复（文本, 按钮行）。
+def _split_note(text):
+    """消息文本 → (urls, note)：恰好 1 个 URL 时其余文本是备注。
 
-    每条链接的判定优先级：台账 DONE（人工标记过）→ Pawchive 已完成
-    帖子外链 → 台账 PENDING（已在记录中）→ 新记录。仅新记录挂 ✅ 按钮
-    （当时就能点完成）；已在 paw 完成的不重复入台账。"""
+    多 URL 时备注归属有歧义 → 全部无备注（note=None）。备注取 URL 之外的
+    全部文本（前后皆可），空白归一；无剩余文本 → None。"""
+    urls = extract_urls(text)
+    if not urls:
+        return [], None
+    if len(urls) > 1:
+        return urls, None
+    rest = str(text or "").replace(urls[0], " ")
+    note = " ".join(rest.split())
+    return urls, (note or None)
+
+
+def observe(text, now=None):
+    """登记一条消息里的链接并生成查重回复（文本, 按钮行）。
+
+    支持「URL + 备注」（恰好 1 个 URL 时其余文本为备注；重发同链接带新
+    备注 → 更新备注，状态不变）。每条链接的判定优先级：台账 DONE →
+    Pawchive 已完成外链 → 台账 PENDING → 新记录。仅新记录挂 ✅ 按钮。"""
     from .menu import encode_menu_data   # 函数内导入避免 menu↔本模块成环
+    urls, note = _split_note(text)
+    if not urls:
+        return f"{TEXT_PREFIX}\n（未识别到链接）", []
     lines = [f"{TEXT_PREFIX}：{len(urls)} 条"]
     rows = []
     for url in urls:
@@ -67,21 +85,29 @@ def observe(urls, now=None):
                 f"[{paw_post.get('creator_name')}] #{paw_post['id']} {url}")
             continue
         state_str, row = runtime_db.manual_link_add(
-            url, host=host, now=now)
+            url, host=host, note=note, now=now)
+        host_disp = row["host"] or host
+        note_disp = f"\n📝 {row['note']}" if row.get("note") else ""
+        if state_str == "note_updated" and row["status"] == "DONE":
+            state_str = "done"      # 已完成链接的新备注：留档但仍报已处理过
         if state_str == "done":
             done = row.get("done_at")
             done_str = ""
             if done:
                 from datetime import datetime
-                done_str = f"（{datetime.fromtimestamp(done):%m-%d %H:%M} 标记完成）"
-            lines.append(f"⚠️ 已处理过：[{row['host'] or host}] {row['url']}"
-                         + done_str)
+                done_str = (f"（{datetime.fromtimestamp(done):%m-%d %H:%M}"
+                            " 标记完成）")
+            lines.append(f"⚠️ 已处理过：[{host_disp}] {row['url']}{done_str}"
+                         + note_disp)
+        elif state_str == "note_updated":
+            lines.append(f"🔁 备注已更新：[{host_disp}] {row['url']}"
+                         + note_disp)
         elif state_str == "pending":
-            lines.append(f"ℹ️ 已在记录中（未处理）：[{row['host'] or host}] "
-                         f"{row['url']}")
+            lines.append(f"ℹ️ 已在记录中（未处理）：[{host_disp}] "
+                         f"{row['url']}" + note_disp)
         else:
-            lines.append(f"🔗 已记录（未处理）：[{row['host'] or host}] "
-                         f"{row['url']}")
+            lines.append(f"🔗 已记录（未处理）：[{host_disp}] "
+                         f"{row['url']}" + note_disp)
             rows.append([Button.inline(
                 "✅ " + _short(row["url"]),
                 encode_menu_data("mlink_done", str(row["id"])))])
@@ -105,6 +131,8 @@ def links_view(limit=20):
     rows = []
     for row in pending:
         lines.append(f"#{row['id']} [{row['host']}] {row['url']}")
+        if row.get("note"):
+            lines.append(f"📝 {row['note']}")
         rows.append([Button.inline(
             "✅ " + _short(row["url"]),
             encode_menu_data("mlink_done", str(row["id"])))])

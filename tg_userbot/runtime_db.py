@@ -375,6 +375,7 @@ _SCHEMA = (
         url        TEXT NOT NULL,
         url_key    TEXT NOT NULL UNIQUE,
         host       TEXT,
+        note       TEXT,
         status     TEXT NOT NULL DEFAULT 'PENDING',
         created_at INTEGER NOT NULL,
         done_at    INTEGER
@@ -688,6 +689,16 @@ def migrate() -> int:
     if version < 9:
         # v8 → v9：新增 manual_links（手动外链台账）。纯建表。
         logger.info("🗄 Runtime DB 迁移：v9（+ manual_links 手动外链台账）")
+    if version < 10:
+        # v9 → v10：manual_links 加 note（链接备注，发链接附言可更新）。
+        # ALTER 幂等：列已存在即跳过。
+        def _v10(conn):
+            cols = {r["name"] for r in _execute(
+                conn, "PRAGMA table_info(manual_links)").fetchall()}
+            if "note" not in cols:
+                _execute(conn, "ALTER TABLE manual_links ADD COLUMN note TEXT")
+        _write(_v10, "迁移 v10（manual_links.note）")
+        logger.info("🗄 Runtime DB 迁移：v10（+ manual_links.note）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -2242,17 +2253,20 @@ def dedup_index_trim(keep):
 # manual_links 模块的存储层：url_key UNIQUE 承担查重（重复登记在 INSERT
 # 层被拒，调用方取回已有行报状态）；状态只有 PENDING/DONE 两态，终态
 # 不删行——台账的历史就是查重数据源。
-def manual_link_add(url, host=None, now=None):
-    """登记一条链接。返回 (state, row)：state ∈ {"new", "pending", "done"}，
-    row 为台账行（新增或已存在的同 url_key 行）。"""
+def manual_link_add(url, host=None, note=None, now=None):
+    """登记一条链接（含备注）。返回 (state, row)。
+
+    state ∈ {"new", "note_updated", "pending", "done"}：url_key UNIQUE 兜底
+    查重；同 url_key 重发且带**不同**备注 → 更新备注记 "note_updated"（状态
+    不变）；无备注或备注相同 → 原查重语义。"""
     key = str(url).strip()
     def do(conn):
         try:
             _execute(
                 conn,
-                "INSERT INTO manual_links(url, url_key, host, status, "
-                "created_at) VALUES(?, ?, ?, 'PENDING', ?)",
-                (key, key, host, _now(now)))
+                "INSERT INTO manual_links(url, url_key, host, note, status, "
+                "created_at) VALUES(?, ?, ?, ?, 'PENDING', ?)",
+                (key, key, host, note, _now(now)))
             row = _execute(
                 conn, "SELECT * FROM manual_links WHERE url_key=?",
                 (key,)).fetchone()
@@ -2261,12 +2275,16 @@ def manual_link_add(url, host=None, now=None):
             row = _execute(
                 conn, "SELECT * FROM manual_links WHERE url_key=?",
                 (key,)).fetchone()
+            if note is not None and (row["note"] or "") != note:
+                _execute(conn, "UPDATE manual_links SET note=? WHERE id=?",
+                         (note, row["id"]))
+                row = _execute(
+                    conn, "SELECT * FROM manual_links WHERE url_key=?",
+                    (key,)).fetchone()
+                return ("note_updated", dict(row))
             return ("pending" if row["status"] == "PENDING" else "done",
                     dict(row))
-    state, row = _write(do, f"外链台账登记（{key[:40]}）")
-    if state == "new":
-        pass
-    return state, row
+    return _write(do, f"外链台账登记（{key[:40]}）")
 
 
 def manual_link_done(link_id, now=None):

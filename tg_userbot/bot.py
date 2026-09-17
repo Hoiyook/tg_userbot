@@ -837,9 +837,8 @@ async def bot_message_handler(event):
             return
 
     # 非命令文本里带 http(s) 链接 → 手动外链台账（记录/查重），不回落主菜单
-    ext_urls = manual_links.extract_urls(text)
-    if ext_urls:
-        reply, buttons = manual_links.observe(ext_urls)
+    if manual_links.extract_urls(text):
+        reply, buttons = manual_links.observe(text)
         await _send_owner(reply, buttons)
         return
 

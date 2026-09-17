@@ -56,7 +56,7 @@ class TestObserveAndDone(_MlinksDbBase):
     """发送 → 记录/查重；标记完成 → 再发送报已处理。"""
 
     def test_new_link_recorded_pending(self):
-        reply, buttons = manual_links.observe(["https://mega.nz/file/a#K1"])
+        reply, buttons = manual_links.observe("https://mega.nz/file/a#K1")
         self.assertIn("🔗 已记录", reply)
         self.assertIn("未处理", reply)
         self.assertTrue(buttons)                     # ✅ 标记按钮
@@ -65,34 +65,34 @@ class TestObserveAndDone(_MlinksDbBase):
         self.assertEqual(row["host"], "mega.nz")
 
     def test_resend_pending_is_notice(self):
-        manual_links.observe(["https://mega.nz/file/a#K1"])
-        reply, buttons = manual_links.observe(["https://mega.nz/file/a#K1"])
+        manual_links.observe("https://mega.nz/file/a#K1")
+        reply, buttons = manual_links.observe("https://mega.nz/file/a#K1")
         self.assertIn("已在记录中", reply)
         self.assertIn("未处理", reply)
 
     def test_mark_done_then_resend_warns(self):
-        reply, _ = manual_links.observe(["https://mega.nz/file/a#K1"])
+        reply, _ = manual_links.observe("https://mega.nz/file/a#K1")
         link_id = runtime_db.list_manual_links()[0]["id"]
         self.assertTrue(runtime_db.manual_link_done(link_id))
-        reply, _ = manual_links.observe(["https://mega.nz/file/a#K1"])
+        reply, _ = manual_links.observe("https://mega.nz/file/a#K1")
         self.assertIn("⚠️ 已处理过", reply)
         self.assertIn("标记完成", reply)
 
     def test_double_mark_done_idempotent(self):
-        manual_links.observe(["https://mega.nz/file/a#K1"])
+        manual_links.observe("https://mega.nz/file/a#K1")
         link_id = runtime_db.list_manual_links()[0]["id"]
         self.assertTrue(runtime_db.manual_link_done(link_id))
         self.assertFalse(runtime_db.manual_link_done(link_id))
 
     def test_two_links_one_message(self):
         reply, _ = manual_links.observe(
-            ["https://mega.nz/file/a#K1", "https://krakenfiles.com/b"])
+            "https://mega.nz/file/a#K1 和 https://krakenfiles.com/b")
         self.assertIn("2 条", reply)
         self.assertEqual(len(runtime_db.list_manual_links()), 2)
 
     def test_view_lists_pending_with_buttons(self):
-        manual_links.observe(["https://mega.nz/file/a#K1"])
-        manual_links.observe(["https://krakenfiles.com/b"])
+        manual_links.observe("https://mega.nz/file/a#K1")
+        manual_links.observe("https://krakenfiles.com/b")
         mega_id = next(r["id"] for r in runtime_db.list_manual_links()
                        if "mega.nz" in r["url"])
         runtime_db.manual_link_done(mega_id)
@@ -105,7 +105,7 @@ class TestObserveAndDone(_MlinksDbBase):
 
     async def test_done_reply_edit_shape(self):
         """面板 ✅ 点击 → 标记 + 刷新视图（原地 edit 语义）。"""
-        manual_links.observe(["https://mega.nz/file/a#K1"])
+        manual_links.observe("https://mega.nz/file/a#K1")
         link_id = runtime_db.list_manual_links()[0]["id"]
         text, buttons = await manual_links.done_reply(str(link_id))
         self.assertIn("✅ 已标记完成", text)
@@ -148,7 +148,7 @@ class TestPawCompletedCheck(_MlinksDbBase):
         assert claimed and claimed["id"] == rows[0]["id"]
         runtime_db.finalize_pawchive_post(
             rows[0]["id"], runtime_db.PAW_POST_COMPLETED)
-        reply, _ = manual_links.observe(["https://mega.nz/file/zz#K9"])
+        reply, _ = manual_links.observe("https://mega.nz/file/zz#K9")
         self.assertIn("Pawchive 外链已完成", reply)
         self.assertIn("作者A", reply)
         # 台账里不重复记（paw 已完成即视为已处理）
@@ -179,3 +179,72 @@ class PanelViewTest(_MlinksDbBase):
         # 带返回导航
         flat = [b for row in buttons for b in row]
         self.assertTrue(any("返回" in b.text for b in flat))
+
+
+class NoteSubmissionTest(_MlinksDbBase):
+    """链接 + 备注：登记/更新/展示（2026-09-16 用户需求）。"""
+
+    def test_link_with_note_recorded(self):
+        reply, _ = manual_links.observe(
+            "https://mega.nz/file/a#K1 我的备份 4K版")
+        self.assertIn("📝 我的备份 4K版", reply)
+        row = runtime_db.list_manual_links()[0]
+        self.assertEqual(row["note"], "我的备份 4K版")
+
+    def test_note_before_url_also_captured(self):
+        reply, _ = manual_links.observe("备份用 https://mega.nz/file/a#K1")
+        row = runtime_db.list_manual_links()[0]
+        self.assertEqual(row["note"], "备份用")
+
+    def test_note_whitespace_collapsed(self):
+        manual_links.observe("https://mega.nz/file/a#K1   多段   备注\t这里")
+        row = runtime_db.list_manual_links()[0]
+        self.assertEqual(row["note"], "多段 备注 这里")
+
+    def test_no_note_is_none(self):
+        manual_links.observe("https://mega.nz/file/a#K1")
+        self.assertIsNone(runtime_db.list_manual_links()[0]["note"])
+
+    def test_resend_with_new_note_updates(self):
+        """同链接再发带新备注 → 备注更新，状态不变。"""
+        manual_links.observe("https://mega.nz/file/a#K1 旧备注")
+        reply, _ = manual_links.observe("https://mega.nz/file/a#K1 新备注")
+        self.assertIn("🔁 备注已更新", reply)
+        row = runtime_db.list_manual_links()[0]
+        self.assertEqual(row["note"], "新备注")
+        self.assertEqual(row["status"], "PENDING")   # 状态不受备注更新影响
+
+    def test_resend_without_note_keeps_note(self):
+        """同链接无备注重发 → 查重提示，原备注保留。"""
+        manual_links.observe("https://mega.nz/file/a#K1 原备注")
+        reply, _ = manual_links.observe("https://mega.nz/file/a#K1")
+        self.assertIn("已在记录中", reply)
+        self.assertEqual(runtime_db.list_manual_links()[0]["note"], "原备注")
+
+    def test_resend_note_after_done_updates_but_reports_done(self):
+        """已完成的链接再发带备注：报告已处理过，备注仍更新（留档）。"""
+        manual_links.observe("https://mega.nz/file/a#K1 原备注")
+        link_id = runtime_db.list_manual_links()[0]["id"]
+        runtime_db.manual_link_done(link_id)
+        reply, _ = manual_links.observe("https://mega.nz/file/a#K1 新备注")
+        self.assertIn("⚠️ 已处理过", reply)
+        self.assertEqual(runtime_db.list_manual_links()[0]["note"], "新备注")
+
+    def test_multi_url_no_note(self):
+        """多 URL 消息：备注归属有歧义 → 全部无备注（原行为）。"""
+        reply, _ = manual_links.observe(
+            "https://mega.nz/file/a#K1 和 https://krakenfiles.com/b 都是")
+        self.assertEqual(len(runtime_db.list_manual_links()), 2)
+        for r in runtime_db.list_manual_links():
+            self.assertIsNone(r["note"])
+
+    def test_view_shows_note(self):
+        manual_links.observe("https://mega.nz/file/a#K1 我的 4K 备份")
+        text, _ = manual_links.links_view()
+        self.assertIn("📝 我的 4K 备份", text)
+
+    def test_extract_urls_still_works(self):
+        """纯 URL 提取保留（多 URL 场景/外部使用）。"""
+        self.assertEqual(
+            manual_links.extract_urls("a https://x/f/1 b"),
+            ["https://x/f/1"])
