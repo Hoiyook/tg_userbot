@@ -428,18 +428,23 @@ def format_retry_text(queue, page=1):
 
 
 def retry_all():
-    """重放待重试列表的全部任务；正在执行中的跳过。返回触发条数。
+    """重放待重试列表的全部任务；正在执行中的跳过。
 
-    重放不改列表归属：记录留在 retry，成功/失败由 execute_queued_task
-    收尾时按 in_retry 更新（与单条手动重试同一套簿记）。
-    """
+    超过 AUTO_RETRY_MAX_TIMES 的死任务**跳过不重放**（R4：永久性失败重放
+    只烧流量并脏化台账；要强行救它们用 /retry <序号> 单条）。重放不改列表
+    归属：记录留在 retry，成功/失败由 execute_queued_task 收尾按 in_retry
+    更新。返回 (触发条数, 超限跳过条数)。"""
     triggered = 0
+    over_cap = 0
     for record in list(state.QUEUE["retry"]):
         if record.get("id") in state.EXECUTING:
             continue
+        if record.get("attempts", 0) > AUTO_RETRY_MAX_TIMES:
+            over_cap += 1
+            continue
         spawn_execute(record)
         triggered += 1
-    return triggered
+    return triggered, over_cap
 
 
 def _idle_capacity():

@@ -641,10 +641,13 @@ async def handle_menu_action(action, arg, event):
             menu.retry_menu_buttons(page),
         )
     if action == "retry_all":
-        n = queue.retry_all()
+        n, over = queue.retry_all()
+        msg = (f"🔁 已重放全部待重试任务：{n} 条" if n
+               else "🔁 待重试列表为空（或都在执行中）")
+        if over:
+            msg += f"；另有 {over} 条超上限已跳过"
         return (
-            (f"🔁 已重放全部待重试任务：{n} 条" if n
-             else "🔁 待重试列表为空（或都在执行中）"),
+            msg,
             menu.retry_menu_buttons(1),
         )
     if action == "retry_run":

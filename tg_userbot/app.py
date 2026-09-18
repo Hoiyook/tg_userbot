@@ -166,6 +166,22 @@ async def start_with_retry(cli, bot_token=None):
     raise last_error
 
 
+async def _maintenance_loop():
+    """每日维护：DB 备份（滚动 7 份）+ 事件流裁剪（R1/R2，2026-09-18）。
+
+    启动即先跑一次（覆盖「上次备份以来」的空窗），之后每 24h 一次。
+    全部失败只告警，绝不影响主流程。"""
+    from . import maintenance
+    while True:
+        try:
+            await asyncio.to_thread(maintenance.daily_maintenance)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"🗄 每日维护异常：{e}")
+        await asyncio.sleep(24 * 3600)
+
+
 async def _keepalive_ping_loop():
     """主连接保活心跳：周期性轻量 ping，防代理对空闲连接的周期性回收。
 
@@ -1326,6 +1342,7 @@ async def main():
         bot_keepalive_task = asyncio.create_task(_bot_keepalive())
     main_serve_task = asyncio.create_task(_main_serve())
     keepalive_ping_task = asyncio.create_task(_keepalive_ping_loop())
+    maintenance_task = asyncio.create_task(_maintenance_loop())
     retry_sweeper_task = asyncio.create_task(_retry_sweeper())
     # 标签监听：Scanner（定时生产任务）+ Worker（常驻受控执行）
     listener_task = asyncio.create_task(_listener_loop())

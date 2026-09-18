@@ -352,12 +352,12 @@ async def handle_command(event, cmd_text):
                 queue.format_retry_text(state.QUEUE), link_preview=False
             )
         elif parts[1].strip().lower() == "all":
-            n = queue.retry_all()
-            await _reply(event, 
-                f"🔁 已重放全部待重试任务：{n} 条" if n
-                else "🔁 待重试列表为空（或都在执行中）"
-            )
-            logger.info(f"执行命令：/retry all | 触发 {n} 条")
+            n, over = queue.retry_all()
+            msg = f"🔁 已重放全部待重试任务：{n} 条" if n                 else "🔁 待重试列表为空（或都在执行中）"
+            if over:
+                msg += f"；另有 {over} 条超过自动重试上限已跳过（/retry <序号> 可单条强救）"
+            await _reply(event, msg)
+            logger.info(f"执行命令：/retry all | 触发 {n} 条，跳过超限 {over} 条")
             return True
         elif parts[1].startswith("del "):
             try:

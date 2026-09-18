@@ -606,15 +606,15 @@ class RetryAllTest(unittest.IsolatedAsyncioTestCase):
         state.EXECUTING.add(state.QUEUE["retry"][1]["id"])
 
         with mock.patch.object(queue, "spawn_execute", fake_spawn):
-            n = queue.retry_all()
+            n, over = queue.retry_all()
 
-        self.assertEqual(n, 2)
+        self.assertEqual((n, over), (2, 0))
         self.assertEqual(len(spawned), 2)
         # 重放不改列表归属（成功/失败仍由 execute_queued_task 收尾处理）
         self.assertEqual(len(state.QUEUE["retry"]), 3)
 
     async def test_retry_all_empty_returns_zero(self):
-        self.assertEqual(queue.retry_all(), 0)
+        self.assertEqual(queue.retry_all(), (0, 0))
 
 
 class AutoReplayDueTest(unittest.IsolatedAsyncioTestCase):
@@ -733,9 +733,10 @@ class AutoReplayDueTest(unittest.IsolatedAsyncioTestCase):
         self._to_retry("over-cap.mp4", attempts=99, due=9e9)
         with mock.patch.object(queue, "spawn_execute",
                                lambda r: self.spawned.append(r)):
-            n = queue.retry_all()
-        self.assertEqual(n, 1)
-        self.assertEqual(len(self.spawned), 1)
+            n, over = queue.retry_all()
+        # R4（2026-09-18）：retry_all 不再强救超上限死任务（/retry <序号> 单条强救）
+        self.assertEqual((n, over), (0, 1))
+        self.assertEqual(len(self.spawned), 0)
 
     # ---------- 自动重放事件（供 Reporter 与用户区分「自动」与「手动」）----------
 
