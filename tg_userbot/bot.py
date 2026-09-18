@@ -235,7 +235,7 @@ async def handle_menu_action(action, arg, event):
             f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
             [[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))],
-             Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
+             [Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))]],
         )
     if action == "wl_scan":
         return (wl_scan.summary_text(await wl_scan.scan_all(manual=True)),
@@ -253,7 +253,7 @@ async def handle_menu_action(action, arg, event):
             f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
             [[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))],
-             Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
+             [Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))]],
         )
     if action == "sqlt_del":
         ok, msg = sql_templates.delete(arg or "")
@@ -406,7 +406,7 @@ async def handle_menu_action(action, arg, event):
             f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
             [[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))],
-             Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
+             [Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))]],
         )
     if action == "up":
         # 打开视图这一刻快照最近文件：按钮只带序号，路径放不进回调数据
@@ -422,7 +422,7 @@ async def handle_menu_action(action, arg, event):
             f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
             [[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))],
-             Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
+             [Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))]],
         )
     if action == "up_file":
         path, err = upload.candidate_at(arg)
@@ -544,7 +544,7 @@ async def handle_menu_action(action, arg, event):
             f"{config.FIND_INPUT_WINDOW_SECONDS} 秒内有效，"
             "超时请重新点【🔍 查询】。发送 / 开头的命令可取消。",
             [[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))],
-             Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
+             [Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))]],
         )
     if action == "cookie":
         return menu.cookie_status_text(), menu.cookie_menu_buttons()

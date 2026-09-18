@@ -1267,3 +1267,21 @@ class InputCancelTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(st.UP_INPUT_UNTIL, 0.0)
         self.assertEqual(st.LISTEN_INPUT_UNTIL, 0.0)
         self.assertTrue(ev.edit.called)              # 原地确认已取消
+
+
+class InputPromptButtonsShapeTest(unittest.TestCase):
+    """输入窗口提示消息的按钮必须是「行的列表」（Telegram 按行迭代；
+    裸按钮曾被拼成 [[❌], 🔙] 形态 → 'KeyboardButtonCallback' object is
+    not iterable → 点击无任何反应，2026-09-18 实测）。"""
+
+    def test_all_input_prompt_button_rows_are_lists(self):
+        """输入窗口提示消息的按钮必须是「行的列表」（Telegram 按行迭代；
+        裸按钮曾被拼成 [[❌], 🔙] 形态 → 'KeyboardButtonCallback' object is
+        not iterable → 点击无任何反应，2026-09-18 实测）。"""
+        import inspect
+        from tg_userbot import bot
+        src = inspect.getsource(bot)
+        bad = ('[[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))],\n'
+               '             Button.inline(')
+        self.assertNotIn(bad, src,
+                         "存在裸按钮行——❌ 取消行后必须紧跟包在行列表里的按钮")
