@@ -23,6 +23,9 @@ BOT_ID = None  # bot 账号的用户 id（bot 登录后填充，清理 bot 对�
 QUEUE = {"tasks": [], "retry": []}
 QUEUE_LOCK = None  # asyncio.Lock，main() 里创建（事件循环规则）
 EXECUTING = set()  # 正在执行的任务 id（防重复触发）
+# 本次尝试是否出现过下载进度 {task_id: bool}：失败收尾时读它区分
+# 「快速失败（死文件）」与「链路失败（可重试）」——死文件熔断用（queue.py）
+DOWNLOAD_PROGRESS_SEEN = {}
 
 # 下载并发信号量（可动态调限）与当前并发数
 DOWNLOAD_SEMAPHORE = None  # config.AdjustableSemaphore，main() 里创建

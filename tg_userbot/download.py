@@ -297,10 +297,14 @@ async def download_url_media(record):
                     last_percent = -1
                     last_activity = time.monotonic()
 
+                    _url_task_id = record.get("id")
+
                     def progress(current, total):
                         nonlocal last_percent, last_activity
                         last_activity = time.monotonic()
                         update_download(did, current, total)
+                        if _url_task_id:
+                            state.DOWNLOAD_PROGRESS_SEEN[_url_task_id] = True
                         if not total:
                             return
                         percent = min(int(current * 100 / total), 100)

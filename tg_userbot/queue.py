@@ -32,6 +32,7 @@ from .config import (
     AUTO_RETRY_BASE_DELAY,
     AUTO_RETRY_MAX_DELAY,
     AUTO_RETRY_MAX_TIMES,
+    AUTO_REPLAY_FUSE_SECONDS,
     QUEUE_FETCH_TIMEOUT,
     QUEUE_FILE,
     QUEUE_KIND_LABELS,
@@ -299,6 +300,24 @@ def queue_enqueue(queue, record):
     return record
 
 
+# 死文件熔断标记 {task_id: 最近一次快速失败的 monotonic 时刻}。
+# 「快速失败」= 本次尝试没有发出任何下载进度（进度回调零次）——典型是
+# Request unsuccessful（文件对象损坏/DC 侧丢数据）。这类任务重试多少次都
+# 一样，AUTO_REPLAY 在熔断窗口内不再自动重放它们（/retry 单条强救不受限）。
+_FAIL_FAST_MARK = {}
+
+
+def _record_fail_fast(record, progress_seen):
+    """失败收尾时记录快速失败标记（供 replay_due 熔断）。
+
+    progress_seen：本次尝试是否出现过下载进度（有进账 = 链路问题可重试，
+    不熔断）。"""
+    if progress_seen:
+        _FAIL_FAST_MARK.pop(record.get("id"), None)
+    else:
+        _FAIL_FAST_MARK[record.get("id")] = time.monotonic()
+
+
 def _backoff_delay(attempts):
     """自动重放的退避秒数：base × 2^(attempts-1)，封顶 AUTO_RETRY_MAX_DELAY。
 
@@ -418,12 +437,27 @@ def format_retry_text(queue, page=1):
     retry = queue.get("retry", [])
     if not retry:
         return "🔁 待重试列表：空"
+    def _render(i, r):
+        # 溯源：频道/超群来源（负 id）生成 t.me 跳转链接——点开即回原消息，
+        # 死文件可手动重发新引用救回（2026-09-18 用户需求）
+        chat_id = r.get("chat_id")
+        link = ""
+        try:
+            cid = int(chat_id) if chat_id is not None else None
+        except (TypeError, ValueError):
+            cid = None
+        if cid is not None and cid < -1000000000 and r.get("msg_id"):
+            link = (f"  ↪ 原消息：https://t.me/c/"
+                    f"{str(cid).replace('-100', '', 1)}/{r['msg_id']}\n")
+        return (f"{i}. {_queue_record_display(r)}"
+                f"（已尝试 {r.get('attempts', 0)} 次）\n{link}"
+                if link else
+                f"{i}. {_queue_record_display(r)}"
+                f"（已尝试 {r.get('attempts', 0)} 次）")
+
     return _paged_lines(
         "🔁 待重试列表", retry, page,
-        lambda i, r: (
-            f"{i}. {_queue_record_display(r)}"
-            f"（已尝试 {r.get('attempts', 0)} 次）"
-        ),
+        _render,
     )
 
 
@@ -476,12 +510,20 @@ def replay_due(now=None):
     now = time.time() if now is None else now
     budget = _idle_capacity()
     triggered = 0
+    now_mono = time.monotonic()
     for record in list(state.QUEUE["retry"]):
         if triggered >= budget:
             break
         if record.get("id") in state.EXECUTING:
             continue
         if record.get("attempts", 0) > AUTO_RETRY_MAX_TIMES:
+            continue
+        # 死文件熔断（2026-09-18）：快速失败（起步即败零进度）后 6h 内
+        # 不再自动重放——死文件重试多少次都一样。冷却过后恢复（也许上游
+        # 恢复了）；/retry 单条强救不受熔断影响。
+        fused_at = _FAIL_FAST_MARK.get(record.get("id"))
+        if (fused_at is not None
+                and now_mono - fused_at < AUTO_REPLAY_FUSE_SECONDS):
             continue
         due = record.get("next_retry_at")
         if due is not None and now < due:
@@ -727,6 +769,11 @@ async def execute_queued_task(record):
                                  attempts=record.get("attempts", 0))
                 stats.emit_event("FAILED", task_id=record["id"],
                                  label=record.get("label"))
+                # 死文件熔断标记：本次尝试零进度（起步即败）→ 记快速失败
+                # 时刻（AUTO_REPLAY 据此跳过）；有进度 → 清标记（链路类可重试）
+                _record_fail_fast(
+                    record, state.DOWNLOAD_PROGRESS_SEEN.get(record["id"], False))
+                state.DOWNLOAD_PROGRESS_SEEN.pop(record["id"], None)
     finally:
         state.EXECUTING.discard(record["id"])
         clear_trace()

@@ -1073,3 +1073,52 @@ class TaskEventEmissionTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetryTraceAndFuseTest(unittest.TestCase):
+    """溯源与熔断（2026-09-18）：
+
+    - /retry 视图带原消息跳转链接（chat_id/msg_id → t.me/c/...）
+    - AUTO_REPLAY 熔断：连续 N 次快速失败（Request unsuccessful 类死文件）
+      的任务不再被自动重放（停放），/retry 单条仍可强救
+    """
+
+    def test_display_contains_trace_link(self):
+        q = {"retry": [{"id": "t1", "kind": "media", "final_name": "a.mp4",
+                        "chat_id": -1001234567890, "msg_id": 77,
+                        "attempts": 3}]}
+        text = queue.format_retry_text(q)
+        self.assertIn("t.me/c/1234567890/77", text)
+
+    def test_display_no_link_for_saved(self):
+        q = {"retry": [{"id": "t2", "kind": "media", "final_name": "b.mp4",
+                        "chat_id": 5452449426, "msg_id": 1}]}
+        text = queue.format_retry_text(q)
+        self.assertNotIn("t.me/c/", text)
+
+    def test_auto_replay_fuse_skips_rapid_failures(self):
+        """连续快速失败任务 → AUTO_REPLAY 跳过（熔断）。"""
+        import time as _t
+        rec = {"id": "dead", "attempts": 3, "label": "x",
+               "next_retry_at": 0}
+        state.QUEUE = {"tasks": [], "retry": [rec]}
+        state.EXECUTING = set()
+        queue._FAIL_FAST_MARK["dead"] = _t.monotonic()   # 刚刚快速失败过
+        self.addCleanup(queue._FAIL_FAST_MARK.clear)
+        with mock.patch.object(queue, "AUTO_REPLAY_FUSE_SECONDS", 3600), \
+                mock.patch.object(queue, "spawn_execute") as sp:
+            n = queue.replay_due()
+        self.assertEqual((n, sp.call_count), (0, 0))   # 熔断：不放行   # 熔断：不放行
+
+    def test_auto_replay_normal_after_cooldown(self):
+        """超过熔断冷却期 → 恢复正常重放。"""
+        import time as _t
+        rec = {"id": "dead", "attempts": 3, "label": "x",
+               "next_retry_at": 0}
+        state.QUEUE = {"tasks": [], "retry": [rec]}
+        state.EXECUTING = set()
+        queue._FAIL_FAST_MARK["dead"] = _t.monotonic() - 7200   # 冷却已过
+        with mock.patch.object(queue, "AUTO_REPLAY_FUSE_SECONDS", 3600), \
+                mock.patch.object(queue, "spawn_execute") as sp:
+            n = queue.replay_due()
+        self.assertEqual(n, 1)
