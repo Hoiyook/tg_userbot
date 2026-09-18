@@ -67,7 +67,8 @@ def observe(text, now=None):
 
     支持「URL + 备注」（恰好 1 个 URL 时其余文本为备注；重发同链接带新
     备注 → 更新备注，状态不变）。每条链接的判定优先级：台账 DONE →
-    Pawchive 已完成外链 → 台账 PENDING → 新记录。仅新记录挂 ✅ 按钮。"""
+    Pawchive 已完成外链 → 台账 PENDING → 新记录。凡台账中 PENDING 的
+    条目（新记录或已在记录中）都挂 ✅ 按钮——随时可点标记完成。"""
     from .menu import encode_menu_data   # 函数内导入避免 menu↔本模块成环
     urls, note = _split_note(text)
     if not urls:
@@ -105,6 +106,10 @@ def observe(text, now=None):
         elif state_str == "pending":
             lines.append(f"ℹ️ 已在记录中（未处理）：[{host_disp}] "
                          f"{row['url']}" + note_disp)
+            # 待办重复发送也挂 ✅（用户要求：随时可点标记完成）
+            rows.append([Button.inline(
+                "✅ " + _short(row["url"]),
+                encode_menu_data("mlink_done", str(row["id"])))])
         else:
             lines.append(f"🔗 已记录（未处理）：[{host_disp}] "
                          f"{row['url']}" + note_disp)

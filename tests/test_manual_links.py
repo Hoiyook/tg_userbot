@@ -310,3 +310,15 @@ class SearchByNoteTest(_MlinksDbBase):
         src = inspect.getsource(commands.handle_command)
         self.assertIn('startswith("/links ")', src)
         self.assertIn("keyword=keyword", src)
+
+
+class PendingResendButtonTest(_MlinksDbBase):
+    """待办重复发送也挂 ✅ 按钮（2026-09-17 用户要求）。"""
+
+    def test_resend_pending_has_button(self):
+        manual_links.observe("https://mega.nz/file/a#K1")
+        reply, buttons = manual_links.observe("https://mega.nz/file/a#K1")
+        self.assertIn("已在记录中", reply)
+        flat = [b for row in buttons for b in row]
+        self.assertEqual(len(flat), 1)           # ✅ 可点
+        self.assertIn("✅", flat[0].text)
