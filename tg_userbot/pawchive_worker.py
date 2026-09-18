@@ -734,11 +734,17 @@ async def run_once():
                 error=f"未预期异常：{type(e).__name__}: {e}")
         except runtime_db.DbUnavailable as db_err:
             logger.error(f"🐾 帖子转退避失败（租约到期后会恢复）：{db_err}")
+    finally:
+        _INFLIGHT.discard(post["id"])
         return False
 
 
 async def _spawn_post(post):
-    """单帖处理任务：成功/失败/取消都清在途标记；异常转退避不留死角。"""
+    """单帖处理任务：成功/失败/取消都清在途标记；异常转退避不留死角。
+
+    2026-09-18 事故：成功路径漏 discard——4 帖完成后 _INFLIGHT 仍持有
+    4 个 id，worker_loop 的 len(_INFLIGHT) < 4 永不成立，1019 PENDING
+    饿死。改为 finally 统一清理（取消/异常分支各自的额外语义保留）。"""
     try:
         await process_post(post)
     except asyncio.CancelledError:
@@ -754,6 +760,9 @@ async def _spawn_post(post):
                 error=f"未预期异常：{type(e).__name__}: {e}")
         except runtime_db.DbUnavailable as db_err:
             logger.error(f"🐾 帖子转退避失败（租约到期后会恢复）：{db_err}")
+    finally:
+        # 成功/失败/取消统一清槽（R-泄漏事故：成功路径漏清 → 4 槽死锁）
+        _INFLIGHT.discard(post["id"])
 
 
 async def worker_loop():

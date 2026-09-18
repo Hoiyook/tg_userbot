@@ -658,3 +658,40 @@ class CurrentPostElapsedTest(_WorkerDbTestCase):
                 (old, claimed["id"])), "回拨 started_at")
         label = worker.current_post_label()
         self.assertIn("已处理 2时00分", label)
+
+
+class InflightLeakTest(_WorkerDbTestCase):
+    """多帖并发后成功路径必须清 _INFLIGHT（2026-09-18 事故：成功分支漏
+    discard → 4 槽被僵尸占满 → worker 永不再领帖，1019 PENDING 饿死）。"""
+
+    async def test_spawn_post_discards_on_success(self):
+        post = _post(files=[{"url": "https://x/1.mp4", "filename": "1.mp4"}])
+        runtime_db.enqueue_pawchive_posts("patreon", "42", "C", [post])
+        claimed = runtime_db.claim_next_pawchive_post()
+        worker._INFLIGHT.add(claimed["id"])
+        self.addCleanup(worker._INFLIGHT.clear)
+
+        async def fake_download(p, files):
+            for f in files:
+                f["status"] = runtime_db.PAW_FILE_DONE
+            return False
+
+        with mock.patch.object(worker, "_download_post_files",
+                               side_effect=fake_download), \
+                mock.patch.object(worker, "notify") as fake_notify:
+            fake_notify.notify_user = mock.AsyncMock()
+            await worker._spawn_post(claimed)
+        self.assertNotIn(claimed["id"], worker._INFLIGHT,
+                         "成功路径漏清 _INFLIGHT → 并发槽死锁")
+
+    async def test_spawn_post_discards_on_manual(self):
+        """MANUAL（外链帖）同样要清。"""
+        post = _post(files=[])          # 纯外链帖 → _finalize → MANUAL
+        runtime_db.enqueue_pawchive_posts("patreon", "42", "C", [post])
+        claimed = runtime_db.claim_next_pawchive_post()
+        worker._INFLIGHT.add(claimed["id"])
+        self.addCleanup(worker._INFLIGHT.clear)
+        with mock.patch.object(worker.notify, "notify_user",
+                               mock.AsyncMock()):
+            await worker._spawn_post(claimed)
+        self.assertNotIn(claimed["id"], worker._INFLIGHT)
