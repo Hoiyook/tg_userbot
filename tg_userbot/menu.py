@@ -70,28 +70,40 @@ def build_main_menu_text():
 
 
 def main_menu_buttons():
+    """主菜单：按使用频率分区（2026-09-17 用户要求重排）。
+
+      监控   → 状态 / 台账 / 进度 / 记录（看数据，最常用，占前两行）
+      管理   → 队列 / 待重试 / 并发 / 白名单（管任务与来源）
+      工具   → 查询 / 监听 / 去重 / Cookie（低频配置与排查）
+      子系统 → Pawchive / CD2 / Chrome / 命令行（独立功能入口）
+
+    📡 标签监听是**独立于下载白名单**的入口（规格书 §18：不能塞进
+    📋 白名单，用户必须能明显区分两套系统）——放进工具区独立成对。
+    CD2 的启停/备份记录在其子菜单（2026-09-15 菜单合并）。
+    """
     return [
+        # 监控
         [Button.inline("📊 状态", encode_menu_data("status")),
-         Button.inline("📈 进度", encode_menu_data("progress"))],
-        [Button.inline("📜 下载记录", encode_menu_data("done")),
-         Button.inline("📋 白名单", encode_menu_data("wl"))],
+         Button.inline("📊 台账", encode_menu_data("stats"))],
+        [Button.inline("📈 进度", encode_menu_data("progress")),
+         Button.inline("📜 记录", encode_menu_data("done"))],
+        # 管理
         [Button.inline("📥 队列", encode_menu_data("queue")),
          Button.inline("🔁 待重试", encode_menu_data("retry"))],
-        [Button.inline("🧵 并发", encode_menu_data("thread"))],
-        [Button.inline("🛡 去重", encode_menu_data("dedup")),
-         Button.inline("🍪 抖音Cookie", encode_menu_data("cookie"))],
-        # CD2 的启动/停止/备份记录收进子菜单（2026-09-15 菜单合并）
-        [Button.inline("☁️ CD2 云盘", encode_menu_data("cd2_menu")),
-         Button.inline("📊 台账", encode_menu_data("stats"))],
+        [Button.inline("🧵 并发", encode_menu_data("thread")),
+         Button.inline("📋 白名单", encode_menu_data("wl"))],
+        # 工具
         [Button.inline("🔍 查询", encode_menu_data("find")),
-         Button.inline("🧹 Caption 清洗", encode_menu_data("capf"))],
-        # 标签监听是**独立于下载白名单**的入口（规格书 §18：不能塞进 📋 白名单，
-        # 用户必须能明显区分两套系统）
-        [Button.inline("📡 标签监听", encode_menu_data("listen")),
-         Button.inline("🌐 Chrome 任务", encode_menu_data("chrome_tasks"))],
-        [Button.inline("📐 SQL模板", encode_menu_data("sqlt"))],
-        [Button.inline("🖥 命令行/上传", encode_menu_data("tools")),
-         Button.inline("🐾 Pawchive", encode_menu_data("paw"))],
+         Button.inline("📡 监听", encode_menu_data("listen"))],
+        [Button.inline("🛡 去重", encode_menu_data("dedup")),
+         Button.inline("🍪 Cookie", encode_menu_data("cookie"))],
+        [Button.inline("🧹 Caption", encode_menu_data("capf")),
+         Button.inline("📐 SQL模板", encode_menu_data("sqlt"))],
+        # 子系统
+        [Button.inline("🐾 Pawchive", encode_menu_data("paw")),
+         Button.inline("☁️ CD2", encode_menu_data("cd2_menu"))],
+        [Button.inline("🌐 Chrome", encode_menu_data("chrome_tasks")),
+         Button.inline("🖥 命令行", encode_menu_data("tools"))],
     ]
 
 

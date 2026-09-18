@@ -66,9 +66,9 @@ class MenuTextTest(unittest.TestCase):
 
     def test_main_menu_buttons_contain_all_entries(self):
         texts = [b.text for row in menu.main_menu_buttons() for b in row]
-        for label in ("📊 状态", "📈 进度", "📜 下载记录",
+        for label in ("📊 状态", "📈 进度", "📜 记录",
                       "📋 白名单", "🧵 并发",
-                      "☁️ CD2 云盘", "🖥 命令行/上传", "🐾 Pawchive"):
+                      "☁️ CD2", "🖥 命令行", "🐾 Pawchive"):
             self.assertIn(label, texts)
 
     def test_main_menu_has_dedup_entry(self):
@@ -217,13 +217,13 @@ class ListenMenuTest(unittest.TestCase):
 
     def test_main_menu_has_listen_entry(self):
         texts = [b.text for row in menu.main_menu_buttons() for b in row]
-        self.assertIn("📡 标签监听", texts)
+        self.assertIn("📡 监听", texts)
 
     def test_main_menu_still_has_whitelist_separately(self):
         """两套系统必须各有各的入口，用户要能明显区分。"""
         texts = [b.text for row in menu.main_menu_buttons() for b in row]
         self.assertIn("📋 白名单", texts)
-        self.assertIn("📡 标签监听", texts)
+        self.assertIn("📡 监听", texts)
 
     def test_listen_view_buttons_registered(self):
         from tg_userbot import listener
@@ -986,7 +986,7 @@ class ShUpMainMenuTest(unittest.TestCase):
                   for row in menu.main_menu_buttons() for b in row]
         texts = [t for t, _ in labels]
         # 两个入口已合并为一个「🖥 命令行/上传」（tools 子视图内保留 sh/up）
-        self.assertTrue(any("命令行/上传" in t for t in texts))
+        self.assertTrue(any("命令行" in t for t in texts))
         actions = {menu.parse_menu_data(d)[0] for _, d in labels}
         self.assertIn("tools", actions)
         self.assertNotIn("sh", actions)
@@ -1194,3 +1194,42 @@ def _make_file(name, content=b"x", mtime=None):
     if mtime is not None:
         os.utime(path, (mtime, mtime))
     return path
+
+
+class MainMenuLayoutTest(unittest.TestCase):
+    """主菜单按使用频率分组（2026-09-17 用户要求：看起来乱 → 分区重排）。
+
+    布局契约：
+      第 1 区「监控」：状态/进度/台账/记录 —— 看数据，最常用
+      第 2 区「下载管理」：队列/待重试/并发 —— 管任务
+      第 3 区「来源与工具」：白名单/标签监听/查询/去重/Cookie/Caption
+      第 4 区「子系统」：Pawchive/CD2/Chrome/命令行
+    每区一行一个主题、成对排布，整屏 ≤10 行。
+    """
+
+    def setUp(self):
+        self.rows = menu.main_menu_buttons()
+        self.texts = [[b.text for b in row] for row in self.rows]
+
+    def _row_texts(self, i):
+        return self.texts[i] if i < len(self.texts) else []
+
+    def test_monitor_row_first(self):
+        """第 1 行 = 状态 + 台账（看数据最频繁的两个）。"""
+        self.assertIn("📊 状态", self._row_texts(0))
+        self.assertIn("📊 台账", self._row_texts(0))
+
+    def test_zone_rows(self):
+        flat = [t for row in self.texts for t in row]
+        for label in ("📈 进度", "📜 记录", "📥 队列", "🔁 待重试",
+                      "🧵 并发", "📋 白名单", "📡 监听", "🔍 查询",
+                      "🛡 去重", "🐾 Pawchive", "☁️ CD2", "🖥 命令行",
+                      "🌐 Chrome", "🍪 Cookie", "🧹 Caption"):
+            self.assertIn(label, flat, f"缺按钮 {label}")
+
+    def test_compact_within_ten_rows(self):
+        self.assertLessEqual(len(self.rows), 10)
+
+    def test_no_duplicate_entries(self):
+        flat = [t for row in self.texts for t in row]
+        self.assertEqual(len(flat), len(set(flat)))

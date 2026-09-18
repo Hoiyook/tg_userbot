@@ -72,6 +72,7 @@ from .config import (
     SESSION_NAME,
     SERVE_RECONNECT_BASE_DELAY,
     SERVE_RECONNECT_MAX_DELAY,
+    KEEPALIVE_PING_SECONDS,
     TELEGRAM_AUTO_RECONNECT,
     WHITELIST_SCAN_INTERVAL_SECONDS,
     AdjustableSemaphore,
@@ -163,6 +164,35 @@ async def start_with_retry(cli, bot_token=None):
                 await asyncio.sleep(5)
 
     raise last_error
+
+
+async def _keepalive_ping_loop():
+    """主连接保活心跳：周期性轻量 ping，防代理对空闲连接的周期性回收。
+
+    2026-09-18 实测：代理凌晨 03:00-07:00 按 60s 周期切断空闲 TCP（断开
+    精确 60s + 6s 重连，每小时 ~50 次）。55s 间隔 ping（低于回收线）让
+    链路持续有流量；ping 失败静默（真正的断线由 _main_serve 的重连守护
+    处理，两者职责分离）。被 main 取消时原样上抛。"""
+    try:
+        while True:
+            await asyncio.sleep(KEEPALIVE_PING_SECONDS)
+            if state.client is None or not state.client.is_connected():
+                continue        # 掉线期间交给 _main_serve，不抢
+            try:
+                await asyncio.wait_for(
+                    _ping_caller(state.client), timeout=15)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass            # ping 失败 = 链路抖动，下轮再试
+    except asyncio.CancelledError:
+        raise
+
+
+async def _ping_caller(client):
+    """telethon 的轻量保活请求（GetState 即可，响应小、不触发更新）。"""
+    from telethon.tl.functions.updates import GetStateRequest
+    await client(GetStateRequest())
 
 
 async def _main_serve():
@@ -1295,6 +1325,7 @@ async def main():
     if BOT_TOKEN and state.bot_client is not None:
         bot_keepalive_task = asyncio.create_task(_bot_keepalive())
     main_serve_task = asyncio.create_task(_main_serve())
+    keepalive_ping_task = asyncio.create_task(_keepalive_ping_loop())
     retry_sweeper_task = asyncio.create_task(_retry_sweeper())
     # 标签监听：Scanner（定时生产任务）+ Worker（常驻受控执行）
     listener_task = asyncio.create_task(_listener_loop())

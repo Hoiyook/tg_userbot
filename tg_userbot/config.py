@@ -1031,6 +1031,12 @@ LOGIN_RETRIES = 10
 TELEGRAM_AUTO_RECONNECT = False
 
 # 主客户端稳态守护：掉线自动重连，指数退避 5s → … → 120s 上限。
+# 主连接保活心跳（2026-09-18）：代理节点在凌晨低峰对**空闲** TCP 连接按
+# 60s 周期回收（实测 03:00-07:00 每小时 ~50 次「断开-6 秒恢复」循环，断开
+# 时长精确 60s）。55s 间隔的轻量 ping 让链路永不落入「空闲」判定，根治之。
+# 下载活跃时 ping 是无谓开销但可忽略（<0.1KB/s）。
+KEEPALIVE_PING_SECONDS = 55
+
 SERVE_RECONNECT_BASE_DELAY = 5
 SERVE_RECONNECT_MAX_DELAY = 120
 

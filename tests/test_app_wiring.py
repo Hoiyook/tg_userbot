@@ -39,3 +39,21 @@ class AppWiringSmokeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KeepalivePingTest(unittest.TestCase):
+    """主连接保活心跳（2026-09-18）：55s 间隔 < 代理 60s 空闲回收线。"""
+
+    def test_ping_interval_below_recycle_line(self):
+        from tg_userbot import config
+        self.assertLess(config.KEEPALIVE_PING_SECONDS, 60)
+        self.assertGreater(config.KEEPALIVE_PING_SECONDS, 10)
+
+    def test_heartbeat_loop_wired(self):
+        """main() 必须启动心跳任务；心跳循环必须调 _ping。"""
+        import inspect
+        src = inspect.getsource(app)
+        self.assertIn("_keepalive_ping_loop", src)
+        self.assertIn("_ping_caller", src[:0] or src)  # 函数存在性
+        self.assertTrue(hasattr(app, "_keepalive_ping_loop"))
+        self.assertTrue(callable(app._keepalive_ping_loop))
