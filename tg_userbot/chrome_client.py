@@ -715,6 +715,46 @@ async def _handle_cancel(event, arg):
     await event.reply(message)
 
 
+# 网盘域名（2026-09-18 用户需求）：这类链接不进下载流，而是在用户日常
+# Chrome 里**可见打开**（日常浏览器带网盘登录态，页面操作交给用户）。
+# host 精确或「.后缀」匹配（sharepoint 的子域形态用 endswith 覆盖）。
+_CLOUD_DRIVE_HOSTS = frozenset({
+    "mega.nz", "mega.io", "drive.google.com", "docs.google.com",
+    "onedrive.live.com", "1drv.ms", "www.dropbox.com", "dropbox.com",
+    "www.mediafire.com", "mediafire.com",
+    "app.box.com", "box.com", "pcloud.link", "e.pcloud.link",
+    "pan.baidu.com", "pan.quark.cn", "www.alipan.com", "alipan.com",
+    "115.com", "terabox.com", "teraboxapp.com",
+})
+_CLOUD_DRIVE_SUFFIXES = (".sharepoint.com", ".mega.nz", ".mega.io")
+
+
+def is_cloud_drive_url(url):
+    """网盘页链接判定（host 大小写不敏感；裸文本返回 False）。"""
+    import urllib.parse as _up
+    try:
+        host = _up.urlparse(str(url or "")).netloc.lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return (host in _CLOUD_DRIVE_HOSTS
+            or any(host.endswith(s) for s in _CLOUD_DRIVE_SUFFIXES))
+
+
+def open_in_visible_chrome(url):
+    """在用户日常 Chrome 里**可见打开**页面（非静默：弹窗口、带登录态）。
+
+    macOS `open -a "Google Chrome" <url>`；Chrome 未装时回退系统默认
+    浏览器（裸 `open`）。同步调用（open 秒回），失败抛 OSError 由调用方
+    处理。"""
+    import subprocess
+    try:
+        subprocess.run(["open", "-a", "Google Chrome", url], check=True)
+    except (OSError, subprocess.CalledProcessError):
+        subprocess.run(["open", url], check=True)
+
+
 async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
     """处理 /chrome* 命令；返回 True（命令已被识别消费）。"""
     sender = sender_id if sender_id is not None else getattr(
@@ -773,6 +813,16 @@ async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
         return True
     if not agent_running():
         await event.reply(not_running_text())
+        return True
+    if is_cloud_drive_url(url):
+        # 网盘页：可见打开（用户自己操作登录/选文件），不进下载流——
+        # 专用实例是无头+无登录态，网盘页对它没有意义
+        open_in_visible_chrome(url)
+        await event.reply(
+            f"{CHROME_TEXT_PREFIX} 🌐 已在 Google Chrome 打开（可见窗口，\n"
+            f"带你的网盘登录态）：\n{url}\n页面里操作即可，文件下载到"
+            "Chrome 默认下载目录。")
+        logger.info(f"执行命令：/chrome 网盘页可见打开：{url[:60]}")
         return True
     task_id = chrome_agent.new_task_id()
     add_request(task_id, url,

@@ -14,6 +14,7 @@ import re
 
 from telethon import Button
 
+from . import chrome_client
 from . import pawchive
 from . import runtime_db
 from . import state
@@ -106,16 +107,20 @@ def observe(text, now=None):
         elif state_str == "pending":
             lines.append(f"ℹ️ 已在记录中（未处理）：[{host_disp}] "
                          f"{row['url']}" + note_disp)
-            # 待办重复发送也挂 ✅（用户要求：随时可点标记完成）
-            rows.append([Button.inline(
-                "✅ " + _short(row["url"]),
-                encode_menu_data("mlink_done", str(row["id"])))])
         else:
             lines.append(f"🔗 已记录（未处理）：[{host_disp}] "
                          f"{row['url']}" + note_disp)
-            rows.append([Button.inline(
+        # 台账中 PENDING 的条目（新记录或重发）都给操作按钮：
+        # ✅ 标记完成；网盘链接额外挂 🌐 在Chrome打开（可见打开，非静默）
+        if row["status"] == "PENDING":
+            row_btns = [Button.inline(
                 "✅ " + _short(row["url"]),
-                encode_menu_data("mlink_done", str(row["id"])))])
+                encode_menu_data("mlink_done", str(row["id"])))]
+            if chrome_client.is_cloud_drive_url(row["url"]):
+                row_btns.append(Button.inline(
+                    "🌐 在Chrome打开",
+                    encode_menu_data("mlink_open", row["url"])))
+            rows.append(row_btns)
     return "\n".join(lines), rows
 
 

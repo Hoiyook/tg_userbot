@@ -996,3 +996,52 @@ class ChromeCancelFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Agent 当前未运行", self.replies[0])
         self.assertEqual(
             len(chrome_client.load_cancellations(self.cancel_path)), 1)
+
+
+class CloudDriveOpenTest(unittest.TestCase):
+    """链接分流（2026-09-18 用户需求）：网盘页 → 可见打开（用户日常
+    Chrome，带登录态）；文件直链 → 既有下载流不变。"""
+
+    def test_cloud_drive_domains(self):
+        from tg_userbot import chrome_client
+        for url in (
+            "https://mega.nz/file/a#K",
+            "https://mega.io/set/1",
+            "https://drive.google.com/file/d/17W9/view",
+            "https://docs.google.com/spreadsheets/d/x",
+            "https://onedrive.live.com/?id=root",
+            "https://1drv.ms/u/s!Abc",
+            "https://contoso.sharepoint.com/:u:/r/sites/x",
+            "https://www.dropbox.com/s/abc/f.mp4?dl=0",
+            "https://www.mediafire.com/file/abc/f.zip",
+            "https://app.box.com/s/xyz",
+            "https://e.pcloud.link/#link=p",
+            "https://pan.baidu.com/s/1abc",
+            "https://pan.quark.cn/s/1abc",
+            "https://www.alipan.com/s/abc",
+            "https://115.com/s/abc",
+            "https://terabox.com/s/1abc",
+            "https://MEGA.NZ/file/UPPER",          # host 大小写不敏感
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(chrome_client.is_cloud_drive_url(url))
+
+    def test_non_cloud_not_matched(self):
+        from tg_userbot import chrome_client
+        for url in ("https://youtube.com/watch?v=x",
+                    "https://example.com/file.zip",
+                    "https://t.me/c/1/2",
+                    "not a url", ""):
+            self.assertFalse(chrome_client.is_cloud_drive_url(url), url)
+
+
+class OpenVisibleTest(unittest.TestCase):
+    def test_open_uses_google_chrome(self):
+        import subprocess
+        from tg_userbot import chrome_client
+        with mock.patch.object(subprocess, "run") as run:
+            chrome_client.open_in_visible_chrome("https://mega.nz/file/a#K")
+        args = run.call_args[0][0]
+        self.assertEqual(args[0], "open")
+        self.assertIn("Google Chrome", args)
+        self.assertIn("https://mega.nz/file/a#K", args)

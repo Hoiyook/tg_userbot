@@ -316,9 +316,37 @@ class PendingResendButtonTest(_MlinksDbBase):
     """待办重复发送也挂 ✅ 按钮（2026-09-17 用户要求）。"""
 
     def test_resend_pending_has_button(self):
-        manual_links.observe("https://mega.nz/file/a#K1")
-        reply, buttons = manual_links.observe("https://mega.nz/file/a#K1")
+        manual_links.observe("https://example.com/f.zip")   # 非云盘：仅 ✅
+        reply, buttons = manual_links.observe("https://example.com/f.zip")
         self.assertIn("已在记录中", reply)
         flat = [b for row in buttons for b in row]
         self.assertEqual(len(flat), 1)           # ✅ 可点
         self.assertIn("✅", flat[0].text)
+
+
+class CloudOpenButtonTest(_MlinksDbBase):
+    """网盘链接挂 🌐 在Chrome打开 按钮（mlink_open → 可见打开）。"""
+
+    def test_cloud_link_gets_open_button(self):
+        manual_links.observe("https://mega.nz/file/a#K1 我的备份")
+        reply, buttons = manual_links.observe("https://mega.nz/file/a#K1")
+        flat = [b for row in buttons for b in row]
+        open_btns = [b for b in flat if "🌐" in b.text]
+        self.assertEqual(len(open_btns), 1)
+        self.assertTrue(open_btns[0].data.startswith(b"m:mlink_open:"))
+
+    def test_non_cloud_no_open_button(self):
+        manual_links.observe("https://example.com/file.zip 普通文件")
+        reply, buttons = manual_links.observe("https://example.com/file.zip")
+        flat = [b for row in buttons for b in row]
+        self.assertFalse(any("🌐" in b.text for b in flat))
+
+    async def test_mlink_open_action(self):
+        from tg_userbot import bot
+        import subprocess
+        with mock.patch.object(subprocess, "run") as run:
+            text, buttons = await bot.handle_menu_action("mlink_open",
+                "https://mega.nz/file/a#K1")
+        args = run.call_args[0][0]
+        self.assertEqual(args[0], "open")
+        self.assertIn("已在 Chrome 打开", text)

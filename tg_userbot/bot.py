@@ -280,6 +280,14 @@ async def handle_menu_action(action, arg, event):
         return pawchive.manual_view_full()
     if action == "paw_done":
         return pawchive.manual_done_reply(arg)
+    if action == "mlink_open":
+        url = arg or ""
+        try:
+            manual_links.chrome_client.open_in_visible_chrome(url)
+            body = f"{manual_links.TEXT_PREFIX}\n🌐 已在 Google Chrome 打开（可见窗口）：\n{url}"
+        except Exception as e:
+            body = f"{manual_links.TEXT_PREFIX}\n❌ 打开失败：{e}"
+        return body, menu.back_home_buttons()
     if action == "mlink_view":
         view_text, rows = manual_links.links_view()
         rows = rows + [[Button.inline(
