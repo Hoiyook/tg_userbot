@@ -6,7 +6,8 @@
       ↓ 同源 API：创作者解析 → 帖子分页（o=50）→ 收藏对比（可选 Cookie）→ 外链提取
     帖子级落 SQLite（pawchive_posts/pawchive_files，schema v8，重复扫描幂等）
       ↓ pawchive_worker 逐帖领取
-    附件直链交给 Chrome Agent 串行下载 → COMPLETED / MANUAL（有外链）/ FAILED
+    附件直链由内置并发下载器下载（2026-09-15 起，早期经 Chrome Agent）
+    → COMPLETED / MANUAL（有外链）/ FAILED
 
 站点结构（2026-09-14 实测）：
     创作者   GET /api/v1/creators                  （q 参数无效→全量+本地过滤+缓存）
@@ -950,8 +951,8 @@ def _help_text():
         "  /paw cookie <Cookie> —— 保存会话 Cookie（用于收藏对比）\n"
         "  /paw csv <作者名> —— 导出直链清单 CSV 发到收藏夹\n"
         "  /paw 或 /paw status —— 状态总览\n\n"
-        "下载由 Chrome Agent 串行执行，落盘 "
-        f"{config.CHROME_DOWNLOAD_DIR}/Pawchive/<作者>/<帖子>/"
+        "下载由内置并发下载器执行，落盘 "
+        f"{config.DOWNLOAD_DIR}/Pawchive/<作者>/<帖子>/"
     )
 
 
