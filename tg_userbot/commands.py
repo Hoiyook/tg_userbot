@@ -348,9 +348,9 @@ async def handle_command(event, cmd_text):
     if queue.is_retry_command(cmd_text):
         parts = cmd_text.split(maxsplit=1)
         if len(parts) == 1:
-            await _reply(event, 
-                queue.format_retry_text(state.QUEUE), link_preview=False
-            )
+            view_text, buttons = queue.format_retry_view(state.QUEUE)
+            await _reply(event, view_text, buttons=buttons,
+                         link_preview=False)
         elif parts[1].strip().lower() == "all":
             n, over = queue.retry_all()
             msg = f"🔁 已重放全部待重试任务：{n} 条" if n                 else "🔁 待重试列表为空（或都在执行中）"

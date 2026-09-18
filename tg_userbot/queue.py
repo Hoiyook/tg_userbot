@@ -21,6 +21,8 @@ import time
 import uuid
 import asyncio
 
+from telethon import Button
+
 from . import state
 from . import notify
 from . import download
@@ -430,6 +432,45 @@ def format_queue_text(queue, page=1):
         "📥 下载队列", tasks, page,
         lambda i, r: f"{i}. {_queue_record_display(r)}",
     )
+
+
+def _origin_link(r):
+    """任务的原帖跳转链接；无原帖快照返回 None（收藏夹直发无公开链接）。"""
+    oc, om = r.get("origin_chat_id"), r.get("origin_msg_id")
+    try:
+        oc_i = int(oc) if oc is not None else None
+    except (TypeError, ValueError):
+        oc_i = None
+    if oc_i is not None and oc_i < -1000000000 and om:
+        return f"https://t.me/c/{str(oc_i).replace('-100', '', 1)}/{om}"
+    return None
+
+
+def format_retry_view(queue, page=1):
+    """/retry 视图：返回 (文本, URL 按钮行)。
+
+    文本与 format_retry_text 同款；有原帖快照的任务附 ↪ 原帖 URL 按钮
+    （代码块内的纯文本链接不可点，按钮才是真正可点的跳转入口）。"""
+    from .menu import encode_menu_data   # 函数内导入避免 menu↔本模块成环
+    retry = queue.get("retry", [])
+    if not retry:
+        return "🔁 待重试列表：空", []
+    text = format_retry_text(queue, page)
+    total = len(retry)
+    start = (min(max(1, page), max(1, (total + LIST_PAGE_SIZE - 1)
+               // LIST_PAGE_SIZE)) - 1) * LIST_PAGE_SIZE
+    page_items = retry[start:start + LIST_PAGE_SIZE]
+    url_rows = []
+    for r in page_items:
+        link = _origin_link(r)
+        if link:
+            name = str(r.get("final_name") or r.get("label") or "任务")
+            label = "✅ " + (name if len(name) <= 24 else name[:23] + "…")
+            url_rows.append([
+                Button.inline(label,
+                              encode_menu_data("retry_run", str(start + 1))),
+                Button.url("🔗 原帖", link)])
+    return text, url_rows
 
 
 def format_retry_text(queue, page=1):

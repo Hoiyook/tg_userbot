@@ -1122,3 +1122,33 @@ class RetryTraceAndFuseTest(unittest.TestCase):
                 mock.patch.object(queue, "spawn_execute") as sp:
             n = queue.replay_due()
         self.assertEqual(n, 1)
+
+
+class RetryViewButtonsTest(unittest.TestCase):
+    """/retry 视图带可点击的 ↪ 原帖 URL 按钮（代码块里的纯文本链接不可点）。"""
+
+    def setUp(self):
+        self.q = {"retry": [
+            {"id": "t1", "kind": "media", "final_name": "a.mp4",
+             "chat_id": 5452449426, "msg_id": 46598, "attempts": 3,
+             "origin_chat_id": -1001719225045, "origin_msg_id": 73658},
+            {"id": "t2", "kind": "media", "final_name": "b.mp4",
+             "chat_id": 5452449426, "msg_id": 46600, "attempts": 1},
+        ]}
+
+    def test_view_returns_url_button_for_origin(self):
+        text, buttons = queue.format_retry_view(self.q)
+        self.assertIn("a.mp4", text)
+        flat = [b for row in buttons for b in row]
+        url_btns = [b for b in flat if getattr(b, "url", None)]
+        self.assertEqual(len(url_btns), 1)     # 只有 t1 有原帖
+        self.assertEqual(url_btns[0].url,
+                         "https://t.me/c/1719225045/73658")
+
+    def test_command_dispatch_passes_buttons(self):
+        """commands 的 /retry 无参分支必须把按钮传给 _reply。"""
+        import inspect
+        from tg_userbot import commands
+        src = inspect.getsource(commands.handle_command)
+        seg = src.split('is_retry_command')[1][:600]
+        self.assertIn("format_retry_view", seg)
