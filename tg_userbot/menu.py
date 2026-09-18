@@ -44,6 +44,15 @@ def parse_menu_data(data):
         return ("unknown", None)
 
 
+def chrome_agent_load_tasks():
+    """Chrome Agent 的任务列表（menu 总览用；读失败返回空）。"""
+    from . import chrome_agent, config
+    try:
+        return chrome_agent.load_tasks(config.CHROME_TASKS_FILE)
+    except Exception:
+        return []
+
+
 def build_main_menu_text():
     """主菜单文本；头部拼一行实时状态，打开菜单即所见、0 次额外点击。"""
     from .stats import collect_stats  # 函数内引用：查台账要读日志/历史文件
@@ -55,9 +64,8 @@ def build_main_menu_text():
     today = collect_stats(1)
 
     lines = ["🤖菜单", ""]
-    if not (in_flight or pending or to_retry or today["success_count"]):
-        lines.append("✅ 空闲：暂无在途与排队任务")
-    else:
+    has_any = bool(in_flight or pending or to_retry or today["success_count"])
+    if has_any:
         lines.append(
             f"⏳ 在途 {in_flight} | 📥 待处理 {pending} | 🔁 待重试 {to_retry}"
         )
@@ -65,6 +73,35 @@ def build_main_menu_text():
             f"✅ 今日 {today['success_count']} 个 / "
             f"{format_size(today['success_bytes'])}"
         )
+    # 系统级总览（2026-09-18 UX Round1 P0-1）：普通下载空闲时，其它子系统
+    # 在工作也要看得见。数据全部来自既有可靠统计；某子系统不可用就跳过，
+    # 绝不编数字。
+    sys_lines = []
+    try:
+        from . import runtime_db
+        counts = runtime_db.pawchive_status_counts()
+        paw_proc = counts.get(runtime_db.PAW_POST_PROCESSING, 0)
+        paw_pend = counts.get(runtime_db.PAW_POST_PENDING, 0)
+        if paw_proc or paw_pend:
+            sys_lines.append(f"🐾 Pawchive：处理 {paw_proc} / 待 {paw_pend}")
+        pend = runtime_db.count_pending_listener_tasks()
+        if pend:
+            sys_lines.append(f"📡 标签监听：待处理 {pend}")
+    except Exception:
+        pass                      # 总览失败绝不挡菜单
+    try:
+        from . import chrome_client
+        tasks = chrome_agent_load_tasks()
+        active = [t for t in tasks
+                  if t.get("status") not in ("SUCCESS", "FAILED", "CANCELLED")]
+        if active:
+            sys_lines.append(f"🌐 Chrome：进行中 {len(active)}")
+    except Exception:
+        pass
+    if sys_lines:
+        lines.extend(sys_lines)
+    if not (has_any or sys_lines):
+        lines.append("✅ 空闲：暂无在途与排队任务")
     lines += [
         "",
         "点击按钮操作，结果会更新在这条消息里。",
@@ -90,15 +127,15 @@ def main_menu_buttons():
         [Button.inline("📊 状态", encode_menu_data("status")),
          Button.inline("📊 台账", encode_menu_data("stats"))],
         [Button.inline("📈 进度", encode_menu_data("progress")),
-         Button.inline("📜 记录", encode_menu_data("done"))],
+         Button.inline("🔍 查询", encode_menu_data("find"))],
         # 管理
         [Button.inline("📥 队列", encode_menu_data("queue")),
          Button.inline("🔁 待重试", encode_menu_data("retry"))],
         [Button.inline("🧵 并发", encode_menu_data("thread")),
-         Button.inline("📋 白名单", encode_menu_data("wl"))],
-        # 工具
-        [Button.inline("🔍 查询", encode_menu_data("find")),
+         Button.inline("📜 记录", encode_menu_data("done"))],
+        [Button.inline("📋 白名单", encode_menu_data("wl")),
          Button.inline("📡 监听", encode_menu_data("listen"))],
+        # 工具
         [Button.inline("🛡 去重", encode_menu_data("dedup")),
          Button.inline("🍪 Cookie", encode_menu_data("cookie"))],
         [Button.inline("🧹 Caption", encode_menu_data("capf")),

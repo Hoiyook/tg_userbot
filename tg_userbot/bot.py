@@ -92,6 +92,29 @@ async def register_bot_commands(client):
     logger.info(f"🤖 bot 命令面板已注册：{len(BOT_COMMANDS)} 个命令")
 
 
+def _clear_input_states():
+    """清掉全部输入窗口等待状态（open_input_window 与 ❌ 取消共用）。"""
+    state.COOKIE_INPUT_UNTIL = 0.0
+    state.FIND_INPUT_UNTIL = 0.0
+    state.CAPTION_INPUT_UNTIL = 0.0
+    state.CAPTION_INPUT_MODE = ""
+    state.LISTEN_INPUT_UNTIL = 0.0
+    state.LISTEN_INPUT_STEP = ""
+    state.WL_INPUT_UNTIL = 0.0
+    state.SQLT_INPUT_UNTIL = 0.0
+    state.SHELL_INPUT_UNTIL = 0.0
+    state.UP_INPUT_UNTIL = 0.0
+    state.PAW_INPUT_UNTIL = 0.0
+    state.PAW_INPUT_STEP = ""
+    state.CMDT_INPUT_UNTIL = 0.0
+
+
+def input_cancel_buttons():
+    """输入窗口提示消息的 ❌ 取消按钮（挂回主菜单导航）。"""
+    return [[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))],
+            menu.back_home_buttons()]
+
+
 def open_input_window(kind):
     """开一个「等待下一条文本」的输入窗口，并关掉其它所有窗口。
 
@@ -211,7 +234,8 @@ async def handle_menu_action(action, arg, event):
             "回补其后消息（受 Worker 节流控制，逐步转发）。\n\n"
             f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
-            menu.back_home_buttons(),
+            [[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))],
+             Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
         )
     if action == "wl_scan":
         return (wl_scan.summary_text(await wl_scan.scan_all(manual=True)),
@@ -228,7 +252,8 @@ async def handle_menu_action(action, arg, event):
             "名字 ≤16 字符（中文/字母/数字/下划线）；同名即覆盖。\n"
             f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
-            menu.back_home_buttons(),
+            [[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))],
+             Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
         )
     if action == "sqlt_del":
         ok, msg = sql_templates.delete(arg or "")
@@ -259,7 +284,7 @@ async def handle_menu_action(action, arg, event):
             "例：SillyTeshii\n\n"
             f"{config.PAWCHIVE_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
-            menu.back_home_buttons(),
+            input_cancel_buttons(),
         )
     if action == "paw_cookie":
         open_input_window("paw_cookie")
@@ -270,7 +295,7 @@ async def handle_menu_action(action, arg, event):
             "用于 /paw plan 对比收藏；不设置也能扫描，只是无法区分已收藏。\n\n"
             f"{config.PAWCHIVE_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
-            menu.back_home_buttons(),
+            input_cancel_buttons(),
         )
     if action == "paw_pause":
         return pawchive.pause_reply(), pawchive.menu_buttons()
@@ -280,6 +305,11 @@ async def handle_menu_action(action, arg, event):
         return pawchive.manual_view_full()
     if action == "paw_done":
         return pawchive.manual_done_reply(arg)
+    if action == "input_cancel":
+        # ❌ 取消：清全部输入等待状态（互斥保证同时只有一个，全清安全）
+        _clear_input_states()
+        return ("❌ 已取消当前输入操作\n\n" + menu.build_main_menu_text(),
+                menu.main_menu_buttons())
     if action == "mlink_open":
         # arg 两种形态：行 id（新版按钮，从 DB 反查 URL）或直接 URL
         #（旧消息上的旧格式按钮——parse_menu_data 兼容含冒号 URL 后可点）
@@ -375,7 +405,8 @@ async def handle_menu_action(action, arg, event):
             "例：ls -la /Volumes/V1/downloads\n\n"
             f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
-            menu.back_home_buttons(),
+            [[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))],
+             Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
         )
     if action == "up":
         # 打开视图这一刻快照最近文件：按钮只带序号，路径放不进回调数据
@@ -390,7 +421,8 @@ async def handle_menu_action(action, arg, event):
             "带空格不必加引号）。\n\n"
             f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
-            menu.back_home_buttons(),
+            [[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))],
+             Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
         )
     if action == "up_file":
         path, err = upload.candidate_at(arg)
@@ -511,7 +543,8 @@ async def handle_menu_action(action, arg, event):
             "🔍 请直接发送要查询的关键字（发到本对话）。\n\n"
             f"{config.FIND_INPUT_WINDOW_SECONDS} 秒内有效，"
             "超时请重新点【🔍 查询】。发送 / 开头的命令可取消。",
-            menu.back_home_buttons(),
+            [[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))],
+             Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
         )
     if action == "cookie":
         return menu.cookie_status_text(), menu.cookie_menu_buttons()
@@ -522,7 +555,7 @@ async def handle_menu_action(action, arg, event):
             f"⚠️ 你发的这条消息会被立即删除；"
             f"{config.COOKIE_INPUT_WINDOW_SECONDS} 秒内有效，"
             "超时请重新点【✏️ 更新】。发送 / 开头的命令可取消。",
-            menu.back_home_buttons(),
+            input_cancel_buttons(),
         )
     if action == "cookie_clear":
         err = config.save_douyin_cookie("")

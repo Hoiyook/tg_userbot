@@ -1233,3 +1233,37 @@ class MainMenuLayoutTest(unittest.TestCase):
     def test_no_duplicate_entries(self):
         flat = [t for row in self.texts for t in row]
         self.assertEqual(len(flat), len(set(flat)))
+
+
+class InputCancelTest(unittest.IsolatedAsyncioTestCase):
+    """❌ 取消按钮：input_cancel 动作清全部输入等待状态（P0-3 验收）。"""
+
+    async def test_input_cancel_clears_all_states(self):
+        from tg_userbot import bot as bot_mod
+        from tg_userbot import state as st
+        saved = (st.COOKIE_INPUT_UNTIL, st.SHELL_INPUT_UNTIL,
+                 st.UP_INPUT_UNTIL, st.LISTEN_INPUT_UNTIL)
+        st.COOKIE_INPUT_UNTIL = 9e9
+        st.SHELL_INPUT_UNTIL = 9e9
+        st.UP_INPUT_UNTIL = 9e9
+        st.LISTEN_INPUT_UNTIL = 9e9
+        self.addCleanup(setattr, st, "COOKIE_INPUT_UNTIL", saved[0])
+        self.addCleanup(setattr, st, "SHELL_INPUT_UNTIL", saved[1])
+        self.addCleanup(setattr, st, "UP_INPUT_UNTIL", saved[2])
+        self.addCleanup(setattr, st, "LISTEN_INPUT_UNTIL", saved[3])
+
+        old_me = st.MY_ID
+        st.MY_ID = 123
+        self.addCleanup(setattr, st, "MY_ID", old_me)
+        ev = mock.Mock()
+        ev.data = b"m:input_cancel"
+        ev.chat_id = 123
+        ev.answer = mock.AsyncMock()
+        ev.edit = mock.AsyncMock()
+        await bot_mod.bot_callback_handler(ev)
+
+        self.assertEqual(st.COOKIE_INPUT_UNTIL, 0.0)
+        self.assertEqual(st.SHELL_INPUT_UNTIL, 0.0)
+        self.assertEqual(st.UP_INPUT_UNTIL, 0.0)
+        self.assertEqual(st.LISTEN_INPUT_UNTIL, 0.0)
+        self.assertTrue(ev.edit.called)              # 原地确认已取消

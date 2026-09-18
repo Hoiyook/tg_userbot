@@ -13,14 +13,21 @@ from .naming import format_size
 
 
 def status_text():
-    """生成 /status 回复文本。"""
+    """生成 /status 回复文本。健康灯随实际连接状态变化（2026-09-18 修复：
+    此前固定 🟢「状态正常」，断连时出现「绿色正常 + 连接断开」的自相矛盾）。"""
     try:
         connected = bool(state.client and state.client.is_connected())
     except Exception:
         connected = False
+    if connected:
+        head = "🟢 TG Userbot 运行正常"
+        conn_line = "连接：正常"
+    else:
+        head = "🔴 TG Userbot 连接异常"
+        conn_line = "连接：断开"
     return (
-        "🟢 TG Userbot 状态正常\n\n"
-        f"连接：{'正常' if connected else '断开'}\n"
+        f"{head}\n\n"
+        f"{conn_line}\n"
         f"用户 ID：{state.MY_ID}\n"
         f"保存目录：{DOWNLOAD_DIR}\n"
         f"日志：{LOG_FILE}"
@@ -30,7 +37,8 @@ def status_text():
 def progress_text():
     """生成 /progress 回复文本。"""
     if not state.ACTIVE_DOWNLOADS:
-        return "📊 当前没有进行中的下载"
+        return ("📊 当前没有进行中的 Telegram 下载"
+                "（Pawchive 见 🐾 面板）")
     lines = []
     for info in sorted(
         state.ACTIVE_DOWNLOADS.values(), key=lambda x: x["filename"]
