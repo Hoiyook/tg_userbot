@@ -765,6 +765,10 @@ async def _enqueue_me(message):
     origin = await resolve_origin_snapshot(message)
     # 目录模式标注：/A#标注 → 标注拼 # 进文件名 + 落 原目录/A/（2026-09-16）
     user_label, source_subdir = split_label_subdir(user_label or "")
+    # 溯源快照：频道原帖的 peer/msg（2026-09-18）——/retry 视图生成
+    # t.me 跳转链接，死文件可回原帖重新转发救回
+    origin_chat = origin.get("peer_id") if origin else None
+    origin_msg = origin.get("channel_post") if origin else None
     await enqueue_media(
         message, state.MY_ID, _origin_folder(origin),
         album_caption=album_caption,
@@ -772,13 +776,16 @@ async def _enqueue_me(message):
         parent_date=_origin_date(origin),
         parent_caption=_origin_caption(origin),
         source_subdir=source_subdir,
+        origin_chat_id=origin_chat,
+        origin_msg_id=origin_msg,
     )
 
 
 async def enqueue_media(message, chat_id, source_override, source_link=None,
                         album_caption=None, user_label=None, src=None,
                         parent_date=None, parent_caption=None,
-                        source_subdir=None):
+                        source_subdir=None, origin_chat_id=None,
+                        origin_msg_id=None):
     """把一条媒体消息入队下载（持久化，重启不丢任务）。
 
     source_link 显式传入时覆盖默认的来源链接；album_caption 为相册无文字
@@ -813,6 +820,10 @@ async def enqueue_media(message, chat_id, source_override, source_link=None,
         # 目录模式标注（/A#x）：落盘 = 原目录/source_subdir/...（payload
         # 自由字段，旧任务无此键零影响）
         record["source_subdir"] = source_subdir
+    if origin_chat_id and origin_msg_id:
+        # 溯源快照：频道原帖定位（/retry 视图的 ↪ 跳转链接数据源）
+        record["origin_chat_id"] = origin_chat_id
+        record["origin_msg_id"] = origin_msg_id
     # 返回是否真正入队（False = 持久化失败未入队，任务交上游恢复路径）
     return await queue.enqueue_and_start(record, src=src)
 

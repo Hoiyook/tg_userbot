@@ -438,22 +438,28 @@ def format_retry_text(queue, page=1):
     if not retry:
         return "🔁 待重试列表：空"
     def _render(i, r):
-        # 溯源：频道/超群来源（负 id）生成 t.me 跳转链接——点开即回原消息，
-        # 死文件可手动重发新引用救回（2026-09-18 用户需求）
-        chat_id = r.get("chat_id")
+        # 溯源（2026-09-18）：优先用频道原帖快照（origin_chat_id/origin_msg_id
+        # ——收藏夹副本的真正出处），生成 t.me 跳转链接，死文件可回原帖重新
+        # 转发救回；收藏夹直发（无原帖）回退为提示消息号。
         link = ""
+        oc, om = r.get("origin_chat_id"), r.get("origin_msg_id")
         try:
-            cid = int(chat_id) if chat_id is not None else None
+            oc_i = int(oc) if oc is not None else None
         except (TypeError, ValueError):
-            cid = None
-        if cid is not None and cid < -1000000000 and r.get("msg_id"):
-            link = (f"  ↪ 原消息：https://t.me/c/"
-                    f"{str(cid).replace('-100', '', 1)}/{r['msg_id']}\n")
-        return (f"{i}. {_queue_record_display(r)}"
-                f"（已尝试 {r.get('attempts', 0)} 次）\n{link}"
-                if link else
-                f"{i}. {_queue_record_display(r)}"
+            oc_i = None
+        if oc_i is not None and oc_i < -1000000000 and om:
+            link = (f"  ↪ 原帖：https://t.me/c/"
+                    f"{str(oc_i).replace('-100', '', 1)}/{om}\n")
+        else:
+            try:
+                if int(r.get("chat_id") or 0) > 0 and r.get("msg_id"):
+                    link = (f"  ↪ 收藏夹消息 #{r['msg_id']}"
+                            "（打开收藏夹按日期可找到）\n")
+            except (TypeError, ValueError):
+                pass
+        base = (f"{i}. {_queue_record_display(r)}"
                 f"（已尝试 {r.get('attempts', 0)} 次）")
+        return f"{base}\n{link}" if link else base
 
     return _paged_lines(
         "🔁 待重试列表", retry, page,

@@ -75,14 +75,17 @@ class _EnqueueMeHarness:
     def __init__(self):
         self.labels = []
         self.subdirs = []
+        self.origins = []
 
     def patch(self, grace):
         async def fake_enqueue(message, chat_id, source_override,
                                source_link=None, album_caption=None,
                                user_label=None, src=None, parent_date=None,
-                               parent_caption=None, source_subdir=None):
+                               parent_caption=None, source_subdir=None,
+                               origin_chat_id=None, origin_msg_id=None):
             self.labels.append(user_label)
             self.subdirs.append(source_subdir)
+            self.origins.append((origin_chat_id, origin_msg_id))
 
         return mock.patch.multiple(
             "tg_userbot.app",
@@ -189,7 +192,8 @@ class SubdirEnqueueTest(unittest.IsolatedAsyncioTestCase):
         async def fake_enqueue(message, chat_id, source_override,
                                source_link=None, album_caption=None,
                                user_label=None, src=None, parent_date=None,
-                               parent_caption=None, source_subdir=None):
+                               parent_caption=None, source_subdir=None,
+                               origin_chat_id=None, origin_msg_id=None):
             captured["user_label"] = user_label
             captured["subdir"] = source_subdir
 
