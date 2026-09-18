@@ -281,10 +281,14 @@ async def handle_menu_action(action, arg, event):
     if action == "paw_done":
         return pawchive.manual_done_reply(arg)
     if action == "mlink_open":
-        url = arg or ""
+        # arg 是台账行 id：URL 从 DB 反查（回调数据 ≤64 字节装不下长 URL）
+        row = runtime_db.get_manual_link(int(arg)) if (arg or "").isdigit() else None
+        if not row:
+            return f"{manual_links.TEXT_PREFIX}\n❌ 该条链接记录已不存在", []
         try:
-            manual_links.chrome_client.open_in_visible_chrome(url)
-            body = f"{manual_links.TEXT_PREFIX}\n🌐 已在 Google Chrome 打开（可见窗口）：\n{url}"
+            manual_links.chrome_client.open_in_visible_chrome(row["url"])
+            body = (f"{manual_links.TEXT_PREFIX}\n🌐 已在 Google Chrome 打开"
+                    f"（可见窗口）：\n{row['url']}")
         except Exception as e:
             body = f"{manual_links.TEXT_PREFIX}\n❌ 打开失败：{e}"
         return body, menu.back_home_buttons()

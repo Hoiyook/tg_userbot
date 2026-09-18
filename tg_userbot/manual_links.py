@@ -117,9 +117,10 @@ def observe(text, now=None):
                 "✅ " + _short(row["url"]),
                 encode_menu_data("mlink_done", str(row["id"])))]
             if chrome_client.is_cloud_drive_url(row["url"]):
+                # 回调数据 ≤64 字节：只带行 id，URL 由 handler 反查 DB
                 row_btns.append(Button.inline(
                     "🌐 在Chrome打开",
-                    encode_menu_data("mlink_open", row["url"])))
+                    encode_menu_data("mlink_open", str(row["id"]))))
             rows.append(row_btns)
     return "\n".join(lines), rows
 

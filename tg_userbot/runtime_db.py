@@ -2372,6 +2372,14 @@ def manual_link_done(link_id, now=None):
     return _write(do, f"外链台账标记完成（{link_id}）")
 
 
+def get_manual_link(link_id):
+    """按行 id 取台账行（找不到返回 None）。"""
+    row = _read(lambda c: _execute(
+        c, "SELECT * FROM manual_links WHERE id=?", (int(link_id),)
+    ).fetchone(), f"取外链台账行（{link_id}）")
+    return dict(row) if row else None
+
+
 def list_manual_links(status=None, limit=50):
     """台账行列表：status=None 全量按 id 降序（最新在前）。"""
     if status:
