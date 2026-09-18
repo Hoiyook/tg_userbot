@@ -26,10 +26,14 @@ def encode_menu_data(action, arg=None):
 
 
 def parse_menu_data(data):
-    """解析回调数据，返回 (动作, 参数)；无法识别返回 ("unknown", None)。"""
+    """解析回调数据，返回 (动作, 参数)；无法识别返回 ("unknown", None)。
+
+    arg 用 **split(":", 2)**（最多切两刀）：mlink_open 的参数可能是带
+    // 的完整 URL——全切会把 https:// 劈成 4 段误判 unknown（2026-09-18
+    实测：旧消息上的 🌐 按钮点了没反应即此因）。"""
     try:
-        parts = data.decode("utf-8").split(":")
-        if len(parts) < 2 or len(parts) > 3 or parts[0] != "m":
+        parts = data.decode("utf-8").split(":", 2)
+        if len(parts) < 2 or parts[0] != "m":
             return ("unknown", None)
         action = parts[1]
         arg = parts[2] if len(parts) == 3 else None

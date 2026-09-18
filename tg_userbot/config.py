@@ -656,7 +656,7 @@ MENU_ACTIONS = (
     "paw", "paw_status", "paw_search", "paw_cookie", "paw_pause",
     "paw_resume", "paw_manual", "paw_done", "paw_archive", "paw_pick",
     "paw_csv",
-    "mlink_done", "mlink_view",
+    "mlink_done", "mlink_open", "mlink_view",
     "paw_retry_all",
     "paw_post", "paw_find",
     "cmdt", "cmdt_add", "cmdt_run", "cmdt_del",

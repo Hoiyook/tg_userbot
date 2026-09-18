@@ -281,14 +281,24 @@ async def handle_menu_action(action, arg, event):
     if action == "paw_done":
         return pawchive.manual_done_reply(arg)
     if action == "mlink_open":
-        # arg 是台账行 id：URL 从 DB 反查（回调数据 ≤64 字节装不下长 URL）
-        row = runtime_db.get_manual_link(int(arg)) if (arg or "").isdigit() else None
-        if not row:
-            return f"{manual_links.TEXT_PREFIX}\n❌ 该条链接记录已不存在", []
+        # arg 两种形态：行 id（新版按钮，从 DB 反查 URL）或直接 URL
+        #（旧消息上的旧格式按钮——parse_menu_data 兼容含冒号 URL 后可点）
+        if (arg or "").isdigit():
+            row = runtime_db.get_manual_link(int(arg))
+            url = row["url"] if row else None
+            if not url:
+                return (f"{manual_links.TEXT_PREFIX}\n❌ 该条链接记录已不存在",
+                        [])
+        elif arg and arg.startswith("http"):
+            url = arg
+        else:
+            url = None
+        if not url:
+            return f"{manual_links.TEXT_PREFIX}\n❌ 无效的链接", []
         try:
-            manual_links.chrome_client.open_in_visible_chrome(row["url"])
+            manual_links.chrome_client.open_in_visible_chrome(url)
             body = (f"{manual_links.TEXT_PREFIX}\n🌐 已在 Google Chrome 打开"
-                    f"（可见窗口）：\n{row['url']}")
+                    f"（可见窗口）：\n{url}")
         except Exception as e:
             body = f"{manual_links.TEXT_PREFIX}\n❌ 打开失败：{e}"
         return body, menu.back_home_buttons()
