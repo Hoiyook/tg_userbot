@@ -386,7 +386,7 @@ ORIGIN_FAILURES_FILE = os.path.join(RUNTIME_DIR, "origin_failures.jsonl")
 # 原地编辑，同 Reporter 模式）每 N 秒刷新一次；每完成 M 帖发一次里程碑汇总
 PAWCHIVE_PANEL_INTERVAL_SECONDS = 60
 # 多帖并发：worker 同时处理的帖子数上限（帖内文件并发仍由 /thread 信号量总控）
-PAWCHIVE_MAX_INFLIGHT_POSTS = 4
+PAWCHIVE_MAX_INFLIGHT_POSTS = 8  # 4→8（2026-09-18：CDN 每 53s 掐断流，更多并发流摊平吞吐）
 PAWCHIVE_MILESTONE_POSTS = 50
 # --- 评论跟进（2026-09-12）---
 # 命中标签的帖子会进「关注列表」，之后按天跟进它的评论区并取回新出现的媒体
