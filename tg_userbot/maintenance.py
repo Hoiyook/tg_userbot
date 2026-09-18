@@ -64,8 +64,20 @@ def daily_maintenance():
     except Exception as e:
         logger.warning(f"🗄 每日 DB 备份失败：{e}")
     try:
-        removed = runtime_db.download_events_trim(EVENTS_TRIM_MAX)
+        # 维护在 to_thread 线程里跑：不能复用主线程的 sqlite 连接
+        #（check_same_thread），这里开独立连接直写。业务连接若同时写
+        # 也不冲突——WAL + busy_timeout 兜住。
+        conn = sqlite3.connect(runtime_db.db_path(), timeout=10)
+        try:
+            cur = conn.execute(
+                "DELETE FROM download_events WHERE id NOT IN "
+                "(SELECT id FROM download_events ORDER BY id DESC LIMIT ?)",
+                (EVENTS_TRIM_MAX,))
+            conn.commit()
+            removed = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        finally:
+            conn.close()
         if removed:
             logger.info(f"🗄 事件流已裁剪 {removed} 条（封顶 {EVENTS_TRIM_MAX}）")
-    except runtime_db.DbUnavailable as e:
+    except sqlite3.Error as e:
         logger.warning(f"🗄 事件流裁剪失败：{e}")

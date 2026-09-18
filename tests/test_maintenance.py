@@ -71,13 +71,15 @@ class BackupTest(_DbBase):
 
 
 class TrimPeriodicTest(_DbBase):
-    """R2：事件流周期裁剪走 runtime_db.download_events_trim（已有）。"""
+    """R2：事件流周期裁剪——maintenance 每日入口直写独立连接（线程安全）。"""
 
-    def test_trim_callable_and_effective(self):
+    def test_daily_maintenance_trims(self):
+        import time as _t
         for i in range(12):
-            runtime_db.download_event_insert("RUNNING", task_id="a" * 32)
-        removed = runtime_db.download_events_trim(4)
-        self.assertEqual(removed, 8)
+            runtime_db.download_event_insert("RUNNING", task_id="a" * 32,
+                                             ts=int(_t.time()) + i)
+        with mock.patch.object(maintenance, "EVENTS_TRIM_MAX", 4):
+            maintenance.daily_maintenance()   # 含备份+裁剪，失败只告警
         self.assertEqual(runtime_db.download_events_count(), 4)
 
 
