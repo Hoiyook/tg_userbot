@@ -84,9 +84,20 @@ class TrimPeriodicTest(_DbBase):
 
 
 class RetryAllCapTest(unittest.IsolatedAsyncioTestCase):
-    """R4：retry_all 对超上限任务的处理（跳过并计入超限数）。"""
+    """2026-09-20 用户决策：取消次数上限——全部重放（over 恒 0）。"""
 
-    async def test_retry_all_skips_over_cap(self):
+    def setUp(self):
+        self._old = (state.QUEUE, state.QUEUE_LOCK, state.EXECUTING)
+        state.QUEUE = {"tasks": [], "retry": []}
+        state.QUEUE_LOCK = asyncio.Lock()
+        state.EXECUTING = set()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        state.QUEUE, state.QUEUE_LOCK, state.EXECUTING = self._old
+
+    async def test_retry_all_replays_all(self):
+        """2026-09-20 用户决策：取消次数上限——全部重放（over 恒 0）。"""
         self._old = (state.QUEUE, state.QUEUE_LOCK, state.EXECUTING)
         state.QUEUE = {"tasks": [], "retry": [
             {"id": "ok1", "attempts": 2, "label": "正常"},
@@ -98,12 +109,9 @@ class RetryAllCapTest(unittest.IsolatedAsyncioTestCase):
         spawned = []
         with mock.patch.object(queue_mod, "spawn_execute",
                                side_effect=lambda r: spawned.append(r["id"])):
-            triggered, over = queue_mod.retry_all()
-        self.assertEqual(spawned, ["ok1"])
-        self.assertEqual((triggered, over), (1, 1))
-
-    def _restore(self):
-        state.QUEUE, state.QUEUE_LOCK, state.EXECUTING = self._old
+            n, over = queue_mod.retry_all()
+        self.assertEqual(spawned, ["ok1", "dead1"])
+        self.assertEqual((n, over), (2, 0))
 
 
 class RollbackGuardTest(_DbBase):

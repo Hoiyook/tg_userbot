@@ -251,9 +251,9 @@ EXPORT_RACE_EXTRA_RETRIES = 6
 AUTO_RETRY_SWEEP_SECONDS = 60      # 后台扫描间隔（秒）
 AUTO_RETRY_BASE_DELAY = 60         # 首次退避（秒）
 AUTO_RETRY_MAX_DELAY = 1800        # 退避封顶（30 分钟）——坏窗口内不至于空转
-# 自动重试次数上限：attempts 是「该任务被执行的次数」（首次下载算 1，每次失败 +1，
-# 手动 /retry 也累加）。超过此值不再自动重放，只能手动救——防无限空转。
-AUTO_RETRY_MAX_TIMES = 10
+# 自动重试次数上限已移除（2026-09-20 用户决策）：死文件由
+# AUTO_REPLAY_FUSE_SECONDS 时间熔断兜底（每 6h 至多一次自动重放），
+# 流量代价可控，无需按次数封顶。
 # 死文件熔断（2026-09-18）：任务「快速失败」（起步即败、无任何字节进账，
 # 如 Request unsuccessful / 文件对象损坏）后在此窗口内不再被 AUTO_REPLAY
 # 自动重放——死文件重试多少次都一样，只会烧流量与日志。冷却过后恢复自动

@@ -716,27 +716,25 @@ class AutoReplayDueTest(unittest.IsolatedAsyncioTestCase):
         state.EXECUTING.add(rec["id"])
         self.assertEqual(self._replay(now=1000.0), 0)
 
-    # ---------- 自动重试次数上限 ----------
+    # ---------- 自动重试次数上限（2026-09-20 用户决策：取消次数上限）----------
+    # 死文件由 AUTO_REPLAY_FUSE_SECONDS（6h 时间熔断）兜底，不再按次数封顶。
 
-    def test_stops_auto_replay_past_attempt_cap(self):
+    def test_auto_replay_past_former_cap_still_replays(self):
+        """曾超旧上限（10 次）的任务照常自动重放——次数上限已取消。"""
         self._set_idle_workers(9)
-        cap = config.AUTO_RETRY_MAX_TIMES
-        self._to_retry("at-cap.mp4", attempts=cap, due=500.0)       # 仍可放
-        self._to_retry("over-cap.mp4", attempts=cap + 1, due=500.0)  # 超限不放
-        self.assertEqual(self._replay(now=1000.0), 1)
-        self.assertEqual(self.spawned[0]["label"], "at-cap.mp4")
-        # 超限任务仍留在榜上，等人工 /retry
-        self.assertEqual(len(state.QUEUE["retry"]), 2)
+        self._to_retry("over-former-cap.mp4", attempts=99, due=500.0)
+        n = self._replay(now=1000.0)
+        self.assertEqual(n, 1)
+        self.assertEqual(self.spawned[0]["label"], "over-former-cap.mp4")
 
-    def test_manual_retry_all_ignores_backoff_and_cap(self):
-        """手动路径不受退避与上限约束（退避只约束自动路径）。"""
+    def test_manual_retry_all_ignores_backoff(self):
+        """手动路径不受退避约束；次数上限已取消 → 全部重放。"""
         self._to_retry("over-cap.mp4", attempts=99, due=9e9)
         with mock.patch.object(queue, "spawn_execute",
                                lambda r: self.spawned.append(r)):
             n, over = queue.retry_all()
-        # R4（2026-09-18）：retry_all 不再强救超上限死任务（/retry <序号> 单条强救）
-        self.assertEqual((n, over), (0, 1))
-        self.assertEqual(len(self.spawned), 0)
+        self.assertEqual((n, over), (1, 0))
+        self.assertEqual(len(self.spawned), 1)
 
     # ---------- 自动重放事件（供 Reporter 与用户区分「自动」与「手动」）----------
 

@@ -33,7 +33,6 @@ from . import config
 from .config import (
     AUTO_RETRY_BASE_DELAY,
     AUTO_RETRY_MAX_DELAY,
-    AUTO_RETRY_MAX_TIMES,
     AUTO_REPLAY_FUSE_SECONDS,
     QUEUE_FETCH_TIMEOUT,
     QUEUE_FILE,
@@ -511,21 +510,17 @@ def format_retry_text(queue, page=1):
 def retry_all():
     """重放待重试列表的全部任务；正在执行中的跳过。
 
-    超过 AUTO_RETRY_MAX_TIMES 的死任务**跳过不重放**（R4：永久性失败重放
-    只烧流量并脏化台账；要强行救它们用 /retry <序号> 单条）。重放不改列表
-    归属：记录留在 retry，成功/失败由 execute_queued_task 收尾按 in_retry
-    更新。返回 (触发条数, 超限跳过条数)。"""
+    2026-09-20 用户决策：**取消次数上限**——全部重放（over 恒 0，返回值
+    兼容保留）；死文件由 AUTO_REPLAY_FUSE_SECONDS 时间熔断兜底（每 6h
+    至多一次）。重放不改列表归属：记录留在 retry，成功/失败由
+    execute_queued_task 收尾按 in_retry 更新。返回 (触发条数, 超限=0)。"""
     triggered = 0
-    over_cap = 0
     for record in list(state.QUEUE["retry"]):
         if record.get("id") in state.EXECUTING:
             continue
-        if record.get("attempts", 0) > AUTO_RETRY_MAX_TIMES:
-            over_cap += 1
-            continue
         spawn_execute(record)
         triggered += 1
-    return triggered, over_cap
+    return triggered, 0
 
 
 def _idle_capacity():
@@ -547,8 +542,8 @@ def replay_due(now=None):
     """重放 retry 榜里「已到退避期」的任务，本轮最多放空闲 worker 数条。
 
     与 retry_all 的分工：retry_all 是手动入口（全放、不看退避/上限）；
-    本函数只服务后台扫描。跳过三类记录：执行中、超过自动重试次数上限
-    （AUTO_RETRY_MAX_TIMES，此后只能人工 /retry）、退避未到期。
+    本函数只服务后台扫描。跳过两类记录：执行中、死文件熔断窗口内
+    （AUTO_REPLAY_FUSE_SECONDS，每 6h 至多自动重放一次）。
     旧记录没有 next_retry_at 字段 → 视为已到期（功能上线前入的榜，重启即自愈）。
 
     「查到期 → spawn」之间没有 await：单线程事件循环内不会被抢占，而 EXECUTING
@@ -563,11 +558,11 @@ def replay_due(now=None):
             break
         if record.get("id") in state.EXECUTING:
             continue
-        if record.get("attempts", 0) > AUTO_RETRY_MAX_TIMES:
-            continue
         # 死文件熔断（2026-09-18）：快速失败（起步即败零进度）后 6h 内
         # 不再自动重放——死文件重试多少次都一样。冷却过后恢复（也许上游
         # 恢复了）；/retry 单条强救不受熔断影响。
+        # 2026-09-20 用户决策：取消次数上限（AUTO_RETRY_MAX_TIMES 移除），
+        # 死文件由时间熔断兜底（每 6h 至多一次自动重放）。
         fused_at = _FAIL_FAST_MARK.get(record.get("id"))
         if (fused_at is not None
                 and now_mono - fused_at < AUTO_REPLAY_FUSE_SECONDS):
