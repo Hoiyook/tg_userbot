@@ -331,12 +331,14 @@ def _file_entry(att):
             "filename": name}
 
 
-def build_scan_records(creator, posts, faved_ids=None, scope="notfaved"):
+def build_scan_records(creator, posts, faved_ids=None, scope="notfaved",
+                       since=None):
     """帖子列表 → 入库记录；只保留目标范围内**有可下载直链或有外链**的帖子。
 
     faved_ids=None（无 Cookie）时范围判断跳过（scope=notfaved 退化为全部）。
-    没有直链也没有外链的帖子（纯文字/纯外站）不进生命周期——worker 对它
-    无事可做。subdir 决定 Chrome 落盘目录：
+    since：可选日期（YYYY-MM-DD），只收 published ≥ 该日的帖子（含当天），
+    更早的一律过滤——用于「只要某个日期之后的新帖」。date_override 与
+    published 无关；纯文字/纯外站帖仍不进生命周期。subdir 决定落盘目录：
     CHROME_DOWNLOAD_DIR/Pawchive/<作者>/<日期>_<帖子ID>_<标题>/
     """
     from .naming import sanitize_filename
@@ -345,6 +347,8 @@ def build_scan_records(creator, posts, faved_ids=None, scope="notfaved"):
     records = []
     for p in posts:
         pid = str(p["id"])
+        if since is not None and (p.get("published") or "")[:10] < since:
+            continue
         if faved_ids is not None:
             if scope == "notfaved" and pid in faved_ids:
                 continue
@@ -381,21 +385,22 @@ def _creator_label(creator):
             or f"{creator.get('service')}/{creator.get('id')}")
 
 
-async def start_scan(creator, scope="notfaved"):
+async def start_scan(creator, scope="notfaved", since=None):
     """后台扫描一个创作者并落库；立即返回，结果经 notify 汇报。"""
     if state.PAW_SCAN_RUNNING is not None:
         return (f"⏳ 已有扫描在进行（{state.PAW_SCAN_RUNNING}），"
                 "等它结束再发起（/paw status 看进度）")
     state.PAW_SCAN_RUNNING = _creator_label(creator)
-    task = asyncio.create_task(_scan_and_notify(creator, scope))
+    task = asyncio.create_task(_scan_and_notify(creator, scope, since))
     _SPAWNED_SCANS.add(task)
     task.add_done_callback(_SPAWNED_SCANS.discard)
     return (f"🐾 开始扫描 {_creator_label(creator)}"
-            f"（范围：{'全部帖子' if scope == 'all' or not config.PAWCHIVE_COOKIE else '未收藏帖子'}）"
+            + (f"，只收 {since} 之后" if since else "")
+            + f"（范围：{'全部帖子' if scope == 'all' or not config.PAWCHIVE_COOKIE else '未收藏帖子'}）"
             "，完成后通知。期间可 /paw status 看进度")
 
 
-async def _scan_and_notify(creator, scope):
+async def _scan_and_notify(creator, scope, since=None):
     """扫描主体：帖子分页 + 收藏对比 + 落库。异常只通知，不炸后台。"""
     label = _creator_label(creator)
     try:
@@ -415,7 +420,8 @@ async def _scan_and_notify(creator, scope):
             faved_ids = await asyncio.to_thread(fetch_favorited_ids, cookie)
         else:
             faved_ids = None
-        records = build_scan_records(creator, posts, faved_ids, scope)
+        records = build_scan_records(creator, posts, faved_ids, scope,
+                                     since=since)
         created, skipped = runtime_db.enqueue_pawchive_posts(
             creator["service"], str(creator["id"]), label, records,
             scan_batch=time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -424,6 +430,7 @@ async def _scan_and_notify(creator, scope):
         state.PAW_LAST_SCAN = {
             "creator": label,
             "scope": scope if faved_ids is not None else "all(无Cookie)",
+            "since": since,
             "fetched": len(posts),
             "created": created,
             "skipped": skipped,
@@ -434,7 +441,8 @@ async def _scan_and_notify(creator, scope):
         summary = (
             f"🐾 Pawchive 扫描完成：{label}\n"
             f"拉取帖子 {len(posts)} | 新入队 {created}（跳过已存在 {skipped}）\n"
-            f"附件直链 {n_files} 个 | 站外链接 {n_links} 条")
+            f"附件直链 {n_files} 个 | 站外链接 {n_links} 条"
+            + (f"\n（只收 {since} 及之后的帖子）" if since else ""))
         if not cookie:
             summary += "\n⚠️ 未配置 Cookie，本次按全部帖子处理（无法对比收藏）"
         await notify_user(summary)
@@ -1012,6 +1020,7 @@ def _help_text():
         f"{TEXT_PREFIX}\n\n"
         "用法：\n"
         "  /paw plan <作者名> [all] —— 扫描作者帖子入队（默认只收未收藏帖；"
+        "  /paw plan <作者名> since <YYYY-MM-DD> —— 只收该日期之后的帖子"
         "带 Cookie 才能对比收藏，all=全部）\n"
         "  /paw search <关键词> —— 搜作者\n"
         "  /paw post <帖子URL|ID> —— 单独获取指定帖子的附件\n"
@@ -1072,14 +1081,26 @@ async def _reply_plan(event, arg):
             link_preview=False)
         return
     scope = "notfaved"
+    since = None
     parts = (arg or "").split()
     if parts and parts[-1].lower() == "all":
         scope = "all"
         parts = parts[:-1]
+    if len(parts) >= 2 and parts[-2].lower() == "since":
+        since = parts[-1]
+        parts = parts[:-2]
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
+            await event.reply(
+                f"{TEXT_PREFIX}\n❌ 日期格式：YYYY-MM-DD"
+                "（例：/paw plan 作者 since 2026-09-01）",
+                link_preview=False)
+            return
     name = " ".join(parts).strip()
     if not name:
-        await event.reply(f"{TEXT_PREFIX}\n用法：/paw plan <作者名> [all]",
-                          link_preview=False)
+        await event.reply(
+            f"{TEXT_PREFIX}\n用法：/paw plan <作者名> [all]"
+            "\n　　/paw plan <作者名> since <YYYY-MM-DD> [all]",
+            link_preview=False)
         return
     try:
         creator = await resolve_creator_async(name)
@@ -1094,7 +1115,7 @@ async def _reply_plan(event, arg):
         return
     if not config.PAWCHIVE_COOKIE and scope == "notfaved":
         scope = "all"   # 无 Cookie 无从对比，直接按全部处理（摘要里会提示）
-    msg = await start_scan(creator, scope)
+    msg = await start_scan(creator, scope, since=since)
     await event.reply(f"{TEXT_PREFIX}\n{msg}", link_preview=False)
 
 

@@ -440,3 +440,52 @@ class CommandReplyTest(_DbTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SinceDateTest(unittest.TestCase):
+    """/paw plan <作者> since <日期>：只收该日期（含）之后的帖子。"""
+
+    def _posts(self):
+        def post(pid, pub, links=None):
+            return {"id": pid, "title": f"帖{pid}", "published": pub,
+                    "attachments": [], "embed": {},
+                    "content": "".join(
+                        f'<a href="{u}">l</a>' for u in (links or []))}
+        return [
+            post("1", "2026-08-01T00:00:00", ["https://mega.nz/file/old"]),
+            post("2", "2026-09-01T00:00:00", ["https://mega.nz/file/mid"]),
+            post("3", "2026-09-15T00:00:00", ["https://mega.nz/file/new"]),
+        ]
+
+    def test_since_filters_older_posts(self):
+        from tg_userbot import pawchive
+        creator = {"service": "patreon", "id": "1", "name": "C"}
+        records = pawchive.build_scan_records(
+            creator, self._posts(), faved_ids=None, scope="all",
+            since="2026-09-01")
+        ids = sorted(r["post_id"] for r in records)
+        self.assertEqual(ids, ["2", "3"])      # 8 月旧帖被过滤
+
+    def test_since_date_inclusive(self):
+        from tg_userbot import pawchive
+        creator = {"service": "patreon", "id": "1", "name": "C"}
+        records = pawchive.build_scan_records(
+            creator, self._posts(), faved_ids=None, scope="all",
+            since="2026-09-01")
+        self.assertIn("2", [r["post_id"] for r in records])   # 当天含
+
+    def test_since_combined_with_scope(self):
+        """since 与收藏范围可叠加（scope 照旧判定）。"""
+        posts = self._posts()
+        creator = {"service": "patreon", "id": "1", "name": "C"}
+        records = pawchive.build_scan_records(
+            creator, posts, faved_ids={"2"}, scope="notfaved",
+            since="2026-09-01")
+        ids = [r["post_id"] for r in records]
+        self.assertEqual(ids, ["3"])           # 2 已收藏被 scope 排除
+
+    def test_parse_plan_since(self):
+        from tg_userbot import pawchive
+        self.assertEqual(
+            pawchive.parse_paw_command("/paw plan SillyTeshii since 2026-09-01"),
+            ("plan", "SillyTeshii since 2026-09-01"))
