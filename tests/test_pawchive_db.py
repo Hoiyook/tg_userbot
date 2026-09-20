@@ -588,3 +588,66 @@ class PawArchiveCommandTest(unittest.TestCase):
                          ("archive", None))
         self.assertEqual(pawchive.parse_paw_command("/paw archive failed"),
                          ("archive", "failed"))
+
+
+class ManualExportTest(_PawDbTestCase):
+    """A1：/paw manual export —— 待处理外链的批量工作清单。"""
+
+    def _seed_two_authors(self):
+        """两作者各一帖纯外链，全部推到 MANUAL。"""
+        p1 = {"post_id": "11", "title": "帖A", "published": "2026-09-15",
+              "post_url": "https://pawchive.pw/x/11", "subdir": "s1",
+              "files": [], "ext_links": [
+                  {"kind": "link", "domain": "mega.nz",
+                   "url": "https://mega.nz/file/A1", "text": ""}]}
+        p2 = {"post_id": "12", "title": "帖B", "published": "2026-09-16",
+              "post_url": "https://pawchive.pw/x/12", "subdir": "s2",
+              "files": [], "ext_links": [
+                  {"kind": "link", "domain": "krakenfiles.com",
+                   "url": "https://krakenfiles.com/B1", "text": ""},
+                  {"kind": "link", "domain": "mega.nz",
+                   "url": "https://mega.nz/file/B2", "text": ""}]}
+        runtime_db.enqueue_pawchive_posts("patreon", "7", "作者甲", [p1])
+        runtime_db.enqueue_pawchive_posts("patreon", "8", "作者乙", [p2])
+        for _ in range(2):
+            claimed = runtime_db.claim_next_pawchive_post()
+            runtime_db.finalize_pawchive_post(
+                claimed["id"], runtime_db.PAW_POST_MANUAL)
+
+    def test_export_contains_all_links_grouped(self):
+        from tg_userbot import pawchive
+        self._seed_two_authors()
+        text = pawchive.manual_export_text()
+        self.assertIn("作者甲", text)
+        self.assertIn("作者乙", text)
+        self.assertIn("https://mega.nz/file/A1", text)
+        self.assertIn("https://krakenfiles.com/B1", text)
+        self.assertIn("#", text)                     # 帖子行 id（/paw done 用）
+        self.assertIn("原帖", text)
+
+    def test_export_empty(self):
+        from tg_userbot import pawchive
+        self.assertIn("没有待处理", pawchive.manual_export_text())
+
+    def test_done_range_support(self):
+        """A2：/paw done 105-120 区间批量标记。"""
+        from tg_userbot import pawchive
+        self._seed_two_authors()
+        ids = sorted(r["id"] for r in runtime_db.list_pawchive_posts(
+            status=runtime_db.PAW_POST_MANUAL))
+        lo, hi = ids[0], ids[-1]
+        reply = pawchive.mark_manual_done(f"{lo}-{hi}")
+        self.assertIn("✅", reply)
+        remaining = runtime_db.list_pawchive_posts(
+            status=runtime_db.PAW_POST_MANUAL)
+        self.assertEqual(len(remaining), 0)
+
+    def test_done_by_author(self):
+        """A2：/paw done @作者名 —— 该作者全部 MANUAL 帖批量标记。"""
+        from tg_userbot import pawchive
+        self._seed_two_authors()
+        reply = pawchive.mark_manual_done("作者甲")
+        self.assertIn("✅", reply)
+        left = runtime_db.list_pawchive_posts(status=runtime_db.PAW_POST_MANUAL)
+        self.assertEqual(len(left), 1)               # 只剩作者乙
+        self.assertEqual(left[0]["creator_name"], "作者乙")

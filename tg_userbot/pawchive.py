@@ -758,6 +758,36 @@ def manual_done_reply(arg):
     return f"{reply}\n\n{view_text}", rows + menu_buttons()
 
 
+def manual_export_text(limit=500):
+    """A1：全部待处理（MANUAL）帖的外链工作清单——按作者分组、带帖子行
+    id 与原帖链接，供用户集中打开处理；处理后 /paw done <区间|作者> 批量
+    标记完成。"""
+    try:
+        posts = runtime_db.list_pawchive_posts(
+            status=runtime_db.PAW_POST_MANUAL, limit=limit)
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if not posts:
+        return f"{TEXT_PREFIX}\n👤 没有待处理外链帖"
+    lines = [f"{TEXT_PREFIX}：外链工作清单（{len(posts)} 帖，按作者）", ""]
+    cur_author = None
+    n_links = 0
+    for p in posts:
+        if p["creator_name"] != cur_author:
+            cur_author = p["creator_name"]
+            lines.append(f"━━ {cur_author}")
+        date = (p.get("published") or "")[:10] or "unknown"
+        lines.append(f"  #{p['id']} {date}｜{(p['title'] or '')[:44]}")
+        lines.append(f"    原帖：{p.get('post_url') or '（无）'}")
+        for l in (p.get("ext_links") or []):
+            n_links += 1
+            lines.append(f"    🔗 [{l.get('domain')}] {l['url']}")
+    lines.append("")
+    lines.append(f"共 {len(posts)} 帖 / {n_links} 条外链。"
+                 "处理完：/paw done <行id>、<起-止区间> 或 <作者名> 批量标记")
+    return "\n".join(lines)
+
+
 def archive_reply():
     """/paw archive failed：把 FAILED **死链帖**批量移入 ARCHIVED。
     帖内含可恢复文件的保持 FAILED（归档不得埋掉数据，2026-09-17 用户决策）。"""
@@ -779,12 +809,52 @@ def manual_text(limit=10):
 
 
 def mark_manual_done(arg):
-    """/paw done <#行id>：把 MANUAL 帖标成 COMPLETED（人工处理完外链）。
+    """/paw done：把 MANUAL 帖标成 COMPLETED（人工处理完外链）。
 
-    #42 / 42 两种写法都收；已完成的给幂等提示；不存在/非 MANUAL 报错。"""
+    三种形态：<#行id>（单条）/ <起-止区间>（批量行 id）/ <作者名>
+    （该作者全部 MANUAL 帖）。已完成的幂等提示；不存在/非 MANUAL 报错。"""
     raw = str(arg or "").lstrip("#").strip()
+    # 区间形态：105-120
+    m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", raw)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if lo > hi:
+            lo, hi = hi, lo
+        done = skipped = 0
+        try:
+            for rid in range(lo, hi + 1):
+                if runtime_db.complete_pawchive_manual_post(rid):
+                    done += 1
+                else:
+                    skipped += 1
+        except runtime_db.DbUnavailable as e:
+            return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+        return (f"{TEXT_PREFIX}\n✅ 区间 {lo}-{hi}：标记完成 {done} 帖"
+                + (f"（{skipped} 条非 MANUAL/不存在跳过）" if skipped else ""))
+    # 作者形态：非数字 → 按作者名匹配
+    if raw and not raw.isdigit():
+        try:
+            posts = runtime_db.list_pawchive_posts(
+                status=runtime_db.PAW_POST_MANUAL, limit=1000)
+        except runtime_db.DbUnavailable as e:
+            return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+        targets = [p for p in posts if raw.lower() in
+                   (p["creator_name"] or "").lower()]
+        if not targets:
+            return f"{TEXT_PREFIX}\n❌ 没有找到作者含「{raw}」的待人工帖"
+        done = 0
+        try:
+            for p in targets:
+                if runtime_db.complete_pawchive_manual_post(p["id"]):
+                    done += 1
+        except runtime_db.DbUnavailable as e:
+            return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+        return (f"{TEXT_PREFIX}\n✅ 作者「{targets[0]['creator_name']}」："
+                f"标记完成 {done}/{len(targets)} 帖")
+    # 单条形态（原逻辑）
     if not raw.isdigit():
-        return f"{TEXT_PREFIX}\n❌ 用法：/paw done <帖子行id>（/paw manual 里 # 后面的数字）"
+        return (f"{TEXT_PREFIX}\n❌ 用法：/paw done <行id | 起-止 | 作者名>"
+                "（/paw manual 里 # 后面的数字）")
     try:
         ok = runtime_db.complete_pawchive_manual_post(int(raw))
     except runtime_db.DbUnavailable as e:
@@ -892,6 +962,9 @@ async def command_reply(event, cmd_text):
         await event.reply(resume_reply(), link_preview=False)
         return
     if action == "manual":
+        if (arg or "").strip().lower() == "export":
+            await event.reply(manual_export_text(), link_preview=False)
+            return
         view_text, buttons = manual_view()
         await event.reply(view_text, buttons=buttons, link_preview=False)
         return
@@ -944,8 +1017,9 @@ def _help_text():
         "  /paw post <帖子URL|ID> —— 单独获取指定帖子的附件\n"
         "  /paw find <关键词> —— 按名称查扫描记录与当前目录文件\n"
         "  /paw manual —— 待人工处理的帖子（含外链清单与 ✅ 按钮）\n"
+        "  /paw manual export —— 全部待处理外链导出为工作清单\n"
         "  /paw archive —— FAILED 死链帖批量归档（不占待办）\n"
-        "  /paw done <行id> —— 外链人工处理完，标记该帖 COMPLETED\n"
+        "  /paw done <行id | 起-止 | 作者名> —— 批量标记完成\n"
         "  /paw retry <行ID|all> —— 失败帖子重投\n"
         "  /paw pause / resume —— 暂停/恢复下载 worker\n"
         "  /paw cookie <Cookie> —— 保存会话 Cookie（用于收藏对比）\n"
