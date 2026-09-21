@@ -355,6 +355,17 @@ def _file_entry(att):
             "filename": name}
 
 
+def is_noise_ext_link(link):
+    """YouTube 预览外链判定（作者贴的宣传预览，非可处理网盘资源）。"""
+    import urllib.parse as _up
+    try:
+        host = _up.urlparse(str((link or {}).get("url") or "")).netloc.lower()
+    except ValueError:
+        return False
+    return (host == "youtube.com" or host == "youtu.be"
+            or host.endswith(".youtube.com") or host == "youtu.be")
+
+
 def build_scan_records(creator, posts, faved_ids=None, scope="notfaved",
                        since=None):
     """帖子列表 → 入库记录；只保留目标范围内**有可下载直链或有外链**的帖子。
@@ -532,8 +543,9 @@ def att_text(ref):
         lines.append("📎 无附件")
     ext = row.get("ext_links") or []
     if ext:
-        lines.append(f"🌐 外链 {len(ext)} 条：")
-        for l in ext:
+        shown = [l for l in ext if not is_noise_ext_link(l)]
+        lines.append(f"🌐 外链 {len(shown)} 条：")
+        for l in shown:
             st = "✅已处理" if row["status"] == "COMPLETED" else "👤未处理"
             lines.append(f"  {st} [{l.get('domain')}] {l.get('url')}")
     lines.append(f"原帖：{row.get('post_url') or '（无）'}")
@@ -880,6 +892,8 @@ def manual_export_text(limit=500):
         lines.append(f"  #{p['id']} {date}｜{(p['title'] or '')[:44]}")
         lines.append(f"    原帖：{p.get('post_url') or '（无）'}")
         for l in (p.get("ext_links") or []):
+            if is_noise_ext_link(l):
+                continue
             n_links += 1
             lines.append(f"    🔗 [{l.get('domain')}] {l['url']}")
     lines.append("")

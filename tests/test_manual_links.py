@@ -783,3 +783,86 @@ class UnifiedLedgerTest(_MlinksDbBase):
         self._seed_paw_manual()
         reply, buttons = manual_links.observe("https://mega.nz/folder/paw#K9")
         self.assertIn("已在 Pawchive 待人工清单", reply)
+
+
+class NoiseUrlFilterTest(_MlinksDbBase):
+    """YouTube 预览链接是噪音：不进台账、不在看板（2026-09-20 用户需求）。"""
+
+    def test_is_noise_url(self):
+        from tg_userbot import manual_links as ml
+        for url in ("https://www.youtube.com/watch?v=x",
+                    "https://youtu.be/abc",
+                    "https://m.youtube.com/watch?v=x",
+                    "https://music.youtube.com/watch?v=x"):
+            self.assertTrue(ml.is_noise_url(url), url)
+        for url in ("https://mega.nz/file/a", "https://krakenfiles.com/b",
+                    "https://notyoutube.com/x"):
+            self.assertFalse(ml.is_noise_url(url), url)
+
+    def test_observe_skips_noise(self):
+        reply, buttons = manual_links.observe(
+            "https://www.youtube.com/watch?v=7hQEV1gh0cE 预览")
+        self.assertIn("已忽略", reply)
+        self.assertEqual(len(runtime_db.list_manual_links()), 0)
+
+    def test_mixed_message_registers_only_real_links(self):
+        reply, buttons = manual_links.observe(
+            "https://www.youtube.com/watch?v=x 预览 "
+            "https://mega.nz/file/real#K 真资源")
+        self.assertIn("已忽略 1 条 YouTube", reply)
+        self.assertIn("已记录", reply)
+        hosts = [r["host"] for r in runtime_db.list_manual_links()]
+        self.assertEqual(hosts, ["mega.nz"])
+
+    def test_all_noise_message_brief_reply(self):
+        reply, buttons = manual_links.observe(
+            "https://youtu.be/abc https://www.youtube.com/watch?v=y")
+        self.assertIn("YouTube", reply)
+        self.assertEqual(len(runtime_db.list_manual_links()), 0)
+        self.assertEqual(buttons, [])
+
+
+class PawViewNoiseFilterTest(_MlinksDbBase):
+    """Pawchive MANUAL 看板/导出/att：YouTube 预览外链不显示。"""
+
+    def _seed_paw_manual_with_youtube(self):
+        import json as _json
+        post = {"post_id": "88", "title": "带油管预览的帖", "published": "2026-09-19",
+                "post_url": "https://pawchive.pw/x/88", "subdir": "s",
+                "files": [], "ext_links": [
+                    {"kind": "link", "domain": "mega.nz",
+                     "url": "https://mega.nz/file/work#K", "text": "真资源"},
+                    {"kind": "link", "domain": "www.youtube.com",
+                     "url": "https://www.youtube.com/watch?v=prev", "text": "预览"}]}
+        runtime_db.enqueue_pawchive_posts("patreon", "9", "作者A", [post])
+        claimed = runtime_db.claim_next_pawchive_post()
+        runtime_db.finalize_pawchive_post(
+            claimed["id"], runtime_db.PAW_POST_MANUAL)
+
+    def test_manual_view_hides_youtube(self):
+        self._seed_paw_manual_with_youtube()
+        from tg_userbot import manual_links as ml
+        text, buttons = ml.unified_view()
+        self.assertIn("mega.nz/file/work#K", text)
+        self.assertNotIn("youtube.com/watch?v=prev", text)
+
+    def test_export_hides_youtube(self):
+        self._seed_paw_manual_with_youtube()
+        from tg_userbot import pawchive
+        text = pawchive.manual_export_text()
+        self.assertIn("mega.nz/file/work#K", text)
+        self.assertNotIn("watch?v=prev", text)
+
+    def test_att_hides_youtube(self):
+        from tg_userbot import pawchive
+        self._seed_paw_manual_with_youtube()
+        rid = [r["id"] for r in runtime_db.list_pawchive_posts(limit=5)][0]
+        text = pawchive.att_text(str(rid))
+        self.assertIn("mega.nz/file/work#K", text)
+        self.assertNotIn("watch?v=prev", text)
+
+    def _pawchive_links_view(self):
+        # 统一看板（unified_view）里的 paw 段
+        from tg_userbot import manual_links
+        text, buttons = manual_links.unified_view()
+        return text, buttons

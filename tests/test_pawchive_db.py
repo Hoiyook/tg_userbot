@@ -690,7 +690,7 @@ class AttCommandTest(_PawDbTestCase):
         self.assertIn("✅ 主视频.mp4", text)
         self.assertIn("⏳ 图.png", text)
         self.assertIn("mega.nz/folder/x#K", text)
-        self.assertIn("youtube.com", text)
+        self.assertNotIn("youtube.com", text)   # YouTube 预览外链已被噪音过滤
 
     def test_att_by_url(self):
         self._seed_manual_with_files()

@@ -26,6 +26,26 @@ TEXT_PREFIX = "🔗 外链台账"
 _URL_RE = re.compile(
     r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+", re.I)
 
+# 噪音域名（2026-09-20 用户需求）：YouTube 预览链接是作者贴的宣传/预览，
+# 不是要处理的网盘资源——不进台账、不进看板。
+NOISE_HOSTS = frozenset({
+    "youtube.com", "youtu.be", "m.youtube.com", "www.youtube.com",
+    "music.youtube.com", "youtube-nocookie.com",
+})
+
+
+def is_noise_url(url):
+    """YouTube 预览类链接判定（host 精确/子域匹配，大小写不敏感）。"""
+    import urllib.parse as _up
+    try:
+        host = _up.urlparse(str(url or "")).netloc.lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return (host in NOISE_HOSTS
+            or any(host.endswith("." + d) for d in NOISE_HOSTS))
+
 
 def extract_urls(text):
     """从消息文本提取外链（去重保序；尾部标点修剪复用 pawchive 的规则）。"""
@@ -72,9 +92,14 @@ def observe(text, now=None):
     条目（新记录或已在记录中）都挂 ✅ 按钮——随时可点标记完成。"""
     from .menu import encode_menu_data   # 函数内导入避免 menu↔本模块成环
     urls, note = _split_note(text)
+    noise = [u for u in urls if is_noise_url(u)]
+    urls = [u for u in urls if not is_noise_url(u)]
     if not urls:
-        return f"{TEXT_PREFIX}\n（未识别到链接）", []
-    lines = [f"{TEXT_PREFIX}：{len(urls)} 条"]
+        tail = (f"（已忽略 {len(noise)} 条 YouTube 预览链接，不登记）"
+                if noise else "（未识别到链接）")
+        return f"{TEXT_PREFIX}\n{tail}", []
+    lines = [f"{TEXT_PREFIX}：{len(urls)} 条"
+             + (f"（已忽略 {len(noise)} 条 YouTube 预览链接）" if noise else "")]
     rows = []
     for url in urls:
         host = url.split("//", 1)[-1].split("/", 1)[0].lower()
@@ -156,7 +181,9 @@ def unified_view(limit=20):
         date = (p.get("published") or "")[:10] or "unknown"
         lines.append(f"🐾 #{p['id']} {p['creator_name']}｜{date}｜"
                      f"{(p['title'] or '')[:36]}")
-        for l in (p.get("ext_links") or []):
+        shown = [l for l in (p.get("ext_links") or [])
+                 if not pawchive.is_noise_ext_link(l)]
+        for l in shown:
             lines.append(f"  🔗 [{l.get('domain')}] {l.get('url')}")
         btn = [Button.inline(f"✅ 完成 #{p['id']}",
                              encode_menu_data("paw_done_view", str(p["id"])))]
