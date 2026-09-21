@@ -86,6 +86,12 @@ def observe(text, now=None):
                 f"⚠️ Pawchive 外链已完成："
                 f"[{paw_post.get('creator_name')}] #{paw_post['id']} {url}")
             continue
+        paw_manual = pawchive.find_manual_ext_link(url)
+        if paw_manual:
+            lines.append(
+                f"ℹ️ 已在 Pawchive 待人工清单："
+                f"[{paw_manual.get('creator_name')}] #{paw_manual['id']} {url}")
+            continue
         state_str, row = runtime_db.manual_link_add(
             url, host=host, note=note, now=now)
         host_disp = row["host"] or host
@@ -123,6 +129,51 @@ def observe(text, now=None):
                     encode_menu_data("mlink_open", str(row["id"]))))
             rows.append(row_btns)
     return "\n".join(lines), rows
+
+
+def unified_view(limit=20):
+    """统一外链看板：手动台账（PENDING）+ Pawchive MANUAL 帖的外链合并展示。
+
+    每个来源自己的按钮：台账条目 ✅（mlink_done）、Pawchive 帖 ✅
+    （paw_done，复用 /paw done 语义）+ 🔗 原帖。"""
+    from . import pawchive
+    from .menu import encode_menu_data
+    try:
+        pending = runtime_db.list_manual_links(status="PENDING", limit=limit)
+        paw_posts = pawchive.manual_posts_for_view(limit=limit)
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}", []
+    lines = [f"{TEXT_PREFIX}：未处理 {len(pending)} 条"
+             f" + Pawchive 待人工 {len(paw_posts)} 帖", ""]
+    rows = []
+    for row in pending:
+        lines.append(f"#{row['id']} [{row['host']}] {row['url']}"
+                     + (f"\n📝 {row['note']}" if row.get("note") else ""))
+        rows.append([Button.inline(
+            "✅ " + _short(row["url"]),
+            encode_menu_data("mlink_done", str(row["id"])))])
+    for p in paw_posts:
+        date = (p.get("published") or "")[:10] or "unknown"
+        lines.append(f"🐾 #{p['id']} {p['creator_name']}｜{date}｜"
+                     f"{(p['title'] or '')[:36]}")
+        for l in (p.get("ext_links") or []):
+            lines.append(f"  🔗 [{l.get('domain')}] {l.get('url')}")
+        btn = [Button.inline(f"✅ 完成 #{p['id']}",
+                             encode_menu_data("paw_done_view", str(p["id"])))]
+        if p.get("post_url"):
+            btn.append(Button.url("🔗 原帖", p["post_url"]))
+        rows.append(btn)
+    if not pending and not paw_posts:
+        return f"{TEXT_PREFIX}：当前没有待处理外链", []
+    return "\n".join(lines), rows
+
+
+def done_paw_post(arg):
+    """🐾 paw 帖 ✅ 按钮：标记该帖完成并返回刷新后的统一看板。"""
+    from . import pawchive
+    reply = pawchive.mark_manual_done(arg)
+    view_text, rows = unified_view()
+    return f"{TEXT_PREFIX}\n{reply}\n\n{view_text}", rows
 
 
 def links_view(limit=20, keyword=None):

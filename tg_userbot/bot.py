@@ -340,6 +340,12 @@ async def handle_menu_action(action, arg, event):
     if action == "mlink_done":
         view_text, buttons = await manual_links.done_reply(arg)
         return view_text, buttons
+    if action == "paw_done_view":
+        # 统一外链看板里的 paw ✅：标记完成后回统一看板（区别于 /paw done）
+        import pawchive as _paw
+        reply = _paw.mark_manual_done(arg)
+        view_text, rows = manual_links.unified_view()
+        return f"{manual_links.TEXT_PREFIX}\n{reply}\n\n{view_text}", rows
     if action == "paw_csv":
         msg = await pawchive.csv_reply()
         return (msg, pawchive.menu_buttons())

@@ -717,3 +717,69 @@ class LongUrlButtonTest(_MlinksDbBase):
         open_btns = [b for b in flat if "🌐" in b.text]
         self.assertEqual(len(open_btns), 1)
         self.assertLessEqual(len(open_btns[0].data), 64)
+
+
+class UnifiedLedgerTest(_MlinksDbBase):
+    """统一外链管理（2026-09-20 用户需求）：
+
+    1. 发送链接时，Pawchive MANUAL（待人工）帖的外链也参与查重——
+       命中提示「已在 Pawchive 待人工清单」并给出帖子上下文；
+    2. 🔗 /links 视图合并两个来源：台账条目 + Pawchive MANUAL 帖的外链，
+       每条带 ✅（标记完成）与 🔗 原帖按钮；
+    3. ✅ 点 Pawchive 来源的条目 → 该帖转 COMPLETED（复用 /paw done 语义）。
+    """
+
+    def _seed_paw_manual(self, url="https://mega.nz/folder/paw#K9",
+                         creator="作者丙"):
+        import json as _json
+        post = {"post_id": "77", "title": "网盘帖", "published": "2026-09-19",
+                "post_url": "https://pawchive.pw/x/77", "subdir": "s",
+                "files": [], "ext_links": [
+                    {"kind": "link", "domain": "mega.nz",
+                     "url": url, "text": ""}]}
+        runtime_db.enqueue_pawchive_posts("patreon", "9", creator, [post])
+        claimed = runtime_db.claim_next_pawchive_post()
+        runtime_db.finalize_pawchive_post(
+            claimed["id"], runtime_db.PAW_POST_MANUAL)
+        return claimed
+
+    def test_resend_of_paw_manual_link_warns_with_context(self):
+        self._seed_paw_manual()
+        reply, _ = manual_links.observe("https://mega.nz/folder/paw#K9")
+        self.assertIn("Pawchive 待人工", reply)
+        self.assertIn("作者丙", reply)
+        # 不重复入台账（paw 帖子记录就是它的账）
+        self.assertEqual(len(runtime_db.list_manual_links()), 0)
+
+    def test_unified_view_shows_both_sources(self):
+        manual_links.observe("https://mega.nz/file/manual#K1")
+        self._seed_paw_manual()
+        text, buttons = manual_links.unified_view()
+        self.assertIn("manual#K1", text)            # 台账条目
+        self.assertIn("paw#K9", text)               # paw MANUAL 外链
+        self.assertIn("作者丙", text)
+        flat = [b for row in buttons for b in row]
+        done_btns = [b for b in flat if "✅" in b.text]
+        # 1 个台账 ✅ + 1 个 paw 帖 ✅
+        self.assertEqual(len(done_btns), 2)
+        for b in flat:
+            data = getattr(b, "data", None)
+            if data:
+                self.assertLessEqual(len(data), 64)
+
+    def test_paw_done_button_click_completes_post(self):
+        claimed = self._seed_paw_manual()
+        text, buttons = manual_links.unified_view()
+        flat = [b for row in buttons for b in row]
+        paw_btn = [b for b in flat
+                   if (getattr(b, "data", b"") or b"").startswith(b"m:paw_done_view:")][0]
+        arg = paw_btn.data.decode().split(":", 2)[2]
+        text, buttons = manual_links.done_paw_post(arg)
+        self.assertIn("✅", text)
+        st = runtime_db.get_pawchive_post_row(claimed["id"])["status"]
+        self.assertEqual(st, runtime_db.PAW_POST_COMPLETED)
+
+    def test_observe_cloud_link_gets_open_button(self):
+        self._seed_paw_manual()
+        reply, buttons = manual_links.observe("https://mega.nz/folder/paw#K9")
+        self.assertIn("已在 Pawchive 待人工清单", reply)
