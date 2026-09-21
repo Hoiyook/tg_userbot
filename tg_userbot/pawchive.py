@@ -249,6 +249,30 @@ def _trim_url_tail(url):
     return url
 
 
+def find_manual_ext_link(url, limit=1000):
+    """查重数据源③：该 URL 是否在某个 MANUAL（待人工）帖的外链里。
+
+    大小写不敏感精确匹配；返回命中帖子 dict，没有则 None。"""
+    low = str(url or "").strip().lower()
+    if not low:
+        return None
+    for post in runtime_db.list_pawchive_posts(
+            status=runtime_db.PAW_POST_MANUAL, limit=limit):
+        for l in (post.get("ext_links") or []):
+            if str(l.get("url") or "").strip().lower() == low:
+                return post
+    return None
+
+
+def manual_posts_for_view(limit=100):
+    """待人工帖视图数据（作者/日期/标题/原帖/外链），按行 id 倒序。"""
+    try:
+        return runtime_db.list_pawchive_posts(
+            status=runtime_db.PAW_POST_MANUAL, limit=limit)
+    except runtime_db.DbUnavailable:
+        return []
+
+
 def find_completed_ext_link(url, limit=1000):
     """查重第二数据源：该 URL 是否出现在某个 COMPLETED 帖子的外链里。
 
