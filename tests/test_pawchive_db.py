@@ -29,6 +29,7 @@ atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import config  # noqa: E402
+from tg_userbot import pawchive  # noqa: E402
 from tg_userbot import runtime_db  # noqa: E402
 
 
@@ -651,3 +652,71 @@ class ManualExportTest(_PawDbTestCase):
         left = runtime_db.list_pawchive_posts(status=runtime_db.PAW_POST_MANUAL)
         self.assertEqual(len(left), 1)               # 只剩作者乙
         self.assertEqual(left[0]["creator_name"], "作者乙")
+
+
+class AttCommandTest(_PawDbTestCase):
+    """/paw att <URL|帖子ID|行id>：查帖子的全部附件与外链及状态。"""
+
+    def _seed_manual_with_files(self):
+        """1 帖：2 附件（1 DONE 1 PENDING）+ 2 外链，推到 MANUAL。"""
+        post = {"post_id": "169052124", "title": "小提丰摇",
+                "published": "2026-09-09", "post_url": "https://pawchive.pw/x/1",
+                "subdir": "s", "ext_links": [
+                    {"kind": "link", "domain": "mega.nz",
+                     "url": "https://mega.nz/folder/x#K", "text": ""},
+                    {"kind": "embed", "domain": "youtube.com",
+                     "url": "https://youtube.com/w?v=1", "text": ""}],
+                "files": [
+                    {"url": "https://file.pawchive.pw/data/1",
+                     "filename": "主视频.mp4"},
+                    {"url": "https://file.pawchive.pw/data/2",
+                     "filename": "图.png"}]}
+        runtime_db.enqueue_pawchive_posts("patreon", "42", "作者A", [post])
+        claimed = runtime_db.claim_next_pawchive_post()
+        runtime_db.finalize_pawchive_post(
+            claimed["id"], runtime_db.PAW_POST_MANUAL)
+        # 文件：一个标 DONE
+        files = runtime_db.list_pawchive_files(claimed["id"])
+        for f in files:
+            if f["filename"] == "主视频.mp4":
+                runtime_db.mark_pawchive_file_done(f["id"], size_bytes=123)
+        return claimed
+
+    def test_att_by_post_id(self):
+        self._seed_manual_with_files()
+        text = pawchive.att_text("169052124")
+        self.assertIn("作者A", text)
+        self.assertIn("MANUAL", text)
+        self.assertIn("✅ 主视频.mp4", text)
+        self.assertIn("⏳ 图.png", text)
+        self.assertIn("mega.nz/folder/x#K", text)
+        self.assertIn("youtube.com", text)
+
+    def test_att_by_url(self):
+        self._seed_manual_with_files()
+        text = pawchive.att_text("https://pawchive.pw/patreon/user/42/post/169052124")
+        self.assertIn("作者A", text)
+
+    def test_att_by_row_id(self):
+        from tg_userbot import runtime_db as rd
+        self._seed_manual_with_files()
+        rid = rd.list_pawchive_posts(limit=5)[0]["id"]
+        self.assertIn("作者A", pawchive.att_text(str(rid)))
+
+    def test_att_not_found(self):
+        self.assertIn("❌", pawchive.att_text("88888888"))
+
+    def test_att_no_files_shows_ext_only(self):
+        """纯外链帖：显示外链与「无附件」。"""
+        post = {"post_id": "55", "title": "纯外链", "published": "2026-09-19",
+                "post_url": "https://pawchive.pw/x/55", "subdir": "s",
+                "files": [], "ext_links": [
+                    {"kind": "link", "domain": "mega.nz",
+                     "url": "https://mega.nz/folder/z#K", "text": ""}]}
+        runtime_db.enqueue_pawchive_posts("patreon", "42", "作者B", [post])
+        claimed = runtime_db.claim_next_pawchive_post()
+        runtime_db.finalize_pawchive_post(
+            claimed["id"], runtime_db.PAW_POST_MANUAL)
+        text = pawchive.att_text("55")
+        self.assertIn("无附件", text)
+        self.assertIn("mega.nz/folder/z#K", text)

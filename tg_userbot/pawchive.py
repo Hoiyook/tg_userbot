@@ -453,6 +453,74 @@ async def _scan_and_notify(creator, scope, since=None):
         state.PAW_SCAN_RUNNING = None
 
 
+_FILE_STATUS_MARK = {
+    runtime_db.PAW_FILE_DONE: "✅",
+    runtime_db.PAW_FILE_FAILED: "❌",
+}
+
+
+def att_text(ref):
+    """/paw att <URL|帖子ID|行id>：查帖子的全部附件与外链及其状态。
+
+    附件行：状态符号 + 文件名（+ 大小/错误）；外链行：状态 + 域名 + URL。
+    找不到帖子返回 ❌ 提示。"""
+    q = str(ref or "").strip()
+    row = None
+    if q.isdigit():
+        row = runtime_db.get_pawchive_post_row(int(q))
+        if row is None:
+            for r in runtime_db.find_pawchive_posts_by_post_id(q):
+                row = r
+                break
+    else:
+        parsed = parse_post_ref(q)
+        if parsed is not None:
+            _svc, _cid, pid = parsed
+            rows = runtime_db.find_pawchive_posts_by_post_id(pid)
+            if len(rows) == 1:
+                row = rows[0]
+            elif len(rows) > 1:
+                listing = "\n".join(
+                    f"  · #{r['id']} {r['creator_name']}（{r['status']}）"
+                    for r in rows)
+                return (f"{TEXT_PREFIX}\n⚠️ 帖子 {pid} 对应多条记录，"
+                        f"请用行 id 精确指定：\n{listing}")
+    if row is None:
+        return (f"{TEXT_PREFIX}\n❌ 找不到帖子：{ref or '（空）'}\n"
+                "用法：/paw att <帖子URL | 帖子ID | 行id>")
+    try:
+        files = runtime_db.list_pawchive_files(row["id"])
+    except runtime_db.DbUnavailable:
+        files = []
+
+    lines = [f"{TEXT_PREFIX}：{row['creator_name']}｜"
+             f"{(row['published'] or '')[:10]}｜{(row['title'] or '')[:40]}"
+             f"（{row['status']}）", ""]
+    if files:
+        lines.append(f"📎 附件 {len(files)} 个：")
+        for f in files:
+            mark = _FILE_STATUS_MARK.get(f["status"], "⏳")
+            size = (f"（{f['size_bytes'] // 1024 // 1024} MB）"
+                    if f.get("size_bytes") else "")
+            err = f"｜{f['error'][:40]}" if f.get("error") else ""
+            lines.append(f"  {mark} {f['filename']}{size}{err}")
+    else:
+        lines.append("📎 无附件")
+    ext = row.get("ext_links") or []
+    if ext:
+        lines.append(f"🌐 外链 {len(ext)} 条：")
+        for l in ext:
+            st = "✅已处理" if row["status"] == "COMPLETED" else "👤未处理"
+            lines.append(f"  {st} [{l.get('domain')}] {l.get('url')}")
+    lines.append(f"原帖：{row.get('post_url') or '（无）'}")
+    return "\n".join(lines)
+
+
+async def att_reply(event, arg):
+    """/paw att 分发：文本回复（纯查询，无按钮）。"""
+    await event.reply(att_text(arg), link_preview=False)
+
+
 async def post_reply_text(text):
     """/paw post <URL|帖子ID> 的主体：入队单帖或重投已有失败帖，返回回执。
 
@@ -947,7 +1015,7 @@ def parse_paw_command(text):
     head, _, rest = body.partition(" ")
     head_l = head.lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
-                  "resume", "manual", "done", "archive", "cookie", "csv",
+                  "resume", "manual", "done", "archive", "att", "cookie", "csv",
                   "find"):
         return (head_l, rest.strip() or None)
     return ("help", None)
@@ -984,6 +1052,9 @@ async def command_reply(event, cmd_text):
         return
     if action == "archive":
         await event.reply(archive_reply(), link_preview=False)
+        return
+    if action == "att":
+        await event.reply(att_text(arg), link_preview=False)
         return
     if action == "paw_done":
         reply = mark_manual_done(arg)
@@ -1027,6 +1098,7 @@ def _help_text():
         "  /paw find <关键词> —— 按名称查扫描记录与当前目录文件\n"
         "  /paw manual —— 待人工处理的帖子（含外链清单与 ✅ 按钮）\n"
         "  /paw manual export —— 全部待处理外链导出为工作清单\n"
+        "  /paw att <URL|帖子ID|行id> —— 查帖子的附件与外链状态\n"
         "  /paw archive —— FAILED 死链帖批量归档（不占待办）\n"
         "  /paw done <行id | 起-止 | 作者名> —— 批量标记完成\n"
         "  /paw retry <行ID|all> —— 失败帖子重投\n"
