@@ -340,6 +340,16 @@ async def handle_menu_action(action, arg, event):
     if action == "mlink_done":
         view_text, buttons = await manual_links.done_reply(arg)
         return view_text, buttons
+    if action == "mlink_paw_done":
+        reply = pawchive.mark_manual_done(arg)
+        view_text, rows = manual_links.unified_view()
+        return f"{manual_links.TEXT_PREFIX}\n{reply}\n\n{view_text}", rows
+    if action == "mlink_paw_del":
+        ok = runtime_db.delete_pawchive_post(int(arg)) if (arg or "").isdigit() else False
+        body = (f"{manual_links.TEXT_PREFIX}\n🗑 Pawchive 帖 #{arg} 已删除"
+                if ok else f"{manual_links.TEXT_PREFIX}\n❌ 删除失败或不存在")
+        view_text, rows = manual_links.unified_view()
+        return f"{body}\n\n{view_text}", rows
     if action == "paw_done_view":
         # 统一外链看板里的 paw ✅：标记完成后回统一看板（区别于 /paw done）
         import pawchive as _paw

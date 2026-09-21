@@ -782,7 +782,7 @@ class UnifiedLedgerTest(_MlinksDbBase):
     def test_observe_cloud_link_gets_open_button(self):
         self._seed_paw_manual()
         reply, buttons = manual_links.observe("https://mega.nz/folder/paw#K9")
-        self.assertIn("已在 Pawchive 待人工清单", reply)
+        self.assertIn("已在 Pawchive 清单", reply)
 
 
 class NoiseUrlFilterTest(_MlinksDbBase):
@@ -866,3 +866,61 @@ class PawViewNoiseFilterTest(_MlinksDbBase):
         from tg_userbot import manual_links
         text, buttons = manual_links.unified_view()
         return text, buttons
+
+
+class PawHitActionButtonsTest(_MlinksDbBase):
+    """Pawchive 待人工命中时：显示外链当前处理状态 + 三操作按钮
+    （✅ 完成 / 🗑 删除该帖 / 🌐 打开 Chrome），点击即生效。"""
+
+    def _seed_paw_manual(self, url="https://drive.google.com/file/d/1BWF"):
+        post = {"post_id": "77", "title": "外链帖", "published": "2026-09-20",
+                "post_url": "https://pawchive.pw/x/77", "subdir": "s",
+                "files": [], "ext_links": [
+                    {"kind": "link", "domain": "drive.google.com",
+                     "url": url, "text": ""}]}
+        runtime_db.enqueue_pawchive_posts("patreon", "9", "作者丙", [post])
+        claimed = runtime_db.claim_next_pawchive_post()
+        runtime_db.finalize_pawchive_post(
+            claimed["id"], runtime_db.PAW_POST_MANUAL)
+        return claimed
+
+    def test_paw_hit_shows_status_and_buttons(self):
+        claimed = self._seed_paw_manual(
+            "https://drive.google.com/file/d/1BWFfgxG5ZNCb7D7x8OrcPSSNQNAkUyWm")
+        reply, buttons = manual_links.observe(
+            "https://drive.google.com/file/d/1BWFfgxG5ZNCb7D7x8OrcPSSNQNAkUyWm")
+        self.assertIn("👤 未处理（Pawchive 待人工）", reply)
+        flat = [b for row in buttons for b in row]
+        texts = [b.text for b in flat]
+        self.assertTrue(any("✅ 完成" in t for t in texts))
+        self.assertTrue(any("🗑 删除" in t for t in texts))
+        self.assertTrue(any("🌐 打开" in t for t in texts))
+        for b in flat:
+            data = getattr(b, "data", None)
+            if data:
+                self.assertLessEqual(len(data), 64)
+            url = getattr(b, "url", None)
+            if url:
+                self.assertTrue(url.startswith("https://"))
+
+    def test_done_button_completes_paw_post(self):
+        url = "https://drive.google.com/file/d/1BWFfgxG5ZNCb7D7x8OrcPSSNQNAkUyWm"
+        claimed = self._seed_paw_manual(url)
+        reply, buttons = manual_links.observe(url)
+        flat = [b for row in buttons for b in row]
+        done_btn = [b for b in flat if "✅ 完成" in b.text][0]
+        self.assertEqual(done_btn.data.decode().split(":")[1], "mlink_paw_done")
+        st = runtime_db.get_pawchive_post_row(claimed["id"])["status"]
+        self.assertEqual(st, runtime_db.PAW_POST_MANUAL)   # 未点击前不变
+        manual_links.complete_paw_post(claimed["id"])
+        self.assertEqual(
+            runtime_db.get_pawchive_post_row(claimed["id"])["status"],
+            runtime_db.PAW_POST_COMPLETED)
+
+    def test_delete_button_removes_paw_post(self):
+        url = "https://drive.google.com/file/d/1BWFfgxG5ZNCb7D7x8OrcPSSNQNAkUyWm"
+        claimed = self._seed_paw_manual(url)
+        reply, buttons = manual_links.observe(url)
+        flat = [b for row in buttons for b in row]
+        del_btn = [b for b in flat if "🗑" in b.text][0]
+        self.assertTrue(del_btn.data.decode().startswith("m:mlink_paw_del:"))

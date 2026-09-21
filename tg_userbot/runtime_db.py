@@ -1483,6 +1483,17 @@ def resurrect_archived_recoverable(now=None):
     return _write(do, "重投已归档帖中的可恢复文件")
 
 
+def delete_pawchive_post(post_row):
+    """删除 Pawchive 帖及其全部附件行（🗑 按钮；不可逆操作）。"""
+    def do(conn):
+        _execute(conn, "DELETE FROM pawchive_files WHERE post_row=?",
+                 (int(post_row),))
+        cur = _execute(conn, "DELETE FROM pawchive_posts WHERE id=?",
+                       (int(post_row),))
+        return cur.rowcount > 0
+    return _write(do, f"删除 Pawchive 帖（{post_row}）")
+
+
 def complete_pawchive_manual_post(post_row, now=None):
     """外链人工处理完成：MANUAL → COMPLETED。
 

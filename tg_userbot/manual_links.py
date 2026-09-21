@@ -113,9 +113,12 @@ def observe(text, now=None):
             continue
         paw_manual = pawchive.find_manual_ext_link(url)
         if paw_manual:
+            st = ("✅ 已处理" if paw_manual["status"] == "COMPLETED"
+                  else "👤 未处理（Pawchive 待人工）")
             lines.append(
-                f"ℹ️ 已在 Pawchive 待人工清单："
+                f"ℹ️ 已在 Pawchive 清单（{st}）："
                 f"[{paw_manual.get('creator_name')}] #{paw_manual['id']} {url}")
+            _add_paw_hit_buttons(rows, paw_manual, url)
             continue
         state_str, row = runtime_db.manual_link_add(
             url, host=host, note=note, now=now)
@@ -201,6 +204,32 @@ def done_paw_post(arg):
     reply = pawchive.mark_manual_done(arg)
     view_text, rows = unified_view()
     return f"{TEXT_PREFIX}\n{reply}\n\n{view_text}", rows
+
+
+def _add_paw_hit_buttons(rows, paw_post, url):
+    """Pawchive 命中条目的操作按钮：✅ 完成 / 🗑 删除 / 🌐 打开 Chrome。
+
+    回调数据只带行 id（≤64 字节），动作由 bot.py 的
+    mlink_paw_done / mlink_paw_del 分支处理。"""
+    from .menu import encode_menu_data
+    pid = str(paw_post["id"])
+    rows.append([
+        Button.inline("✅ 完成", encode_menu_data("mlink_paw_done", pid)),
+        Button.inline("🗑 删除", encode_menu_data("mlink_paw_del", pid)),
+        Button.url("🌐 打开", url) if url else
+        Button.inline("🌐 打开（无链接）", encode_menu_data("mlink_view")),
+    ])
+
+
+def complete_paw_post(post_row):
+    """Pawchive 帖 MANUAL → COMPLETED（✅ 按钮动作）。"""
+    ok = runtime_db.complete_pawchive_manual_post(int(post_row))
+    return ok
+
+
+def delete_paw_post(post_row):
+    """删除 Pawchive 帖及其文件行（🗑 按钮动作；不可逆）。"""
+    return runtime_db.delete_pawchive_post(int(post_row))
 
 
 def links_view(limit=20, keyword=None):
