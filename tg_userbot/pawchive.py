@@ -1015,8 +1015,8 @@ def parse_paw_command(text):
     head, _, rest = body.partition(" ")
     head_l = head.lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
-                  "resume", "manual", "done", "archive", "att", "cookie", "csv",
-                  "find"):
+                  "resume", "manual", "done", "archive", "att", "post",
+                  "cookie", "csv", "find"):
         return (head_l, rest.strip() or None)
     return ("help", None)
 

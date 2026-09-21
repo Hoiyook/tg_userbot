@@ -489,3 +489,28 @@ class SinceDateTest(unittest.TestCase):
         self.assertEqual(
             pawchive.parse_paw_command("/paw plan SillyTeshii since 2026-09-01"),
             ("plan", "SillyTeshii since 2026-09-01"))
+
+
+class PostSubcommandParseTest(unittest.TestCase):
+    """回归（2026-09-20 事故）：'post' 曾被元组编辑误删 → /paw post 全部
+    解析成 help（站点 404 误导排查方向）。钉死子命令注册完整性。"""
+
+    def test_post_subcommand_parsed(self):
+        from tg_userbot import pawchive
+        self.assertEqual(
+            pawchive.parse_paw_command(
+                "/paw post https://pawchive.pw/patreon/user/1/post/2"),
+            ("post", "https://pawchive.pw/patreon/user/1/post/2"))
+
+    def test_all_documented_subcommands_registered(self):
+        """帮助文本里出现的每个 /paw 子命令必须能被 parse 识别。"""
+        from tg_userbot import pawchive
+        help_text = pawchive._help_text()
+        import re
+        # 中文顿号「或」连接的两个子命令形态（/paw A 或 B）不做单测断言
+        subs = {s for s in re.findall(r"/paw (\w+)", help_text)
+                if s not in ("或",)}
+        for sub in subs:
+            action, _ = pawchive.parse_paw_command(f"/paw {sub} test")
+            self.assertEqual(action, sub,
+                             f"子命令 /paw {sub} 未注册进 parse_paw_command")
