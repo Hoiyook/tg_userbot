@@ -195,7 +195,10 @@ def unified_view(limit=20):
         rows.append(btn)
     if not pending and not paw_posts:
         return f"{TEXT_PREFIX}：当前没有待处理外链", []
-    return "\n".join(lines), rows
+    out = "\n".join(lines)
+    if len(out) > 3800:          # 4096 拒收护栏：按钮回调数据之外的长文本截断
+        out = out[:3800] + "\n……（内容过长已截断）"
+    return out, rows
 
 
 def done_paw_post(arg):
