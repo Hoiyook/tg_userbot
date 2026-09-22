@@ -211,6 +211,9 @@ def _chrome_body_sep():
 async def handle_menu_action(action, arg, event):
     """按按钮动作执行并返回 (新文本, 新按钮)；返回 (None, None) 表示不改动消息。"""
     if action == "home":
+        # 回主菜单 = 离开一切输入模式：窗口不清掉的话，菜单看起来已经
+        # 「正常」了，下一条普通文本仍会被旧窗口吃掉（UX Round1 P0-3）
+        _clear_input_states()
         return menu.build_main_menu_text(), menu.main_menu_buttons()
     if action == "status":
         return text_mod.status_text(), menu.back_home_buttons()
@@ -306,8 +309,10 @@ async def handle_menu_action(action, arg, event):
     if action == "paw_done":
         return pawchive.manual_done_reply(arg)
     if action == "input_cancel":
-        # ❌ 取消：清全部输入等待状态（互斥保证同时只有一个，全清安全）
+        # ❌ 取消：清全部输入等待状态（互斥保证同时只有一个，全清安全）；
+        # 标签监听向导的草稿一并作废（等同 listen_cancel 的清理面）
         _clear_input_states()
+        listener.draft_cancel()
         return ("❌ 已取消当前输入操作\n\n" + menu.build_main_menu_text(),
                 menu.main_menu_buttons())
     if action == "mlink_open":
@@ -370,7 +375,7 @@ async def handle_menu_action(action, arg, event):
             "例：https://pawchive.pw/patreon/user/152819670/post/169389311\n\n"
             f"{config.PAWCHIVE_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
-            pawchive.menu_buttons(),
+            input_cancel_buttons(),
         )
     if action == "paw_find":
         open_input_window("paw_find")
@@ -380,7 +385,7 @@ async def handle_menu_action(action, arg, event):
             "与当前 /sh 工作目录下的文件名。\n"
             f"{config.PAWCHIVE_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
-            pawchive.menu_buttons(),
+            input_cancel_buttons(),
         )
     if action == "paw_pick":
         # 搜索结果按钮：arg 是序号，完整 creator 从 state 候选里取
@@ -527,7 +532,7 @@ async def handle_menu_action(action, arg, event):
             "例：磁盘占用 du -sh * | sort -rh | head -20\n\n"
             "名字 ≤16 字符（中文/字母/数字/下划线）；同名即覆盖；"
             "执行走 /sh 全套纪律（黑名单/超时）。",
-            menu.tools_menu_buttons(state.UP_CANDIDATES),
+            input_cancel_buttons(),
         )
     if action == "cmdt_run":
         ok, result = await cmd_templates.execute(arg or "")
@@ -622,7 +627,7 @@ async def handle_menu_action(action, arg, event):
         open_input_window(mode)
         return (
             caption_filter.input_prompt(mode),
-            menu.caption_filter_menu_buttons(),
+            input_cancel_buttons(),
         )
     if action in ("capf_reset", "capf_clear"):
         return (
@@ -635,7 +640,7 @@ async def handle_menu_action(action, arg, event):
     if action == "listen_add":
         listener.draft_start()
         open_input_window("listen_chat")
-        return listener.input_prompt("chat"), listener.menu_buttons()
+        return listener.input_prompt("chat"), input_cancel_buttons()
     if action == "listen_cancel":
         listener.draft_cancel()
         return listener.view_text(), listener.menu_buttons()
@@ -679,7 +684,7 @@ async def handle_menu_action(action, arg, event):
         return (
             f"✏️ 修改规则 {index}（重新走一遍向导）\n\n"
             + listener.input_prompt("chat"),
-            listener.menu_buttons(),
+            input_cancel_buttons(),
         )
     if action in ("listen_tgt", "listen_tgtadd", "listen_dl", "listen_save"):
         if not listener.draft_active():
@@ -751,6 +756,7 @@ async def handle_menu_action(action, arg, event):
             menu.back_home_buttons(),
         )
     if action == "back":
+        _clear_input_states()
         return menu.build_main_menu_text(), menu.main_menu_buttons()
     return None, None
 
@@ -1215,7 +1221,10 @@ async def bot_callback_handler(event):
         logger.exception(f"bot 菜单处理失败：{e}")
         try:
             await event.edit(
-                "❌ 操作失败，请查看日志", buttons=menu.back_home_buttons()
+                f"❌ 操作失败：{type(e).__name__}: {e}\n\n"
+                "可稍后重试；持续失败用 /status 检查连接，"
+                "或 🖥 命令行查日志。",
+                buttons=menu.back_home_buttons(),
             )
         except Exception:
             pass

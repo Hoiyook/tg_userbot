@@ -1285,3 +1285,77 @@ class InputPromptButtonsShapeTest(unittest.TestCase):
                '             Button.inline(')
         self.assertNotIn(bad, src,
                          "存在裸按钮行——❌ 取消行后必须紧跟包在行列表里的按钮")
+
+
+class InputWindowCancelCoverageTest(unittest.IsolatedAsyncioTestCase):
+    """P0-3 补缺回归：**每个**输入窗口的提示消息都必须带 ❌ 取消按钮。
+
+    首轮 UX Round1 只给 cookie/find/wl_since/sqlt/sh/up/paw_search/
+    paw_cookie 挂了取消；paw_post / paw_find / cmdt_add / capf 三兄弟 /
+    listen_add（含修改向导入口）漏挂——用户忘掉模式时只有干等超时或碰巧
+    发一条 / 命令才能脱身。"""
+
+    # 全部会 open_input_window 的菜单动作
+    INPUT_ACTIONS = (
+        "cookie_set", "find", "wl_since", "sqlt_add", "sh_input", "up_input",
+        "paw_search", "paw_cookie", "paw_post", "paw_find", "cmdt_add",
+        "capf_add", "capf_del", "capf_test", "listen_add",
+    )
+
+    def setUp(self):
+        self._saved = [(name, getattr(state, name)) for name in (
+            "COOKIE_INPUT_UNTIL", "FIND_INPUT_UNTIL", "CAPTION_INPUT_UNTIL",
+            "CAPTION_INPUT_MODE", "LISTEN_INPUT_UNTIL", "LISTEN_INPUT_STEP",
+            "WL_INPUT_UNTIL", "SQLT_INPUT_UNTIL", "SHELL_INPUT_UNTIL",
+            "UP_INPUT_UNTIL", "PAW_INPUT_UNTIL", "PAW_INPUT_STEP",
+            "CMDT_INPUT_UNTIL",
+        )]
+        for name, _ in self._saved:
+            setattr(state, name, 0.0 if name.endswith("_UNTIL") else "")
+
+    def tearDown(self):
+        for name, value in self._saved:
+            setattr(state, name, value)
+        from tg_userbot import listener
+        listener.draft_cancel()
+
+    @staticmethod
+    def _has_cancel(buttons):
+        for row in buttons or []:
+            for b in row:
+                action, _ = menu.parse_menu_data(b.data)
+                if action == "input_cancel":
+                    return True
+        return False
+
+    async def test_every_input_window_has_cancel_button(self):
+        for action in self.INPUT_ACTIONS:
+            with self.subTest(action=action):
+                _, buttons = await bot.handle_menu_action(
+                    action, None, mock.MagicMock())
+                self.assertTrue(
+                    self._has_cancel(buttons),
+                    f"{action} 打开的输入窗口没有 ❌ 取消按钮")
+
+    async def test_home_clears_input_states(self):
+        """回主菜单 = 离开输入模式：home/back 必须清掉全部等待窗口。"""
+        state.COOKIE_INPUT_UNTIL = 9e9
+        state.PAW_INPUT_UNTIL = 9e9
+        state.PAW_INPUT_STEP = "post"
+        await bot.handle_menu_action("home", None, mock.MagicMock())
+        self.assertEqual(state.COOKIE_INPUT_UNTIL, 0.0)
+        self.assertEqual(state.PAW_INPUT_UNTIL, 0.0)
+        self.assertEqual(state.PAW_INPUT_STEP, "")
+
+    async def test_back_clears_input_states(self):
+        state.SHELL_INPUT_UNTIL = 9e9
+        await bot.handle_menu_action("back", None, mock.MagicMock())
+        self.assertEqual(state.SHELL_INPUT_UNTIL, 0.0)
+
+    async def test_input_cancel_also_cancels_listen_draft(self):
+        """❌ 取消在标签监听向导内 = listen_cancel：草稿一并作废。"""
+        from tg_userbot import listener
+        listener.draft_start()
+        self.assertTrue(listener.draft_active())
+        await bot.handle_menu_action("input_cancel", None, mock.MagicMock())
+        self.assertFalse(listener.draft_active())
