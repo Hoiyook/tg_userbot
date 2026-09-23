@@ -142,3 +142,41 @@ class RollbackGuardTest(_DbBase):
         with open(queue_file + ".imported", encoding="utf-8") as f:
             archived = _json.load(f)
         self.assertEqual(archived["tasks"][0]["id"], "b" * 32)
+
+
+class MaintenanceLoopFirstIterationTest(unittest.IsolatedAsyncioTestCase):
+    """_maintenance_loop 首轮冒烟：备份→Cookie 体检整段跑通、失效会提醒。
+
+    该循环一天只执行一轮且启动即跑，首轮里的名字级错误（如 2026-09-24 的
+    config NameError）只有真正执行首轮才会暴露——此测试钉住它。"""
+
+    async def test_first_iteration_completes_and_notifies_on_invalid(self):
+        from tg_userbot import app as app_mod
+        from tg_userbot import notify, pawchive
+
+        async def fake_daily():
+            return None
+
+        async def fake_check(force=False):
+            self.assertTrue(force, "每日体检应绕过缓存现打")
+            return False, "已失效（HTTP 401）"
+
+        sent = []
+
+        async def fake_notify(text):
+            sent.append(text)
+
+        async def fake_sleep(seconds):
+            raise asyncio.CancelledError   # 首轮跑完即停
+
+        with mock.patch.object(maintenance, "daily_maintenance", fake_daily), \
+             mock.patch.object(pawchive, "cookie_check_cached", fake_check), \
+             mock.patch.object(notify, "notify_user", fake_notify), \
+             mock.patch.object(config, "PAWCHIVE_COOKIE", "sessionid=X"), \
+             mock.patch.object(app_mod.asyncio, "sleep", fake_sleep):
+            task = asyncio.ensure_future(app_mod._maintenance_loop())
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Cookie", sent[0])
+        self.assertIn("已失效", sent[0])

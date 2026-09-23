@@ -183,7 +183,8 @@ async def _maintenance_loop():
         # Cookie 每日体检：已配置才查，失效才提醒（一天至多这一条）
         try:
             from . import notify, pawchive
-            if config.PAWCHIVE_COOKIE:
+            from . import config as _config
+            if _config.PAWCHIVE_COOKIE:
                 ok, detail = await pawchive.cookie_check_cached(force=True)
                 if not ok:
                     await notify.notify_user(
