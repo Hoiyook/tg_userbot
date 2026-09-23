@@ -26,7 +26,7 @@ py3.8+ 的 `CancelledError` 是 `BaseException`，会绕开 `except Exception` �
 """
 import asyncio
 
-from .log import logger
+from .log import logger, log_throttled
 
 
 async def shielded(proc, timeout, what):
@@ -55,17 +55,21 @@ async def shielded(proc, timeout, what):
                 await task
             except asyncio.CancelledError:
                 pass
-            logger.warning(f"⏰ {what} 超时（{timeout}s），本轮跳过")
+            log_throttled(
+                f"shielded:{what}:timeout",
+                f"⏰ {what} 超时（{timeout}s），本轮跳过")
             return None
         try:
             return task.result()
         except asyncio.CancelledError:
-            logger.warning(
-                f"{what} 被底层连接取消（网络层 future.cancel()），本轮跳过"
-            )
+            log_throttled(
+                f"shielded:{what}:cancelled",
+                f"{what} 被底层连接取消（网络层 future.cancel()），本轮跳过")
             return None
         except Exception as e:
-            logger.warning(f"{what} 失败：{e}")
+            # 断连风暴期间本路径每 60s 刷一条（面板/通知循环），聚合降噪；
+            # 降级判定：同一 what 5 分钟内只全量打第一条（2026-09-24）
+            log_throttled(f"shielded:{what}", f"{what} 失败：{e}")
             return None
     finally:
         # 兜底：任何路径都不留孤儿子任务（未完成即取消）

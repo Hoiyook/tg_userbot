@@ -40,7 +40,7 @@ from .config import (
     DOWNLOAD_DIR,
 )
 from .history import is_done_command
-from .log import logger
+from .log import logger, log_throttled
 from .sources import is_downloadable
 
 
@@ -234,7 +234,9 @@ async def cleanup_saved_messages_once():
         return
     cli = state.client
     if cli is None or not cli.is_connected():
-        logger.info("⏱ 主客户端未连接，跳过本轮 Saved Messages 清理")
+        log_throttled("cleanup:saved_skip",
+                      "⏱ 主客户端未连接，跳过本轮 Saved Messages 清理",
+                      level="info")
         return
 
     try:
@@ -385,7 +387,9 @@ async def cleanup_bot_chat_once():
         return
     cli = state.client
     if cli is None or not cli.is_connected():
-        logger.info("⏱ 主客户端未连接，跳过本轮 bot 菜单对话清理")
+        log_throttled("cleanup:bot_skip",
+                      "⏱ 主客户端未连接，跳过本轮 bot 菜单对话清理",
+                      level="info")
         return
     try:
         from datetime import datetime, timezone

@@ -9,6 +9,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
 _TMP = tempfile.mkdtemp(prefix="tg_userbot_log_test_")
@@ -102,3 +103,49 @@ class CurrentLogPathTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LogThrottledTest(unittest.TestCase):
+    """log_throttled：同类告警窗口聚合（2026-09-24 断连风暴降噪）。"""
+
+    def setUp(self):
+        logmod._THROTTLE_STATE.clear()
+        self.patcher = mock.patch.object(logmod.logger, "warning")
+        self.patcher_i = mock.patch.object(logmod.logger, "info")
+        self.warn = self.patcher.start()
+        self.info = self.patcher_i.start()
+        self.addCleanup(self.patcher.stop)
+        self.addCleanup(self.patcher_i.stop)
+
+    def tearDown(self):
+        logmod._THROTTLE_STATE.clear()
+
+    def test_first_logs_then_suppressed(self):
+        self.assertTrue(logmod.log_throttled("k1", "第一条"))
+        self.assertFalse(logmod.log_throttled("k1", "第二条"))
+        self.assertFalse(logmod.log_throttled("k1", "第三条"))
+        self.assertEqual(self.warn.call_count, 1)
+        self.assertIn("第一条", self.warn.call_args.args[0])
+
+    def test_summary_after_window(self):
+        logmod.log_throttled("k2", "首条")
+        # 3 条进窗口静默
+        for i in range(3):
+            logmod.log_throttled("k2", f"静默{i}")
+        # 时间推进越过窗口 → 下一条全量打出并带静默摘要
+        with mock.patch.object(logmod.time, "monotonic",
+                               return_value=logmod.time.monotonic() + 301):
+            self.assertTrue(logmod.log_throttled("k2", "新窗口首条"))
+        texts = [c.args[0] for c in self.warn.call_args_list]
+        self.assertTrue(any("静默 3 条" in t for t in texts), texts)
+        self.assertIn("新窗口首条", texts[-1])
+
+    def test_keys_isolated(self):
+        logmod.log_throttled("ka", "A 告警")
+        self.assertTrue(logmod.log_throttled("kb", "B 告警"),
+                        "不同 key 互不影响，各自首条都应打出")
+
+    def test_level_and_thread_safety_shape(self):
+        self.assertTrue(logmod.log_throttled("kc", "info 走 info", level="info"))
+        self.assertEqual(self.info.call_count, 1)
+        self.assertEqual(self.warn.call_count, 0)

@@ -13,6 +13,8 @@
 """
 import contextvars
 import logging
+import threading
+import time
 from logging.handlers import TimedRotatingFileHandler
 
 logger = logging.getLogger("tg_userbot")
@@ -22,6 +24,35 @@ logger = logging.getLogger("tg_userbot")
 _trace_var = contextvars.ContextVar("trace_id", default="")
 
 _active_log_file = None  # 当前写入的日志文件路径（rotate 后仍指向 base 文件）
+
+# ------------------------------------------------------------
+# 同类告警聚合（2026-09-24 断连风暴降噪）：风暴期间「发送通知失败 / 面板
+# 刷新失败 / 跳过本轮清理」每分钟各刷一条，全天 3600+ 条淹没有效信息。
+# log_throttled 把同一 key 的日志聚合：窗口内第一条全量打出，之后静默
+# 计数；下一条越过窗口的打出摘要（附上一窗口静默条数）再开新窗。
+# ------------------------------------------------------------
+_THROTTLE_LOCK = threading.Lock()
+_THROTTLE_STATE = {}  # key -> {"first": monotonic, "suppressed": int}
+
+
+def log_throttled(key, msg, level="warning", interval=300.0):
+    """按 key 聚合的日志：interval 秒内首条全量、其余静默计数。
+
+    线程安全（面板循环 / 清理线程 / 通知路径都可能并发触发）。返回本条
+    是否真正落了日志（测试断言用）。
+    """
+    now = time.monotonic()
+    with _THROTTLE_LOCK:
+        st = _THROTTLE_STATE.get(key)
+        if st is None or now - st["first"] >= interval:
+            suppressed = st["suppressed"] if st else 0
+            _THROTTLE_STATE[key] = {"first": now, "suppressed": 0}
+            text = msg if not suppressed else (
+                f"{msg}\n（上一窗口同类告警已静默 {suppressed} 条）")
+            getattr(logger, level)(text)
+            return True
+        st["suppressed"] += 1
+        return False
 
 
 def set_trace(trace_id: str) -> None:
