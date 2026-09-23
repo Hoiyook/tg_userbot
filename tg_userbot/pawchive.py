@@ -183,6 +183,57 @@ def fetch_favorited_ids(cookie):
     return {str(f["id"]) for f in favs}
 
 
+def validate_cookie_blocking(cookie=None, timeout=20, retries=2):
+    """校验 Pawchive Cookie 会话是否仍有效（阻塞 HTTP，调用方放线程跑）。
+
+    打同一个 favorites 接口：返回 JSON（哪怕空收藏）= 会话有效；HTTP
+    401/403 = 明确失效；登录墙返回 HTML（JSON 解码炸）也按失效。网络抖动
+    **不算**失效——detail 里区分「已失效」与「校验失败（网络）」，调用方
+    只对前者提醒用户换 Cookie。返回 (ok, detail)。
+    """
+    cookie = config.PAWCHIVE_COOKIE if cookie is None else cookie
+    if not (cookie or "").strip():
+        return False, "未配置"
+    url = f"{config.PAWCHIVE_API_BASE}/api/v1/account/favorites?type=post"
+    try:
+        favs = _http_get_json(url, cookie=cookie, timeout=timeout,
+                              retries=retries)
+    except RuntimeError as e:
+        msg = str(e)
+        if "HTTP 401" in msg or "HTTP 403" in msg:
+            return False, f"已失效（{msg.split(':', 1)[0]}）"
+        return False, f"校验失败（{msg[:60]}）"
+    except ValueError:
+        # json.JSONDecodeError：接口吐登录页 HTML 而不是 JSON = 会话过期
+        return False, "已失效（站点返回登录页）"
+    except Exception as e:
+        return False, f"校验失败（{type(e).__name__}）"
+    if isinstance(favs, list):
+        return True, f"有效（收藏 {len(favs)} 条）"
+    return True, "有效"
+
+
+# 校验结果缓存：🧪 按钮连点 / 面板刷新共用，TTL 内不重复打站点
+COOKIE_CHECK_TTL_SECONDS = 600
+
+
+async def cookie_check_cached(force=False):
+    """带缓存的 Cookie 校验；结果写 state.PAW_COOKIE_CHECK（status 只读展示）。
+
+    TTL 内重复调用直接回上次结论（面板/连点不重复打站点）；🧪 按钮与每日
+    体检传 force=True 现打一次。网络类失败也如实缓存（detail 里带
+    「校验失败」字样，与「已失效」区分），下次 force 自然刷新。
+    """
+    st = state.PAW_COOKIE_CHECK
+    now = time.monotonic()
+    if (not force and st.get("detail") and st.get("ts")
+            and now - st["ts"] < COOKIE_CHECK_TTL_SECONDS):
+        return st.get("ok"), st.get("detail")
+    ok, detail = await asyncio.to_thread(validate_cookie_blocking)
+    st.update({"ts": now, "ok": ok, "detail": detail})
+    return ok, detail
+
+
 def _normalize_single(data):
     """站点接口差异：详情/资料可能包成单元素数组，归一化成 dict。"""
     if isinstance(data, list) and data:
@@ -452,7 +503,13 @@ async def _scan_and_notify(creator, scope, since=None):
             fetch_creator_posts, creator["service"], creator["id"], cookie,
             known_ids)
         if cookie:
-            faved_ids = await asyncio.to_thread(fetch_favorited_ids, cookie)
+            # Cookie 过期时站点吐登录页，这里会炸——不能让整场扫描失败，
+            # 降级为「无收藏对比」（PAW_LAST_SCAN 的 scope 会如实标注）
+            try:
+                faved_ids = await asyncio.to_thread(fetch_favorited_ids, cookie)
+            except Exception as e:
+                logger.warning(f"🐾 收藏对比拉取失败（本次按全量处理）：{e}")
+                faved_ids = None
         else:
             faved_ids = None
         records = build_scan_records(creator, posts, faved_ids, scope,
@@ -734,6 +791,24 @@ def status_text():
             f"{_STATUS_LABELS.get(s, s)} {n}" for s, n in sorted(counts.items())))
     else:
         lines.append("（还没有扫描结果，/paw plan <作者名> 开始）")
+    # 失败帖画像（2026-09-24）：把「❌ 失败」拆成可重投/纯死链，重投按钮
+    # 才有决策依据（493 条失败里 464 条是死链，盲重投只空转）。
+    failed_n = counts.get(runtime_db.PAW_POST_FAILED, 0)
+    if failed_n:
+        try:
+            recoverable, dead = runtime_db.classify_pawchive_failed()
+            lines.append(f"失败帖画像：♻️ 可重投 {recoverable} / "
+                         f"🗄 纯死链 {dead}（/paw retry all 只重投前者）")
+        except runtime_db.DbUnavailable:
+            pass
+    # Cookie 健康（只读展示最近一次校验结论，这里绝不打站点网络请求）
+    if config.PAWCHIVE_COOKIE:
+        ck = state.PAW_COOKIE_CHECK
+        if ck.get("detail"):
+            mark = "✅" if ck.get("ok") else "⚠️"
+            lines.append(f"{mark} Cookie：{ck['detail']}")
+        else:
+            lines.append("🍪 Cookie：已配置（🧪 校验 可验证有效性）")
     if state.PAW_LAST_SCAN:
         s = state.PAW_LAST_SCAN
         lines.append(
@@ -780,7 +855,8 @@ def menu_buttons():
          Button.inline("🔁 重投全部失败", encode_menu_data("paw_retry_all"))],
         [Button.inline("📌 指定帖子下载", encode_menu_data("paw_post")),
          Button.inline("🔎 按名称查询", encode_menu_data("paw_find"))],
-        [Button.inline("🍪 设置 Cookie", encode_menu_data("paw_cookie"))],
+        [Button.inline("🍪 设置 Cookie", encode_menu_data("paw_cookie")),
+         Button.inline("🧪 校验 Cookie", encode_menu_data("paw_cookie_check"))],
         [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
     ]
 

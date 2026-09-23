@@ -655,7 +655,7 @@ MENU_ACTIONS = (
     # 导出 CSV / 重投全部失败 / 搜索候选按钮（paw_pick 带序号）
     "paw", "paw_status", "paw_search", "paw_cookie", "paw_pause",
     "paw_resume", "paw_manual", "paw_done", "paw_archive", "paw_pick",
-    "paw_csv",
+    "paw_csv", "paw_cookie_check",
     "mlink_done", "mlink_open", "mlink_view", "mlink_paw_done",
     "mlink_paw_del", "paw_done_view",
     "input_cancel",
@@ -664,6 +664,8 @@ MENU_ACTIONS = (
     "cmdt", "cmdt_add", "cmdt_run", "cmdt_del",
     # CD2 子菜单视图与「命令行/上传」合并工具箱视图
     "cd2_menu", "tools",
+    # 115 备份对账：本地滞留媒体 × 近期备份日志交叉（2026-09-24）
+    "cd2ck",
 )
 
 
@@ -806,7 +808,7 @@ REGISTERED_COMMAND_NAMES = frozenset({name for name in (
     "dedup",
     "caption_filter", "listen", "wl", "sql", "sqlt", "paw", "origin",
     "clean", "clearmsg", "setcleartime", "done", "thread", "folder",
-    "logpath", "links", "help", "start",
+    "logpath", "links", "help", "start", "cd2ck",
 )})
 
 

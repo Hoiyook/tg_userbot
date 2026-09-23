@@ -1693,10 +1693,41 @@ def retry_pawchive_posts(row_ids=None, now=None):
                 )
         return requeued, skipped
 
-    count = _write(do, "重投 Pawchive 失败帖子")
-    if count:
-        logger.info(f"🗄 Pawchive 重投 {count} 条失败帖子")
-    return count
+    result = _write(do, "重投 Pawchive 失败帖子")
+    if result[0]:
+        logger.info(f"🗄 Pawchive 重投 {result[0]} 条失败帖子")
+    return result
+
+
+def classify_pawchive_failed():
+    """失败帖画像：返回 (可重投帖数, 纯死链/无文件帖数)。
+
+    「可重投」与 retry_pawchive_posts 的重投判定**同源**（帖内至少一个
+    PENDING 或非死链 FAILED 文件）——画像里的数字就是 /paw retry all 会
+    真正动的那批，两处永不出现口径打架。/paw status 展示用。
+    """
+
+    def do(conn):
+        rows = _execute(
+            conn, "SELECT id FROM pawchive_posts WHERE status=?",
+            (PAW_POST_FAILED,)).fetchall()
+        recoverable = dead = 0
+        for pid in [r["id"] for r in rows]:
+            files = _execute(
+                conn, "SELECT status, error FROM pawchive_files "
+                "WHERE post_row=?", (pid,)).fetchall()
+            has = any(
+                r["status"] == PAW_FILE_PENDING
+                or (r["status"] == PAW_FILE_FAILED
+                    and not (r["error"] or "").startswith(PAW_DEAD_LINK_MARK))
+                for r in files)
+            if files and has:
+                recoverable += 1
+            else:
+                dead += 1
+        return recoverable, dead
+
+    return _read(do, "统计 Pawchive 失败帖画像")
 
 
 def release_pawchive_post(post_row):

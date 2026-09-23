@@ -167,7 +167,8 @@ async def start_with_retry(cli, bot_token=None):
 
 
 async def _maintenance_loop():
-    """每日维护：DB 备份（滚动 7 份）+ 事件流裁剪（R1/R2，2026-09-18）。
+    """每日维护：DB 备份（滚动 7 份）+ 事件流裁剪（R1/R2，2026-09-18）
+    + Pawchive Cookie 体检（2026-09-24）。
 
     启动即先跑一次（覆盖「上次备份以来」的空窗），之后每 24h 一次。
     全部失败只告警，绝不影响主流程。"""
@@ -179,6 +180,20 @@ async def _maintenance_loop():
             raise
         except Exception as e:
             logger.warning(f"🗄 每日维护异常：{e}")
+        # Cookie 每日体检：已配置才查，失效才提醒（一天至多这一条）
+        try:
+            from . import notify, pawchive
+            if config.PAWCHIVE_COOKIE:
+                ok, detail = await pawchive.cookie_check_cached(force=True)
+                if not ok:
+                    await notify.notify_user(
+                        f"⚠️ Pawchive Cookie 疑似失效：{detail}\n"
+                        "更新：发 /paw cookie 重新粘贴，或 bot 菜单 "
+                        "🐾 Pawchive → 🍪 设置 Cookie")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"🍪 Pawchive Cookie 体检异常（不影响维护）：{e}")
         await asyncio.sleep(24 * 3600)
 
 

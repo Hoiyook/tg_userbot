@@ -664,4 +664,13 @@ async def handle_command(event, cmd_text):
         logger.info(f"执行命令：/clean | 删除 {count} 个临时文件")
         return True
 
+    if cmd_text == "/cd2ck":
+        # 115 备份对账：walk 大目录 + 读备份日志是阻塞活，放线程跑
+        await _reply(event, "🔍 对账中：扫描本地滞留媒体 × 近 3 天备份日志…")
+        from . import cd2
+        out = await asyncio.to_thread(cd2.reconcile_text)
+        await _reply(event, out)
+        logger.info("执行命令：/cd2ck | 115 备份对账")
+        return True
+
     return False

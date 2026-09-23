@@ -160,7 +160,8 @@ def cd2_menu_buttons():
     return [
         [Button.inline("▶️ 启动 / 查状态", encode_menu_data("cd2")),
          Button.inline("🛑 停止", encode_menu_data("cd2_stop"))],
-        [Button.inline("🗂 备份记录", encode_menu_data("bak"))],
+        [Button.inline("🗂 备份记录", encode_menu_data("bak")),
+         Button.inline("🔍 115 对账", encode_menu_data("cd2ck"))],
         [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
     ]
 

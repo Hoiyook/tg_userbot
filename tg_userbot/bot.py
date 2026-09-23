@@ -72,6 +72,7 @@ BOT_COMMANDS = (
     ("chrome_cancel", "取消 Chrome 任务：/chrome_cancel <序号>"),
     ("chrome", "用 Chrome 下载：/chrome <URL>"),
     ("paw", "Pawchive：扫描作者作品、收藏对比、Chrome 批量下载"),
+    ("cd2ck", "115 备份对账：本地滞留媒体 × 备份日志交叉"),
     ("origin", "查看评论来源解析失败账本（可溯源）"),
     ("cmdt", "命令模板：保存/执行常用 shell 命令"),
     ("clearmsg", "清理程序产生的消息"),
@@ -300,6 +301,14 @@ async def handle_menu_action(action, arg, event):
             "发送 / 开头的命令可取消。",
             input_cancel_buttons(),
         )
+    if action == "paw_cookie_check":
+        # 🧪 Cookie 体检：现打一次站点校验（绕过 TTL），失效给更新指引
+        ok, detail = await pawchive.cookie_check_cached(force=True)
+        mark = "✅" if ok else "⚠️"
+        hint = ("" if ok else
+                "\n\n更新：点【🍪 设置 Cookie】重新粘贴，或 /paw cookie")
+        return (f"{pawchive.TEXT_PREFIX}\n{mark} Cookie 校验：{detail}{hint}",
+                pawchive.menu_buttons())
     if action == "paw_pause":
         return pawchive.pause_reply(), pawchive.menu_buttons()
     if action == "paw_resume":
@@ -522,6 +531,10 @@ async def handle_menu_action(action, arg, event):
         return await cd2.cd2_stop_or_status(), menu.cd2_menu_buttons()
     if action == "bak":
         return cd2.backup_records_text(), menu.cd2_menu_buttons()
+    if action == "cd2ck":
+        # 对账要 walk 整个下载目录（阻塞），放线程跑；按钮先 answer 过不超时
+        out = await asyncio.to_thread(cd2.reconcile_text)
+        return out, menu.cd2_menu_buttons()
     if action == "cmdt":
         return cmd_templates.list_text(), cmd_templates.menu_buttons()
     if action == "cmdt_add":

@@ -12,6 +12,7 @@
 """
 import os
 import re
+import time
 import asyncio
 import signal
 import subprocess
@@ -199,6 +200,12 @@ BACKUP_MEDIA_EXTS = frozenset(
     "mp3 m4a ogg opus flac wav aac".split()
 )
 
+# 对账口径的产物扩展名：在备份记录视图白名单之外，CD2 实际也搬档案与文档
+# （2026-09-20~23 日志实测 zip 3669 行、pdf/psd 273 行）——滞留判定必须贴
+# CD2 真实搬运口径，否则 zip 类产物全被漏判。
+RECONCILE_MEDIA_EXTS = BACKUP_MEDIA_EXTS | frozenset(
+    "zip rar 7z pdf psd epub".split())
+
 # 匹配备份日志里的“删除源文件”逐文件行，捕获（时间, 虚拟路径）
 _BACKUP_LINE_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\S+\s+INFO\s+cloudapi::backup_manager:\s+"
@@ -207,12 +214,15 @@ _BACKUP_LINE_RE = re.compile(
 )
 
 
-def parse_backup_log_lines(lines):
-    """从备份日志的文本行解析出 (时间, 虚拟路径)，媒体白名单内、按路径去重。
+def parse_backup_log_lines(lines, exts=None):
+    """从备份日志的文本行解析出 (时间, 虚拟路径)，扩展名白名单内、按路径去重。
 
     只认两种逐文件“delete file...”行；批量的 notify callback 行跳过（重复）。
-    返回按时间倒序的 [(时间, 路径), ...]，纯函数可单测。
+    exts 缺省 = BACKUP_MEDIA_EXTS（备份记录视图口径）；115 对账传
+    RECONCILE_MEDIA_EXTS（含 zip 等档案）。返回按时间倒序的 [(时间, 路径), ...]，
+    纯函数可单测。
     """
+    exts = BACKUP_MEDIA_EXTS if exts is None else exts
     seen = {}
     for raw in lines:
         m = _BACKUP_LINE_RE.match(raw.strip())
@@ -220,7 +230,7 @@ def parse_backup_log_lines(lines):
             continue
         ts, path = m.group(1), m.group(2)
         ext = os.path.splitext(path)[1].lstrip(".").lower()
-        if ext not in BACKUP_MEDIA_EXTS:
+        if ext not in exts:
             continue
         seen[path] = ts  # 同一路径多次出现保留最后时间
     items = [(ts, path) for path, ts in seen.items()]
@@ -274,4 +284,157 @@ def backup_records_text(days=7, limit=15):
             display = display[:69] + "…"
         out.append(f"· {mmdd}  {display}")
     text = head + "\n".join(out)
+    return text[:4000]
+
+
+# ------------------------------------------------------------
+# 【115 对账】（2026-09-24）：本地滞留媒体 × 近期备份日志交叉。
+#
+# CD2 的语义是「备份到 115 完成即删本地源」——正常情况下下载目录里不该有
+# 超过一天的媒体文件。滞留 = 竞态漏备（CD2 扫描时文件还没落盘，之后无人
+# 再扫）或备份后重新出现（重下）。两种都需要 CD2 应用内对那个目录手动补
+# 一次同步；本对账只负责把它们找出来，绝不删除/移动任何文件。
+#
+# 备份日志里的路径是 CD2 虚拟路径（卷根不带 /Volumes，如 /V1/downloads/…），
+# 与本地真实路径差一个前缀，见 _local_to_virtual / _virtual_to_local。
+# ------------------------------------------------------------
+_STALE_MIN_AGE_HOURS = 24   # 滞留判定线：比这更「新」的文件视为还在正常排队
+_RECON_LOG_DAYS = 3         # 交叉比对的备份日志天数
+_RECON_TOP_DIRS = 8         # 报告里最多列几个目录
+
+
+def _volume_name():
+    """从 DOWNLOAD_DIR（/Volumes/<卷>/…）取数据卷名；解析不出返回 None。"""
+    m = re.match(r"^/Volumes/([^/]+)/", config.DOWNLOAD_DIR)
+    return m.group(1) if m else None
+
+
+def _local_to_virtual(path):
+    """本地真实路径 → CD2 虚拟路径（去掉一级 /Volumes）；不在数据卷上返回 None。"""
+    vol = _volume_name()
+    if vol and path.startswith(f"/Volumes/{vol}/"):
+        return path[len("/Volumes"):]
+    return None
+
+
+def _virtual_to_local(path):
+    """CD2 虚拟路径 → 本地真实路径（补回 /Volumes 前缀）；对不上返回 None。"""
+    vol = _volume_name()
+    if vol and path.startswith(f"/{vol}/"):
+        return "/Volumes" + path
+    return None
+
+
+def _read_backup_log_lines(log_dir=None, days=_RECON_LOG_DAYS):
+    """读最近 days 天 backup.<日期>.log 的原始文本行（列表；目录缺失返回 None）。"""
+    log_dir = os.path.expanduser(log_dir or cd2_log_dir())
+    if not log_dir or not os.path.isdir(log_dir):
+        return None
+    lines = []
+    today = date.today()
+    for i in range(days):
+        d = today - timedelta(days=i)
+        p = os.path.join(log_dir, f"backup.{d.isoformat()}.log")
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                lines.extend(f.read().splitlines())
+        except (OSError, ValueError):
+            continue
+    return lines
+
+
+def backup_log_paths(days=_RECON_LOG_DAYS):
+    """近期备份日志里出现过的虚拟路径集合（媒体白名单内、已去重）。
+
+    日志目录未配置/不可读返回 None——调用方据此在对账报告里如实标注
+    「无法交叉比对」，而不是把所有滞留都算成漏备。
+    """
+    lines = _read_backup_log_lines(days=days)
+    if lines is None:
+        return None
+    return {path for _ts, path in
+            parse_backup_log_lines(lines, exts=RECONCILE_MEDIA_EXTS)}
+
+
+def reconcile_local_backup(download_root=None, min_age_hours=_STALE_MIN_AGE_HOURS,
+                           log_days=_RECON_LOG_DAYS, top=_RECON_TOP_DIRS):
+    """对账主体：本地滞留媒体 × 近期备份日志交叉，返回结构化结果。
+
+    返回 dict：
+      stale_n / stale_bytes      本地滞留媒体总数与总字节（超龄未删源）
+      missed_n / missed_bytes    漏备候选（滞留且近 N 天日志未见）
+      reappeared_n               备份后重现（滞留但日志里有——重下后未再备份）
+      dirs                       [(相对目录, 个数, 字节)] 按字节降序最多 top 条
+      log_available              备份日志是否可读（False 时 missed 口径=全部滞留）
+    纯只读：只 walk 与读日志，绝不改文件。
+    """
+    root = os.path.expanduser(download_root or config.DOWNLOAD_DIR)
+    cutoff = time.time() - min_age_hours * 3600
+    log_paths = backup_log_paths(log_days)
+    stale = {}   # dir -> [count, bytes]
+    s_n = s_b = missed_n = missed_b = reappeared = 0
+    if os.path.isdir(root):
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                ext = os.path.splitext(name)[1].lstrip(".").lower()
+                if ext not in RECONCILE_MEDIA_EXTS:
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    st_ = os.stat(path)
+                except OSError:
+                    continue
+                if st_.st_mtime > cutoff:
+                    continue
+                s_n += 1
+                s_b += st_.st_size
+                bucket = stale.setdefault(
+                    os.path.relpath(dirpath, root), [0, 0])
+                bucket[0] += 1
+                bucket[1] += st_.st_size
+                virtual = _local_to_virtual(path)
+                if log_paths is not None:
+                    if virtual is not None and virtual in log_paths:
+                        reappeared += 1
+                        continue
+                    missed_n += 1
+                    missed_b += st_.st_size
+    dirs = sorted(
+        ((d, n, b) for d, (n, b) in stale.items()),
+        key=lambda x: x[2], reverse=True)[:top]
+    return {
+        "stale_n": s_n, "stale_bytes": s_b,
+        "missed_n": missed_n, "missed_bytes": missed_b,
+        "reappeared_n": reappeared,
+        "dirs": dirs,
+        "log_available": log_paths is not None,
+    }
+
+
+def reconcile_text(download_root=None):
+    """【🔍 115 对账】的展示文本（命令 /cd2ck 与 CD2 子菜单按钮共用）。"""
+    from .naming import format_size
+    root = os.path.expanduser(download_root or config.DOWNLOAD_DIR)
+    r = reconcile_local_backup(root)
+    head = (f"🔍 115 备份对账\n"
+            f"范围：{root}（滞留 = 超过 {_STALE_MIN_AGE_HOURS}h 仍在本地）\n\n")
+    if not r["stale_n"]:
+        return head + "✅ 对账干净：没有滞留媒体，CD2 备份链路正常"
+    lines = [f"本地滞留媒体：{r['stale_n']} 个 / "
+             f"{format_size(r['stale_bytes'])}"]
+    if r["log_available"]:
+        lines.append(
+            f"  ├ 漏备候选（近 {_RECON_LOG_DAYS} 天日志未见）："
+            f"{r['missed_n']} 个 / {format_size(r['missed_bytes'])}")
+        lines.append(f"  └ 备份后重现（重下未再备）：{r['reappeared_n']} 个")
+    else:
+        lines.append("  ⚠️ 备份日志不可读，无法区分漏备与重现")
+    if r["dirs"]:
+        lines.append("\n滞留最多的目录：")
+        for d, n, b in r["dirs"]:
+            lines.append(f"  · {d} —— {n} 个 / {format_size(b)}")
+    lines.append(
+        "\n建议：CD2 应用内对上述目录手动触发一次同步（补扫描），"
+        "备份完成后会自动删除本地源。")
+    text = head + "\n".join(lines)
     return text[:4000]

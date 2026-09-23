@@ -156,6 +156,9 @@ PAW_SEARCH_CANDIDATES = {}
 PAW_SCAN_RUNNING = None
 # 最近一次扫描的汇总快照（status 视图展示），未扫过为 None。
 PAW_LAST_SCAN = None
+# Pawchive Cookie 最近一次校验结果 {"ts": monotonic, "ok": bool|None,
+# "detail": str}：🧪 按钮 / 每日体检写入，/paw status 只读展示（不触发网络）。
+PAW_COOKIE_CHECK = {"ts": 0.0, "ok": None, "detail": ""}
 
 # CD2 进程句柄（仅防 GC 回收后台进程，无人读取）
 _CD2_PROC = None
