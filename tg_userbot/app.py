@@ -180,15 +180,19 @@ async def _maintenance_loop():
             raise
         except Exception as e:
             logger.warning(f"🗄 每日维护异常：{e}")
-        # Cookie 每日体检：已配置才查，失效才提醒（一天至多这一条）
+        # Cookie 每日体检：已配置才查。只对「确认失效」（401/登录墙）提醒；
+        # 网络抖动（校验失败）不是失效——站点慢时误报会吓到用户去重贴
+        # Cookie（2026-09-24），这类明天自愈，只留日志
         try:
             from . import notify, pawchive
             from . import config as _config
             if _config.PAWCHIVE_COOKIE:
                 ok, detail = await pawchive.cookie_check_cached(force=True)
-                if not ok:
+                if not ok and "已失效" in detail:
                     await notify.notify_user(
-                        f"⚠️ Pawchive Cookie 疑似失效：{detail}\n"
+                        f"⚠️ Pawchive Cookie 已失效：{detail}\n"
+                        "影响：扫描无法对比收藏，将按全部帖子处理"
+                        "（已入库帖有去重，不会重复下载）\n"
                         "更新：发 /paw cookie 重新粘贴，或 bot 菜单 "
                         "🐾 Pawchive → 🍪 设置 Cookie")
         except asyncio.CancelledError:

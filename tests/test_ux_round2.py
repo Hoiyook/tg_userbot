@@ -550,3 +550,72 @@ class ScanProgressTest(unittest.IsolatedAsyncioTestCase):
             text = pawchive_worker.build_progress_text()
         self.assertIn("🔎 扫描中：MofuMochii", text)
         self.assertIn("收藏对比", text)
+
+
+# ============================================================
+# 6) Cookie 失效降级：不跳帖（去重交给入库唯一索引）+ 通知只对真失效
+# ============================================================
+class CookieInvalidNoSkipTest(unittest.TestCase):
+    """Cookie 拿不到收藏清单（失效/网络失败）→ faved_ids=None →
+    范围过滤整体跳过、全量处理——绝不能因为 Cookie 问题漏帖；
+    重复入队由 UNIQUE(service, creator_id, post_id) 去重兜底。"""
+
+    POSTS = [
+        {"id": 1, "title": "会收藏的帖", "published": "2026-09-01T10:00:00",
+         "attachments": [{"path": "a/1.mp4", "name": "1.mp4"}]},
+        {"id": 2, "title": "新帖", "published": "2026-09-02T10:00:00",
+         "attachments": [{"path": "a/2.mp4", "name": "2.mp4"}]},
+    ]
+    CREATOR = {"id": "46802018", "name": "MofuMochii", "service": "patreon"}
+
+    def test_valid_cookie_notfaved_scope_skips_faved(self):
+        recs = pawchive.build_scan_records(
+            self.CREATOR, self.POSTS, faved_ids={"1"}, scope="notfaved")
+        self.assertEqual([r["post_id"] for r in recs], ["2"])
+
+    def test_invalid_cookie_processes_all_posts(self):
+        """faved_ids=None（Cookie 失效/校验失败降级）→ 一帖不少。"""
+        recs = pawchive.build_scan_records(
+            self.CREATOR, self.POSTS, faved_ids=None, scope="notfaved")
+        self.assertEqual([r["post_id"] for r in recs], ["1", "2"])
+
+
+class DailyCookieNotifyOnlyOnRealInvalidTest(unittest.IsolatedAsyncioTestCase):
+    """每日体检：网络抖动（校验失败）不通知；确认失效才通知。"""
+
+    async def _run_check(self, ok, detail):
+        from tg_userbot import app as app_mod
+        from tg_userbot import maintenance, notify, pawchive
+        sent = []
+
+        async def fake_notify(text):
+            sent.append(text)
+
+        async def fake_daily():
+            return None
+
+        async def fake_check(force=False):
+            return ok, detail
+
+        async def fake_sleep(seconds):
+            raise asyncio.CancelledError
+
+        with mock.patch.object(maintenance, "daily_maintenance", fake_daily), \
+             mock.patch.object(pawchive, "cookie_check_cached", fake_check), \
+             mock.patch.object(notify, "notify_user", fake_notify), \
+             mock.patch.object(config, "PAWCHIVE_COOKIE", "sessionid=X"), \
+             mock.patch.object(app_mod.asyncio, "sleep", fake_sleep):
+            task = asyncio.ensure_future(app_mod._maintenance_loop())
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        return sent
+
+    async def test_network_failure_not_notified(self):
+        sent = await self._run_check(False, "校验失败（重试 2 次仍失败）")
+        self.assertEqual(sent, [], "网络抖动不是失效，不该打扰用户")
+
+    async def test_real_invalid_notified_with_dedup_note(self):
+        sent = await self._run_check(False, "已失效（HTTP 401）")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("已失效", sent[0])
+        self.assertIn("不会重复下载", sent[0])
