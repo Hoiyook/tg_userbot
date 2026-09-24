@@ -30,6 +30,7 @@ import os
 import shutil
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import httpx
@@ -208,22 +209,64 @@ def _head_status(url, timeout=15):
         return "ERR:" + type(e).__name__
 
 
+def _repair_url(url, filename):
+    """老数据无扩展名 URL → 按文件名补扩展名；本就有扩展名返回 None。
+
+    扩展名插在 query（?f=…）之前；文件名无合法扩展名（字母数字、≤5 位）
+    不动。纯函数可单测。"""
+    base = os.path.basename(urllib.parse.urlsplit(url).path)
+    if "." in base:
+        return None
+    _stem, dot, ext = str(filename or "").rpartition(".")
+    # 纯数字段（如「2024.09.22」的 22）不是扩展名，别往上拼
+    if not dot or not ext.isalnum() or len(ext) > 5 or ext.isdigit():
+        return None
+    if "?" in url:
+        head, _sep, query = url.partition("?")
+        return f"{head}.{ext}?{query}"
+    return f"{url}.{ext}"
+
+
 def _head_dead_ids(targets):
-    """并发 HEAD 一批 (file_row, url)，返回死链（404/410）的 file id 集合。
+    """并发 HEAD 一批 (file_row, url)，返回 (死链 file id 集合, 自愈映射)。
 
     纯 HTTP，在 to_thread 里跑；**绝不碰 runtime_db**（DB 连接属主线程，
     sqlite3 的 check_same_thread 会拒绝跨线程使用）。
-    """
+
+    自愈（2026-09-24）：站点 CDN 起对无扩展名路径 404，而老数据存的 URL
+    都不带扩展名——404 时先按文件名补扩展名重探一次，活着就把修复后的
+    URL 交回调用方回写 DB，绝不在这种情况下误判死链。"""
     import concurrent.futures
 
     if not targets:
-        return set()
+        return set(), {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         codes = list(ex.map(lambda t: _head_status(t[1]), targets))
     summary = collections.Counter(str(code) for code in codes)
     logger.info(f"🐾 死链预检：{len(targets)} 个直链 → {dict(summary)}")
-    return {t[0]["id"] for t, code in zip(targets, codes)
-            if code in _DEAD_STATUS}
+
+    repaired = {}
+    still_dead = []
+    recheck = []
+    for t, code in zip(targets, codes):
+        if code not in _DEAD_STATUS:
+            continue
+        fixed = _repair_url(t[1], (t[0] or {}).get("filename"))
+        if fixed:
+            recheck.append((t, fixed))
+        else:
+            still_dead.append(t)
+    if recheck:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            codes2 = list(ex.map(lambda t: _head_status(t[1]), recheck))
+        for (t, fixed), code in zip(recheck, codes2):
+            if code in _DEAD_STATUS:
+                still_dead.append(t)
+            else:
+                repaired[t[0]["id"]] = fixed
+                logger.info(f"🐾 URL 自愈：{t[0].get('filename')} "
+                            f"补扩展名后可访问（HTTP {code}）")
+    return {t[0]["id"] for t in still_dead}, repaired
 
 
 def _mark_dead(file_row, code=404):
@@ -693,10 +736,15 @@ async def process_post(post):
     if config.PAWCHIVE_PRECHECK_HEAD:
         targets = [(f, f["url"]) for f in files
                    if f["status"] == runtime_db.PAW_FILE_PENDING]
-        dead_ids = await asyncio.to_thread(_head_dead_ids, targets)
+        dead_ids, repaired = await asyncio.to_thread(_head_dead_ids, targets)
         for f in files:
-            if f["status"] == runtime_db.PAW_FILE_PENDING \
-                    and f["id"] in dead_ids:
+            if f["status"] != runtime_db.PAW_FILE_PENDING:
+                continue
+            if f["id"] in repaired:
+                # 老数据无扩展名 URL 自愈：回写 DB + 内存，照常下载
+                runtime_db.update_pawchive_file_url(f["id"], repaired[f["id"]])
+                f["url"] = repaired[f["id"]]
+            elif f["id"] in dead_ids:
                 _mark_dead(f)
                 logger.warning(f"🐾 死链预检跳过：{f['filename']}")
 

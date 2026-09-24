@@ -138,9 +138,9 @@ class PrecheckTest(_WorkerDbTestCase):
         f = {"id": 1, "url": "https://x/a.mp4",
              "status": runtime_db.PAW_FILE_PENDING}
         with mock.patch.object(worker, "_head_status", return_value=None):
-            dead = await asyncio.to_thread(worker._head_dead_ids,
-                                           [(f, f["url"])])
-        self.assertEqual(dead, set())
+            dead, repaired = await asyncio.to_thread(worker._head_dead_ids,
+                                                     [(f, f["url"])])
+        self.assertEqual((dead, repaired), (set(), {}))
 
 
 class LegacyRequeueTest(_WorkerDbTestCase):

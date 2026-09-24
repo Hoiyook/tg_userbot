@@ -26,6 +26,7 @@ atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import cd2, config, pawchive, runtime_db, state  # noqa: E402
+from tg_userbot import pawchive_worker  # noqa: E402
 
 
 # ============================================================
@@ -619,3 +620,119 @@ class DailyCookieNotifyOnlyOnRealInvalidTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sent), 1)
         self.assertIn("已失效", sent[0])
         self.assertIn("不会重复下载", sent[0])
+
+
+# ============================================================
+# 7) CDN 无扩展名 404：URL 自愈（2026-09-24 Caught Behemoth 排查产物）
+# ============================================================
+class FileEntryExtensionTest(unittest.TestCase):
+    """_file_entry：API path 缺扩展名时从文件名补上。"""
+
+    def test_path_without_ext_gets_ext_from_name(self):
+        att = {"path": "/82/3a/hash123", "name": "bh_px.png"}
+        entry = pawchive._file_entry(att)
+        self.assertIn("/data/82/3a/hash123.png?f=bh_px.png", entry["url"])
+
+    def test_path_with_ext_untouched(self):
+        att = {"path": "/82/3a/hash123.png", "name": "bh_px.png"}
+        entry = pawchive._file_entry(att)
+        self.assertIn("/hash123.png?", entry["url"])
+
+    def test_name_without_ext_leaves_path(self):
+        att = {"path": "/82/3a/hash123", "name": "无名"}
+        entry = pawchive._file_entry(att)
+        self.assertIn("/data/82/3a/hash123?", entry["url"])
+
+
+class RepairUrlTest(unittest.TestCase):
+    """_repair_url 纯函数：补扩展名位置与守卫。"""
+
+    def test_appends_ext_before_query(self):
+        url = "https://f.pw/data/82/3a/hash?f=bh_px.png"
+        self.assertEqual(
+            pawchive_worker._repair_url(url, "bh_px.png"),
+            "https://f.pw/data/82/3a/hash.png?f=bh_px.png")
+
+    def test_no_query_case(self):
+        self.assertEqual(
+            pawchive_worker._repair_url("https://f.pw/data/x/hash", "a.zip"),
+            "https://f.pw/data/x/hash.zip")
+
+    def test_already_has_ext_returns_none(self):
+        self.assertIsNone(pawchive_worker._repair_url(
+            "https://f.pw/data/x/hash.png", "a.png"))
+
+    def test_bad_name_returns_none(self):
+        self.assertIsNone(pawchive_worker._repair_url(
+            "https://f.pw/data/x/hash", "2024.09.22"))
+        self.assertIsNone(pawchive_worker._repair_url(
+            "https://f.pw/data/x/hash", "无扩展名"))
+
+
+class HeadDeadIdsRepairTest(unittest.TestCase):
+    """404 时先试补扩展名再判死；补活返回自愈映射。"""
+
+    def setUp(self):
+        self.targets = [(
+            {"id": 7, "filename": "bh_px.png"},
+            "https://f.pw/data/82/3a/hash?f=bh_px.png")]
+
+    def test_repair_alive_not_dead(self):
+        calls = []
+
+        def fake_head(url, timeout=15):
+            calls.append(url)
+            # 第一轮：原 URL 404；第二轮：补扩展名 200
+            return 404 if url.endswith("hash?f=bh_px.png") else 200
+
+        with mock.patch.object(pawchive_worker, "_head_status",
+                               side_effect=fake_head):
+            dead, repaired = pawchive_worker._head_dead_ids(self.targets)
+        self.assertEqual(dead, set(), "补活后绝不能标死")
+        self.assertEqual(repaired.get(7),
+                         "https://f.pw/data/82/3a/hash.png?f=bh_px.png")
+
+    def test_repair_still_404_is_dead(self):
+        with mock.patch.object(pawchive_worker, "_head_status",
+                               return_value=404):
+            dead, repaired = pawchive_worker._head_dead_ids(self.targets)
+        self.assertEqual(dead, {7})
+        self.assertEqual(repaired, {})
+
+    def test_healthy_url_untouched(self):
+        with mock.patch.object(pawchive_worker, "_head_status",
+                               return_value=200):
+            dead, repaired = pawchive_worker._head_dead_ids(self.targets)
+        self.assertEqual((dead, repaired), (set(), {}))
+
+
+class UpdateFileUrlTest(unittest.TestCase):
+    """update_pawchive_file_url：自愈回写存量行。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_urlfix_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "作者", [{
+                "post_id": "p1", "title": "t",
+                "published": "2026-09-24T00:00:00",
+                "post_url": "https://x/p1", "subdir": "Pawchive/A/p1",
+                "files": [{"url": "https://f.pw/data/x/hash",
+                           "filename": "a.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+
+    def test_url_updated(self):
+        f = runtime_db.list_pawchive_files(
+            runtime_db.claim_next_pawchive_post(now=1000)["id"])[0]
+        n = runtime_db.update_pawchive_file_url(
+            f["id"], "https://f.pw/data/x/hash.png")
+        self.assertEqual(n, 1)
+        rows = runtime_db.list_pawchive_files(f["post_row"])
+        self.assertEqual(rows[0]["url"], "https://f.pw/data/x/hash.png")

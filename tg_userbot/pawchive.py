@@ -420,9 +420,16 @@ def extract_links(post):
 
 
 def _file_entry(att):
-    """附件 → {url, filename}：直链指向 file 服务器原始文件（非缩略图）。"""
+    """附件 → {url, filename}：直链指向 file 服务器原始文件（非缩略图）。
+
+    2026-09-24 起站点 CDN 对**无扩展名**路径一律 404（此前曾返回不带扩展
+    名的 path）——path 缺扩展名时从文件名补上，否则预检/下载全数误判死链。"""
     path = att["path"]
     name = att.get("name") or os.path.basename(path)
+    if "." not in os.path.basename(path):
+        stem, dot, ext = name.rpartition(".")
+        if dot and ext.isalnum() and len(ext) <= 5:
+            path = f"{path}.{ext}"
     qname = urllib.parse.quote(name)
     return {"url": f"{config.PAWCHIVE_FILE_BASE}/data{path}?f={qname}",
             "filename": name}

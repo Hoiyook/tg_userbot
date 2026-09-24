@@ -1548,6 +1548,19 @@ def mark_pawchive_file_done(file_id, size_bytes=None, now=None):
     return _write(do, "标记 Pawchive 文件完成")
 
 
+def update_pawchive_file_url(file_id, url, now=None):
+    """URL 自愈回写：老数据无扩展名 URL 被补出可用地址后更新存量行。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn, "UPDATE pawchive_files SET url=?, updated_at=? WHERE id=?",
+            (url, now, int(file_id)))
+        return cur.rowcount
+
+    return _write(do, "更新 Pawchive 文件直链")
+
+
 def mark_pawchive_file_failed(file_id, error=None, now=None):
     now = _now(now)
 
