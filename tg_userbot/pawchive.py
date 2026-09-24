@@ -139,6 +139,28 @@ async def resolve_creator_async(name):
     return await asyncio.to_thread(resolve_creator, name)
 
 
+def creators_cache_stale():
+    """创作者缓存是否已过期（文件缺失/超 TTL 都算过期）。"""
+    try:
+        return (time.time() - os.path.getmtime(_cache_path())
+                >= config.PAWCHIVE_CREATORS_CACHE_TTL)
+    except OSError:
+        return True
+
+
+# 缓存过期时的即时提示：解析要现拉约 14MB 创作者列表，站点直连较慢
+# （2026-09-24 实测 1~2 分钟），不提示的话用户全程静默像「没反应」
+STALE_CREATORS_ACK = (
+    "⏳ 创作者列表缓存已过期，正在拉取最新列表"
+    "（约 1~2 分钟，完成后自动继续，请稍等）")
+
+
+async def ack_stale_creators(reply):
+    """缓存过期时先发一条即时提示再进入慢解析；reply 是单参发送函数。"""
+    if creators_cache_stale():
+        await reply(STALE_CREATORS_ACK)
+
+
 # ============================================================
 # 帖子 / 收藏 / 外链
 # ============================================================
@@ -1230,6 +1252,8 @@ async def _reply_search(event, term):
         await event.reply(f"{TEXT_PREFIX}\n用法：/paw search <关键词>",
                           link_preview=False)
         return
+    await ack_stale_creators(
+        lambda t: event.reply(f"{TEXT_PREFIX}\n{t}", link_preview=False))
     try:
         hits = await asyncio.to_thread(search_creators, term, 5)
     except Exception as e:
@@ -1266,6 +1290,8 @@ async def _reply_plan(event, arg):
             f"{TEXT_PREFIX}\n⏳ 已有扫描在进行（{state.PAW_SCAN_RUNNING}）",
             link_preview=False)
         return
+    await ack_stale_creators(
+        lambda t: event.reply(f"{TEXT_PREFIX}\n{t}", link_preview=False))
     scope = "notfaved"
     since = None
     parts = (arg or "").split()

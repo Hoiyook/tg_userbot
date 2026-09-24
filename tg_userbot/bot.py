@@ -1179,6 +1179,8 @@ async def _handle_paw_input(step, text):
         await state.bot_client.send_message(
             state.MY_ID, "❌ 作者名不能为空，请重新点 🔍 搜作者")
         return
+    await pawchive.ack_stale_creators(
+        lambda t: state.bot_client.send_message(state.MY_ID, t))
     try:
         creator = await pawchive.resolve_creator_async(name)
     except Exception as e:

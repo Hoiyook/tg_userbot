@@ -384,3 +384,63 @@ class ReconcileScanTest(_ReconCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ============================================================
+# 4) 创作者缓存过期即时提示（2026-09-24 /paw plan 静默无反应修复）
+# ============================================================
+class CreatorsCacheStaleTest(unittest.TestCase):
+    """creators_cache_stale：新鲜 False / 过期 True / 缺失 True。"""
+
+    def setUp(self):
+        self.cache = os.path.join(_TMP, f"creators_{id(self)}.json")
+
+    def tearDown(self):
+        if os.path.exists(self.cache):
+            os.remove(self.cache)
+
+    def test_fresh_cache_not_stale(self):
+        with open(self.cache, "w") as f:
+            f.write("[]")
+        with mock.patch.object(pawchive, "_cache_path",
+                               return_value=self.cache):
+            self.assertFalse(pawchive.creators_cache_stale())
+
+    def test_expired_and_missing_are_stale(self):
+        with open(self.cache, "w") as f:
+            f.write("[]")
+        old = time.time() - config.PAWCHIVE_CREATORS_CACHE_TTL - 60
+        os.utime(self.cache, (old, old))
+        with mock.patch.object(pawchive, "_cache_path",
+                               return_value=self.cache):
+            self.assertTrue(pawchive.creators_cache_stale())
+        with mock.patch.object(pawchive, "_cache_path",
+                               return_value=self.cache + ".nope"):
+            self.assertTrue(pawchive.creators_cache_stale())
+
+
+class StaleAckTest(unittest.IsolatedAsyncioTestCase):
+    """ack_stale_creators：过期才提示，新鲜不发。"""
+
+    async def test_ack_sent_when_stale(self):
+        sent = []
+
+        async def reply(text):
+            sent.append(text)
+
+        with mock.patch.object(pawchive, "creators_cache_stale",
+                               return_value=True):
+            await pawchive.ack_stale_creators(reply)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("缓存已过期", sent[0])
+
+    async def test_no_ack_when_fresh(self):
+        sent = []
+
+        async def reply(text):
+            sent.append(text)
+
+        with mock.patch.object(pawchive, "creators_cache_stale",
+                               return_value=False):
+            await pawchive.ack_stale_creators(reply)
+        self.assertEqual(sent, [])
