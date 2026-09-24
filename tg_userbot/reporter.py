@@ -952,7 +952,9 @@ def build_event_text(kind, **kw):
         if kw.get("capped"):
             lines.append(f"⚠️ {kw['capped']} 个聊天触到队列上限，下轮继续")
         if kw.get("chat_failures"):
-            lines.append(f"聊天失败：{kw['chat_failures']} 个")
+            lines.append(
+                f"⚠️ 聊天失败：{kw['chat_failures']} 个"
+                "（多为断连窗口；checkpoint 未动，恢复后下轮自动补扫，消息不会丢）")
         for err in (kw.get("errors") or [])[:3]:
             lines.append(f"⚠️ {err}")
         return "\n".join(lines)

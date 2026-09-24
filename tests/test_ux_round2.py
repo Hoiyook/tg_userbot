@@ -736,3 +736,73 @@ class UpdateFileUrlTest(unittest.TestCase):
         self.assertEqual(n, 1)
         rows = runtime_db.list_pawchive_files(f["post_row"])
         self.assertEqual(rows[0]["url"], "https://f.pw/data/x/hash.png")
+
+
+# ============================================================
+# 8) 监听扫描断连兜底：等重连 + 失败文案带自愈说明
+# ============================================================
+class WaitReconnectTest(unittest.IsolatedAsyncioTestCase):
+    """_wait_reconnect：在线即返；断连等到重连；超时返回 False。"""
+
+    def setUp(self):
+        from tg_userbot import listener
+        self.listener = listener
+        self._saved = (state.client,)
+
+    def tearDown(self):
+        state.client = self._saved[0]
+
+    async def test_online_returns_true_immediately(self):
+        cli = mock.MagicMock()
+        cli.is_connected = lambda: True
+        state.client = cli
+        self.assertTrue(await self.listener._wait_reconnect(timeout=5))
+
+    async def test_no_client_returns_false_without_waiting(self):
+        """client 缺席无从等待：立即 False（否则测试/异常态空转满 60s）。"""
+        state.client = None
+        sleeps = []
+
+        async def fake_sleep(s):
+            sleeps.append(s)
+
+        with mock.patch.object(self.listener.asyncio, "sleep", fake_sleep):
+            ok = await self.listener._wait_reconnect(timeout=60, poll=3)
+        self.assertFalse(ok)
+        self.assertEqual(sleeps, [], "没有 client 绝不该进入等待循环")
+
+    async def test_fake_client_without_is_connected_treated_online(self):
+        """无 is_connected 接口的假客户端（测试桩）：视为在线直接扫。"""
+        state.client = object()   # object 没有 is_connected
+        self.assertTrue(await self.listener._wait_reconnect(timeout=5))
+
+    async def test_reconnects_within_timeout(self):
+        cli = mock.MagicMock()
+        cli.is_connected = lambda: self.ticks > 1      # 第二轮探测才在线
+        self.ticks = 0
+        state.client = cli
+        with mock.patch.object(self.listener.asyncio, "sleep",
+                               mock.AsyncMock(side_effect=lambda s: setattr(
+                                   self, "ticks", self.ticks + 1))):
+            ok = await self.listener._wait_reconnect(timeout=60, poll=3)
+        self.assertTrue(ok)
+
+    async def test_timeout_returns_false(self):
+        cli = mock.MagicMock()
+        cli.is_connected = lambda: False
+        state.client = cli
+        with mock.patch.object(self.listener.asyncio, "sleep",
+                               mock.AsyncMock()):
+            ok = await self.listener._wait_reconnect(timeout=0.1, poll=3)
+        self.assertFalse(ok)
+
+
+class FetchNewFailureWordingTest(unittest.TestCase):
+    """断连导致的读取失败必须带「自动补扫、不会丢」说明。"""
+
+    def test_source_contains_reassurance(self):
+        import inspect
+        from tg_userbot import listener
+        src = inspect.getsource(listener)
+        self.assertIn("下轮自动补扫", src)
+        self.assertIn("消息不会丢", src)

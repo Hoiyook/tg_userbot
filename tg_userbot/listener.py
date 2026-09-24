@@ -848,6 +848,11 @@ async def _scan_chat(chat_id, rules):
 
     new_msgs = await _fetch_new(chat_id, checkpoint)
     if new_msgs is None:
+        cli = state.client
+        if cli is None or not cli.is_connected():
+            raise RuntimeError(
+                f"主客户端断连，未能读取：{chat_id}"
+                "（checkpoint 未动，连接恢复后下轮自动补扫，消息不会丢）")
         raise RuntimeError(f"读取新消息失败：{chat_id}")
     result["scanned"] = len(new_msgs)
     if not new_msgs:
@@ -949,6 +954,32 @@ def is_scanning() -> bool:
     return _SCANNING
 
 
+async def _wait_reconnect(timeout=60.0, poll=3.0):
+    """主客户端断连时等待重连；返回 True=已连上（含本来就在线）。
+
+    断连窗口撞上扫描轮（2026-09-24 晚高峰实测长窗口整轮全灭）：等重连
+    通常几秒就好，比整轮失败、下轮再补快得多。等不到也照扫——聊天级
+    失败不丢数据，checkpoint 不动。"""
+    cli = state.client
+    if cli is None:
+        return False        # 没有 client：无从等待，让聊天级失败如实上报
+    is_connected = getattr(cli, "is_connected", None)
+    if not callable(is_connected):
+        return True         # 测试假客户端等无该接口：当作在线，直接扫
+    if is_connected():
+        return True
+    logger.warning("📡 主客户端断连中，扫描等待重连…")
+    waited = 0.0
+    while waited < timeout:
+        await asyncio.sleep(poll)
+        waited += poll
+        cli = state.client
+        if cli is not None and cli.is_connected():
+            logger.info(f"📡 客户端已重连（等了 {waited:.0f} 秒），继续扫描")
+            return True
+    return False
+
+
 async def scan_all(manual=False) -> dict:
     """扫描全部监听聊天，把匹配结果落成持久化任务。返回汇总桶。
 
@@ -975,6 +1006,13 @@ async def scan_all(manual=False) -> dict:
     _SCANNING = True
     totals = dict(empty)
     try:
+        # 断连窗口兜底：本轮开跑前客户端不在线就等一等（见 _wait_reconnect）
+        try:
+            await _wait_reconnect()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"📡 等待重连探测异常（照常扫描）：{e}")
         # 按需重读配置（手工改了 listen.json 时无需重启）。失败保持当前内存态。
         try:
             reload_listen_config()
