@@ -503,6 +503,12 @@ def build_progress_text():
     parts = [f"{_STATUS_LABELS.get(s, s)}{n}" for s, n in sorted(counts.items())]
     lines = [f"🐾 Pawchive 进度（{time.strftime('%H:%M:%S')}）",
              " ".join(parts) if counts else "（队列为空）"]
+    # 扫描实时进度（/paw status 同源）：让「有没有在扫、扫到哪了」一眼可见
+    if state.PAW_SCAN_RUNNING:
+        prog = state.PAW_SCAN_PROGRESS or {}
+        bits = [p for p in (prog.get("stage"), prog.get("detail")) if p]
+        head = f"🔎 扫描中：{state.PAW_SCAN_RUNNING}"
+        lines.append(head + ("：" + " · ".join(bits) if bits else ""))
     inflight = current_post_label()
     if inflight:
         lines.append(f"当前：{inflight}")

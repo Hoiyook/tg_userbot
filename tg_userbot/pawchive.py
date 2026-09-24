@@ -499,6 +499,8 @@ async def start_scan(creator, scope="notfaved", since=None):
         return (f"⏳ 已有扫描在进行（{state.PAW_SCAN_RUNNING}），"
                 "等它结束再发起（/paw status 看进度）")
     state.PAW_SCAN_RUNNING = _creator_label(creator)
+    state.PAW_SCAN_PROGRESS = {
+        "started": time.monotonic(), "stage": "准备中", "detail": ""}
     task = asyncio.create_task(_scan_and_notify(creator, scope, since))
     _SPAWNED_SCANS.add(task)
     task.add_done_callback(_SPAWNED_SCANS.discard)
@@ -508,11 +510,20 @@ async def start_scan(creator, scope="notfaved", since=None):
             "，完成后通知。期间可 /paw status 看进度")
 
 
+def _scan_stage(stage):
+    """扫描进度回调工厂：各阶段更新 state.PAW_SCAN_PROGRESS（线程池里跑，
+    只做字典赋值无锁安全）。detail 为空串表示只切阶段。"""
+    def cb(detail=""):
+        state.PAW_SCAN_PROGRESS.update({"stage": stage, "detail": detail})
+    return cb
+
+
 async def _scan_and_notify(creator, scope, since=None):
     """扫描主体：帖子分页 + 收藏对比 + 落库。异常只通知，不炸后台。"""
     label = _creator_label(creator)
     try:
         cookie = config.PAWCHIVE_COOKIE or None
+        _scan_stage("预载已知集")()
         # 增量扫描：预载已入库帖子 id，整页已知即提前停止（首扫为空集=全量）
         try:
             known_ids = await asyncio.to_thread(
@@ -521,10 +532,13 @@ async def _scan_and_notify(creator, scope, since=None):
         except runtime_db.DbUnavailable as e:
             logger.warning(f"🐾 已知集预载失败（本次全量分页）：{e}")
             known_ids = None
+        _scan_stage("拉取帖子")()
         posts = await asyncio.to_thread(
             fetch_creator_posts, creator["service"], creator["id"], cookie,
-            known_ids)
+            progress=_scan_stage("拉取帖子"), known_ids=known_ids)
         if cookie:
+            _scan_stage("收藏对比")(
+                f"共 {len(posts)} 帖，拉取收藏清单（较慢）")
             # Cookie 过期时站点吐登录页，这里会炸——不能让整场扫描失败，
             # 降级为「无收藏对比」（PAW_LAST_SCAN 的 scope 会如实标注）
             try:
@@ -534,6 +548,9 @@ async def _scan_and_notify(creator, scope, since=None):
                 faved_ids = None
         else:
             faved_ids = None
+        _scan_stage("入库")(
+            f"共 {len(posts)} 帖"
+            + (f"，收藏 {len(faved_ids)}" if faved_ids is not None else ""))
         records = build_scan_records(creator, posts, faved_ids, scope,
                                      since=since)
         created, skipped = runtime_db.enqueue_pawchive_posts(
@@ -565,6 +582,7 @@ async def _scan_and_notify(creator, scope, since=None):
         await notify_user(f"❌ Pawchive 扫描失败（{label}）：{e}")
     finally:
         state.PAW_SCAN_RUNNING = None
+        state.PAW_SCAN_PROGRESS = {}
 
 
 _FILE_STATUS_MARK = {
@@ -804,6 +822,15 @@ def status_text():
     lines = [TEXT_PREFIX, ""]
     if state.PAW_SCAN_RUNNING:
         lines.append(f"🔄 正在扫描：{state.PAW_SCAN_RUNNING}")
+        prog = state.PAW_SCAN_PROGRESS or {}
+        parts = [p for p in (prog.get("stage"), prog.get("detail")) if p]
+        started = prog.get("started")
+        if started:
+            elapsed = int(max(0.0, time.monotonic() - float(started)))
+            parts.append(f"已进行 {elapsed // 60} 分 {elapsed % 60} 秒")
+        if parts:
+            lines.append("   " + " · ".join(parts))
+        lines.append("（📊 状态 按钮可随时刷新）")
     try:
         counts = runtime_db.pawchive_status_counts()
     except runtime_db.DbUnavailable as e:

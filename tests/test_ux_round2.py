@@ -444,3 +444,109 @@ class StaleAckTest(unittest.IsolatedAsyncioTestCase):
                                return_value=False):
             await pawchive.ack_stale_creators(reply)
         self.assertEqual(sent, [])
+
+
+# ============================================================
+# 5) 扫描实时进度（/paw status · 🐾 面板，2026-09-24）
+# ============================================================
+class ScanProgressTest(unittest.IsolatedAsyncioTestCase):
+    """扫描各阶段写进度状态；status/面板渲染；结束清空。"""
+
+    def setUp(self):
+        self.saved = (state.PAW_SCAN_RUNNING, state.PAW_SCAN_PROGRESS,
+                      state.PAW_LAST_SCAN)
+        state.PAW_SCAN_RUNNING = None
+        state.PAW_SCAN_PROGRESS = {}
+        state.PAW_LAST_SCAN = None
+        self.db_dir = tempfile.mkdtemp(prefix="ux2_scan_", dir=_TMP)
+        self._db = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.db_dir, "db.sqlite"))
+        self._db.start()
+        self.addCleanup(self._db.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def tearDown(self):
+        state.PAW_SCAN_RUNNING, state.PAW_SCAN_PROGRESS, \
+            state.PAW_LAST_SCAN = self.saved
+
+    def test_stage_callback_updates_state(self):
+        cb = pawchive._scan_stage("拉取帖子")
+        cb()
+        self.assertEqual(state.PAW_SCAN_PROGRESS["stage"], "拉取帖子")
+        cb("已拉取 450 条")
+        self.assertEqual(state.PAW_SCAN_PROGRESS["detail"], "已拉取 450 条")
+
+    async def test_scan_lifecycle_sets_and_clears_progress(self):
+        creator = {"id": "46802018", "name": "MofuMochii", "service": "patreon"}
+
+        def fake_fetch(service, cid, cookie=None, progress=None,
+                       known_ids=None):
+            if progress:
+                progress("已拉取 120 条")
+            return [{"id": 1, "title": "t"}]
+
+        notifies = []
+
+        async def fake_notify(text):
+            notifies.append(text)
+
+        def fake_faved(cookie):
+            return {"1"}
+
+        self.assertNotEqual(state.PAW_SCAN_RUNNING, None) if False else None
+        reply_holder = {}
+
+        async def fake_start(creator, scope="notfaved", since=None):
+            pass
+
+        with mock.patch.object(pawchive, "fetch_creator_posts", fake_fetch), \
+             mock.patch.object(pawchive, "fetch_favorited_ids", fake_faved), \
+             mock.patch.object(pawchive, "notify_user", fake_notify), \
+             mock.patch.object(pawchive, "build_scan_records",
+                               return_value=[]):
+            msg = await pawchive.start_scan(creator)
+            self.assertIn("开始扫描", msg)
+            self.assertEqual(state.PAW_SCAN_RUNNING, "MofuMochii")
+            # 等后台扫描任务跑完
+            for t in list(pawchive._SPAWNED_SCANS):
+                await t
+        self.assertEqual(state.PAW_SCAN_RUNNING, None,
+                         "扫描结束必须清 RUNNING")
+        self.assertEqual(state.PAW_SCAN_PROGRESS, {},
+                         "扫描结束必须清进度")
+        self.assertEqual(state.PAW_LAST_SCAN["creator"], "MofuMochii")
+        self.assertTrue(any("扫描完成" in n for n in notifies))
+
+    async def test_status_text_renders_progress(self):
+        state.PAW_SCAN_RUNNING = "MofuMochii"
+        # 固定时钟：started=1000，now=1090 → 恰好 90 秒，断言才确定
+        state.PAW_SCAN_PROGRESS = {
+            "started": 1000.0,
+            "stage": "拉取帖子",
+            "detail": "已拉取 450 条",
+        }
+        with mock.patch.object(pawchive.time, "monotonic",
+                               return_value=1090.0):
+            text = pawchive.status_text()
+        self.assertIn("🔄 正在扫描：MofuMochii", text)
+        self.assertIn("拉取帖子", text)
+        self.assertIn("已拉取 450 条", text)
+        self.assertIn("已进行 1 分", text)
+
+    async def test_panel_renders_scan_line(self):
+        from tg_userbot import pawchive_worker
+        state.PAW_SCAN_RUNNING = "MofuMochii"
+        state.PAW_SCAN_PROGRESS = {"started": time.monotonic(),
+                                   "stage": "收藏对比", "detail": "共 120 帖"}
+        with mock.patch.object(pawchive_worker.runtime_db,
+                               "pawchive_status_counts",
+                               return_value={}), \
+                mock.patch.object(pawchive_worker, "_panel_progress_lines",
+                                  return_value=[]), \
+                mock.patch.object(pawchive_worker, "_disk_free_gb",
+                                  return_value=None):
+            text = pawchive_worker.build_progress_text()
+        self.assertIn("🔎 扫描中：MofuMochii", text)
+        self.assertIn("收藏对比", text)

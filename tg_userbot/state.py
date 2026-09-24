@@ -158,6 +158,10 @@ PAW_INPUT_STEP = ""            # search | cookie
 PAW_SEARCH_CANDIDATES = {}
 # 正在进行的 /paw plan 扫描的创作者摘要（None = 空闲）；/paw status 只读展示。
 PAW_SCAN_RUNNING = None
+# 扫描实时进度 {"started": monotonic, "stage": str, "detail": str}：
+# 分页拉取/收藏对比/入库各阶段更新（进度回调跑在线程池，只做字典赋值）；
+# /paw status 与 🐾 进度面板只读展示，扫描结束整字典清空。
+PAW_SCAN_PROGRESS = {}
 # 最近一次扫描的汇总快照（status 视图展示），未扫过为 None。
 PAW_LAST_SCAN = None
 # Pawchive Cookie 最近一次校验结果 {"ts": monotonic, "ok": bool|None,
