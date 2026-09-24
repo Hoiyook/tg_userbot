@@ -532,6 +532,38 @@ class ClaimRequestsTest(unittest.TestCase):
         self.assertEqual([t["task_id"] for t in claimed], ["r3"])
         self.assertEqual([t["task_id"] for t in tasks], ["r1", "r3"])
 
+    def test_notified_requests_never_reclaimed(self):
+        """已通知过结果的请求在任务出窗（被清理）后**不得**复投。
+
+        2026-09-24 生产事故：09-09 的 3 条 /chrome 请求走完整个生命周期后
+        留在请求文件里，15 天后其任务记录被「保留最近 200 条」清理出窗口，
+        claim_new_requests 把它们当新请求重新下载——其中一条死源每次尝试
+        挂满 30 分钟超时，堵死串行队列一小时。"""
+        # 场景复现：任务列表里已没有 r1（被清理出窗），但请求文件里
+        # r1 带 notified_at（生命周期已走完）
+        tasks = []
+        self._write_requests([
+            {"task_id": "r1", "url": "https://a.com/1.zip",
+             "created_at": "2026-09-09 19:36:37",
+             "notified_at": "2026-09-09 19:36:40"},
+            {"task_id": "r9", "url": "https://a.com/9.zip"},   # 未认领过：应认领
+        ])
+        claimed = chrome_agent.claim_new_requests(tasks, self.req_path)
+        self.assertEqual([t["task_id"] for t in claimed], ["r9"],
+                         "已通知的请求绝不能被重新认领")
+        self.assertNotIn("r1", [t["task_id"] for t in tasks])
+
+    def test_claimed_but_not_notified_still_claimable_once(self):
+        """认领过但还没走到终态通知的请求：只要任务还在窗口里就不会重认领
+        （known 兜底）；这里验证 notified_at 缺失时正常认领不受影响。"""
+        tasks = []
+        self._write_requests([
+            {"task_id": "r7", "url": "https://a.com/7.zip",
+             "created_at": "2026-09-24 10:00:00"},
+        ])
+        claimed = chrome_agent.claim_new_requests(tasks, self.req_path)
+        self.assertEqual([t["task_id"] for t in claimed], ["r7"])
+
     def test_malformed_request_entries_skipped(self):
         self._write_requests([
             {"url": "https://a.com/no-id.zip"},                # 缺 task_id

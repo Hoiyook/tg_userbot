@@ -797,13 +797,24 @@ def load_requests(path):
 
 
 def claim_new_requests(tasks, path):
-    """把请求文件里未见过的合法任务并入任务列表，返回本次认领的记录。"""
+    """把请求文件里未见过的合法任务并入任务列表，返回本次认领的记录。
+
+    **已通知过结果的请求（notified_at 非空）永不再认领**。请求文件只进
+    不出（留作结果通知的映射），而任务列表只保留最近 200 条终态——只按
+    task_id 去重时，老任务被清理出窗口后，其请求会被当成「新请求」重新
+    下载（2026-09-24 实测：09-09 提交的 3 条 CD2 链接 15 天后被复投，其中
+    一条死源每次尝试挂满 30 分钟超时，把串行队列堵死一小时）。终态任务在
+    出窗之前必然已被通知（notify_loop 每 5 秒跑），所以这个判据是严密的：
+    没有 notified_at 的请求要么还没认领（应认领），要么任务还在窗口里
+    （known 兜底）。"""
     known = {t.get("task_id") for t in tasks}
     claimed = []
     for req in load_requests(path):
         task_id = req.get("task_id")
         url = req.get("url")
         if not task_id or task_id in known or not validate_chrome_url(url):
+            continue
+        if req.get("notified_at"):
             continue
         task = create_task(url, task_id,
                            download_subdir=req.get("download_subdir"))
