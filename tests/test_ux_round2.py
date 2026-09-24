@@ -806,3 +806,101 @@ class FetchNewFailureWordingTest(unittest.TestCase):
         src = inspect.getsource(listener)
         self.assertIn("下轮自动补扫", src)
         self.assertIn("消息不会丢", src)
+
+
+# ============================================================
+# 9) /paw pr 帖子执行详情报告（2026-09-24）
+# ============================================================
+class PostReportTest(unittest.TestCase):
+    """post_report_text：统计头 / 逐附件（失败排前）/ 外链 / 落盘实况。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_pr_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        self._dl = tempfile.mkdtemp(prefix="ux2_prdl_", dir=_TMP)
+        self._dlp = mock.patch.object(config, "DOWNLOAD_DIR", self._dl)
+        self._dlp.start()
+        self.addCleanup(self._dlp.stop)
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "32091060", "ruberule", [{
+                "post_id": "112544981", "title": "Caught Behemoth",
+                "published": "2024-09-22T10:00:00",
+                "post_url": "https://pawchive.pw/patreon/user/32091060/post/112544981",
+                "subdir": "Pawchive/ruberule/2024-09-22_112544981_Caught Behemoth",
+                "files": [
+                    {"url": "https://f.pw/data/1.png", "filename": "bh_01.png"},
+                    {"url": "https://f.pw/data/2.png", "filename": "bh_px.png"},
+                ],
+                "ext_links": [{"domain": "mega.nz",
+                               "url": "https://mega.nz/folder/x"}],
+            }], scan_batch="2026-09-24 08:00:00")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        files = runtime_db.list_pawchive_files(post["id"])
+        runtime_db.mark_pawchive_file_done(files[0]["id"], size_bytes=2048)
+        runtime_db.mark_pawchive_file_failed(
+            files[1]["id"], error="站点缺文件(404) HTTP 404")
+        runtime_db.finalize_pawchive_post(
+            post["id"], runtime_db.PAW_POST_FAILED)
+        self.row_id = post["id"]
+
+    def test_report_by_row_id(self):
+        text = pawchive.post_report_text(str(self.row_id))
+        self.assertIn("📋 帖子报告", text)
+        self.assertIn("ruberule", text)
+        self.assertIn("附件 2 个", text)
+        self.assertIn("✅ 完成 1", text)
+        self.assertIn("未完成 1", text)
+        self.assertIn("共 2.00 KB", text)
+        # 失败的排前面
+        self.assertLess(text.index("bh_px.png"), text.index("bh_01.png"))
+        self.assertIn("站点缺文件(404)", text)
+        self.assertIn("🌐 外链 1 条", text)
+        self.assertIn("mega.nz", text)
+        self.assertIn("目录不在本地", text)   # tmp DOWNLOAD_DIR 无此目录
+        self.assertIn("扫描批次：2026-09-24 08:00:00", text)
+
+    def test_report_by_post_url(self):
+        text = pawchive.post_report_text(
+            "https://pawchive.pw/patreon/user/32091060/post/112544981")
+        self.assertIn("📋 帖子报告", text)
+        self.assertIn("Caught Behemoth", text)
+
+    def test_local_dir_presence_shown(self):
+        os.makedirs(os.path.join(
+            self._dl, "Pawchive/ruberule/2024-09-22_112544981_Caught Behemoth"),
+            exist_ok=True)
+        text = pawchive.post_report_text(str(self.row_id))
+        self.assertIn("个文件在盘上", text)
+
+    def test_not_found(self):
+        text = pawchive.post_report_text("999999")
+        self.assertIn("找不到帖子", text)
+
+    def test_multi_match_disambiguation(self):
+        """同 post_id 不同创作者 → 消歧清单（att/pr 共用解析）。"""
+        runtime_db.enqueue_pawchive_posts(
+            "fanbox", "99", "another", [{
+                "post_id": "112544981", "title": "同名帖",
+                "published": "2024-09-22T10:00:00", "post_url": "https://x/2",
+                "subdir": "Pawchive/another/p",
+                "files": [{"url": "https://f.pw/data/9.png",
+                           "filename": "z.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        text = pawchive.post_report_text("112544981")
+        self.assertIn("对应多条记录", text)
+        self.assertIn("ruberule", text)
+        self.assertIn("another", text)
+
+    def test_command_and_panel_wiring(self):
+        self.assertEqual(pawchive.parse_paw_command("/paw pr 1260"),
+                         ("pr", "1260"))
+        self.assertIn("paw_pr", config.MENU_ACTIONS)
+        texts = [b.text for row in pawchive.menu_buttons() for b in row]
+        self.assertIn("📋 帖子报告", texts)

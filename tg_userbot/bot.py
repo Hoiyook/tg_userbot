@@ -193,7 +193,7 @@ def open_input_window(kind):
             time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
         )
     elif kind in ("paw_search", "paw_cookie", "paw_post", "paw_find",
-                  "cmdt_add"):
+                  "paw_pr", "cmdt_add"):
         if kind == "cmdt_add":
             # 「📜 命令模板」窗口：一条文本 = 「<名字> <命令>」（同名即覆盖）
             state.CMDT_INPUT_UNTIL = (
@@ -335,6 +335,17 @@ async def handle_menu_action(action, arg, event):
                 "\n\n更新：点【🍪 设置 Cookie】重新粘贴，或 /paw cookie")
         return (f"{pawchive.TEXT_PREFIX}\n{mark} Cookie 校验：{detail}{hint}",
                 pawchive.menu_buttons())
+    if action == "paw_pr":
+        # 📋 帖子报告（/paw pr 的面板入口）：下一条文本 = 帖子引用
+        open_input_window("paw_pr")
+        return (
+            "📋 帖子执行详情报告\n\n"
+            "请发送帖子引用（URL / 帖子数字 ID / 行 id，发到本对话）。\n"
+            "报告含：附件与外链统计、逐项下载状态、落盘目录实况。\n"
+            f"{config.PAWCHIVE_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "发送 / 开头的命令可取消。",
+            input_cancel_buttons(),
+        )
     if action == "paw_pause":
         return pawchive.pause_reply(), pawchive.menu_buttons()
     if action == "paw_resume":
@@ -1156,6 +1167,10 @@ async def _handle_paw_input(step, text):
     """Pawchive 输入窗口：search 当作者名、cookie 存密钥文件、post 入队单帖。"""
     if step == "post":
         msg = await pawchive.post_reply_text(text.strip())
+        await state.bot_client.send_message(state.MY_ID, msg, link_preview=False)
+        return
+    if step == "pr":
+        msg = pawchive.post_report_text(text.strip())
         await state.bot_client.send_message(state.MY_ID, msg, link_preview=False)
         return
     if step == "find":

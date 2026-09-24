@@ -598,35 +598,42 @@ _FILE_STATUS_MARK = {
 }
 
 
+def _resolve_post_row(ref):
+    """<URL|帖子ID|行id> → (帖子行, 全部同 post_id 行)。
+
+    行 id 精确命中时 all_rows 只含它；URL/帖子ID 形态可能命中多条（不同
+    创作者同名帖）——多匹配的消歧由调用方决定（att 列清单让用户选行 id，
+    pr 同款）。找不到 row 为 None。"""
+    q = str(ref or "").strip()
+    if q.isdigit():
+        row = runtime_db.get_pawchive_post_row(int(q))
+        if row is not None:
+            return row, [row]
+        rows = runtime_db.find_pawchive_posts_by_post_id(q)
+        return (rows[0], rows) if rows else (None, [])
+    parsed = parse_post_ref(q)
+    if parsed is None:
+        return None, []
+    _svc, _cid, pid = parsed
+    rows = runtime_db.find_pawchive_posts_by_post_id(pid)
+    return (rows[0], rows) if rows else (None, [])
+
+
 def att_text(ref):
     """/paw att <URL|帖子ID|行id>：查帖子的全部附件与外链及其状态。
 
     附件行：状态符号 + 文件名（+ 大小/错误）；外链行：状态 + 域名 + URL。
     找不到帖子返回 ❌ 提示。"""
-    q = str(ref or "").strip()
-    row = None
-    if q.isdigit():
-        row = runtime_db.get_pawchive_post_row(int(q))
-        if row is None:
-            for r in runtime_db.find_pawchive_posts_by_post_id(q):
-                row = r
-                break
-    else:
-        parsed = parse_post_ref(q)
-        if parsed is not None:
-            _svc, _cid, pid = parsed
-            rows = runtime_db.find_pawchive_posts_by_post_id(pid)
-            if len(rows) == 1:
-                row = rows[0]
-            elif len(rows) > 1:
-                listing = "\n".join(
-                    f"  · #{r['id']} {r['creator_name']}（{r['status']}）"
-                    for r in rows)
-                return (f"{TEXT_PREFIX}\n⚠️ 帖子 {pid} 对应多条记录，"
-                        f"请用行 id 精确指定：\n{listing}")
+    row, all_rows = _resolve_post_row(ref)
     if row is None:
         return (f"{TEXT_PREFIX}\n❌ 找不到帖子：{ref or '（空）'}\n"
                 "用法：/paw att <帖子URL | 帖子ID | 行id>")
+    if len(all_rows) > 1:
+        listing = "\n".join(
+            f"  · #{r['id']} {r['creator_name']}（{r['status']}）"
+            for r in all_rows)
+        return (f"{TEXT_PREFIX}\n⚠️ 帖子 {row['post_id']} 对应多条记录，"
+                f"请用行 id 精确指定：\n{listing}")
     try:
         files = runtime_db.list_pawchive_files(row["id"])
     except runtime_db.DbUnavailable:
@@ -659,6 +666,109 @@ def att_text(ref):
 async def att_reply(event, arg):
     """/paw att 分发：文本回复（纯查询，无按钮）。"""
     await event.reply(att_text(arg), link_preview=False)
+
+
+# 帖子报告里逐附件最多列几行（超出的用「…其余 N 个」折叠，防 4096 截断）
+_REPORT_MAX_FILE_LINES = 25
+
+
+def post_report_text(ref):
+    """/paw pr <URL|帖子ID|行id>：帖子执行详情报告。
+
+    比 att 多三样：统计汇总（附件/外链的各状态数量与总大小）、执行轨迹
+    （尝试次数/扫描批次/错误）、落盘目录实况（在不在、几个文件——
+    「下载了吗、文件在哪」一眼可答）。失败/未完成的附件排前面。"""
+    try:
+        row, all_rows = _resolve_post_row(ref)
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if row is None:
+        return (f"{TEXT_PREFIX}\n❌ 找不到帖子：{ref or '（空）'}\n"
+                "用法：/paw pr <帖子URL | 帖子ID | 行id>")
+    if len(all_rows) > 1:
+        listing = "\n".join(
+            f"  · #{r['id']} {r['creator_name']}（{r['status']}）"
+            for r in all_rows)
+        return (f"{TEXT_PREFIX}\n⚠️ 帖子 {row['post_id']} 对应多条记录，"
+                f"请用行 id 精确指定：\n{listing}")
+    try:
+        files = runtime_db.list_pawchive_files(row["id"])
+    except runtime_db.DbUnavailable:
+        files = []
+
+    # 统计头
+    from collections import Counter
+    from .naming import format_size
+    by_status = Counter(f["status"] for f in files)
+    total_bytes = sum(f.get("size_bytes") or 0 for f in files)
+    ext = [l for l in (row.get("ext_links") or [])
+           if not is_noise_ext_link(l)]
+    done = by_status.get(runtime_db.PAW_FILE_DONE, 0)
+
+    status_disp = row["status"]
+    attempts = row.get("attempts") or 0
+    head = [
+        f"📋 帖子报告 #{row['id']}",
+        f"作者：{row['creator_name']}（{row['service']}）｜"
+        f"发布：{(row['published'] or '')[:10]}",
+        f"标题：{(row['title'] or '')[:50]}",
+        f"状态：{status_disp}（尝试 {attempts} 次）",
+    ]
+    if row.get("last_error"):
+        head.append(f"备注：{str(row['last_error'])[:70]}")
+    if row.get("scan_batch"):
+        head.append(f"扫描批次：{row['scan_batch']}")
+
+    # 落盘目录实况（「文件在哪、下了几个」的直接答案）
+    subdir = row.get("subdir") or ""
+    if subdir:
+        local_dir = os.path.join(config.DOWNLOAD_DIR, subdir)
+        if os.path.isdir(local_dir):
+            local_files = [n for n in os.listdir(local_dir)
+                           if not n.startswith(".")]
+            head.append(
+                f"📁 本地：{subdir}（{len(local_files)} 个文件在盘上）")
+        else:
+            head.append(
+                f"📁 本地：{subdir}（目录不在本地——可能已备份到 115 "
+                "并删除源，或尚未下载）")
+
+    lines = head + ["", f"📎 附件 {len(files)} 个｜✅ 完成 {done}｜"
+                    f"未完成 {len(files) - done}｜共 {format_size(total_bytes)}"]
+    if files:
+        # 失败/未完成的排前面（行动项），完成的随后；超量折叠
+        def _rank(f):
+            order = {runtime_db.PAW_FILE_FAILED: 0,
+                     runtime_db.PAW_FILE_SUBMITTED: 1,
+                     runtime_db.PAW_FILE_PENDING: 2}
+            return (order.get(f["status"], 3), str(f.get("filename") or ""))
+        ranked = sorted(files, key=_rank)
+        shown = ranked[:_REPORT_MAX_FILE_LINES]
+        for f in shown:
+            mark = _FILE_STATUS_MARK.get(f["status"], "⏳")
+            size = (f"（{format_size(f['size_bytes'])}）"
+                    if f.get("size_bytes") else "")
+            err = f"｜{str(f['error'])[:36]}" if f.get("error") else ""
+            lines.append(f"  {mark} {f['filename']}{size}{err}")
+        if len(ranked) > len(shown):
+            lines.append(f"  …其余 {len(ranked) - len(shown)} 个已完成附件略"
+                         "（/paw csv 可导全量）")
+    else:
+        lines.append("  （无附件）")
+
+    # 外链处理状态：外链没有独立状态机，跟帖子生命周期走
+    lines.append(f"🌐 外链 {len(ext)} 条"
+                 + ("｜✅ 已处理" if row["status"] == "COMPLETED"
+                    else "｜👤 待人工处理" if ext else ""))
+    for l in ext[:8]:
+        st = "✅" if row["status"] == "COMPLETED" else "👤"
+        lines.append(f"  {st} [{l.get('domain')}] {str(l.get('url'))[:70]}")
+    if len(ext) > 8:
+        lines.append(f"  …其余 {len(ext) - 8} 条略")
+    if row.get("post_url"):
+        lines.append(f"原帖：{row['post_url']}")
+    out = "\n".join(lines)
+    return out[:3900] + ("\n…（超长截断）" if len(out) > 3900 else "")
 
 
 async def post_reply_text(text):
@@ -910,7 +1020,8 @@ def menu_buttons():
         [Button.inline("👤 待人工处理", encode_menu_data("paw_manual")),
          Button.inline("🔁 重投全部失败", encode_menu_data("paw_retry_all"))],
         [Button.inline("📌 指定帖子下载", encode_menu_data("paw_post")),
-         Button.inline("🔎 按名称查询", encode_menu_data("paw_find"))],
+         Button.inline("🔎 按名称查询", encode_menu_data("paw_find")),
+         Button.inline("📋 帖子报告", encode_menu_data("paw_pr"))],
         [Button.inline("🍪 设置 Cookie", encode_menu_data("paw_cookie")),
          Button.inline("🧪 校验 Cookie", encode_menu_data("paw_cookie_check"))],
         [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
@@ -1186,7 +1297,7 @@ def parse_paw_command(text):
     head_l = head.lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
                   "resume", "manual", "done", "archive", "att", "post",
-                  "cookie", "csv", "find"):
+                  "cookie", "csv", "find", "pr"):
         return (head_l, rest.strip() or None)
     return ("help", None)
 
@@ -1225,6 +1336,9 @@ async def command_reply(event, cmd_text):
         return
     if action == "att":
         await event.reply(att_text(arg), link_preview=False)
+        return
+    if action == "pr":
+        await event.reply(post_report_text(arg), link_preview=False)
         return
     if action == "paw_done":
         reply = mark_manual_done(arg)
@@ -1269,6 +1383,8 @@ def _help_text():
         "  /paw manual —— 待人工处理的帖子（含外链清单与 ✅ 按钮）\n"
         "  /paw manual export —— 全部待处理外链导出为工作清单\n"
         "  /paw att <URL|帖子ID|行id> —— 查帖子的附件与外链状态\n"
+        "  /paw pr <URL|帖子ID|行id> —— 帖子执行详情报告（附件/外链统计、"
+        "逐项状态、落盘目录实况）\n"
         "  /paw archive —— FAILED 死链帖批量归档（不占待办）\n"
         "  /paw done <行id | 起-止 | 作者名> —— 批量标记完成\n"
         "  /paw retry <行ID|all> —— 失败帖子重投\n"

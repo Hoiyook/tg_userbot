@@ -664,7 +664,7 @@ MENU_ACTIONS = (
     # 导出 CSV / 重投全部失败 / 搜索候选按钮（paw_pick 带序号）
     "paw", "paw_status", "paw_search", "paw_cookie", "paw_pause",
     "paw_resume", "paw_manual", "paw_done", "paw_archive", "paw_pick",
-    "paw_csv", "paw_cookie_check",
+    "paw_csv", "paw_cookie_check", "paw_pr",
     "mlink_done", "mlink_open", "mlink_view", "mlink_paw_done",
     "mlink_paw_del", "paw_done_view",
     "input_cancel",
