@@ -74,6 +74,7 @@ BOT_COMMANDS = (
     ("paw", "Pawchive：扫描作者作品、收藏对比、Chrome 批量下载"),
     ("cd2ck", "115 备份对账：本地滞留媒体 × 备份日志交叉"),
     ("origin", "查看评论来源解析失败账本（可溯源）"),
+    ("cmdhis", "最近命令行：复制最近执行过的 /sh 命令"),
     ("cmdt", "命令模板：保存/执行常用 shell 命令"),
     ("clearmsg", "清理程序产生的消息"),
     ("help", "查看全部命令"),
@@ -103,6 +104,8 @@ def _clear_input_states():
     state.LISTEN_INPUT_STEP = ""
     state.WL_INPUT_UNTIL = 0.0
     state.SQLT_INPUT_UNTIL = 0.0
+    state.SQL_CONSOLE_INPUT_UNTIL = 0.0
+    state.MLINK_SEARCH_INPUT_UNTIL = 0.0
     state.SHELL_INPUT_UNTIL = 0.0
     state.UP_INPUT_UNTIL = 0.0
     state.PAW_INPUT_UNTIL = 0.0
@@ -139,6 +142,8 @@ def open_input_window(kind):
     state.LISTEN_INPUT_STEP = ""
     state.WL_INPUT_UNTIL = 0.0
     state.SQLT_INPUT_UNTIL = 0.0
+    state.SQL_CONSOLE_INPUT_UNTIL = 0.0
+    state.MLINK_SEARCH_INPUT_UNTIL = 0.0
     state.SHELL_INPUT_UNTIL = 0.0
     state.UP_INPUT_UNTIL = 0.0
     state.PAW_INPUT_UNTIL = 0.0
@@ -165,6 +170,16 @@ def open_input_window(kind):
     elif kind == "sqlt":
         # 「➕ 新增模板」窗口：一条文本 = 「<名字> <SQL>」（同名即覆盖）
         state.SQLT_INPUT_UNTIL = (
+            time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
+        )
+    elif kind == "sql":
+        # 「🖥 SQL 控制台」窗口：一条文本 = 一条 SQL，立即执行
+        state.SQL_CONSOLE_INPUT_UNTIL = (
+            time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
+        )
+    elif kind == "mlink_search":
+        # 「🔎 搜外链备注」窗口：一条文本 = 关键词（搜备注与链接）
+        state.MLINK_SEARCH_INPUT_UNTIL = (
             time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
         )
     elif kind == "sh":
@@ -246,6 +261,17 @@ async def handle_menu_action(action, arg, event):
                 menu.wl_menu_buttons())
     if action == "sqlt":
         return (sql_templates.list_text(), sql_templates.menu_buttons())
+    if action == "sql_console":
+        # 🖥 SQL 控制台（/sql 的面板入口）：一条文本 = 一条 SQL 立即执行
+        open_input_window("sql")
+        return (
+            "🖥 SQL 诊断控制台\n\n"
+            "请发送一条 SQL（直接作用于 runtime DB，写语句立即生效）。\n"
+            "例：SELECT status, COUNT(*) FROM listener_tasks GROUP BY status\n\n"
+            f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "发送 / 开头的命令可取消。",
+            input_cancel_buttons(),
+        )
     if action == "sqlt_add":
         open_input_window("sqlt")
         return (
@@ -349,8 +375,29 @@ async def handle_menu_action(action, arg, event):
     if action == "mlink_view":
         view_text, rows = manual_links.links_view()
         rows = rows + [[Button.inline(
-            "🔙 返回主菜单", menu.encode_menu_data("home"))]]
+            "🔎 搜备注", menu.encode_menu_data("mlink_search")),
+            Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))]]
         return view_text, rows
+    if action == "mlink_search":
+        # 🔎 搜外链备注（/links 关键词 的面板入口）
+        open_input_window("mlink_search")
+        return (
+            "🔎 搜外链\n\n"
+            "请发送关键词：按备注或链接子串搜索（含已完成，"
+            "按备注找回外链）。\n"
+            f"{config.LISTEN_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "发送 / 开头的命令可取消。",
+            input_cancel_buttons(),
+        )
+    if action == "origin":
+        from . import sources
+        return sources.origin_failures_text(), menu.back_home_buttons()
+    if action == "clearmsg":
+        # 🗑 清程序消息：与 /clearmsg 同一套双入口甄别（bot 对话语境下
+        # 清 bot 对话的程序消息）。清理约 1 分钟，先回执再后台干活
+        asyncio.create_task(commands.handle_command(event, "/clearmsg"))
+        return ("🧹 已开始清理本对话的程序消息（约 1 分钟，完成后逐条回报）",
+                menu.back_home_buttons())
     if action == "mlink_done":
         view_text, buttons = await manual_links.done_reply(arg)
         return view_text, buttons
@@ -424,7 +471,7 @@ async def handle_menu_action(action, arg, event):
                     menu.sh_menu_buttons())
         if not shell.change_cwd(path):
             return "❌ 目录不可访问", menu.sh_menu_buttons()
-        out = await shell.command_reply("/sh ls -la")
+        out = await shell.command_reply("/sh ls -la", record=False)
         return (f"{out}\n\n──────\n\n{shell.sh_view_text()}",
                 _sh_buttons_for("ls -la", out))
     if action == "sh_input":
@@ -854,6 +901,24 @@ async def bot_message_handler(event):
             return
         state.SQLT_INPUT_UNTIL = 0.0
 
+    # 🖥 SQL 控制台窗口：一条文本 = 一条 SQL，立即执行（/ 开头退出窗口）。
+    if (state.SQL_CONSOLE_INPUT_UNTIL
+            and time.monotonic() < state.SQL_CONSOLE_INPUT_UNTIL):
+        if not text.startswith("/"):
+            state.SQL_CONSOLE_INPUT_UNTIL = 0.0
+            await _handle_sql_console_input(event, text)
+            return
+        state.SQL_CONSOLE_INPUT_UNTIL = 0.0
+
+    # 🔎 搜外链备注窗口：一条文本 = 关键词（/ 开头退出窗口）。
+    if (state.MLINK_SEARCH_INPUT_UNTIL
+            and time.monotonic() < state.MLINK_SEARCH_INPUT_UNTIL):
+        if not text.startswith("/"):
+            state.MLINK_SEARCH_INPUT_UNTIL = 0.0
+            await _handle_mlink_search_input(event, text)
+            return
+        state.MLINK_SEARCH_INPUT_UNTIL = 0.0
+
     # /sh 自定义命令窗口：一条文本 = 一条 shell 命令。注意**不能**用
     # 「/ 开头即取消」的约定——绝对路径、/bin/ls 这样的命令本身就以 / 开头；
     # 只有已注册命令（/status、/help…）才算取消。
@@ -925,6 +990,10 @@ async def bot_message_handler(event):
 
     # 注册过的 / 命令在 bot 对话同样执行（命令面板点出来的命令落在本对话）；
     # 未识别的 / 命令（含 /start）回落主菜单，语义与旧行为一致。
+    # 快捷指令（如发 1 = /cmdhis）：命令之前、URL 之前——映射命中即执行。
+    shortcut = commands.resolve_shortcut(text)
+    if shortcut and await commands.handle_command(event, shortcut):
+        return
     if text.startswith("/"):
         if await commands.handle_command(event, text):
             return
@@ -948,6 +1017,26 @@ async def _send_owner(text_body, buttons=None):
     await state.bot_client.send_message(
         state.MY_ID, text_body,
         buttons=text_mod.clean_buttons(buttons), link_preview=False)
+
+
+async def _handle_sql_console_input(event, text):
+    """🖥 SQL 控制台窗口的输入：一条文本 = 一条 SQL（同 /sql 纪律）。"""
+    try:
+        result = runtime_db.execute_user_sql(text.strip())
+    except runtime_db.DbUnavailable as e:
+        await state.bot_client.send_message(
+            state.MY_ID, f"{text_mod.SQL_TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}")
+        return
+    await state.bot_client.send_message(
+        state.MY_ID, text_mod.format_sql_result(result), link_preview=False)
+
+
+async def _handle_mlink_search_input(event, text):
+    """🔎 搜外链窗口的输入：一条文本 = 关键词（搜备注与链接，含已完成）。"""
+    view_text, rows = manual_links.links_view(keyword=text.strip())
+    rows = rows + [[Button.inline(
+        "🔙 返回主菜单", menu.encode_menu_data("home"))]]
+    await _send_owner(view_text, rows)
 
 
 async def _handle_find_input(event, text):

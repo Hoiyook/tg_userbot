@@ -199,7 +199,7 @@ class TestShLsCallbackFlow(unittest.IsolatedAsyncioTestCase):
                    "-rw-r--r-- 1 u s 0 Jan 1 10:00 f.mp4\n")
         reply = f"$ ls -la\n```\n{listing}\n```"
 
-        async def fake_command_reply(cmd):
+        async def fake_command_reply(cmd, record=True):
             return reply
 
         with mock.patch.object(shell, "command_reply",

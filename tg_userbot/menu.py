@@ -197,6 +197,12 @@ def tools_menu_buttons(candidates):
         Button.inline("🔗 外链台账", encode_menu_data("mlink_view")),
         Button.inline("📜 命令模板", encode_menu_data("cmdt")),
     ])
+    # 低频排查/维护入口（2026-09-24 指令↔按钮盘点补缺）：
+    # /origin 解析失败账本、/clearmsg 清程序消息
+    rows.append([
+        Button.inline("🧾 解析账本", encode_menu_data("origin")),
+        Button.inline("🗑 清程序消息", encode_menu_data("clearmsg")),
+    ])
     rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
     return rows
 

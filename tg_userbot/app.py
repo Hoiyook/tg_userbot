@@ -568,6 +568,13 @@ async def new_message_handler(event):
 
         text = (message.message or "").strip()
 
+        # 快捷指令（如发 1 = /cmdhis，2026-09-24）：Saved Messages 同样生效；
+        # 在命令与 URL 解析之前，精确命中映射才触发
+        if is_me:
+            shortcut = commands.resolve_shortcut(text)
+            if shortcut and await commands.handle_command(event, shortcut):
+                return
+
         # 处理命令（只在 Saved Messages 生效）
         if is_me and text.startswith("/"):
             handled = await commands.handle_command(event, text)

@@ -110,6 +110,10 @@ LISTEN_INPUT_STEP = ""         # chat | tag | target
 # 「⏪ 回补」输入窗口（/wl since 的菜单入口）：等待下一条文本的截止时刻
 # （monotonic）。与上面四个输入窗口互斥，由 bot.open_input_window 统一开关。
 WL_INPUT_UNTIL = 0.0
+# 「🖥 SQL 控制台」「🔎 搜外链备注」输入窗口（bot 菜单 2026-09-24 补缺）：
+# 同一套互斥窗口机制，open_input_window 统一开关。
+SQL_CONSOLE_INPUT_UNTIL = 0.0
+MLINK_SEARCH_INPUT_UNTIL = 0.0
 # 白名单扫描最近一轮汇总快照（menu / reporter 只读展示），未扫过为 None。
 WL_LAST_SCAN = None
 

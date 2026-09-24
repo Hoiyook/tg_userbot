@@ -193,7 +193,8 @@ def execute_template(name):
 def menu_buttons():
     """模板视图按钮组。名字直接进回调数据（≤16 字符，64 字节限内）。"""
     from .menu import encode_menu_data   # 函数内导入避免 menu↔本模块成环
-    rows = [[Button.inline("➕ 新增模板", encode_menu_data("sqlt_add"))]]
+    rows = [[Button.inline("➕ 新增模板", encode_menu_data("sqlt_add")),
+             Button.inline("🖥 SQL控制台", encode_menu_data("sql_console"))]]
     for name in names():
         rows.append([
             Button.inline(f"▶️ {name}", encode_menu_data("sqlt_run", name)),

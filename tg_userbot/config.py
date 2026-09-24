@@ -480,6 +480,15 @@ SQL_CONSOLE_CELL_LIMIT = 48               # 单元格字符上限（截断带省
 
 # /sh 命令行执行器（owner-only）：工作目录记忆文件 + 子进程超时
 SHELL_STATE_FILE = os.path.join(RUNTIME_DIR, "shell_state.json")
+# /sh 命令行历史（/cmdhis 展示、快捷指令快速复制重发用）
+SHELL_HISTORY_FILE = os.path.join(RUNTIME_DIR, "shell_history.json")
+
+# 快捷指令映射（2026-09-24）：消息文本**精确命中** key → 当作 value 命令执行。
+# 扩展直接往 dict 加（key 不以 / 开头、≤8 字符防误触）；输入窗口等待期内
+# 窗口优先（快捷指令不抢输入），URL/转发/白名单链路不受影响。
+COMMAND_SHORTCUTS = {
+    "1": "/cmdhis",
+}
 SHELL_TIMEOUT_SECONDS = 30
 
 # /up 文件上传（owner-only）：单文件上限、进度编辑间隔、上传视图文件数
@@ -666,6 +675,9 @@ MENU_ACTIONS = (
     "cd2_menu", "tools",
     # 115 备份对账：本地滞留媒体 × 近期备份日志交叉（2026-09-24）
     "cd2ck",
+    # 面板补缺（2026-09-24 指令↔按钮全量盘点）：SQL 控制台输入窗口 /
+    # 外链备注搜索输入窗口 / 解析失败账本 / 清程序消息
+    "sql_console", "mlink_search", "origin", "clearmsg",
 )
 
 
@@ -808,7 +820,7 @@ REGISTERED_COMMAND_NAMES = frozenset({name for name in (
     "dedup",
     "caption_filter", "listen", "wl", "sql", "sqlt", "paw", "origin",
     "clean", "clearmsg", "setcleartime", "done", "thread", "folder",
-    "logpath", "links", "help", "start", "cd2ck",
+    "logpath", "links", "help", "start", "cd2ck", "cmdhis",
 )})
 
 

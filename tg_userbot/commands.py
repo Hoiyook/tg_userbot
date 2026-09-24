@@ -10,6 +10,7 @@ CLEAR_INTERVAL_SECONDS / CLEAR_TIME_CHANGED）一律读 state.*；跨模块函�
 import asyncio
 
 from . import state
+from . import config
 from . import chrome_client
 from . import text
 from . import queue
@@ -103,7 +104,42 @@ def _help2_text():
     return "\n".join(lines)
 
 
+def resolve_shortcut(text):
+    """快捷指令解析：文本精确命中 COMMAND_SHORTCUTS → 返回映射命令。
+
+    守卫：不以 / 开头（/ 开头走正常命令）、≤8 字符防误触；命中返回
+    「/xxx」形式的命令文本，未命中返回 None。纯函数可单测。
+    """
+    if not text:
+        return None
+    key = text.strip()
+    if not key or key.startswith("/") or len(key) > 8:
+        return None
+    return config.COMMAND_SHORTCUTS.get(key)
+
+
 async def handle_command(event, cmd_text):
+    # 快捷指令（如发 1 = /cmdhis）：调用方（bot 对话 / 主账号 Saved Messages）
+    # 已各自解析过才会带映射命令进来，这里不做二次解析
+    if cmd_text == "/cmdhis":
+        # 最近命令行：正文进代码块（首行留外），整块长按即可复制——
+        # 不带序号，复制单行不带前缀（2026-09-24 用户要求方便复制）
+        items = shell.load_command_history()
+        if not items:
+            await _reply(event, "📜 命令行历史：还没有执行过 /sh 命令")
+            return True
+        shown, total = [], 0
+        for c in items:
+            if total + len(c) + 1 > 3800 or len(shown) >= 30:
+                break
+            shown.append(c)
+            total += len(c) + 1
+        await _reply(event,
+                     f"📜 最近命令行（新→旧，{len(shown)}/{len(items)} 条，"
+                     "长按代码块可复制）\n" + "\n".join(shown))
+        logger.info("执行命令：/cmdhis")
+        return True
+
     if cmd_text == "/status":
         await _reply(event, text.status_text())
         logger.info("执行命令：/status")
