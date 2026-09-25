@@ -1682,3 +1682,118 @@ class PostRefreshTest(unittest.TestCase):
         # 归档删除后重开 = False（行没了）
         runtime_db.delete_pawchive_post(self.row_id)
         self.assertFalse(runtime_db.reopen_pawchive_post(self.row_id))
+
+
+# ============================================================
+# 20) /paw backfill 历史帖回填（2026-09-25）
+# ============================================================
+class BackfillTest(unittest.TestCase):
+    """posts_for_backfill：全状态列出、名字大小写不敏感。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_bf_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "MofuMochii", [{
+                "post_id": f"p{i}", "title": f"帖{i}",
+                "published": "2026-09-01T00:00:00",
+                "post_url": f"https://x/p{i}",
+                "subdir": f"Pawchive/MofuMochii/p{i}",
+                "files": [{"url": f"https://f/p{i}.png",
+                           "filename": f"{i}.png"}],
+                "ext_links": [],
+            } for i in (1, 2)], scan_batch="t")
+
+    def test_lists_all_statuses(self):
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        runtime_db.finalize_pawchive_post(post["id"],
+                                          runtime_db.PAW_POST_COMPLETED)
+        rows = runtime_db.posts_for_backfill("mofumochii")   # 小写命中
+        self.assertEqual(len(rows), 2)
+        statuses = {r["status"] for r in rows}
+        self.assertEqual(statuses, {"COMPLETED", "PENDING"})
+
+
+class BackfillRunTest(unittest.IsolatedAsyncioTestCase):
+    """backfill_author：补录新附件+重开；站点已无帖跳过；互斥守卫。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_bfrun_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "MofuMochii", [{
+                "post_id": "p1", "title": "帖1",
+                "published": "2026-09-01T00:00:00",
+                "post_url": "https://x/p1",
+                "subdir": "Pawchive/MofuMochii/p1",
+                "files": [{"url": "https://f/p1/a.rar", "filename": "a.rar"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        f = runtime_db.list_pawchive_files(post["id"])[0]
+        runtime_db.mark_pawchive_file_done(f["id"], size_bytes=10)
+        runtime_db.finalize_pawchive_post(post["id"],
+                                          runtime_db.PAW_POST_COMPLETED)
+        self.row_id = post["id"]
+
+    def tearDown(self):
+        state.PAW_SCAN_RUNNING = None
+        state.PAW_SCAN_PROGRESS = {}
+
+    async def test_backfill_adds_file_field_and_reopens(self):
+        async def run():
+            detail = {"id": "p1", "attachments": [
+                {"name": "a.rar", "path": "/x/aa"}],
+                "file": {"name": "twitter.png", "path": "/y/bb"}}
+
+            def fake_fetch(service, cid, pid, cookie=None):   # 同步：to_thread 调用
+                return detail
+            with mock.patch.object(pawchive, "fetch_post_detail", fake_fetch), \
+                    mock.patch.object(pawchive.asyncio, "sleep",
+                                      mock.AsyncMock()):
+                msg = await pawchive.backfill_author("MofuMochii")
+                self.assertIn("开始回填", msg)
+                # 任务必须在补丁存活期内跑完（否则真网络调用+真节流）
+                for t in list(pawchive._SPAWNED_SCANS):
+                    await t
+        await run()
+        names = [f["filename"] for f in
+                 runtime_db.list_pawchive_files(self.row_id)]
+        self.assertIn("twitter.png", names)
+        row = runtime_db.get_pawchive_post_row(self.row_id)
+        self.assertEqual(row["status"], "PENDING")   # COMPLETED 重开
+
+    async def test_gone_post_skipped(self):
+        async def run():
+            def fake_fetch(service, cid, pid, cookie=None):
+                raise RuntimeError("HTTP 404")
+            with mock.patch.object(pawchive, "fetch_post_detail", fake_fetch), \
+                    mock.patch.object(pawchive.asyncio, "sleep",
+                                      mock.AsyncMock()):
+                await pawchive.backfill_author("MofuMochii")
+                for t in list(pawchive._SPAWNED_SCANS):
+                    await t
+        await run()
+        row = runtime_db.get_pawchive_post_row(self.row_id)
+        self.assertEqual(row["status"], "COMPLETED")   # 不动
+
+    async def test_mutex_guard(self):
+        state.PAW_SCAN_RUNNING = "别的扫描"
+        msg = await pawchive.backfill_author("MofuMochii")
+        self.assertIn("已有扫描/回填", msg)
+
+    async def test_unknown_author(self):
+        msg = await pawchive.backfill_author("不存在")
+        self.assertIn("没有叫", msg)

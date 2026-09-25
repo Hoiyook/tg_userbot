@@ -1746,6 +1746,22 @@ def author_progress(creator_name):
     return _read(do, "统计作者 Pawchive 进度")
 
 
+def posts_for_backfill(creator_name):
+    """某作者全部存量帖（回填用）：任何状态都要重拉详情对比。"""
+
+    def do(conn):
+        rows = _execute(
+            conn, "SELECT id, post_id, creator_id, service, status, "
+            "creator_name FROM pawchive_posts "
+            "WHERE creator_name = ? COLLATE NOCASE "
+            "ORDER BY id DESC", (str(creator_name or "").strip(),)).fetchall()
+        return [{"id": r[0], "post_id": r[1], "creator_id": r[2],
+                 "service": r[3], "status": r[4], "creator_name": r[5]}
+                for r in rows]
+
+    return _read(do, "列出回填目标帖")
+
+
 def author_failed_split(creator_name):
     """某作者失败文件两分：(死链数, 非死链数)。/paw progress 用。"""
 

@@ -166,6 +166,105 @@ def set_default_since(value):
     os.replace(tmp, _since_path())
 
 
+# ------------------------------------------------------------
+# 历史帖回填（/paw backfill <作者名>，2026-09-25）：存量帖扫描时站点
+# 还没补全数据（file 主文件字段、补传的附件），逐帖重拉详情、按文件名
+# 差集补录并重开下载。带节流（站点慢且有 429 前科），复用扫描互斥与
+# 进度状态（/paw status 可见）。
+# ------------------------------------------------------------
+BACKFILL_THROTTLE_SECONDS = 2.5
+BACKFILL_GONE_MARK = "站点已无此帖"
+
+
+async def backfill_author(name):
+    """回填一个作者的全部存量帖。返回回执文案（完成后 notify）。"""
+    label = str(name or "").strip()
+    if not label:
+        return f"{TEXT_PREFIX}\n用法：/paw backfill <作者名>"
+    if state.PAW_SCAN_RUNNING is not None:
+        return (f"{TEXT_PREFIX}\n⏳ 已有扫描/回填在进行"
+                f"（{state.PAW_SCAN_RUNNING}），稍后再试")
+    try:
+        rows = runtime_db.posts_for_backfill(label)
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if not rows:
+        return (f"{TEXT_PREFIX}\n❌ 没有叫「{label}」的扫描记录"
+                "（不确定用 /paw search <词>）")
+    state.PAW_SCAN_RUNNING = f"回填 {rows[0]['creator_name']}"
+    state.PAW_SCAN_PROGRESS = {
+        "started": time.monotonic(), "stage": "回填详情", "detail": "0/0"}
+
+    async def _notify(text):
+        from . import notify
+        await notify.notify_user(text)
+
+    async def _run():
+        added_total = posts_touched = gone = 0
+        done = 0
+        try:
+            for r in rows:
+                done += 1
+                _scan_stage("回填详情")(
+                    f"{done}/{len(rows)}｜新增 {added_total}")
+                try:
+                    detail = await asyncio.to_thread(
+                        fetch_post_detail, r["service"], r["creator_id"],
+                        r["post_id"], config.PAWCHIVE_COOKIE or None)
+                except Exception:
+                    gone += 1          # 详情 404/网络失败：站点侧已无此帖
+                    await asyncio.sleep(BACKFILL_THROTTLE_SECONDS)
+                    continue
+                d = detail[0] if isinstance(detail, list) else detail
+                files = [_file_entry(a) for a in (d.get("attachments") or [])
+                         if a and a.get("path")]
+                fmain = d.get("file") or {}
+                if fmain.get("path") and not any(
+                        a.get("path") == fmain["path"]
+                        for a in (d.get("attachments") or [])):
+                    files.insert(0, _file_entry({
+                        "path": fmain["path"],
+                        "name": fmain.get("name")
+                        or os.path.basename(fmain["path"]),
+                    }))
+                existing = {f["filename"] for f in
+                            runtime_db.list_pawchive_files(r["id"])}
+                missing = [f for f in files
+                           if f["filename"] not in existing]
+                if missing:
+                    added = runtime_db.add_missing_pawchive_files(
+                        r["id"], missing)
+                    added_total += added
+                    posts_touched += 1
+                    if r["status"] not in (runtime_db.PAW_POST_PENDING,
+                                           runtime_db.PAW_POST_PROCESSING):
+                        runtime_db.reopen_pawchive_post(r["id"])
+                await asyncio.sleep(BACKFILL_THROTTLE_SECONDS)
+            summary = (
+                f"🐾 回填完成：{rows[0]['creator_name']}\n"
+                f"检查 {len(rows)} 帖｜站点已无 {gone} 帖\n"
+                f"补录新附件 {added_total} 个（涉及 {posts_touched} 帖，"
+                "已重开入队只下新增）")
+            if added_total:
+                summary += "\nworker 将自动补下，完成进度看 /paw progress"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception(f"🐾 回填异常：{label}")
+            summary = f"❌ 回填异常（已处理到第 {done}/{len(rows)} 帖）：{e}"
+        finally:
+            state.PAW_SCAN_RUNNING = None
+            state.PAW_SCAN_PROGRESS = {}
+        await _notify(summary)
+
+    task = asyncio.create_task(_run())
+    _SPAWNED_SCANS.add(task)
+    task.add_done_callback(_SPAWNED_SCANS.discard)
+    return (f"{TEXT_PREFIX}\n🔁 开始回填 {rows[0]['creator_name']}"
+            f"（{len(rows)} 帖，节流 {BACKFILL_THROTTLE_SECONDS}s/帖，"
+            "预计需一段时间）\n进度看 /paw status，完成后通知")
+
+
 def author_progress_text(name):
     """/paw progress <作者名>：按作者的处理进度总览（只读）。
 
@@ -1570,7 +1669,8 @@ def parse_paw_command(text):
     head_l = head.lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
                   "resume", "manual", "done", "archive", "att", "post",
-                  "cookie", "csv", "find", "pr", "since", "fail", "progress"):
+                  "cookie", "csv", "find", "pr", "since", "fail", "progress",
+                  "backfill"):
         return (head_l, rest.strip() or None)
     return ("help", None)
 
@@ -1627,6 +1727,9 @@ async def command_reply(event, cmd_text):
         return
     if action == "progress":
         await event.reply(author_progress_text(arg), link_preview=False)
+        return
+    if action == "backfill":
+        await event.reply(await backfill_author(arg), link_preview=False)
         return
     if action == "pr":
         await event.reply(post_report_text(arg), link_preview=False)
