@@ -106,6 +106,45 @@ def _help2_text():
     return "\n".join(lines)
 
 
+# 多词指令的子命令映射（2026-09-25 统一重构）：空格形态在指令入口被
+# 规范化改写为下划线形态（/paw plan → /paw_plan），下划线为标准形、
+# 空格形保留为兼容别名——Telegram 的命令补全面板只认单 token，
+# /paw_plan 是「真命令」，/paw plan 不是。各模块 parse 同步兼容两种头。
+_COMMAND_SUBS = {
+    "/paw": {"help", "status", "plan", "search", "retry", "pause",
+             "resume", "manual", "done", "archive", "att", "post",
+             "cookie", "csv", "find", "pr", "since", "fail",
+             "progress", "backfill"},
+    "/listen": {"on", "off", "scan", "list", "add", "del", "interval",
+                "edit"},
+    "/wl": {"list", "add", "del", "scan", "since"},
+    "/retry": {"all", "del"},
+    "/queue": {"del"},
+    "/sqlt": {"add", "del"},
+    "/cmdt": {"add", "del", "run"},
+    "/caption_filter": {"add", "del", "test"},
+}
+
+
+def _canonical_command(text):
+    """『/基指令 子命令 …』→『/基指令_子命令 …』（仅映射表内的组合改写）。
+
+    纯文本改写：/paw_plan X 与 /paw plan X 在入口即归一为同一串
+    （parse 头部均已兼容下划线）。非映射组合原样返回。"""
+    parts = str(text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return text
+    base = parts[0].split("@")[0].lower()
+    subs = _COMMAND_SUBS.get(base)
+    if not subs:
+        return text
+    head, _sep, rest = parts[1].partition(" ")
+    sub = head.strip().lower()
+    if sub in subs:
+        return f"{base}_{sub}" + ((f" {rest}") if rest else "")
+    return text
+
+
 def resolve_shortcut(text):
     """快捷指令解析：文本精确命中 COMMAND_SHORTCUTS → 返回映射命令。
 
@@ -148,7 +187,7 @@ def _record_usage(cmd_text):
 
 
 def _help_text():
-    """完整命令手册（紧凑版，全部指令 + 关键参数形态；≤3900 字符）。
+    """完整命令手册（下划线标准形；空格形保留为兼容别名）。
     详版（含例子与语义说明）在仓库 docs/操作手册.md，两处同源维护。"""
     return (
         "📖 TG Userbot 操作手册（详版见 docs/操作手册.md）\n"
@@ -160,10 +199,10 @@ def _help_text():
         "/progress —— 下载进度\n"
         "/done [N][关键词] —— 下载记录（默认10）\n"
         "/find 关键词 —— 媒体下落三源查询\n"
-        "/queue；/queue del 序号 —— 队列/移除\n"
-        "/retry、/retry all、/retry del 序号 —— 待重试\n"
+        "/queue；/queue_del 序号 —— 队列/移除\n"
+        "/retry；/retry_all；/retry_del 序号 —— 待重试\n"
         "/usage —— 功能使用统计\n"
-        "/cmdhis —— 最近命令行（发 1 同效）\n"
+        "/cmdhis [N] —— 最近发给 bot 的消息（发 1 同效）\n"
         "\n"
         "【下载自动行为】\n"
         "媒体发进/转发进收藏夹 = 自动下载；白名单 chat 同理（留副本）\n"
@@ -176,19 +215,19 @@ def _help_text():
         "\n"
         "【Pawchive】\n"
         "/paw（=status）—— 状态/失败画像/Cookie/扫描进度\n"
-        "/paw progress 作者 —— 按作者进度（完成率/死链/待办）\n"
-        "/paw plan 作者 [all]；plan 作者 since 日期 [all]\n"
-        "/paw search 词；/paw post URL|ID\n"
-        "/paw att URL|ID|行id —— 附件外链状态\n"
-        "/paw pr URL|ID|行id —— 执行详情报告\n"
-        "/paw find 词；/paw csv [作者]\n"
-        "/paw manual [export]；/paw done 行id|起-止|作者\n"
-        "/paw fail —— 非死链失败明细\n"
-        "/paw retry 行ID|all；/paw pause｜/paw resume\n"
-        "/paw archive —— 归档明细；archive failed —— 执行归档\n"
-        "/paw archive del 行id|起-止 —— 彻底删除（不可逆）\n"
-        "/paw since 日期|off —— 默认时间下限\n"
-        "/paw cookie Cookie —— 会话 Cookie\n"
+        "/paw_plan 作者 [all]；/paw_plan 作者 since 日期 [all]\n"
+        "/paw_progress 作者 —— 按作者进度（完成率/死链/待办）\n"
+        "/paw_search 词；/paw_post URL|ID（可刷新补差）\n"
+        "/paw_att URL|ID|行id —— 附件外链状态\n"
+        "/paw_pr URL|ID|行id —— 执行详情报告\n"
+        "/paw_find 词；/paw_csv [作者]\n"
+        "/paw_manual [export]；/paw_done 行id|起-止|作者\n"
+        "/paw_fail —— 非死链失败明细\n"
+        "/paw_retry 行ID|all；/paw_pause｜/paw_resume\n"
+        "/paw_archive —— 归档明细；/paw_archive_del 行id|起-止\n"
+        "/paw_backfill 作者 —— 回填历史帖（补站点后补的数据）\n"
+        "/paw_since 日期|off —— 默认时间下限\n"
+        "/paw_cookie Cookie —— 会话 Cookie\n"
         "\n"
         "【Chrome】\n"
         "/chrome [子目录/][#标注] URL —— 直链下载，网盘页可见打开\n"
@@ -198,20 +237,29 @@ def _help_text():
         "【工具/系统】\n"
         "/sh [命令]；/sh cd 目录 —— 命令行（黑名单纪律）\n"
         "/up 路径 —— 上传到收藏夹\n"
-        "/cmdt [add 名 命令｜del 名｜run 名] —— 命令模板\n"
+        "/cmdt 列表｜/cmdt_add 名 命令｜/cmdt_del 名｜/cmdt_run 名\n"
         "/sql 一条SQL —— 诊断控制台\n"
-        "/sqlt [add 名 SQL｜del 名｜名] —— SQL 模板\n"
-        "/listen [on｜off｜add 聊天 标签 [目标,目标] [on|off]｜"
-        "edit 序号｜del 序号｜interval 分钟｜scan]\n"
-        "/wl [add ID或@名｜del ID或序号｜scan｜since 聊天 消息id]\n"
-        "/caption_filter [add 规则｜del 序号｜test 原文]\n"
+        "/sqlt 列表｜/sqlt_add 名 SQL｜/sqlt_del 名｜/sqlt 名\n"
+        "/listen 列表｜/listen_on｜/listen_off｜/listen_scan\n"
+        "/listen_add 聊天 标签 [目标,目标] [on|off]｜/listen_edit 序号\n"
+        "/listen_del 序号｜/listen_interval 分钟\n"
+        "/wl 列表｜/wl_add ID或@名｜/wl_del ID或序号｜/wl_scan\n"
+        "/wl_since 聊天 消息id —— 回补存量\n"
+        "/caption_filter 列表｜/caption_filter_add 规则\n"
+        "/caption_filter_del 序号｜/caption_filter_test 原文\n"
         "/clean｜/clearmsg｜/setcleartime 30s|1m|1h|off\n"
         "/origin —— 解析失败账本；/cd2ck —— 115 备份对账\n"
-        "/help2 —— 数据表与配置文件字典"
+        "/help2 —— 数据表与配置文件字典\n"
+        "注：/paw_plan 与 /paw plan 两种写法等效（下划线为标准形）"
     )
 
 
+
 async def handle_command(event, cmd_text):
+    # 多词指令规范化（2026-09-25）：/paw plan 与 /paw_plan 归一为下划线
+    # 标准形，此后全链路（审计/分发）只见标准形
+    cmd_text = _canonical_command(cmd_text)
+
     # 功能使用审计（2026-09-24）：只记已注册指令，失败不影响命令
     _record_usage(cmd_text)
 
@@ -450,9 +498,11 @@ async def handle_command(event, cmd_text):
             await _reply(event, 
                 queue.format_queue_text(state.QUEUE), link_preview=False
             )
-        elif parts[1].startswith("del "):
+        elif cmd_text.startswith("/queue_del"):
             try:
-                idx = int(parts[1].split(None, 1)[1])
+                idx = int(parts[1])
+            except (IndexError, ValueError):
+                idx = None
             except (IndexError, ValueError):
                 await _reply(event, "❌ /queue del 用法：/queue del <序号>")
                 return True
@@ -471,23 +521,22 @@ async def handle_command(event, cmd_text):
 
     if queue.is_retry_command(cmd_text):
         parts = cmd_text.split(maxsplit=1)
+        # 标准形 /retry_all、/retry_del N（入口规范化已把空格形归一）
         if len(parts) == 1:
             view_text, buttons = queue.format_retry_view(state.QUEUE)
             await _reply(event, view_text, buttons=buttons,
                          link_preview=False)
-        elif parts[1].strip().lower() == "all":
+        elif cmd_text.startswith("/retry_all"):
             n, over = queue.retry_all()
             msg = f"🔁 已重放全部待重试任务：{n} 条" if n                 else "🔁 待重试列表为空（或都在执行中）"
-            if over:
-                msg += f"；另有 {over} 条超过自动重试上限已跳过（/retry <序号> 可单条强救）"
             await _reply(event, msg)
-            logger.info(f"执行命令：/retry all | 触发 {n} 条，跳过超限 {over} 条")
+            logger.info(f"执行命令：/retry_all | 触发 {n} 条")
             return True
-        elif parts[1].startswith("del "):
+        elif cmd_text.startswith("/retry_del"):
             try:
-                idx = int(parts[1].split(None, 1)[1])
+                idx = int(parts[1])
             except (IndexError, ValueError):
-                await _reply(event, "❌ /retry del 用法：/retry del <序号>")
+                await _reply(event, "❌ /retry_del 用法：/retry_del <序号>")
                 return True
             async with state.QUEUE_LOCK:
                 ok, removed = queue.queue_remove(state.QUEUE, "retry", idx)
@@ -499,7 +548,7 @@ async def handle_command(event, cmd_text):
                 )
             else:
                 await _reply(event, 
-                    "❌ /retry：序号无效，用 /retry 查看列表"
+                    "❌ /retry_del：序号无效，用 /retry 查看列表"
                 )
         else:
             try:

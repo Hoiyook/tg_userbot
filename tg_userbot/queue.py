@@ -132,13 +132,15 @@ async def queue_del_task(index=None, record_id=None):
 
 
 def is_queue_command(text):
-    # /queue、/queue del 1 ...
-    return bool(re.fullmatch(r"/queue(?:\s+\S+)*", text.strip(), re.IGNORECASE))
+    # /queue、/queue del 1、/queue_del 1（标准形）...
+    return bool(re.fullmatch(r"/queue(?:_\w+)?(?:\s+\S+)*", text.strip(),
+                             re.IGNORECASE))
 
 
 def is_retry_command(text):
-    # /retry、/retry 1、/retry del 1 ...
-    return bool(re.fullmatch(r"/retry(?:\s+\S+)*", text.strip(), re.IGNORECASE))
+    # /retry、/retry 1、/retry del 1、/retry_all、/retry_del 1（标准形）...
+    return bool(re.fullmatch(r"/retry(?:_\w+)?(?:\s+\S+)*", text.strip(),
+                             re.IGNORECASE))
 
 
 def load_queue(path=None):

@@ -145,7 +145,7 @@ def list_text():
 # ============================================================
 # 命令解析
 # ============================================================
-_CMDT_CMD_RE = re.compile(r"^/cmdt(?:\s|$)", re.IGNORECASE)
+_CMDT_CMD_RE = re.compile(r"^/cmdt(?:_\w+)?(?:\s|$)", re.IGNORECASE)
 
 
 def is_cmdt_command(text) -> bool:
@@ -160,7 +160,7 @@ def parse_cmdt_command(text):
     if not body:
         return ("list", None)
     head, _, rest = body.partition(" ")
-    head_l = head.lower()
+    head_l = head.lstrip("_").lower()   # /cmdt_add（标准）兼容
     if head_l in ("list", "help"):
         return ("list", None)
     if head_l == "add":

@@ -1387,7 +1387,7 @@ def summary_text(totals) -> str:
 
 
 # ---- 命令 ----
-_LISTEN_CMD_RE = re.compile(r"^/listen(?:\s|$)", re.IGNORECASE)
+_LISTEN_CMD_RE = re.compile(r"^/listen(?:_\w+)?(?:\s|$)", re.IGNORECASE)
 
 
 def is_listen_command(text) -> bool:
@@ -1404,7 +1404,7 @@ def parse_listen_command(text):
     if not body:
         return ("list", None)
     head, _, rest = body.partition(" ")
-    head = head.strip().lower()
+    head = head.strip().lstrip("_").lower()   # /listen_add（标准）兼容
     rest = rest.strip()
     if head in ("on", "off", "scan", "list"):
         return (head, None)

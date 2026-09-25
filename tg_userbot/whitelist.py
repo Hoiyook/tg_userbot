@@ -68,8 +68,9 @@ def classify_message_chat(chat_id, my_id, whitelist):
 
 
 def is_wl_command(text):
-    # /wl、/wl list、/wl add @xxx、/wl del 123 ...
-    return bool(re.fullmatch(r"/wl(?:\s+\S+)*", text.strip(), re.IGNORECASE))
+    # /wl、/wl list、/wl add @xxx、/wl_since 1 100（标准形）...
+    return bool(re.fullmatch(r"/wl(?:_\w+)?(?:\s+\S+)*", text.strip(),
+                             re.IGNORECASE))
 
 
 def parse_wl_command(text):
@@ -81,17 +82,22 @@ def parse_wl_command(text):
     if not is_wl_command(text):
         return None
     parts = text.split(maxsplit=1)
-    if len(parts) == 1:
+    # 子词两个位置：标准形在 base token（/wl_since …），兼容形在 rest 首
+    #（/wl since …）
+    base = parts[0].split("@")[0].lower()
+    sub = base[len("/wl"):].lstrip("_")
+    rest = parts[1].strip() if len(parts) == 2 else ""
+    if not sub:
+        head, _sep, tail = rest.partition(" ")
+        sub, rest = head.lower(), tail.strip()
+    if not sub or sub == "list":
         return ("list", None)
-    sub = parts[1].strip()
-    if sub == "list":
-        return ("list", None)
-    if sub.startswith("add"):
-        return ("add", sub[len("add"):].strip())
-    if sub.startswith("del"):
-        return ("del", sub[len("del"):].strip())
-    if sub.startswith("since"):
-        return ("since", sub[len("since"):].strip())
+    if sub == "add":
+        return ("add", rest)
+    if sub == "del":
+        return ("del", rest)
+    if sub == "since":
+        return ("since", rest)
     if sub == "scan":
         return ("scan", None)
     return ("invalid", None)

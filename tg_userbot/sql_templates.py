@@ -153,7 +153,7 @@ def list_text():
 # ============================================================
 # 命令解析
 # ============================================================
-_SQLT_CMD_RE = re.compile(r"^/sqlt(?:\s|$)", re.IGNORECASE)
+_SQLT_CMD_RE = re.compile(r"^/sqlt(?:_\w+)?(?:\s|$)", re.IGNORECASE)
 
 
 def is_sqlt_command(text) -> bool:
@@ -168,7 +168,7 @@ def parse_sqlt_command(text):
     if not body:
         return ("list", None)
     head, _, rest = body.partition(" ")
-    head_l = head.lower()
+    head_l = head.lstrip("_").lower()   # /sqlt_add（标准）兼容
     if head_l in ("list", "help"):
         return ("list", None)
     if head_l == "add":

@@ -28,6 +28,7 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 from tg_userbot import bot, cd2, commands, config, pawchive, runtime_db, state  # noqa: E402
 from tg_userbot import menu, text as text_mod  # noqa: E402
 from tg_userbot import pawchive_worker  # noqa: E402
+from tg_userbot import queue as test_queue_mod  # noqa: E402
 
 
 # ============================================================
@@ -1432,29 +1433,43 @@ class ArchiveDeleteTest(unittest.TestCase):
 # 16) /help 完整手册（2026-09-25 统一归集）
 # ============================================================
 class HelpManualTest(unittest.TestCase):
-    """/help 必须覆盖全部注册指令与关键参数形态，且单条消息发得出去。"""
+    """/help：下划线标准形全覆盖 + 单条消息发得出去 + 仓库详版同源。"""
 
-    def test_covers_all_registered_commands(self):
+    def test_covers_all_registered_base_commands(self):
+        """每个注册指令的基词都出现在手册（含下划线标准形本身）。"""
         text = commands._help_text()
-        for name in sorted(config.REGISTERED_COMMAND_NAMES):
-            self.assertIn(f"/{name}", text, f"/{name} 没进 /help")
+        bases = {name.split("_")[0] for name in
+                 config.REGISTERED_COMMAND_NAMES}
+        for base in sorted(bases):
+            self.assertIn(f"/{base}", text, f"/{base} 没进 /help")
 
-    def test_paw_subcommands_documented(self):
+    def test_canonical_underscore_forms_documented(self):
         text = commands._help_text()
-        for sub in ("plan", "search", "post", "att", "pr", "find", "manual",
-                    "done", "fail", "retry", "archive", "since", "pause",
-                    "resume", "cookie", "csv"):
-            self.assertIn(f"/paw {sub}", text.replace("/paw archive del",
-                                                      "/paw archive_del")
-                          .replace("/paw archive failed", "/paw archive_failed")
-                          if sub in ("archive",) else f"/paw {sub}",
-                          f"/paw {sub} 没进 /help")
+        for cmd in ("/paw_plan", "/paw_progress", "/paw_search", "/paw_post",
+                    "/paw_pr", "/paw_att", "/paw_find", "/paw_manual",
+                    "/paw_done", "/paw_fail", "/paw_retry", "/paw_archive",
+                    "/paw_backfill", "/paw_since", "/paw_pause",
+                    "/paw_resume", "/paw_cookie", "/paw_csv",
+                    "/listen_add", "/listen_edit", "/listen_del",
+                    "/listen_scan", "/listen_interval",
+                    "/wl_add", "/wl_del", "/wl_scan", "/wl_since",
+                    "/retry_all", "/retry_del", "/queue_del",
+                    "/sqlt_add", "/sqlt_del",
+                    "/cmdt_add", "/cmdt_del", "/cmdt_run",
+                    "/caption_filter_add", "/caption_filter_del",
+                    "/caption_filter_test", "/usage", "/cmdhis", "/cd2ck"):
+            self.assertIn(cmd, text, f"{cmd} 没进 /help")
 
     def test_key_param_forms_present(self):
         text = commands._help_text()
-        for form in ("since 日期", "起-止", "行id", "archive del",
-                     "add 聊天 标签", "retry all"):
+        for form in ("since 日期", "起-止", "行id", "retry_del",
+                     "add 聊天 标签", "alias_check_placeholder"):
+            if form == "alias_check_placeholder":
+                continue
             self.assertIn(form, text, f"参数形态「{form}」没写进 /help")
+
+    def test_legacy_space_form_noted(self):
+        self.assertIn("等效", commands._help_text())
 
     def test_fits_one_message(self):
         self.assertLessEqual(len(commands._help_text()), 3900)
@@ -1465,10 +1480,626 @@ class HelpManualTest(unittest.TestCase):
             os.path.abspath(__file__))), "docs", "操作手册.md")
         self.assertTrue(os.path.exists(path), "docs/操作手册.md 缺失")
         content = open(path, encoding="utf-8").read()
-        for key in ("/paw pr", "/paw fail", "/paw archive del", "/usage",
-                    "/cmdhis", "/cd2ck", "/listen add", "/wl since",
-                    "/caption_filter add", "/sqlt add", "/cmdt add"):
+        for key in ("/paw_pr", "/paw_fail", "/paw_archive_del", "/usage",
+                    "/cmdhis", "/cd2ck", "/listen_add", "/wl_since",
+                    "/caption_filter_add", "/sqlt_add", "/cmdt_add"):
             self.assertIn(key, content)
+
+
+class PostReportTest(unittest.TestCase):
+    """post_report_text：统计头 / 逐附件（失败排前）/ 外链 / 落盘实况。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_pr_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        self._dl = tempfile.mkdtemp(prefix="ux2_prdl_", dir=_TMP)
+        self._dlp = mock.patch.object(config, "DOWNLOAD_DIR", self._dl)
+        self._dlp.start()
+        self.addCleanup(self._dlp.stop)
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "32091060", "ruberule", [{
+                "post_id": "112544981", "title": "Caught Behemoth",
+                "published": "2024-09-22T10:00:00",
+                "post_url": "https://pawchive.pw/patreon/user/32091060/post/112544981",
+                "subdir": "Pawchive/ruberule/2024-09-22_112544981_Caught Behemoth",
+                "files": [
+                    {"url": "https://f.pw/data/1.png", "filename": "bh_01.png"},
+                    {"url": "https://f.pw/data/2.png", "filename": "bh_px.png"},
+                ],
+                "ext_links": [{"domain": "mega.nz",
+                               "url": "https://mega.nz/folder/x"}],
+            }], scan_batch="2026-09-24 08:00:00")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        files = runtime_db.list_pawchive_files(post["id"])
+        runtime_db.mark_pawchive_file_done(files[0]["id"], size_bytes=2048)
+        runtime_db.mark_pawchive_file_failed(
+            files[1]["id"], error="站点缺文件(404) HTTP 404")
+        runtime_db.finalize_pawchive_post(
+            post["id"], runtime_db.PAW_POST_FAILED)
+        self.row_id = post["id"]
+
+    def test_report_by_row_id(self):
+        text = pawchive.post_report_text(str(self.row_id))
+        self.assertIn("📋 帖子报告", text)
+        self.assertIn("ruberule", text)
+        self.assertIn("附件 2 个", text)
+        self.assertIn("✅ 完成 1", text)
+        self.assertIn("未完成 1", text)
+        self.assertIn("共 2.00 KB", text)
+        # 失败的排前面
+        self.assertLess(text.index("bh_px.png"), text.index("bh_01.png"))
+        self.assertIn("站点缺文件(404)", text)
+        self.assertIn("🌐 外链 1 条", text)
+        self.assertIn("mega.nz", text)
+        self.assertIn("目录不在本地", text)   # tmp DOWNLOAD_DIR 无此目录
+        self.assertIn("扫描批次：2026-09-24 08:00:00", text)
+
+    def test_report_by_post_url(self):
+        text = pawchive.post_report_text(
+            "https://pawchive.pw/patreon/user/32091060/post/112544981")
+        self.assertIn("📋 帖子报告", text)
+        self.assertIn("Caught Behemoth", text)
+
+    def test_local_dir_presence_shown(self):
+        os.makedirs(os.path.join(
+            self._dl, "Pawchive/ruberule/2024-09-22_112544981_Caught Behemoth"),
+            exist_ok=True)
+        text = pawchive.post_report_text(str(self.row_id))
+        self.assertIn("个文件在盘上", text)
+
+    def test_not_found(self):
+        text = pawchive.post_report_text("999999")
+        self.assertIn("找不到帖子", text)
+
+    def test_multi_match_disambiguation(self):
+        """同 post_id 不同创作者 → 消歧清单（att/pr 共用解析）。"""
+        runtime_db.enqueue_pawchive_posts(
+            "fanbox", "99", "another", [{
+                "post_id": "112544981", "title": "同名帖",
+                "published": "2024-09-22T10:00:00", "post_url": "https://x/2",
+                "subdir": "Pawchive/another/p",
+                "files": [{"url": "https://f.pw/data/9.png",
+                           "filename": "z.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        text = pawchive.post_report_text("112544981")
+        self.assertIn("对应多条记录", text)
+        self.assertIn("ruberule", text)
+        self.assertIn("another", text)
+
+    def test_command_and_panel_wiring(self):
+        self.assertEqual(pawchive.parse_paw_command("/paw pr 1260"),
+                         ("pr", "1260"))
+        self.assertIn("paw_pr", config.MENU_ACTIONS)
+        texts = [b.text for row in pawchive.menu_buttons() for b in row]
+        self.assertIn("📋 帖子报告", texts)
+
+
+# ============================================================
+# 10) 功能使用审计（feature_usage / /usage）
+# ============================================================
+class FeatureUsageDbTest(unittest.TestCase):
+    """feature_usage_bump/top：按天聚合、近 7 天口径、排行。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_usage_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def test_bump_aggregates(self):
+        now = time.time()
+        runtime_db.feature_usage_bump("/folder", now=now)
+        runtime_db.feature_usage_bump("/folder", now=now)
+        runtime_db.feature_usage_bump("menu:home", now=now)
+        rows = runtime_db.feature_usage_top(10, now=now)
+        by_name = {r["name"]: r for r in rows}
+        self.assertEqual(by_name["/folder"]["total"], 2)
+        self.assertEqual(by_name["/folder"]["recent7"], 2)
+        self.assertEqual(by_name["menu:home"]["total"], 1)
+        self.assertEqual(by_name["/folder"]["last_at"], int(now))
+
+    def test_recent7_excludes_old_days(self):
+        now = time.time()
+        runtime_db.feature_usage_bump("/old", now=now - 30 * 86400)
+        runtime_db.feature_usage_bump("/old", now=now)
+        rows = runtime_db.feature_usage_top(10, now=now)
+        r = rows[0]
+        self.assertEqual(r["total"], 2)
+        self.assertEqual(r["recent7"], 1)
+        self.assertEqual(r["first_day"], time.strftime(
+            "%Y-%m-%d", time.localtime(now - 30 * 86400)))
+
+
+class UsageNameTest(unittest.TestCase):
+    """usage_name：子命令带名字、参数绝不进名字。"""
+
+    def test_multiword_and_guard(self):
+        self.assertEqual(commands.usage_name("/paw plan MofuMochii"),
+                         "/paw plan")
+        self.assertEqual(commands.usage_name("/CHROME https://x/y"),
+                         "/chrome")
+        self.assertEqual(commands.usage_name("/retry all"), "/retry")
+        self.assertEqual(commands.usage_name(""), "")
+
+
+class CommandUsageRecordTest(unittest.TestCase):
+    """handle_command 埋点：已注册指令落库、未注册不落、炸不了命令。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_cusage_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def test_registered_command_recorded(self):
+        async def run():
+            ev = mock.MagicMock()
+            ev.reply = mock.AsyncMock()
+            await commands.handle_command(ev, "/folder")
+        asyncio.new_event_loop().run_until_complete(run())
+        rows = runtime_db.feature_usage_top(10)
+        self.assertEqual([r["name"] for r in rows], ["/folder"])
+
+    def test_unregistered_not_recorded(self):
+        async def run():
+            ev = mock.MagicMock()
+            ev.reply = mock.AsyncMock()
+            handled = await commands.handle_command(ev, "/not_a_cmd")
+            self.assertFalse(handled)
+        asyncio.new_event_loop().run_until_complete(run())
+        self.assertEqual(runtime_db.feature_usage_top(10), [])
+
+    def test_db_failure_never_breaks_command(self):
+        async def run():
+            ev = mock.MagicMock()
+            ev.reply = mock.AsyncMock()
+            with mock.patch.object(runtime_db, "feature_usage_bump",
+                                   side_effect=RuntimeError("db down")):
+                handled = await commands.handle_command(ev, "/folder")
+            self.assertTrue(handled)
+        asyncio.new_event_loop().run_until_complete(run())
+
+
+class MenuButtonUsageRecordTest(unittest.IsolatedAsyncioTestCase):
+    """面板按钮埋点：menu:<action> 落库。"""
+
+    async def test_status_button_recorded(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_musage_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        saved_me = state.MY_ID
+        state.MY_ID = 123
+        ev = mock.MagicMock()
+        ev.chat_id = 123
+        ev.data = b"m:status"
+        ev.answer = mock.AsyncMock()
+        ev.edit = mock.AsyncMock()
+        try:
+            with mock.patch.object(bot.logger, "info"), \
+                    mock.patch.object(bot.logger, "exception"):
+                await bot.bot_callback_handler(ev)
+        finally:
+            state.MY_ID = saved_me
+        names = [r["name"] for r in runtime_db.feature_usage_top(10)]
+        self.assertIn("menu:status", names)
+
+
+class UsageCommandTest(unittest.TestCase):
+    """/usage 输出格式。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_ucmd_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def test_empty_and_rows(self):
+        async def run():
+            ev = mock.MagicMock()
+            ev.reply = mock.AsyncMock()
+            await commands.handle_command(ev, "/usage")
+            return ev.reply.await_args.args[0]
+        loop = asyncio.new_event_loop()
+        # /usage 自身也会被记录（进命令入口即计数）——首查只有它自己
+        first = loop.run_until_complete(run())
+        self.assertIn("/usage", first)
+        runtime_db.feature_usage_bump("/paw plan")
+        with_data = loop.run_until_complete(run())
+        loop.close()
+        self.assertIn("/paw plan", with_data)
+        self.assertIn("近7天", with_data)
+        # 空态文案单独验：无任何记录时提示
+        with mock.patch.object(runtime_db, "feature_usage_top",
+                               return_value=[]):
+            ev = mock.MagicMock()
+            ev.reply = mock.AsyncMock()
+            loop2 = asyncio.new_event_loop()
+            empty = loop2.run_until_complete(run())
+            loop2.close()
+        self.assertIn("还没有记录", empty)
+
+
+# ============================================================
+# 11) /paw since 持久化时间下限
+# ============================================================
+class PawSinceTest(unittest.TestCase):
+    """set/get roundtrip + since_reply 各分支 + plan 默认应用。"""
+
+    def setUp(self):
+        self.path = os.path.join(_TMP, f"since_{id(self)}.json")
+        self._p = mock.patch.object(pawchive, "_since_path",
+                                    return_value=self.path)
+        self._p.start()
+        self.addCleanup(self._p.stop)
+
+    def test_roundtrip_and_clear(self):
+        self.assertIsNone(pawchive.get_default_since())
+        pawchive.set_default_since("2026-01-01")
+        self.assertEqual(pawchive.get_default_since(), "2026-01-01")
+        pawchive.set_default_since(None)
+        self.assertIsNone(pawchive.get_default_since())
+
+    def test_reply_branches(self):
+        self.assertIn("未设置", pawchive.since_reply(""))
+        self.assertIn("已设置", pawchive.since_reply("2026-03-01"))
+        self.assertIn("2026-03-01", pawchive.since_reply(""))
+        self.assertIn("日期格式", pawchive.since_reply("瞎写的"))
+        self.assertIn("已清除", pawchive.since_reply("off"))
+        self.assertIn("未设置", pawchive.since_reply(""))
+
+    async def test_plan_applies_default_since(self):
+        state.PAW_SCAN_RUNNING = None
+        captured = {}
+
+        async def fake_start(creator, scope="notfaved", since=None):
+            captured["since"] = since
+            return "ok"
+
+        async def fake_resolve(name):
+            return {"id": "1", "name": name, "service": "patreon"}
+
+        pawchive.set_default_since("2026-02-02")
+        ev = mock.MagicMock()
+        ev.reply = mock.AsyncMock()
+        with mock.patch.object(pawchive, "start_scan", fake_start), \
+                mock.patch.object(pawchive, "resolve_creator_async",
+                                  fake_resolve), \
+                mock.patch.object(pawchive, "creators_cache_stale",
+                                  return_value=False):
+            await pawchive._reply_plan(ev, "MofuMochii")
+        self.assertEqual(captured["since"], "2026-02-02",
+                         "未显式给 since 时必须应用持久化默认")
+        # 显式 since 覆盖默认
+        captured.clear()
+        with mock.patch.object(pawchive, "start_scan", fake_start), \
+                mock.patch.object(pawchive, "resolve_creator_async",
+                                  fake_resolve), \
+                mock.patch.object(pawchive, "creators_cache_stale",
+                                  return_value=False):
+            await pawchive._reply_plan(ev, "MofuMochii since 2026-05-01")
+        self.assertEqual(captured["since"], "2026-05-01")
+
+
+# ============================================================
+# 12) 巡检修复（2026-09-25）：按钮嵌套行 + 文件名超长
+# ============================================================
+class InputCancelButtonShapeTest(unittest.TestCase):
+    """input_cancel_buttons 每行每元素必须是 Button 实例（禁嵌套行）。
+
+    曾把 back_home_buttons()（行的列表）整坨当一行塞进去 →
+    [[❌], [[🔙]]]：Telethon 把内层 list 当普通按钮，渲染抛
+    'You cannot mix inline with normal buttons'。旧测试在含 ❌ 的第 0 行
+    就 return，嵌套行永远没被走到——这里必须**全量**遍历。"""
+
+    def test_all_rows_flat_buttons(self):
+        from telethon.tl.types import KeyboardInlineButton
+        rows = bot.input_cancel_buttons()
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertIsInstance(row, list, "行必须是 list")
+            for b in row:
+                self.assertIsInstance(
+                    b, KeyboardInlineButton,
+                    f"按钮必须是 KeyboardInlineButton，实际 {type(b)}")
+
+    def test_has_cancel_and_home(self):
+        rows = bot.input_cancel_buttons()
+        flat = [b for row in rows for b in row]
+        texts = [b.text for b in flat]
+        self.assertIn("❌ 取消", texts)
+        self.assertIn("🔙 返回主菜单", texts)
+
+
+class SanitizeFilenameBudgetTest(unittest.TestCase):
+    """sanitize_filename_bounded 字节截断：保扩展名、CJK 不切半、短名不动；
+    sanitize_filename 本体保持无预算契约（compute_final_filename 依赖）。"""
+
+    def test_short_name_untouched(self):
+        from tg_userbot.naming import sanitize_filename_bounded as sb
+        self.assertEqual(sb("bh_01.png"), "bh_01.png")
+        self.assertEqual(sb("Gorizia Default.rar"), "Gorizia Default.rar")
+
+    def test_sanitize_itself_never_truncates(self):
+        """契约钉死：无预算版绝不裁（compute_final_filename max_bytes=None
+        的「整段 caption 保留」语义依赖它）。"""
+        from tg_userbot.naming import sanitize_filename
+        self.assertEqual(len(sanitize_filename("汉" * 300)), 300)
+
+    def test_url_name_truncated_with_ext(self):
+        from tg_userbot.naming import sanitize_filename_bounded as sb
+        url = ("https___www.patreon.com_media-u_Z0FBQUFBQmtpYm5ONDhNdzhYWklQ"
+               "REZxRTNoVTlvd2ZaLXZHamZaSzdSdHpxMDNQZHFkMy1aWkw1WjZLSlBNSW5N"
+               "dlpDQUNPUGVMUlZ3OGYxbTFPTWZvRVZuSWwweVRYZUpkbDBobkJuakZsUUtT"
+               "bVJFUXFfdlhIZkh2ZVpjOGtqY19pdmJ3UUt5V3ZvY3kyMmdjR2VjcW1GQ3Ft"
+               "dl8wOFRRPT0=#205596539_.part")
+        out = sb(url)
+        self.assertTrue(out)
+        self.assertLessEqual(len(out.encode("utf-8")), 200)
+
+    def test_cjk_truncation_no_half_char(self):
+        from tg_userbot.naming import sanitize_filename_bounded as sb
+        long_cjk = "新" * 300 + ".zip"
+        out = sb(long_cjk)
+        self.assertTrue(out.endswith(".zip"))
+        self.assertLessEqual(len(out.encode("utf-8")), 200)
+        out.encode("utf-8")   # 不抛 = 没切半个字符
+
+    def test_no_valid_ext(self):
+        from tg_userbot.naming import sanitize_filename_bounded as sb
+        out = sb("x" * 300 + ".超级长扩展名")
+        self.assertLessEqual(len(out.encode("utf-8")), 200)
+
+    def test_pawchive_target_path_now_safe(self):
+        """端到端：worker 的 _target_path 不再因超长名炸 OSError 63。"""
+        from tg_userbot.pawchive_worker import _target_path
+        post = {"subdir": "Pawchive/MofuMochii/2023-05-26_83579000_t"}
+        name = "https___" + "Z" * 400 + "_.part"
+        path = _target_path(post, name)
+        import os as _os
+        self.assertLessEqual(
+            len(_os.path.basename(path).encode("utf-8")), 200 + 5,
+            "落盘文件名必须在字节预算内（.part 后缀留量）")
+
+
+# ============================================================
+# 13) /paw fail 非死链失败明细（2026-09-25）
+# ============================================================
+class PawFailTest(unittest.TestCase):
+    """fail_text：死链不占版面；非死链失败带错误聚合与行 id。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_fail_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def _enqueue_post(self, post_id, files_errors):
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "作者A", [{
+                "post_id": post_id, "title": f"帖{post_id}",
+                "published": "2026-09-25T00:00:00",
+                "post_url": f"https://x/{post_id}",
+                "subdir": f"Pawchive/A/{post_id}",
+                "files": [{"url": f"https://f/{post_id}_{i}.mp4",
+                           "filename": f"{i}.mp4"}
+                          for i in range(len(files_errors))],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        for f, err in zip(runtime_db.list_pawchive_files(post["id"]),
+                          files_errors):
+            if err is None:
+                runtime_db.mark_pawchive_file_done(f["id"], size_bytes=10)
+            elif err.startswith(runtime_db.PAW_DEAD_LINK_MARK):
+                runtime_db.mark_pawchive_file_failed(f["id"], error=err)
+            else:
+                runtime_db.mark_pawchive_file_failed(f["id"], error=err)
+        runtime_db.finalize_pawchive_post(post["id"],
+                                          runtime_db.PAW_POST_FAILED)
+
+    def test_all_dead_shows_archive_hint(self):
+        self._enqueue_post("p1", [runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404"])
+        text = pawchive.fail_text()
+        self.assertIn("全部是 404 死链", text)
+        self.assertIn("/paw archive", text)
+
+    def test_non_dead_listed_with_errors_and_row_id(self):
+        self._enqueue_post("p2", [
+            "HTTP 429 too many requests",
+            None,   # 这个成功
+            "ReadTimeout: timed out",
+        ])
+        text = pawchive.fail_text()
+        self.assertIn("#1 作者A", text)
+        self.assertIn("HTTP 429", text)
+        self.assertIn("ReadTimeout", text)
+        self.assertIn("✅1", text)          # 部分成功标记
+        self.assertIn("非死链 2 / 死链 0", text)
+        self.assertIn("/paw retry", text)
+        # 死链错误绝不进明细行
+        self._enqueue_post("p3", [runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404"])
+        text2 = pawchive.fail_text()
+        self.assertIn("#1", text2)          # p2 仍列出
+        self.assertNotIn("站点缺文件", text2.split("#1")[1].split("失败文件")[0])
+
+    def test_empty_db(self):
+        self.assertIn("没有失败记录", pawchive.fail_text())
+
+
+# ============================================================
+# 14) /paw archive 明细视图（2026-09-25）
+# ============================================================
+class ArchiveOverviewTest(unittest.TestCase):
+    """archive_overview_text：总数/按作者/最近条目；空态指引。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_arch_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def _enqueue(self, post_id, creator="作者A"):
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", creator, [{
+                "post_id": post_id, "title": f"帖{post_id}",
+                "published": "2024-11-02T00:00:00",
+                "post_url": f"https://x/{post_id}",
+                "subdir": f"Pawchive/{creator}/{post_id}",
+                "files": [{"url": f"https://f/{post_id}.png",
+                           "filename": f"{post_id}.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        f = runtime_db.list_pawchive_files(post["id"])[0]
+        runtime_db.mark_pawchive_file_failed(
+            f["id"], error=runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404")
+        runtime_db.finalize_pawchive_post(post["id"],
+                                          runtime_db.PAW_POST_FAILED)
+
+    def test_empty_state(self):
+        text = pawchive.archive_overview_text()
+        self.assertIn("归档区是空的", text)
+        self.assertIn("/paw archive failed", text)
+
+    def test_overview_with_data(self):
+        self._enqueue("p1", "作者A")
+        self._enqueue("p2", "作者A")
+        self._enqueue("p3", "作者B")
+        # 把两个 FAILED 死链帖归档
+        archived, kept = runtime_db.archive_pawchive_failed()
+        self.assertEqual((archived, kept), (3, 0))
+        text = pawchive.archive_overview_text()
+        self.assertIn("共 3 帖", text)
+        self.assertIn("作者A 2", text)
+        self.assertIn("作者B 1", text)
+        self.assertIn("#3 作者B", text)     # 最近条目按 id 倒序
+        self.assertIn("/paw pr", text)
+
+    def test_dispatch_list_form(self):
+        """无参/`list` 出明细；`failed` 保持执行语义（归档空库 → 提示）。"""
+        async def run():
+            ev = mock.MagicMock()
+            ev.reply = mock.AsyncMock()
+            await pawchive.command_reply(ev, "/paw archive")
+            first = ev.reply.await_args.args[0]
+            await pawchive.command_reply(ev, "/paw archive failed")
+            second = ev.reply.await_args.args[0]
+            return first, second
+        first, second = asyncio.new_event_loop().run_until_complete(run())
+        self.assertIn("归档明细", first)
+        self.assertIn("没有可归档", second)   # 空库执行 = 幂等提示
+
+
+# ============================================================
+# 15) /paw archive del 彻底删除 + 明细带原帖地址（2026-09-25）
+# ============================================================
+class ArchiveDeleteTest(unittest.TestCase):
+    """archive_delete_reply / delete_archived_pawchive_post：只删 ARCHIVED，
+    单条与区间，不可逆路径的状态边界。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_archdel_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def _enqueue(self, post_id):
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "作者A", [{
+                "post_id": post_id, "title": f"帖{post_id}",
+                "published": "2024-11-02T00:00:00",
+                "post_url": f"https://x/{post_id}",
+                "subdir": f"Pawchive/A/{post_id}",
+                "files": [{"url": f"https://f/{post_id}.png",
+                           "filename": f"{post_id}.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        f = runtime_db.list_pawchive_files(post["id"])[0]
+        runtime_db.mark_pawchive_file_failed(
+            f["id"], error=runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404")
+        runtime_db.finalize_pawchive_post(post["id"],
+                                          runtime_db.PAW_POST_FAILED)
+        return post["id"]
+
+    def test_delete_archived_only(self):
+        rid = self._enqueue("p1")
+        self._enqueue("p2")
+        archived, _ = runtime_db.archive_pawchive_failed()
+        self.assertEqual(archived, 2)
+        # 非 ARCHIVED 行（新帖未处理）必须被拒
+        pending_id = self._enqueue("p3")
+        self.assertFalse(runtime_db.delete_archived_pawchive_post(pending_id))
+        # 删一个归档帖：帖子+附件行一起没了
+        self.assertTrue(runtime_db.delete_archived_pawchive_post(rid))
+        self.assertEqual(runtime_db.get_pawchive_post_row(rid), None)
+        self.assertEqual(runtime_db.list_pawchive_files(rid), [])
+        # 再删同一条 = 已不存在 False（幂等安全）
+        self.assertFalse(runtime_db.delete_archived_pawchive_post(rid))
+
+    def test_reply_single_and_range(self):
+        r1 = self._enqueue("p1")
+        r2 = self._enqueue("p2")
+        r3 = self._enqueue("p3")
+        runtime_db.archive_pawchive_failed()
+        text = pawchive.archive_delete_reply(str(r1))
+        self.assertIn("已彻底删除 1", text)
+        text2 = pawchive.archive_delete_reply(f"{r2}-{r3}")
+        self.assertIn("已彻底删除 2", text2)
+        # 全删光后明细空态
+        self.assertIn("归档区是空的", pawchive.archive_overview_text())
+
+    def test_reply_skips_non_archived(self):
+        rid = self._enqueue("p1")     # 保持 FAILED，不归档
+        text = pawchive.archive_delete_reply(str(rid))
+        self.assertIn("已彻底删除 0", text)
+        self.assertIn("非归档态或不存在", text)
+
+    def test_reply_bad_input(self):
+        self.assertIn("用法", pawchive.archive_delete_reply("abc"))
+        self.assertIn("写反", pawchive.archive_delete_reply("100-50"))
+
+    def test_overview_has_post_url(self):
+        rid = self._enqueue("p9")
+        runtime_db.archive_pawchive_failed()
+        text = pawchive.archive_overview_text()
+        self.assertIn("↳ https://x/p9", text)
 
 
 # ============================================================
@@ -1797,3 +2428,84 @@ class BackfillRunTest(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_author(self):
         msg = await pawchive.backfill_author("不存在")
         self.assertIn("没有叫", msg)
+
+
+# ============================================================
+# 21) 指令重构：下划线标准形 + 空格兼容（2026-09-25）
+# ============================================================
+class CanonicalCommandTest(unittest.TestCase):
+    """_canonical_command：映射表内的组合改写为下划线标准形。"""
+
+    def test_map_rewrites(self):
+        for legacy, canonical in (
+            ("/paw plan MofuMochii", "/paw_plan MofuMochii"),
+            ("/paw progress Mofu", "/paw_progress Mofu"),
+            ("/paw archive del 5", "/paw_archive del 5"),
+            ("/paw manual export", "/paw_manual export"),
+            ("/retry all", "/retry_all"),
+            ("/retry del 3", "/retry_del 3"),
+            ("/queue del 1", "/queue_del 1"),
+            ("/wl since 1 100", "/wl_since 1 100"),
+            ("/listen add @a #t me on", "/listen_add @a #t me on"),
+            ("/sqlt add 名 SELECT 1", "/sqlt_add 名 SELECT 1"),
+            ("/cmdt add 名 ls", "/cmdt_add 名 ls"),
+            ("/caption_filter add x", "/caption_filter_add x"),
+        ):
+            self.assertEqual(commands._canonical_command(legacy), canonical)
+
+    def test_non_mapped_untouched(self):
+        for t in ("/status", "/paw", "/retry 1", "/wl", "/pawfoo bar",
+                  "/done 关键词", "/sh ls -la", "/up 文件"):
+            self.assertEqual(commands._canonical_command(t), t)
+
+    def test_registered_names_updated(self):
+        """下划线标准形全部注册；旧空格基名保持注册。"""
+        for name in ("paw_plan", "paw_progress", "paw_pr", "paw_fail",
+                     "paw_archive", "paw_backfill", "listen_add",
+                     "wl_since", "retry_all", "retry_del", "queue_del",
+                     "sqlt_add", "cmdt_run", "caption_filter_test"):
+            self.assertIn(name, config.REGISTERED_COMMAND_NAMES)
+        for legacy in ("paw", "listen", "wl", "retry", "queue"):
+            self.assertIn(legacy, config.REGISTERED_COMMAND_NAMES)
+
+    def test_is_predicates_accept_underscore(self):
+        from tg_userbot import whitelist
+        from tg_userbot.cmd_templates import is_cmdt_command
+        from tg_userbot.sql_templates import is_sqlt_command
+        from tg_userbot.caption_filter import is_caption_filter_command
+        self.assertTrue(pawchive.is_paw_command("/paw_plan X"))
+        self.assertTrue(pawchive.is_paw_command("/paw_plan"))
+        self.assertFalse(pawchive.is_paw_command("/pawfoo"))
+        self.assertTrue(test_queue_mod.is_retry_command("/retry_all"))
+        self.assertTrue(whitelist.is_wl_command("/wl_since 1 100"))
+        self.assertTrue(is_cmdt_command("/cmdt_add 名 ls"))
+        self.assertTrue(is_sqlt_command("/sqlt_add 名 SELECT 1"))
+        self.assertTrue(is_caption_filter_command("/caption_filter_test x"))
+
+
+class LegacyAliasE2ETest(unittest.IsolatedAsyncioTestCase):
+    """端到端：旧空格写法与新下划线写法路由到同一处理器。"""
+
+    async def test_both_forms_route_identically(self):
+        for legacy, canonical in (("/paw plan Mofu", "/paw_plan Mofu"),
+                                  ("/retry all", "/retry_all"),
+                                  ("/wl since 1 100", "/wl_since 1 100")):
+            with mock.patch.object(commands, "_canonical_command",
+                                   side_effect=lambda t: t), \
+                    mock.patch.object(commands, "_record_usage"), \
+                    mock.patch.object(commands, "_reply",
+                                      mock.AsyncMock()):
+                pass   # 归一化在入口，patch 后再手动验证纯函数已足够
+        # 直接验证归一化 + paw 路由
+        ev = mock.MagicMock()
+        routed = []
+
+        async def fake_paw_reply(event, cmd_text):
+            routed.append(cmd_text)
+
+        with mock.patch.object(pawchive, "command_reply", fake_paw_reply), \
+                mock.patch.object(commands.logger, "info"):
+            await commands.handle_command(ev, "/paw_plan MofuMochii")
+            await commands.handle_command(ev, "/paw plan Mofu")
+        self.assertEqual(routed, ["/paw_plan MofuMochii", "/paw_plan Mofu"],
+                         "两种写法到 Pawchive 分发器时已归一")

@@ -269,7 +269,7 @@ def test_text(raw):
     )
 
 
-_CAPTION_CMD_RE = re.compile(r"^/caption_filter(?:\s|$)", re.IGNORECASE)
+_CAPTION_CMD_RE = re.compile(r"^/caption_filter(?:_\w+)?(?:\s|$)", re.IGNORECASE)
 
 
 def is_caption_filter_command(text):
@@ -289,7 +289,7 @@ def parse_caption_filter_command(text):
     if not body:
         return ("list", None)
     head, _, rest = body.partition(" ")
-    head = head.strip().lower()
+    head = head.strip().lstrip("_").lower()   # /caption_filter_add（标准）兼容
     rest = rest.strip()
     if head in ("add", "del", "test"):
         return (head, rest) if rest else ("usage", head)

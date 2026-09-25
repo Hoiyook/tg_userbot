@@ -1148,5 +1148,5 @@ class RetryViewButtonsTest(unittest.TestCase):
         import inspect
         from tg_userbot import commands
         src = inspect.getsource(commands.handle_command)
-        seg = src.split('is_retry_command')[1][:600]
+        seg = src.split('is_retry_command')[1][:1600]
         self.assertIn("format_retry_view", seg)

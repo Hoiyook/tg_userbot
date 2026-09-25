@@ -815,6 +815,8 @@ CLEAR_TIME_CONFIG_FILE = os.path.join(RUNTIME_DIR, "clear_time.json")
 # 已注册命令名全集（/ 开头的输入判「是不是命令」用）：bot 按钮面板注册的
 # + 仅收藏夹跑的（CLEAN_COMMANDS 除斜杠）。评论捕获的目录模式标注（/A#x）
 # 以 / 开头但不是命令，靠这份名单区分（2026-09-16）。
+# 含 2026-09-25 指令重构后的全部下划线标准形（/paw_plan 等）——
+# 多词指令标准化后每个都是独立 token，必须各自注册
 REGISTERED_COMMAND_NAMES = frozenset({name for name in (
     "status", "stats", "find", "progress", "up", "sh", "queue", "retry",
     "dedup",
@@ -822,6 +824,18 @@ REGISTERED_COMMAND_NAMES = frozenset({name for name in (
     "clean", "clearmsg", "setcleartime", "done", "thread", "folder",
     "logpath", "links", "help", "start", "cd2ck", "cmdhis",
     "usage", "help2",
+    # /paw 子命令标准形
+    "paw_status", "paw_help", "paw_plan", "paw_search", "paw_retry",
+    "paw_pause", "paw_resume", "paw_manual", "paw_done", "paw_archive",
+    "paw_att", "paw_post", "paw_cookie", "paw_csv", "paw_find", "paw_pr",
+    "paw_since", "paw_fail", "paw_progress", "paw_backfill",
+    # 其余多词指令标准形
+    "listen_on", "listen_off", "listen_scan", "listen_list", "listen_add",
+    "listen_del", "listen_edit", "listen_interval",
+    "wl_list", "wl_add", "wl_del", "wl_scan", "wl_since",
+    "retry_all", "retry_del", "queue_del",
+    "sqlt_add", "sqlt_del", "cmdt_add", "cmdt_del", "cmdt_run",
+    "caption_filter_add", "caption_filter_del", "caption_filter_test",
 )})
 
 

@@ -1651,7 +1651,7 @@ def write_csv(creator_service, creator_id, creator_name):
 # ============================================================
 # 命令解析
 # ============================================================
-_PAW_CMD_RE = re.compile(r"^/paw(?:\s|$)", re.IGNORECASE)
+_PAW_CMD_RE = re.compile(r"^/paw(?:_\w+)?(?:\s|$)", re.IGNORECASE)
 
 
 def is_paw_command(text) -> bool:
@@ -1666,7 +1666,8 @@ def parse_paw_command(text):
     if not body:
         return ("status", None)
     head, _, rest = body.partition(" ")
-    head_l = head.lower()
+    # 2026-09-25 指令重构：/paw_plan（标准）与 /paw plan（兼容）两种头
+    head_l = head.lstrip("_").lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
                   "resume", "manual", "done", "archive", "att", "post",
                   "cookie", "csv", "find", "pr", "since", "fail", "progress",
