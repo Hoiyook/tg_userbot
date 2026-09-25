@@ -1609,6 +1609,28 @@ def non_dead_failed_posts(limit=20):
     return _read(do, "统计非死链失败帖")
 
 
+def delete_archived_pawchive_post(row_id):
+    """彻底删除**归档态**帖及其附件行（/paw archive del；不可逆）。
+
+    只接受 ARCHIVED——PENDING/FAILED/COMPLETED/MANUAL 帖另有生命周期
+    出口（重投/重试/✅），归档命令的删除路径绝不越过这个状态边界。
+    死链帖没有落盘文件，无需清理磁盘。返回是否删除。"""
+
+    def do(conn):
+        cur = _execute(
+            conn, "SELECT id FROM pawchive_posts WHERE id=? AND status=?",
+            (int(row_id), PAW_POST_ARCHIVED)).fetchone()
+        if not cur:
+            return False
+        _execute(conn, "DELETE FROM pawchive_files WHERE post_row=?",
+                 (int(row_id),))
+        _execute(conn, "DELETE FROM pawchive_posts WHERE id=?",
+                 (int(row_id),))
+        return True
+
+    return _write(do, f"删除归档 Pawchive 帖（{row_id}）")
+
+
 def archived_posts_overview(limit=15):
     """归档明细：返回 (总数, 按作者计数 top5, 最近 limit 条行)。
 
@@ -1624,13 +1646,15 @@ def archived_posts_overview(limit=15):
             "WHERE status=? GROUP BY creator_name ORDER BY n DESC LIMIT 5",
             (PAW_POST_ARCHIVED,)).fetchall()
         recent = _execute(
-            conn, "SELECT id, creator_name, title, published, last_error "
-            "FROM pawchive_posts WHERE status=? ORDER BY id DESC LIMIT ?",
+            conn, "SELECT id, creator_name, title, published, last_error, "
+            "post_url FROM pawchive_posts WHERE status=? "
+            "ORDER BY id DESC LIMIT ?",
             (PAW_POST_ARCHIVED, int(limit))).fetchall()
         return (total,
                 [(r[0], int(r[1])) for r in by_creator],
                 [{"id": r[0], "creator_name": r[1], "title": r[2],
-                  "published": r[3], "last_error": r[4]} for r in recent])
+                  "published": r[3], "last_error": r[4],
+                  "post_url": r[5]} for r in recent])
 
     return _read(do, "统计归档帖明细")
 

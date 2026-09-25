@@ -1239,7 +1239,8 @@ def manual_export_text(limit=500):
 
 
 def archive_overview_text(limit=15):
-    """/paw archive（无参）：归档明细视图——总数 + 按作者分布 + 最近条目。"""
+    """/paw archive（无参）：归档明细——总数 + 按作者 + 最近条目（带原帖
+    地址，Telegram 自动渲染成可点链接）。"""
     try:
         total, by_creator, recent = runtime_db.archived_posts_overview(limit)
     except runtime_db.DbUnavailable as e:
@@ -1257,11 +1258,47 @@ def archive_overview_text(limit=15):
         lines.append(
             f"#{r['id']} {r['creator_name']}｜"
             f"{(r['published'] or '')[:10]}｜{str(r['title'])[:26]}{err}")
+        if r.get("post_url"):
+            lines.append(f"    ↳ {r['post_url']}")
     if total > len(recent):
         lines.append(f"…其余 {total - len(recent)} 帖略（/sql 可查全量）")
     lines.append("")
-    lines.append("单帖详情 /paw pr <行id>｜执行归档 /paw archive failed")
+    lines.append("单帖详情 /paw pr <行id>｜执行归档 /paw archive failed｜"
+                 "彻底删除 /paw archive del <行id|起-止>")
     return "\n".join(lines)[:3900]
+
+
+def archive_delete_reply(arg):
+    """/paw archive del <行id|起-止>：彻底删除**归档态**帖（不可逆）。
+
+    与 /paw done 同款形态解析（单条 / 区间）；只吃 ARCHIVED，其它状态
+    如实报跳过（PENDING/FAILED/COMPLETED/MANUAL 另有生命周期出口，归档
+    命令的删除路径绝不越过状态边界）。死链帖没有落盘文件，无需清磁盘。"""
+    raw = str(arg or "").lstrip("#").strip()
+    m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", raw)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if lo > hi:
+            return f"{TEXT_PREFIX}\n❌ 区间起止写反了（{lo}-{hi}）"
+        ids = range(lo, hi + 1)
+    elif raw.isdigit():
+        ids = [int(raw)]
+    else:
+        return (f"{TEXT_PREFIX}\n用法：/paw archive del <行id | 起-止>\n"
+                "例：/paw archive del 2404　/paw archive del 100-150")
+    deleted = skipped = 0
+    for i in ids:
+        try:
+            if runtime_db.delete_archived_pawchive_post(i):
+                deleted += 1
+            else:
+                skipped += 1
+        except runtime_db.DbUnavailable as e:
+            return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    msg = f"🗑 已彻底删除 {deleted} 个归档帖"
+    if skipped:
+        msg += f"；{skipped} 个行 id 非归档态或不存在，已跳过"
+    return f"{TEXT_PREFIX}\n{msg}"
 
 
 def archive_reply():
@@ -1451,9 +1488,14 @@ async def command_reply(event, cmd_text):
                           link_preview=False)
         return
     if action == "archive":
-        # /paw archive（无参|list）= 明细视图；/paw archive failed = 执行
-        if (arg or "").strip().lower() in ("", "list", "明细", "查看"):
+        # /paw archive（无参|list）= 明细视图；del <…> = 彻底删除归档帖；
+        # /paw archive failed = 执行归档
+        head, _, rest = (arg or "").strip().partition(" ")
+        if head.lower() in ("", "list", "明细", "查看"):
             await event.reply(archive_overview_text(), link_preview=False)
+        elif head.lower() == "del":
+            await event.reply(archive_delete_reply(rest),
+                              link_preview=False)
         else:
             await event.reply(archive_reply(), link_preview=False)
         return
@@ -1516,7 +1558,8 @@ def _help_text():
         "  /paw att <URL|帖子ID|行id> —— 查帖子的附件与外链状态\n"
         "  /paw pr <URL|帖子ID|行id> —— 帖子执行详情报告（附件/外链统计、"
         "逐项状态、落盘目录实况）\n"
-        "  /paw archive —— 归档明细（总数/按作者/最近条目）\n"
+        "  /paw archive —— 归档明细（总数/按作者/最近条目含原帖地址）\n"
+        "  /paw archive del <行id|起-止> —— 彻底删除归档帖（不可逆）\n"
         "  /paw archive failed —— FAILED 死链帖批量归档（不占待办）\n"
         "  /paw done <行id | 起-止 | 作者名> —— 批量标记完成\n"
         "  /paw retry <行ID|all> —— 失败帖子重投\n"

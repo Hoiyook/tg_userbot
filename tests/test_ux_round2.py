@@ -1345,3 +1345,83 @@ class ArchiveOverviewTest(unittest.TestCase):
         first, second = asyncio.new_event_loop().run_until_complete(run())
         self.assertIn("归档明细", first)
         self.assertIn("没有可归档", second)   # 空库执行 = 幂等提示
+
+
+# ============================================================
+# 15) /paw archive del 彻底删除 + 明细带原帖地址（2026-09-25）
+# ============================================================
+class ArchiveDeleteTest(unittest.TestCase):
+    """archive_delete_reply / delete_archived_pawchive_post：只删 ARCHIVED，
+    单条与区间，不可逆路径的状态边界。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_archdel_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def _enqueue(self, post_id):
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "作者A", [{
+                "post_id": post_id, "title": f"帖{post_id}",
+                "published": "2024-11-02T00:00:00",
+                "post_url": f"https://x/{post_id}",
+                "subdir": f"Pawchive/A/{post_id}",
+                "files": [{"url": f"https://f/{post_id}.png",
+                           "filename": f"{post_id}.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        f = runtime_db.list_pawchive_files(post["id"])[0]
+        runtime_db.mark_pawchive_file_failed(
+            f["id"], error=runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404")
+        runtime_db.finalize_pawchive_post(post["id"],
+                                          runtime_db.PAW_POST_FAILED)
+        return post["id"]
+
+    def test_delete_archived_only(self):
+        rid = self._enqueue("p1")
+        self._enqueue("p2")
+        archived, _ = runtime_db.archive_pawchive_failed()
+        self.assertEqual(archived, 2)
+        # 非 ARCHIVED 行（新帖未处理）必须被拒
+        pending_id = self._enqueue("p3")
+        self.assertFalse(runtime_db.delete_archived_pawchive_post(pending_id))
+        # 删一个归档帖：帖子+附件行一起没了
+        self.assertTrue(runtime_db.delete_archived_pawchive_post(rid))
+        self.assertEqual(runtime_db.get_pawchive_post_row(rid), None)
+        self.assertEqual(runtime_db.list_pawchive_files(rid), [])
+        # 再删同一条 = 已不存在 False（幂等安全）
+        self.assertFalse(runtime_db.delete_archived_pawchive_post(rid))
+
+    def test_reply_single_and_range(self):
+        r1 = self._enqueue("p1")
+        r2 = self._enqueue("p2")
+        r3 = self._enqueue("p3")
+        runtime_db.archive_pawchive_failed()
+        text = pawchive.archive_delete_reply(str(r1))
+        self.assertIn("已彻底删除 1", text)
+        text2 = pawchive.archive_delete_reply(f"{r2}-{r3}")
+        self.assertIn("已彻底删除 2", text2)
+        # 全删光后明细空态
+        self.assertIn("归档区是空的", pawchive.archive_overview_text())
+
+    def test_reply_skips_non_archived(self):
+        rid = self._enqueue("p1")     # 保持 FAILED，不归档
+        text = pawchive.archive_delete_reply(str(rid))
+        self.assertIn("已彻底删除 0", text)
+        self.assertIn("非归档态或不存在", text)
+
+    def test_reply_bad_input(self):
+        self.assertIn("用法", pawchive.archive_delete_reply("abc"))
+        self.assertIn("写反", pawchive.archive_delete_reply("100-50"))
+
+    def test_overview_has_post_url(self):
+        rid = self._enqueue("p9")
+        runtime_db.archive_pawchive_failed()
+        text = pawchive.archive_overview_text()
+        self.assertIn("↳ https://x/p9", text)
