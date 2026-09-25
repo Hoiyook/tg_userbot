@@ -75,6 +75,7 @@ BOT_COMMANDS = (
     ("cd2ck", "115 备份对账：本地滞留媒体 × 备份日志交叉"),
     ("origin", "查看评论来源解析失败账本（可溯源）"),
     ("cmdhis", "最近命令行：复制最近执行过的 /sh 命令"),
+    ("usage", "功能使用统计：各功能使用次数与频率"),
     ("cmdt", "命令模板：保存/执行常用 shell 命令"),
     ("clearmsg", "清理程序产生的消息"),
     ("help", "查看全部命令"),
@@ -1326,6 +1327,12 @@ async def bot_callback_handler(event):
     logger.info(f"🤖 bot 菜单回调：{action} {arg or ''}")
     try:
         reply, buttons = await handle_menu_action(action, arg, event)
+        if reply is not None or buttons is not None:
+            # 功能使用审计：面板按钮也是「使用功能」，与指令同一套账
+            try:
+                runtime_db.feature_usage_bump(f"menu:{action}")
+            except Exception:
+                pass
         if reply is not None:
             await event.edit(
                 text_mod.with_code_block(reply),

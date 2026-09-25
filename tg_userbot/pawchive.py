@@ -139,6 +139,56 @@ async def resolve_creator_async(name):
     return await asyncio.to_thread(resolve_creator, name)
 
 
+# ============================================================
+# 扫描时间下限（/paw since，2026-09-24）：持久化默认值。plan 未显式给
+# since 时自动应用——「有些很久的帖子不想要」设一次即可；显式 since 仍可
+# 临时覆盖，/paw since off 清除。
+# ============================================================
+def _since_path():
+    return os.path.join(config.PAWCHIVE_DATA_DIR, "scan_since.json")
+
+
+def get_default_since():
+    """当前默认时间下限（YYYY-MM-DD 或 None）。文件损坏按未设置。"""
+    try:
+        with open(_since_path(), "r", encoding="utf-8") as f:
+            return (json.load(f) or {}).get("since") or None
+    except (OSError, ValueError):
+        return None
+
+
+def set_default_since(value):
+    """写入默认时间下限；value=None 清除。原子写。"""
+    os.makedirs(config.PAWCHIVE_DATA_DIR, exist_ok=True)
+    tmp = _since_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"since": value}, f, ensure_ascii=False)
+    os.replace(tmp, _since_path())
+
+
+def since_reply(arg):
+    """/paw since <YYYY-MM-DD|off> 的回执；无参 = 查看当前。"""
+    q = str(arg or "").strip().lower()
+    if not q:
+        cur = get_default_since()
+        if cur:
+            return (f"{TEXT_PREFIX}\n📅 当前默认时间下限：{cur}\n"
+                    "（/paw plan 未显式给 since 时自动应用；"
+                    "取消用 /paw since off）")
+        return (f"{TEXT_PREFIX}\n📅 未设置默认时间下限（扫描全量拉取）。\n"
+                "设置：/paw since <YYYY-MM-DD>\n取消：/paw since off")
+    if q in ("off", "none", "取消"):
+        set_default_since(None)
+        return f"{TEXT_PREFIX}\n✅ 已清除默认时间下限（恢复全量拉取）"
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", q):
+        return (f"{TEXT_PREFIX}\n❌ 日期格式：YYYY-MM-DD\n"
+                "例：/paw since 2026-01-01；取消：/paw since off")
+    set_default_since(q)
+    return (f"{TEXT_PREFIX}\n✅ 已设置默认时间下限：{q}\n"
+            "之后 /paw plan 未显式给 since 时自动只收该日期之后的帖子"
+            "（显式 since 仍可临时覆盖；取消：/paw since off）")
+
+
 def creators_cache_stale():
     """创作者缓存是否已过期（文件缺失/超 TTL 都算过期）。"""
     try:
@@ -967,6 +1017,11 @@ def status_text():
                          f"🗄 纯死链 {dead}（/paw retry all 只重投前者）")
         except runtime_db.DbUnavailable:
             pass
+    # 扫描时间下限（/paw since 设置的持久化默认）
+    _default_since = get_default_since()
+    if _default_since:
+        lines.append(f"📅 扫描时间下限：{_default_since}"
+                     "（/paw since off 取消）")
     # Cookie 健康（只读展示最近一次校验结论，这里绝不打站点网络请求）
     if config.PAWCHIVE_COOKIE:
         ck = state.PAW_COOKIE_CHECK
@@ -1297,7 +1352,7 @@ def parse_paw_command(text):
     head_l = head.lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
                   "resume", "manual", "done", "archive", "att", "post",
-                  "cookie", "csv", "find", "pr"):
+                  "cookie", "csv", "find", "pr", "since"):
         return (head_l, rest.strip() or None)
     return ("help", None)
 
@@ -1336,6 +1391,9 @@ async def command_reply(event, cmd_text):
         return
     if action == "att":
         await event.reply(att_text(arg), link_preview=False)
+        return
+    if action == "since":
+        await event.reply(since_reply(arg), link_preview=False)
         return
     if action == "pr":
         await event.reply(post_report_text(arg), link_preview=False)
@@ -1378,6 +1436,8 @@ def _help_text():
         "  /paw plan <作者名> since <YYYY-MM-DD> —— 只收该日期之后的帖子"
         "带 Cookie 才能对比收藏，all=全部）\n"
         "  /paw search <关键词> —— 搜作者\n"
+        "  /paw since <YYYY-MM-DD|off> —— 设默认时间下限（plan 自动只收"
+        "该日之后的帖）\n"
         "  /paw post <帖子URL|ID> —— 单独获取指定帖子的附件\n"
         "  /paw find <关键词> —— 按名称查扫描记录与当前目录文件\n"
         "  /paw manual —— 待人工处理的帖子（含外链清单与 ✅ 按钮）\n"
@@ -1457,6 +1517,9 @@ async def _reply_plan(event, arg):
                 "（例：/paw plan 作者 since 2026-09-01）",
                 link_preview=False)
             return
+    if since is None:
+        # 未显式给 since → 应用 /paw since 设置的持久化默认
+        since = get_default_since()
     name = " ".join(parts).strip()
     if not name:
         await event.reply(

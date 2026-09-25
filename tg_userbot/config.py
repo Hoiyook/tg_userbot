@@ -424,7 +424,7 @@ REPORT_LISTEN = True
 # WAL 依赖 mmap 共享内存、在该文件系统上可能不可用；真机上若探测到 WAL 回落，
 # 可把 DB 挪到应用私有目录。注意：**只允许主进程写**，Chrome Agent 进程绝不
 # 能开连接（见 runtime_db 的「不做 import 期连接」）。
-RUNTIME_DB_SCHEMA_VERSION = 10  # v10：manual_links 加 note（链接备注）
+RUNTIME_DB_SCHEMA_VERSION = 11  # v11：+ feature_usage 功能使用审计
 # 单条写事务等锁的上限（毫秒）与 SQLITE_BUSY/LOCKED 的有限重试（规格 §39：
 # 记日志 → 短暂等待 → 有限次数重试，绝不无限循环、绝不因此崩掉主进程）。
 RUNTIME_DB_BUSY_TIMEOUT_MS = 5000
@@ -821,6 +821,7 @@ REGISTERED_COMMAND_NAMES = frozenset({name for name in (
     "caption_filter", "listen", "wl", "sql", "sqlt", "paw", "origin",
     "clean", "clearmsg", "setcleartime", "done", "thread", "folder",
     "logpath", "links", "help", "start", "cd2ck", "cmdhis",
+    "usage", "help2",
 )})
 
 

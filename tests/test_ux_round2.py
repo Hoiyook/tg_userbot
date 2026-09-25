@@ -25,7 +25,7 @@ _TMP = tempfile.mkdtemp(prefix="tg_userbot_ux2_test_")
 atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
-from tg_userbot import cd2, config, pawchive, runtime_db, state  # noqa: E402
+from tg_userbot import bot, cd2, commands, config, pawchive, runtime_db, state  # noqa: E402
 from tg_userbot import pawchive_worker  # noqa: E402
 
 
@@ -904,3 +904,226 @@ class PostReportTest(unittest.TestCase):
         self.assertIn("paw_pr", config.MENU_ACTIONS)
         texts = [b.text for row in pawchive.menu_buttons() for b in row]
         self.assertIn("📋 帖子报告", texts)
+
+
+# ============================================================
+# 10) 功能使用审计（feature_usage / /usage）
+# ============================================================
+class FeatureUsageDbTest(unittest.TestCase):
+    """feature_usage_bump/top：按天聚合、近 7 天口径、排行。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_usage_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def test_bump_aggregates(self):
+        now = time.time()
+        runtime_db.feature_usage_bump("/folder", now=now)
+        runtime_db.feature_usage_bump("/folder", now=now)
+        runtime_db.feature_usage_bump("menu:home", now=now)
+        rows = runtime_db.feature_usage_top(10, now=now)
+        by_name = {r["name"]: r for r in rows}
+        self.assertEqual(by_name["/folder"]["total"], 2)
+        self.assertEqual(by_name["/folder"]["recent7"], 2)
+        self.assertEqual(by_name["menu:home"]["total"], 1)
+        self.assertEqual(by_name["/folder"]["last_at"], int(now))
+
+    def test_recent7_excludes_old_days(self):
+        now = time.time()
+        runtime_db.feature_usage_bump("/old", now=now - 30 * 86400)
+        runtime_db.feature_usage_bump("/old", now=now)
+        rows = runtime_db.feature_usage_top(10, now=now)
+        r = rows[0]
+        self.assertEqual(r["total"], 2)
+        self.assertEqual(r["recent7"], 1)
+        self.assertEqual(r["first_day"], time.strftime(
+            "%Y-%m-%d", time.localtime(now - 30 * 86400)))
+
+
+class UsageNameTest(unittest.TestCase):
+    """usage_name：子命令带名字、参数绝不进名字。"""
+
+    def test_multiword_and_guard(self):
+        self.assertEqual(commands.usage_name("/paw plan MofuMochii"),
+                         "/paw plan")
+        self.assertEqual(commands.usage_name("/CHROME https://x/y"),
+                         "/chrome")
+        self.assertEqual(commands.usage_name("/retry all"), "/retry")
+        self.assertEqual(commands.usage_name(""), "")
+
+
+class CommandUsageRecordTest(unittest.TestCase):
+    """handle_command 埋点：已注册指令落库、未注册不落、炸不了命令。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_cusage_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def test_registered_command_recorded(self):
+        async def run():
+            ev = mock.MagicMock()
+            ev.reply = mock.AsyncMock()
+            await commands.handle_command(ev, "/folder")
+        asyncio.new_event_loop().run_until_complete(run())
+        rows = runtime_db.feature_usage_top(10)
+        self.assertEqual([r["name"] for r in rows], ["/folder"])
+
+    def test_unregistered_not_recorded(self):
+        async def run():
+            ev = mock.MagicMock()
+            ev.reply = mock.AsyncMock()
+            handled = await commands.handle_command(ev, "/not_a_cmd")
+            self.assertFalse(handled)
+        asyncio.new_event_loop().run_until_complete(run())
+        self.assertEqual(runtime_db.feature_usage_top(10), [])
+
+    def test_db_failure_never_breaks_command(self):
+        async def run():
+            ev = mock.MagicMock()
+            ev.reply = mock.AsyncMock()
+            with mock.patch.object(runtime_db, "feature_usage_bump",
+                                   side_effect=RuntimeError("db down")):
+                handled = await commands.handle_command(ev, "/folder")
+            self.assertTrue(handled)
+        asyncio.new_event_loop().run_until_complete(run())
+
+
+class MenuButtonUsageRecordTest(unittest.IsolatedAsyncioTestCase):
+    """面板按钮埋点：menu:<action> 落库。"""
+
+    async def test_status_button_recorded(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_musage_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        saved_me = state.MY_ID
+        state.MY_ID = 123
+        ev = mock.MagicMock()
+        ev.chat_id = 123
+        ev.data = b"m:status"
+        ev.answer = mock.AsyncMock()
+        ev.edit = mock.AsyncMock()
+        try:
+            with mock.patch.object(bot.logger, "info"), \
+                    mock.patch.object(bot.logger, "exception"):
+                await bot.bot_callback_handler(ev)
+        finally:
+            state.MY_ID = saved_me
+        names = [r["name"] for r in runtime_db.feature_usage_top(10)]
+        self.assertIn("menu:status", names)
+
+
+class UsageCommandTest(unittest.TestCase):
+    """/usage 输出格式。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_ucmd_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def test_empty_and_rows(self):
+        async def run():
+            ev = mock.MagicMock()
+            ev.reply = mock.AsyncMock()
+            await commands.handle_command(ev, "/usage")
+            return ev.reply.await_args.args[0]
+        loop = asyncio.new_event_loop()
+        # /usage 自身也会被记录（进命令入口即计数）——首查只有它自己
+        first = loop.run_until_complete(run())
+        self.assertIn("/usage", first)
+        runtime_db.feature_usage_bump("/paw plan")
+        with_data = loop.run_until_complete(run())
+        loop.close()
+        self.assertIn("/paw plan", with_data)
+        self.assertIn("近7天", with_data)
+        # 空态文案单独验：无任何记录时提示
+        with mock.patch.object(runtime_db, "feature_usage_top",
+                               return_value=[]):
+            ev = mock.MagicMock()
+            ev.reply = mock.AsyncMock()
+            loop2 = asyncio.new_event_loop()
+            empty = loop2.run_until_complete(run())
+            loop2.close()
+        self.assertIn("还没有记录", empty)
+
+
+# ============================================================
+# 11) /paw since 持久化时间下限
+# ============================================================
+class PawSinceTest(unittest.TestCase):
+    """set/get roundtrip + since_reply 各分支 + plan 默认应用。"""
+
+    def setUp(self):
+        self.path = os.path.join(_TMP, f"since_{id(self)}.json")
+        self._p = mock.patch.object(pawchive, "_since_path",
+                                    return_value=self.path)
+        self._p.start()
+        self.addCleanup(self._p.stop)
+
+    def test_roundtrip_and_clear(self):
+        self.assertIsNone(pawchive.get_default_since())
+        pawchive.set_default_since("2026-01-01")
+        self.assertEqual(pawchive.get_default_since(), "2026-01-01")
+        pawchive.set_default_since(None)
+        self.assertIsNone(pawchive.get_default_since())
+
+    def test_reply_branches(self):
+        self.assertIn("未设置", pawchive.since_reply(""))
+        self.assertIn("已设置", pawchive.since_reply("2026-03-01"))
+        self.assertIn("2026-03-01", pawchive.since_reply(""))
+        self.assertIn("日期格式", pawchive.since_reply("瞎写的"))
+        self.assertIn("已清除", pawchive.since_reply("off"))
+        self.assertIn("未设置", pawchive.since_reply(""))
+
+    async def test_plan_applies_default_since(self):
+        state.PAW_SCAN_RUNNING = None
+        captured = {}
+
+        async def fake_start(creator, scope="notfaved", since=None):
+            captured["since"] = since
+            return "ok"
+
+        async def fake_resolve(name):
+            return {"id": "1", "name": name, "service": "patreon"}
+
+        pawchive.set_default_since("2026-02-02")
+        ev = mock.MagicMock()
+        ev.reply = mock.AsyncMock()
+        with mock.patch.object(pawchive, "start_scan", fake_start), \
+                mock.patch.object(pawchive, "resolve_creator_async",
+                                  fake_resolve), \
+                mock.patch.object(pawchive, "creators_cache_stale",
+                                  return_value=False):
+            await pawchive._reply_plan(ev, "MofuMochii")
+        self.assertEqual(captured["since"], "2026-02-02",
+                         "未显式给 since 时必须应用持久化默认")
+        # 显式 since 覆盖默认
+        captured.clear()
+        with mock.patch.object(pawchive, "start_scan", fake_start), \
+                mock.patch.object(pawchive, "resolve_creator_async",
+                                  fake_resolve), \
+                mock.patch.object(pawchive, "creators_cache_stale",
+                                  return_value=False):
+            await pawchive._reply_plan(ev, "MofuMochii since 2026-05-01")
+        self.assertEqual(captured["since"], "2026-05-01")

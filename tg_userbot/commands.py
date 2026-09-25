@@ -8,6 +8,7 @@ CLEAR_INTERVAL_SECONDS / CLEAR_TIME_CHANGED）一律读 state.*；跨模块函�
 以模块对象调用。
 """
 import asyncio
+import time
 
 from . import state
 from . import config
@@ -118,7 +119,35 @@ def resolve_shortcut(text):
     return config.COMMAND_SHORTCUTS.get(key)
 
 
+def usage_name(cmd_text):
+    """功能使用审计的名字：指令首词 + 多子命令指令带子词。
+
+    /paw plan → 「/paw plan」（plan/search/retry 等是不同功能）；
+    /chrome <URL> → 「/chrome」（绝不把 URL/参数记进名字）。"""
+    parts = str(cmd_text or "").split()
+    if not parts:
+        return ""
+    base = parts[0].split("@")[0].lower()
+    if base == "/paw" and len(parts) > 1:
+        return f"/paw {parts[1].split('@')[0].lower()}"
+    return base
+
+
+def _record_usage(cmd_text):
+    """命令使用审计落库；只记已注册指令，DB 异常绝不影响命令执行。"""
+    try:
+        name = usage_name(cmd_text)
+        if not name or name.lstrip("/") not in config.REGISTERED_COMMAND_NAMES:
+            return
+        runtime_db.feature_usage_bump(name)
+    except Exception:
+        pass
+
+
 async def handle_command(event, cmd_text):
+    # 功能使用审计（2026-09-24）：只记已注册指令，失败不影响命令
+    _record_usage(cmd_text)
+
     # 快捷指令（如发 1 = /cmdhis）：调用方（bot 对话 / 主账号 Saved Messages）
     # 已各自解析过才会带映射命令进来，这里不做二次解析
     if cmd_text == "/cmdhis":
@@ -692,6 +721,25 @@ async def handle_command(event, cmd_text):
             except Exception:
                 pass
 
+        return True
+
+    if cmd_text == "/usage":
+        # 功能使用审计（2026-09-24）：次数排行 + 近 7 天 + 最后使用
+        rows = runtime_db.feature_usage_top(20)
+        if not rows:
+            await _reply(event, "📊 功能使用统计：还没有记录")
+            return True
+        lines = ["📊 功能使用统计（累计｜近7天｜最后使用）", ""]
+        for i, r in enumerate(rows, 1):
+            last = time.strftime("%m-%d %H:%M", time.localtime(r["last_at"]))
+            lines.append(
+                f"{i}. {r['name']} — {r['total']}｜{r['recent7']}"
+                f"｜{last}")
+        lines.append("")
+        lines.append("共 {n} 个功能（/sql 查 feature_usage 表可自由聚合）"
+                     .format(n=len(rows)))
+        await _reply(event, "\n".join(lines)[:3900])
+        logger.info("执行命令：/usage")
         return True
 
     if cmd_text == "/clean":

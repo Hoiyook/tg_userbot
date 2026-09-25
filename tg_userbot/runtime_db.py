@@ -381,6 +381,21 @@ _SCHEMA = (
         done_at    INTEGER
     )
     """,
+    # ============================================================
+    # 功能使用审计（2026-09-24，schema v11）：按 (功能名, 日期) 聚合计数，
+    # /usage 看排行，/sql 亦可自由聚合。功能名 = 指令（/paw plan）或
+    # 面板动作（menu:home）。
+    # ============================================================
+    """
+    CREATE TABLE IF NOT EXISTS feature_usage (
+        name     TEXT NOT NULL,
+        day      TEXT NOT NULL,
+        count    INTEGER NOT NULL DEFAULT 0,
+        first_at INTEGER NOT NULL,
+        last_at  INTEGER NOT NULL,
+        PRIMARY KEY (name, day)
+    )
+    """,
 )
 
 # SQLITE_BUSY / SQLITE_LOCKED 的典型文案（只用于判定是否值得重试）
@@ -699,6 +714,9 @@ def migrate() -> int:
                 _execute(conn, "ALTER TABLE manual_links ADD COLUMN note TEXT")
         _write(_v10, "迁移 v10（manual_links.note）")
         logger.info("🗄 Runtime DB 迁移：v10（+ manual_links.note）")
+    if version < 11:
+        # v10 → v11：新增 feature_usage（功能使用审计，按天计数）。纯建表。
+        logger.info("🗄 Runtime DB 迁移：v11（+ feature_usage 功能使用审计）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -1546,6 +1564,53 @@ def mark_pawchive_file_done(file_id, size_bytes=None, now=None):
         return bool(cur.rowcount)
 
     return _write(do, "标记 Pawchive 文件完成")
+
+
+# ============================================================
+# 功能使用审计（schema v11）
+# ============================================================
+def feature_usage_bump(name, now=None):
+    """功能使用计数 +1（按「功能名 × 本地日期」聚合）。
+
+    低频写（人手触发），每事件一次小事务；DB 失败由 _write 记日志不抛。"""
+    now = _now(now)
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+
+    def do(conn):
+        _execute(
+            conn,
+            "INSERT OR IGNORE INTO feature_usage "
+            "(name, day, count, first_at, last_at) VALUES (?, ?, 0, ?, ?)",
+            (name, day, now, now))
+        _execute(
+            conn,
+            "UPDATE feature_usage SET count = count + 1, last_at = ? "
+            "WHERE name = ? AND day = ?",
+            (now, name, day))
+
+    _write(do, "记录功能使用")
+
+
+def feature_usage_top(limit=20, now=None):
+    """使用排行：[{'name','total','recent7','first_day','last_at'}, ...]。
+
+    total=累计次数；recent7=近 7 天次数；last_at=最近一次使用的 epoch。"""
+    now = _now(now)
+    cutoff_day = time.strftime("%Y-%m-%d", time.localtime(now - 7 * 86400))
+
+    def do(conn):
+        return _execute(
+            conn,
+            "SELECT name, SUM(count) AS total, "
+            "SUM(CASE WHEN day >= ? THEN count ELSE 0 END) AS recent7, "
+            "MIN(day) AS first_day, MAX(last_at) AS last_at "
+            "FROM feature_usage GROUP BY name "
+            "ORDER BY total DESC, name LIMIT ?",
+            (cutoff_day, int(limit))).fetchall()
+
+    rows = _read(do, "统计功能使用")
+    return [{"name": r[0], "total": int(r[1]), "recent7": int(r[2]),
+             "first_day": r[3], "last_at": int(r[4])} for r in rows]
 
 
 def update_pawchive_file_url(file_id, url, now=None):
