@@ -1208,3 +1208,72 @@ class SanitizeFilenameBudgetTest(unittest.TestCase):
         self.assertLessEqual(
             len(_os.path.basename(path).encode("utf-8")), 200 + 5,
             "落盘文件名必须在字节预算内（.part 后缀留量）")
+
+
+# ============================================================
+# 13) /paw fail 非死链失败明细（2026-09-25）
+# ============================================================
+class PawFailTest(unittest.TestCase):
+    """fail_text：死链不占版面；非死链失败带错误聚合与行 id。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_fail_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def _enqueue_post(self, post_id, files_errors):
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "作者A", [{
+                "post_id": post_id, "title": f"帖{post_id}",
+                "published": "2026-09-25T00:00:00",
+                "post_url": f"https://x/{post_id}",
+                "subdir": f"Pawchive/A/{post_id}",
+                "files": [{"url": f"https://f/{post_id}_{i}.mp4",
+                           "filename": f"{i}.mp4"}
+                          for i in range(len(files_errors))],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        for f, err in zip(runtime_db.list_pawchive_files(post["id"]),
+                          files_errors):
+            if err is None:
+                runtime_db.mark_pawchive_file_done(f["id"], size_bytes=10)
+            elif err.startswith(runtime_db.PAW_DEAD_LINK_MARK):
+                runtime_db.mark_pawchive_file_failed(f["id"], error=err)
+            else:
+                runtime_db.mark_pawchive_file_failed(f["id"], error=err)
+        runtime_db.finalize_pawchive_post(post["id"],
+                                          runtime_db.PAW_POST_FAILED)
+
+    def test_all_dead_shows_archive_hint(self):
+        self._enqueue_post("p1", [runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404"])
+        text = pawchive.fail_text()
+        self.assertIn("全部是 404 死链", text)
+        self.assertIn("/paw archive", text)
+
+    def test_non_dead_listed_with_errors_and_row_id(self):
+        self._enqueue_post("p2", [
+            "HTTP 429 too many requests",
+            None,   # 这个成功
+            "ReadTimeout: timed out",
+        ])
+        text = pawchive.fail_text()
+        self.assertIn("#1 作者A", text)
+        self.assertIn("HTTP 429", text)
+        self.assertIn("ReadTimeout", text)
+        self.assertIn("✅1", text)          # 部分成功标记
+        self.assertIn("非死链 2 / 死链 0", text)
+        self.assertIn("/paw retry", text)
+        # 死链错误绝不进明细行
+        self._enqueue_post("p3", [runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404"])
+        text2 = pawchive.fail_text()
+        self.assertIn("#1", text2)          # p2 仍列出
+        self.assertNotIn("站点缺文件", text2.split("#1")[1].split("失败文件")[0])
+
+    def test_empty_db(self):
+        self.assertIn("没有失败记录", pawchive.fail_text())

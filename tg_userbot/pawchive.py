@@ -166,6 +166,44 @@ def set_default_since(value):
     os.replace(tmp, _since_path())
 
 
+def fail_text(limit=20):
+    """/paw fail：**非死链**失败的明细（404 死链不占版面——重投无意义）。
+
+    每帖一行：行 id、作者、标题、非死链错误聚合、尝试次数；按「可救性」
+    排序（非死链文件多在前）。部分成功的帖（有 ✅ 有 ❌）单独标出——
+    那类最值得人看。死链占多少顺带给个数，方便决定要不要 /paw archive。"""
+    try:
+        rows = runtime_db.non_dead_failed_posts(limit=limit)
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    try:
+        dead_files, failed_files = runtime_db.failed_file_split()
+    except runtime_db.DbUnavailable:
+        dead_files, failed_files = 0, 0
+
+    lines = [f"{TEXT_PREFIX}：非死链失败明细", ""]
+    if not rows:
+        if dead_files:
+            lines.append(f"（{dead_files} 个失败文件全部是 404 死链——"
+                         "没有可救的；/paw archive 可归档清版面）")
+        else:
+            lines.append("没有失败记录")
+        return "\n".join(lines)
+
+    for r in rows:
+        mix = f"，✅{r['done']}" if r["done"] else ""
+        lines.append(
+            f"#{r['id']} {r['creator_name']}｜{str(r['title'])[:24]}"
+            f"（尝试{r['attempts']}）{mix}")
+        for err, n in (r["errors"] or [])[:3]:
+            lines.append(f"    {n}× {str(err)[:60]}")
+    lines.append("")
+    lines.append(f"失败文件：非死链 {failed_files} / 死链 {dead_files}")
+    lines.append("重投非死链：/paw retry <行id> 或 /paw retry all；"
+                 "单帖详情 /paw pr <行id>")
+    return "\n".join(lines)[:3900]
+
+
 def since_reply(arg):
     """/paw since <YYYY-MM-DD|off> 的回执；无参 = 查看当前。"""
     q = str(arg or "").strip().lower()
@@ -1352,7 +1390,7 @@ def parse_paw_command(text):
     head_l = head.lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
                   "resume", "manual", "done", "archive", "att", "post",
-                  "cookie", "csv", "find", "pr", "since"):
+                  "cookie", "csv", "find", "pr", "since", "fail"):
         return (head_l, rest.strip() or None)
     return ("help", None)
 
@@ -1394,6 +1432,9 @@ async def command_reply(event, cmd_text):
         return
     if action == "since":
         await event.reply(since_reply(arg), link_preview=False)
+        return
+    if action == "fail":
+        await event.reply(fail_text(), link_preview=False)
         return
     if action == "pr":
         await event.reply(post_report_text(arg), link_preview=False)
@@ -1448,6 +1489,7 @@ def _help_text():
         "  /paw archive —— FAILED 死链帖批量归档（不占待办）\n"
         "  /paw done <行id | 起-止 | 作者名> —— 批量标记完成\n"
         "  /paw retry <行ID|all> —— 失败帖子重投\n"
+        "  /paw fail —— 非死链失败明细（404 死链不占版面）\n"
         "  /paw pause / resume —— 暂停/恢复下载 worker\n"
         "  /paw cookie <Cookie> —— 保存会话 Cookie（用于收藏对比）\n"
         "  /paw csv <作者名> —— 导出直链清单 CSV 发到收藏夹\n"

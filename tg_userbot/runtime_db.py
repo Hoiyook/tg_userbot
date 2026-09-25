@@ -34,6 +34,7 @@
 事件循环——所以事务必须短（批量插入合并成一次提交），且失败按 §39 做**有限**
 重试，绝不无限循环、绝不因此崩掉主进程。
 """
+import collections
 import json
 import os
 import re
@@ -1564,6 +1565,63 @@ def mark_pawchive_file_done(file_id, size_bytes=None, now=None):
         return bool(cur.rowcount)
 
     return _write(do, "标记 Pawchive 文件完成")
+
+
+# ============================================================
+# 失败明细（/paw fail，2026-09-25）
+# ============================================================
+def non_dead_failed_posts(limit=20):
+    """有**非死链**失败文件的 FAILED 帖（可救的失败），按可救性排序。
+
+    每行 {id, creator_name, title, attempts, done, errors}：errors =
+    [(错误摘要, 数量)]（死链错误不进），done = 同帖已完成文件数。
+    死链（error 以 PAW_DEAD_LINK_MARK 开头）不占版面——重投它们无意义，
+    /paw fail 只关心救得回来的。"""
+
+    def do(conn):
+        posts = _execute(
+            conn,
+            "SELECT p.id, p.creator_name, p.title, p.attempts FROM "
+            "pawchive_posts p WHERE p.status = ? ORDER BY p.id DESC",
+            (PAW_POST_FAILED,)).fetchall()
+        out = []
+        for p in posts:
+            files = _execute(
+                conn, "SELECT status, error FROM pawchive_files "
+                "WHERE post_row=?", (p["id"],)).fetchall()
+            errors = collections.Counter(
+                (r["error"] or "（无错误信息）")[:60] for r in files
+                if r["status"] == PAW_FILE_FAILED
+                and not (r["error"] or "").startswith(PAW_DEAD_LINK_MARK))
+            if not errors:
+                continue
+            done = sum(1 for r in files if r["status"] == PAW_FILE_DONE)
+            out.append({
+                "id": p["id"], "creator_name": p["creator_name"],
+                "title": p["title"], "attempts": p["attempts"],
+                "done": done,
+                "errors": errors.most_common(3),
+            })
+            if len(out) >= int(limit):
+                break
+        return out
+
+    return _read(do, "统计非死链失败帖")
+
+
+def failed_file_split():
+    """失败文件两分：(死链数, 非死链数)。/paw fail 的总览行。"""
+
+    def do(conn):
+        rows = _execute(
+            conn, "SELECT error, COUNT(*) FROM pawchive_files "
+            "WHERE status=? GROUP BY error", (PAW_FILE_FAILED,)).fetchall()
+        dead = sum(n for err, n in rows
+                   if (err or "").startswith(PAW_DEAD_LINK_MARK))
+        total = sum(n for _e, n in rows)
+        return dead, total - dead
+
+    return _read(do, "两分失败文件")
 
 
 # ============================================================
