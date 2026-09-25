@@ -114,7 +114,7 @@ _COMMAND_SUBS = {
     "/paw": {"help", "status", "plan", "search", "retry", "pause",
              "resume", "manual", "done", "archive", "att", "post",
              "cookie", "csv", "find", "pr", "since", "fail",
-             "progress", "backfill"},
+             "progress", "backfill", "notify"},
     "/listen": {"on", "off", "scan", "list", "add", "del", "interval",
                 "edit"},
     "/wl": {"list", "add", "del", "scan", "since"},
@@ -228,6 +228,7 @@ def _help_text():
         "/paw_backfill 作者 —— 回填历史帖（补站点后补的数据）\n"
         "/paw_since 日期|off —— 默认时间下限\n"
         "/paw_cookie Cookie —— 会话 Cookie\n"
+        "/paw_notify on|off —— 帖子开始/完成通知开关\n"
         "\n"
         "【Chrome】\n"
         "/chrome [子目录/][#标注] URL —— 直链下载，网盘页可见打开\n"

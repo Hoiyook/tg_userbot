@@ -105,6 +105,7 @@ BOT_COMMANDS = (
     ("paw_resume", "Pawchive 恢复下载 worker"),
     ("paw_cookie", "Pawchive 设置 Cookie"),
     ("paw_csv", "Pawchive 导出直链 CSV：/paw_csv [作者]"),
+    ("paw_notify", "帖子开始/完成通知开关：/paw_notify on|off"),
     ("cd2ck", "115 备份对账：本地滞留媒体 × 备份日志交叉"),
     ("origin", "查看评论来源解析失败账本（可溯源）"),
     ("cmdhis", "最近发给 bot 的消息（整块可复制重发）"),

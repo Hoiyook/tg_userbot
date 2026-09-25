@@ -144,6 +144,45 @@ async def resolve_creator_async(name):
 # since 时自动应用——「有些很久的帖子不想要」设一次即可；显式 since 仍可
 # 临时覆盖，/paw since off 清除。
 # ============================================================
+def _notify_toggle_path():
+    return os.path.join(config.PAWCHIVE_DATA_DIR, "notify_each_post.json")
+
+
+def notify_each_post_enabled():
+    """每个帖子的开始/完成通知开关（默认开；/paw notify off 关闭）。"""
+    try:
+        with open(_notify_toggle_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return bool(data.get("enabled", True))
+    except (OSError, ValueError):
+        return True
+
+
+def set_notify_each_post(enabled):
+    os.makedirs(config.PAWCHIVE_DATA_DIR, exist_ok=True)
+    tmp = _notify_toggle_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"enabled": bool(enabled)}, f)
+    os.replace(tmp, _notify_toggle_path())
+
+
+def notify_toggle_reply(arg):
+    """/paw notify <on|off> 的回执；无参 = 查看当前。"""
+    q = str(arg or "").strip().lower()
+    if not q:
+        cur = "开" if notify_each_post_enabled() else "关"
+        return (f"{TEXT_PREFIX}\n🔔 帖子开始/完成通知：{cur}\n"
+                "切换：/paw notify on｜off")
+    if q in ("on", "开", "1"):
+        set_notify_each_post(True)
+        return f"{TEXT_PREFIX}\n✅ 已开启帖子开始/完成通知"
+    if q in ("off", "关", "0"):
+        set_notify_each_post(False)
+        return (f"{TEXT_PREFIX}\n⚪ 已关闭帖子开始/完成通知"
+                "（失败帖仍会通知）")
+    return (f"{TEXT_PREFIX}\n用法：/paw notify on｜off")
+
+
 def _since_path():
     return os.path.join(config.PAWCHIVE_DATA_DIR, "scan_since.json")
 
@@ -1670,8 +1709,8 @@ def parse_paw_command(text):
     head_l = head.lstrip("_").lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
                   "resume", "manual", "done", "archive", "att", "post",
-                  "cookie", "csv", "find", "pr", "since", "fail", "progress",
-                  "backfill"):
+                  "cookie", "csv", "find", "pr", "since", "fail",
+                  "progress", "backfill", "notify"):
         return (head_l, rest.strip() or None)
     return ("help", None)
 
@@ -1731,6 +1770,9 @@ async def command_reply(event, cmd_text):
         return
     if action == "backfill":
         await event.reply(await backfill_author(arg), link_preview=False)
+        return
+    if action == "notify":
+        await event.reply(notify_toggle_reply(arg), link_preview=False)
         return
     if action == "pr":
         await event.reply(post_report_text(arg), link_preview=False)

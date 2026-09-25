@@ -495,6 +495,19 @@ async def _finalize(post, files):
     runtime_db.finalize_pawchive_post(post["id"], runtime_db.PAW_POST_COMPLETED)
     logger.info(f"🐾 帖子完成：{label}｜{title}（{len(files)} 个文件）")
     _bump_milestone("completed")
+    # 完成通知（同一开关；批量扫描嫌吵就 /paw notify off）
+    from . import pawchive   # 函数内导入避免环
+    if pawchive.notify_each_post_enabled():
+        total = sum(f.get("size_bytes") or 0 for f in files)
+        from .naming import format_size
+        try:
+            await notify.notify_user(
+                f"✅ Pawchive 完成：{post['creator_name']}｜{title}\n"
+                f"{len(files)} 个文件 / {format_size(total)}\n"
+                f"落盘 {config.DOWNLOAD_DIR}/{post.get('subdir') or ''}")
+        except Exception as e:
+            logger.warning(f"完成通知发送失败（忽略）：{e}")
+    _bump_milestone("completed")
     await _milestone_notify_if_due()
 
 
@@ -727,6 +740,18 @@ async def process_post(post):
         return False
 
     files = runtime_db.list_pawchive_files(post["id"])
+
+    # 开始通知（2026-09-25 用户要求与转发链路一致）；/paw notify off 可关
+    from . import pawchive   # 函数内导入：pawchive → worker 已有环，避免模块级
+    if pawchive.notify_each_post_enabled() and files:
+        try:
+            await notify.notify_user(
+                f"🐾 开始下载：{post['creator_name']}｜"
+                f"{(post.get('title') or '')[:40]}\n"
+                f"附件 {len(files)} 个（/paw status 看进度）")
+        except Exception as e:
+            logger.warning(f"开始通知发送失败（忽略）：{e}")
+
     if not files:
         # 没有直链（纯外链帖）：直接按外链判定终态
         await _finalize(post, files)

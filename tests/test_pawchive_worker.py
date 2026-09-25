@@ -60,6 +60,17 @@ class _WorkerDbTestCase(unittest.IsolatedAsyncioTestCase):
         # 里程碑计数复位（模块级全局，跨用例隔离）
         for k in worker._MILESTONE:
             worker._MILESTONE[k] = 0
+        # 帖子开始/完成通知默认关（存量契约测试按静默口径断言）；开关行为
+        # 由 test_ux_round2.NotifyOnProcessTest 单独正向覆盖
+        self._ntf_path = os.path.join(
+            os.path.dirname(self.__dict__.get("dir", ".")) or ".",
+            f"ntf_{id(self)}.json")
+        from tg_userbot import pawchive as _paw_mod
+        self._ntf_patch = mock.patch.object(
+            _paw_mod, "_notify_toggle_path", return_value=self._ntf_path)
+        self._ntf_patch.start()
+        self.addCleanup(self._ntf_patch.stop)
+        _paw_mod.set_notify_each_post(False)
         # 续租循环打桩：测试里若把 asyncio.sleep 换成瞬时返回，该循环会变成
         # 无间隔写库忙循环与主线程争锁（2026-09-17 实测 CPU 94% 卡死）——
         # 直接不启动它；续租语义由 test_pawchive_db 单独覆盖

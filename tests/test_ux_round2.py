@@ -2509,3 +2509,92 @@ class LegacyAliasE2ETest(unittest.IsolatedAsyncioTestCase):
             await commands.handle_command(ev, "/paw plan Mofu")
         self.assertEqual(routed, ["/paw_plan MofuMochii", "/paw_plan Mofu"],
                          "两种写法到 Pawchive 分发器时已归一")
+
+
+# ============================================================
+# 22) Pawchive 开始/完成通知开关（2026-09-25 与转发链路对齐）
+# ============================================================
+class NotifyToggleTest(unittest.TestCase):
+    def test_roundtrip(self):
+        path = os.path.join(_TMP, f"ntf_{id(self)}.json")
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        with mock.patch.object(pawchive, "_notify_toggle_path",
+                               return_value=path):
+            self.assertTrue(pawchive.notify_each_post_enabled())   # 默认开
+            pawchive.set_notify_each_post(False)
+            self.assertFalse(pawchive.notify_each_post_enabled())
+            pawchive.set_notify_each_post(True)
+            self.assertTrue(pawchive.notify_each_post_enabled())
+
+    def test_reply_branches(self):
+        path = os.path.join(_TMP, f"ntfrep_{id(self)}.json")
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        with mock.patch.object(pawchive, "_notify_toggle_path",
+                               return_value=path):
+            self.assertIn("：开", pawchive.notify_toggle_reply(""))
+            self.assertIn("已开启", pawchive.notify_toggle_reply("on"))
+            self.assertIn("已关闭", pawchive.notify_toggle_reply("off"))
+            self.assertIn("：关", pawchive.notify_toggle_reply(""))
+            self.assertIn("用法", pawchive.notify_toggle_reply("啥"))
+
+
+class NotifyOnProcessTest(unittest.IsolatedAsyncioTestCase):
+    """process_post：开关开→发开始通知；关→不发。完成通知同开关。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_ntf_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        self._sent = []
+        self._patch_notify = mock.patch.object(
+            pawchive_worker.notify, "notify_user",
+            mock.AsyncMock(side_effect=lambda t: self._sent.append(t)))
+        self._patch_notify.start()
+        self.addCleanup(self._patch_notify.stop)
+
+    def _enqueue_completed_post(self):
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "MofuMochii", [{
+                "post_id": "p9", "title": "t9",
+                "published": "2026-09-01T00:00:00",
+                "post_url": "https://x/p9",
+                "subdir": "Pawchive/MofuMochii/p9",
+                "files": [{"url": "https://f/p9.png",
+                           "filename": "9.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        return runtime_db.claim_next_pawchive_post(now=1000)
+
+    async def test_start_notification_on(self):
+        post = self._enqueue_completed_post()
+        with mock.patch.object(pawchive_worker, "_download_post_files",
+                               mock.AsyncMock()), \
+                mock.patch.object(pawchive_worker, "_renew_lease_loop",
+                                  mock.AsyncMock()) as lease, \
+                mock.patch.object(pawchive_worker, "_finalize",
+                                  mock.AsyncMock()):
+            lease.return_value.cancel = lambda: None
+            await pawchive_worker.process_post(post)
+        self.assertTrue(any("开始下载：MofuMochii" in t for t in self._sent),
+                        self._sent)
+
+    async def test_disabled_no_start_notification(self):
+        pawchive.set_notify_each_post(False)
+        post = self._enqueue_completed_post()
+        with mock.patch.object(pawchive_worker, "_download_post_files",
+                               mock.AsyncMock()), \
+                mock.patch.object(pawchive_worker, "_renew_lease_loop",
+                                  mock.AsyncMock()) as lease, \
+                mock.patch.object(pawchive_worker, "_finalize",
+                                  mock.AsyncMock()):
+            lease.return_value.cancel = lambda: None
+            await pawchive_worker.process_post(post)
+        self.assertFalse(any("开始下载" in t for t in self._sent))
+
+    def tearDown(self):
+        pawchive.set_notify_each_post(True)
