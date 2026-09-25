@@ -1127,3 +1127,84 @@ class PawSinceTest(unittest.TestCase):
                                   return_value=False):
             await pawchive._reply_plan(ev, "MofuMochii since 2026-05-01")
         self.assertEqual(captured["since"], "2026-05-01")
+
+
+# ============================================================
+# 12) 巡检修复（2026-09-25）：按钮嵌套行 + 文件名超长
+# ============================================================
+class InputCancelButtonShapeTest(unittest.TestCase):
+    """input_cancel_buttons 每行每元素必须是 Button 实例（禁嵌套行）。
+
+    曾把 back_home_buttons()（行的列表）整坨当一行塞进去 →
+    [[❌], [[🔙]]]：Telethon 把内层 list 当普通按钮，渲染抛
+    'You cannot mix inline with normal buttons'。旧测试在含 ❌ 的第 0 行
+    就 return，嵌套行永远没被走到——这里必须**全量**遍历。"""
+
+    def test_all_rows_flat_buttons(self):
+        from telethon.tl.types import KeyboardInlineButton
+        rows = bot.input_cancel_buttons()
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertIsInstance(row, list, "行必须是 list")
+            for b in row:
+                self.assertIsInstance(
+                    b, KeyboardInlineButton,
+                    f"按钮必须是 KeyboardInlineButton，实际 {type(b)}")
+
+    def test_has_cancel_and_home(self):
+        rows = bot.input_cancel_buttons()
+        flat = [b for row in rows for b in row]
+        texts = [b.text for b in flat]
+        self.assertIn("❌ 取消", texts)
+        self.assertIn("🔙 返回主菜单", texts)
+
+
+class SanitizeFilenameBudgetTest(unittest.TestCase):
+    """sanitize_filename_bounded 字节截断：保扩展名、CJK 不切半、短名不动；
+    sanitize_filename 本体保持无预算契约（compute_final_filename 依赖）。"""
+
+    def test_short_name_untouched(self):
+        from tg_userbot.naming import sanitize_filename_bounded as sb
+        self.assertEqual(sb("bh_01.png"), "bh_01.png")
+        self.assertEqual(sb("Gorizia Default.rar"), "Gorizia Default.rar")
+
+    def test_sanitize_itself_never_truncates(self):
+        """契约钉死：无预算版绝不裁（compute_final_filename max_bytes=None
+        的「整段 caption 保留」语义依赖它）。"""
+        from tg_userbot.naming import sanitize_filename
+        self.assertEqual(len(sanitize_filename("汉" * 300)), 300)
+
+    def test_url_name_truncated_with_ext(self):
+        from tg_userbot.naming import sanitize_filename_bounded as sb
+        url = ("https___www.patreon.com_media-u_Z0FBQUFBQmtpYm5ONDhNdzhYWklQ"
+               "REZxRTNoVTlvd2ZaLXZHamZaSzdSdHpxMDNQZHFkMy1aWkw1WjZLSlBNSW5N"
+               "dlpDQUNPUGVMUlZ3OGYxbTFPTWZvRVZuSWwweVRYZUpkbDBobkJuakZsUUtT"
+               "bVJFUXFfdlhIZkh2ZVpjOGtqY19pdmJ3UUt5V3ZvY3kyMmdjR2VjcW1GQ3Ft"
+               "dl8wOFRRPT0=#205596539_.part")
+        out = sb(url)
+        self.assertTrue(out)
+        self.assertLessEqual(len(out.encode("utf-8")), 200)
+
+    def test_cjk_truncation_no_half_char(self):
+        from tg_userbot.naming import sanitize_filename_bounded as sb
+        long_cjk = "新" * 300 + ".zip"
+        out = sb(long_cjk)
+        self.assertTrue(out.endswith(".zip"))
+        self.assertLessEqual(len(out.encode("utf-8")), 200)
+        out.encode("utf-8")   # 不抛 = 没切半个字符
+
+    def test_no_valid_ext(self):
+        from tg_userbot.naming import sanitize_filename_bounded as sb
+        out = sb("x" * 300 + ".超级长扩展名")
+        self.assertLessEqual(len(out.encode("utf-8")), 200)
+
+    def test_pawchive_target_path_now_safe(self):
+        """端到端：worker 的 _target_path 不再因超长名炸 OSError 63。"""
+        from tg_userbot.pawchive_worker import _target_path
+        post = {"subdir": "Pawchive/MofuMochii/2023-05-26_83579000_t"}
+        name = "https___" + "Z" * 400 + "_.part"
+        path = _target_path(post, name)
+        import os as _os
+        self.assertLessEqual(
+            len(_os.path.basename(path).encode("utf-8")), 200 + 5,
+            "落盘文件名必须在字节预算内（.part 后缀留量）")

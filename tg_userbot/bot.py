@@ -115,9 +115,15 @@ def _clear_input_states():
 
 
 def input_cancel_buttons():
-    """输入窗口提示消息的 ❌ 取消按钮（挂回主菜单导航）。"""
-    return [[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))],
-            menu.back_home_buttons()]
+    """输入窗口提示消息的 ❌ 取消按钮（挂回主菜单导航）。
+
+    back_home_buttons() 返回的是「行的列表」，必须展开合并——直接当一行
+    塞进去会变成 [[❌], [[🔙]]] 嵌套：Telethon 把内层 list 当普通按钮，
+    渲染即抛 'You cannot mix inline with normal buttons'（2026-09-25
+    paw_pr 输入窗口实测）。此前的取消按钮测试只看第 0 行就返回，嵌套行
+    永远没被走到，所以没拦住。"""
+    return ([[Button.inline("❌ 取消", menu.encode_menu_data("input_cancel"))]]
+            + menu.back_home_buttons())
 
 
 def open_input_window(kind):

@@ -281,9 +281,12 @@ def _mark_dead(file_row, code=404):
 # 内置下载器（httpx 直连 + 并发）
 # ============================================================
 def _target_path(post, filename):
-    """落盘绝对路径：DOWNLOAD_DIR/<subdir=「Pawchive/作者/帖子」>/<文件名>。"""
-    from .naming import sanitize_filename
-    name = sanitize_filename(filename or "untitled")
+    """落盘绝对路径：DOWNLOAD_DIR/<subdir=「Pawchive/作者/帖子」>/<文件名>。
+
+    文件名走带字节预算的变体：附件「名」可能是整条 patreon URL（2026-09-25
+    MofuMochii 帖实测），不截则 OSError [Errno 63] File name too long。"""
+    from .naming import sanitize_filename_bounded
+    name = sanitize_filename_bounded(filename or "untitled")
     return os.path.join(config.DOWNLOAD_DIR,
                         post.get("subdir") or "Pawchive/unknown", name)
 

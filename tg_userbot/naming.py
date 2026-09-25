@@ -33,6 +33,31 @@ def sanitize_filename(name: str) -> str:
     return name or "未命名文件"
 
 
+def sanitize_filename_bounded(name: str,
+                              max_bytes: int = MAX_FILENAME_BYTES) -> str:
+    """sanitize + 字节预算截断（保扩展名）。
+
+    单独成函数而不塞进 sanitize：sanitize 也服务于 compute_final_filename
+    的「max_bytes=None = 不裁剪」契约（队列展示/测试依赖整段 caption 保留），
+    不能无条件截。Pawchive worker 的落盘路径等直接 sanitize 的调用方用本
+    函数——2026-09-25 MofuMochii 帖实测：附件「名」是整条 patreon URL，
+    不截则 .part 路径 OSError [Errno 63] File name too long。"""
+    name = sanitize_filename(name)
+    if len(name.encode("utf-8")) <= max_bytes:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    keep_ext = bool(dot) and bool(ext) and len(ext) <= 5 and ext.isalnum()
+    suffix = f".{ext}" if keep_ext else ""
+    stem = stem if keep_ext else name
+    budget = max(1, max_bytes - len(suffix.encode("utf-8")))
+    out = ""
+    for ch in stem:
+        if len(out.encode("utf-8")) + len(ch.encode("utf-8")) > budget:
+            break
+        out += ch
+    return (out or "未命名文件") + suffix
+
+
 def unique_path(path: str) -> str:
     """文件重名时自动增加 (1)、(2)..."""
     if not os.path.exists(path):
