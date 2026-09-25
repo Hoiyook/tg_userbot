@@ -1238,6 +1238,32 @@ def manual_export_text(limit=500):
     return "\n".join(lines)
 
 
+def archive_overview_text(limit=15):
+    """/paw archive（无参）：归档明细视图——总数 + 按作者分布 + 最近条目。"""
+    try:
+        total, by_creator, recent = runtime_db.archived_posts_overview(limit)
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if not total:
+        return (f"{TEXT_PREFIX}：归档明细\n\n"
+                "归档区是空的（/paw archive failed 可把死链帖批量归档）")
+    lines = [f"{TEXT_PREFIX}：🗄 归档明细（共 {total} 帖）", ""]
+    if by_creator:
+        lines.append("按作者：" + "｜".join(
+            f"{name} {n}" for name, n in by_creator))
+        lines.append("")
+    for r in recent:
+        err = f"｜{str(r['last_error'])[:36]}" if r["last_error"] else ""
+        lines.append(
+            f"#{r['id']} {r['creator_name']}｜"
+            f"{(r['published'] or '')[:10]}｜{str(r['title'])[:26]}{err}")
+    if total > len(recent):
+        lines.append(f"…其余 {total - len(recent)} 帖略（/sql 可查全量）")
+    lines.append("")
+    lines.append("单帖详情 /paw pr <行id>｜执行归档 /paw archive failed")
+    return "\n".join(lines)[:3900]
+
+
 def archive_reply():
     """/paw archive failed：把 FAILED **死链帖**批量移入 ARCHIVED。
     帖内含可恢复文件的保持 FAILED（归档不得埋掉数据，2026-09-17 用户决策）。"""
@@ -1425,7 +1451,11 @@ async def command_reply(event, cmd_text):
                           link_preview=False)
         return
     if action == "archive":
-        await event.reply(archive_reply(), link_preview=False)
+        # /paw archive（无参|list）= 明细视图；/paw archive failed = 执行
+        if (arg or "").strip().lower() in ("", "list", "明细", "查看"):
+            await event.reply(archive_overview_text(), link_preview=False)
+        else:
+            await event.reply(archive_reply(), link_preview=False)
         return
     if action == "att":
         await event.reply(att_text(arg), link_preview=False)
@@ -1486,7 +1516,8 @@ def _help_text():
         "  /paw att <URL|帖子ID|行id> —— 查帖子的附件与外链状态\n"
         "  /paw pr <URL|帖子ID|行id> —— 帖子执行详情报告（附件/外链统计、"
         "逐项状态、落盘目录实况）\n"
-        "  /paw archive —— FAILED 死链帖批量归档（不占待办）\n"
+        "  /paw archive —— 归档明细（总数/按作者/最近条目）\n"
+        "  /paw archive failed —— FAILED 死链帖批量归档（不占待办）\n"
         "  /paw done <行id | 起-止 | 作者名> —— 批量标记完成\n"
         "  /paw retry <行ID|all> —— 失败帖子重投\n"
         "  /paw fail —— 非死链失败明细（404 死链不占版面）\n"

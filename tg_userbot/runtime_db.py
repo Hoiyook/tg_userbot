@@ -1609,6 +1609,32 @@ def non_dead_failed_posts(limit=20):
     return _read(do, "统计非死链失败帖")
 
 
+def archived_posts_overview(limit=15):
+    """归档明细：返回 (总数, 按作者计数 top5, 最近 limit 条行)。
+
+    行含 {id, creator_name, title, published, last_error}——归档时间未
+    落字段（ARCHIVED 由 FAILED 就地转出），展示用发布日期定位。"""
+
+    def do(conn):
+        total = _execute(
+            conn, "SELECT COUNT(*) FROM pawchive_posts WHERE status=?",
+            (PAW_POST_ARCHIVED,)).fetchone()[0]
+        by_creator = _execute(
+            conn, "SELECT creator_name, COUNT(*) AS n FROM pawchive_posts "
+            "WHERE status=? GROUP BY creator_name ORDER BY n DESC LIMIT 5",
+            (PAW_POST_ARCHIVED,)).fetchall()
+        recent = _execute(
+            conn, "SELECT id, creator_name, title, published, last_error "
+            "FROM pawchive_posts WHERE status=? ORDER BY id DESC LIMIT ?",
+            (PAW_POST_ARCHIVED, int(limit))).fetchall()
+        return (total,
+                [(r[0], int(r[1])) for r in by_creator],
+                [{"id": r[0], "creator_name": r[1], "title": r[2],
+                  "published": r[3], "last_error": r[4]} for r in recent])
+
+    return _read(do, "统计归档帖明细")
+
+
 def failed_file_split():
     """失败文件两分：(死链数, 非死链数)。/paw fail 的总览行。"""
 

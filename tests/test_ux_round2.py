@@ -1277,3 +1277,71 @@ class PawFailTest(unittest.TestCase):
 
     def test_empty_db(self):
         self.assertIn("没有失败记录", pawchive.fail_text())
+
+
+# ============================================================
+# 14) /paw archive 明细视图（2026-09-25）
+# ============================================================
+class ArchiveOverviewTest(unittest.TestCase):
+    """archive_overview_text：总数/按作者/最近条目；空态指引。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_arch_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def _enqueue(self, post_id, creator="作者A"):
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", creator, [{
+                "post_id": post_id, "title": f"帖{post_id}",
+                "published": "2024-11-02T00:00:00",
+                "post_url": f"https://x/{post_id}",
+                "subdir": f"Pawchive/{creator}/{post_id}",
+                "files": [{"url": f"https://f/{post_id}.png",
+                           "filename": f"{post_id}.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        f = runtime_db.list_pawchive_files(post["id"])[0]
+        runtime_db.mark_pawchive_file_failed(
+            f["id"], error=runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404")
+        runtime_db.finalize_pawchive_post(post["id"],
+                                          runtime_db.PAW_POST_FAILED)
+
+    def test_empty_state(self):
+        text = pawchive.archive_overview_text()
+        self.assertIn("归档区是空的", text)
+        self.assertIn("/paw archive failed", text)
+
+    def test_overview_with_data(self):
+        self._enqueue("p1", "作者A")
+        self._enqueue("p2", "作者A")
+        self._enqueue("p3", "作者B")
+        # 把两个 FAILED 死链帖归档
+        archived, kept = runtime_db.archive_pawchive_failed()
+        self.assertEqual((archived, kept), (3, 0))
+        text = pawchive.archive_overview_text()
+        self.assertIn("共 3 帖", text)
+        self.assertIn("作者A 2", text)
+        self.assertIn("作者B 1", text)
+        self.assertIn("#3 作者B", text)     # 最近条目按 id 倒序
+        self.assertIn("/paw pr", text)
+
+    def test_dispatch_list_form(self):
+        """无参/`list` 出明细；`failed` 保持执行语义（归档空库 → 提示）。"""
+        async def run():
+            ev = mock.MagicMock()
+            ev.reply = mock.AsyncMock()
+            await pawchive.command_reply(ev, "/paw archive")
+            first = ev.reply.await_args.args[0]
+            await pawchive.command_reply(ev, "/paw archive failed")
+            second = ev.reply.await_args.args[0]
+            return first, second
+        first, second = asyncio.new_event_loop().run_until_complete(run())
+        self.assertIn("归档明细", first)
+        self.assertIn("没有可归档", second)   # 空库执行 = 幂等提示
