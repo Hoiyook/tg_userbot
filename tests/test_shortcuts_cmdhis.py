@@ -22,6 +22,7 @@ atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import bot, commands, config, shell, state  # noqa: E402
+from tg_userbot import msg_history as msg_history_mod  # noqa: E402
 from tg_userbot import menu, sql_templates  # noqa: E402
 
 
@@ -101,80 +102,78 @@ class ShortcutRoutingBotChatTest(unittest.IsolatedAsyncioTestCase):
 
 
 # ============================================================
-# 2) /cmdhis 命令行历史
+# 2) /cmdhis 消息历史（2026-09-25 需求重定义：记录发给 bot 的消息，
+#    不是 sh 历史命令——sh 历史机制已整体撤除）
 # ============================================================
-class ShellHistoryTest(unittest.TestCase):
-    """历史存储：新→旧、去相邻重复、截断、损坏容错。"""
+class MsgHistoryStoreTest(unittest.TestCase):
+    """msg_history 存储：新→旧、去相邻重复、截断、损坏容错、多行保留。"""
 
     def setUp(self):
-        self.path = os.path.join(_TMP, f"shellhist_{id(self)}.json")
+        self.path = os.path.join(_TMP, f"msghist_{id(self)}.json")
         self.addCleanup(lambda: os.path.exists(self.path)
                         and os.remove(self.path))
 
     def test_record_order_and_cap(self):
+        from tg_userbot import msg_history
         for i in range(60):
-            shell.record_command_history(f"cmd{i}", path=self.path)
-        items = shell.load_command_history(self.path)
-        self.assertEqual(len(items), shell.SHELL_HISTORY_MAX)
-        self.assertEqual(items[0], "cmd59")       # 最新在前
-        self.assertEqual(items[-1], "cmd10")      # 最旧被截掉
+            msg_history.record_message(f"消息{i}", path=self.path)
+        items = msg_history.load_messages(self.path)
+        self.assertEqual(len(items), msg_history.MAX_MESSAGES)
+        self.assertEqual(items[0], "消息59")
+        self.assertEqual(items[-1], "消息10")
 
-    def test_adjacent_dedup(self):
-        shell.record_command_history("ls -la", path=self.path)
-        shell.record_command_history("ls -la", path=self.path)
-        shell.record_command_history("df -h", path=self.path)
-        shell.record_command_history("df -h", path=self.path)
-        self.assertEqual(shell.load_command_history(self.path),
-                         ["df -h", "ls -la"])
+    def test_adjacent_dedup_and_multiline(self):
+        from tg_userbot import msg_history
+        msg_history.record_message("/paw plan MofuMochii", path=self.path)
+        msg_history.record_message("/paw plan MofuMochii", path=self.path)
+        msg_history.record_message("第一行\n第二行", path=self.path)
+        items = msg_history.load_messages(self.path)
+        self.assertEqual(items, ["第一行\n第二行", "/paw plan MofuMochii"])
 
-    def test_corrupt_file_tolerated(self):
+    def test_blank_ignored_and_corrupt_tolerated(self):
+        from tg_userbot import msg_history
+        msg_history.record_message("   ", path=self.path)
+        self.assertEqual(msg_history.load_messages(self.path), [])
         with open(self.path, "w") as f:
             f.write("{坏 json")
-        self.assertEqual(shell.load_command_history(self.path), [])
-        shell.record_command_history("ok", path=self.path)
-        self.assertEqual(shell.load_command_history(self.path), ["ok"])
-
-    def test_command_reply_records_but_navigation_skips(self):
-        """真执行记录历史；record=False（目录导航）不记。"""
-        async def run():
-            with mock.patch.object(shell, "_reply_for",
-                                   mock.AsyncMock(return_value="out")) as rf:
-                await shell.command_reply("/sh echo hi", path_guard=None) \
-                    if False else None
-                with mock.patch.object(shell, "record_command_history") as rec:
-                    await shell.command_reply("/sh echo a")
-                rec.assert_called_once_with("echo a")
-                with mock.patch.object(shell, "record_command_history") as rec2:
-                    await shell.command_reply("/sh ls -la", record=False)
-                rec2.assert_not_called()
-        asyncio.new_event_loop().run_until_complete(run())
+        self.assertEqual(msg_history.load_messages(self.path), [])
+        msg_history.record_message("ok", path=self.path)
+        self.assertEqual(msg_history.load_messages(self.path), ["ok"])
 
 
 class CmdhisCommandTest(unittest.TestCase):
-    """/cmdhis 输出：代码块化、新→旧、空历史提示。"""
+    """/cmdhis：读消息历史渲染；代码块化、新→旧、空态；N 参数。"""
 
     def _run(self, coro):
         return asyncio.new_event_loop().run_until_complete(coro)
 
-    def test_empty_history(self):
+    def test_empty(self):
         ev = mock.MagicMock()
         ev.reply = mock.AsyncMock()
-        with mock.patch.object(shell, "load_command_history",
+        with mock.patch.object(msg_history_mod, "load_messages",
                                return_value=[]):
             self._run(commands.handle_command(ev, "/cmdhis"))
-        self.assertIn("还没有执行过", ev.reply.await_args.args[0])
+        self.assertIn("还没有发给 bot", ev.reply.await_args.args[0])
 
-    def test_lists_commands_newest_first(self):
+    def test_lists_messages_newest_first_in_code_block(self):
         ev = mock.MagicMock()
         ev.reply = mock.AsyncMock()
-        with mock.patch.object(shell, "load_command_history",
-                               return_value=["df -h", "ls -la"]):
+        with mock.patch.object(msg_history_mod, "load_messages",
+                               return_value=["/paw plan MofuMochii", "你好"]):
             self._run(commands.handle_command(ev, "/cmdhis"))
         text = ev.reply.await_args.args[0]
         self.assertIn("2/2 条", text)
-        self.assertLess(text.index("df -h"), text.index("ls -la"))
-        # with_code_block 生效：首行留外、正文进围栏（方便整块复制）
-        self.assertIn("```", text)
+        self.assertLess(text.index("/paw plan MofuMochii"), text.index("你好"))
+        self.assertIn("```", text)   # with_code_block：整块可复制
+
+    def test_limit_param(self):
+        ev = mock.MagicMock()
+        ev.reply = mock.AsyncMock()
+        msgs = [f"m{i}" for i in range(20)]
+        with mock.patch.object(msg_history_mod, "load_messages",
+                               return_value=msgs):
+            self._run(commands.handle_command(ev, "/cmdhis 5"))
+        self.assertIn("5/20 条", ev.reply.await_args.args[0])
 
     def test_registered_and_panel_listed(self):
         self.assertIn("cmdhis", config.REGISTERED_COMMAND_NAMES)
@@ -284,3 +283,56 @@ class NewActionsFlowTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BotHandlerRecordsHistoryTest(unittest.IsolatedAsyncioTestCase):
+    """bot_message_handler 接线：普通/命令/链接消息入史；输入窗口的
+    敏感文本与程序面板**绝不入史**。"""
+
+    def setUp(self):
+        self.path = os.path.join(_TMP, f"msghook_{id(self)}.json")
+        self.addCleanup(lambda: os.path.exists(self.path)
+                        and os.remove(self.path))
+        self._saved = (state.MY_ID, state.FIND_INPUT_UNTIL)
+        state.MY_ID = 5452449426
+        state.FIND_INPUT_UNTIL = 0.0
+
+    def tearDown(self):
+        state.MY_ID, state.FIND_INPUT_UNTIL = self._saved
+
+    async def _message(self, text):
+        ev = mock.MagicMock()
+        ev.chat_id = state.MY_ID
+        ev.out = False
+        ev.message = mock.MagicMock()
+        ev.message.message = text
+        ev.message.fwd_from = None
+        ev.delete = mock.AsyncMock()
+        state.bot_client = mock.MagicMock()
+        state.bot_client.send_message = mock.AsyncMock()
+        with mock.patch.object(bot.commands, "handle_command",
+                               mock.AsyncMock(return_value=True)), \
+                mock.patch.object(bot.msg_history, "_history_path",
+                                  return_value=self.path), \
+                mock.patch.object(bot.logger, "info"):
+            await bot.bot_message_handler(ev)
+
+    async def test_command_and_text_recorded(self):
+        await self._message("/paw plan MofuMochii")
+        await self._message("随便一句话")
+        items = msg_history_mod.load_messages(self.path)
+        self.assertEqual(items[0], "随便一句话")          # 新→旧
+        self.assertIn("/paw plan MofuMochii", items)
+
+    async def test_input_window_text_not_recorded(self):
+        """find 输入窗口的文本被窗口消费，不能落进历史。"""
+        state.FIND_INPUT_UNTIL = 9e9
+        with mock.patch.object(bot, "_handle_find_input",
+                               mock.AsyncMock()):
+            await self._message("这是查询关键词不该入史")
+        self.assertEqual(msg_history_mod.load_messages(self.path), [])
+
+    async def test_panel_prefix_not_recorded(self):
+        from tg_userbot.config import REPORT_STATUS_PREFIX
+        await self._message(REPORT_STATUS_PREFIX + " 面板内容")
+        self.assertEqual(msg_history_mod.load_messages(self.path), [])

@@ -12,6 +12,7 @@ import time
 
 from . import state
 from . import config
+from . import msg_history
 from . import chrome_client
 from . import text
 from . import queue
@@ -215,22 +216,14 @@ async def handle_command(event, cmd_text):
 
     # 快捷指令（如发 1 = /cmdhis）：调用方（bot 对话 / 主账号 Saved Messages）
     # 已各自解析过才会带映射命令进来，这里不做二次解析
-    if cmd_text == "/cmdhis":
-        # 最近命令行：正文进代码块（首行留外），整块长按即可复制——
-        # 不带序号，复制单行不带前缀（2026-09-24 用户要求方便复制）
-        items = shell.load_command_history()
-        if not items:
-            await _reply(event, "📜 命令行历史：还没有执行过 /sh 命令")
-            return True
-        shown, total = [], 0
-        for c in items:
-            if total + len(c) + 1 > 3800 or len(shown) >= 30:
-                break
-            shown.append(c)
-            total += len(c) + 1
-        await _reply(event,
-                     f"📜 最近命令行（新→旧，{len(shown)}/{len(items)} 条，"
-                     "长按代码块可复制）\n" + "\n".join(shown))
+    if cmd_text == "/cmdhis" or cmd_text.startswith("/cmdhis "):
+        # 最近发给 bot 的消息记录（2026-09-25 需求重定义：不是 sh 历史）：
+        # 正文进代码块、无序号——整块长按即可复制，单行复制不带前缀
+        parts = cmd_text.split(maxsplit=1)
+        limit = 30
+        if len(parts) == 2 and parts[1].isdigit():
+            limit = max(1, min(int(parts[1]), 50))
+        await _reply(event, msg_history.render_text(limit))
         logger.info("执行命令：/cmdhis")
         return True
 

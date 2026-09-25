@@ -480,8 +480,8 @@ SQL_CONSOLE_CELL_LIMIT = 48               # 单元格字符上限（截断带省
 
 # /sh 命令行执行器（owner-only）：工作目录记忆文件 + 子进程超时
 SHELL_STATE_FILE = os.path.join(RUNTIME_DIR, "shell_state.json")
-# /sh 命令行历史（/cmdhis 展示、快捷指令快速复制重发用）
-SHELL_HISTORY_FILE = os.path.join(RUNTIME_DIR, "shell_history.json")
+# bot 消息历史（/cmdhis：owner 发给 bot 的文本消息，供回看复制重发）
+BOT_MSG_HISTORY_FILE = os.path.join(RUNTIME_DIR, "bot_messages.json")
 
 # 快捷指令映射（2026-09-24）：消息文本**精确命中** key → 当作 value 命令执行。
 # 扩展直接往 dict 加（key 不以 / 开头、≤8 字符防误触）；输入窗口等待期内

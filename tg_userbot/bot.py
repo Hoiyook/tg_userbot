@@ -38,6 +38,7 @@ from . import sql_templates
 from . import cmd_templates
 from . import runtime_db
 from . import shell
+from . import msg_history
 from . import upload
 from . import pawchive
 from . import commands
@@ -74,7 +75,7 @@ BOT_COMMANDS = (
     ("paw", "Pawchive：扫描作者作品、收藏对比、Chrome 批量下载"),
     ("cd2ck", "115 备份对账：本地滞留媒体 × 备份日志交叉"),
     ("origin", "查看评论来源解析失败账本（可溯源）"),
-    ("cmdhis", "最近命令行：复制最近执行过的 /sh 命令"),
+    ("cmdhis", "最近发给 bot 的消息（整块可复制重发）"),
     ("usage", "功能使用统计：各功能使用次数与频率"),
     ("cmdt", "命令模板：保存/执行常用 shell 命令"),
     ("clearmsg", "清理程序产生的消息"),
@@ -489,7 +490,7 @@ async def handle_menu_action(action, arg, event):
                     menu.sh_menu_buttons())
         if not shell.change_cwd(path):
             return "❌ 目录不可访问", menu.sh_menu_buttons()
-        out = await shell.command_reply("/sh ls -la", record=False)
+        out = await shell.command_reply("/sh ls -la")
         return (f"{out}\n\n──────\n\n{shell.sh_view_text()}",
                 _sh_buttons_for("ls -la", out))
     if action == "sh_input":
@@ -1005,6 +1006,10 @@ async def bot_message_handler(event):
                 ],
             )
         return
+
+    # 消息历史（/cmdhis）：记录点在全部输入窗口之后——cookie 等敏感输入
+    # 在窗口分支已被消费并 return，到不了这里；程序自产面板更早被守卫拦下
+    msg_history.record_message(text)
 
     # 注册过的 / 命令在 bot 对话同样执行（命令面板点出来的命令落在本对话）；
     # 未识别的 / 命令（含 /start）回落主菜单，语义与旧行为一致。

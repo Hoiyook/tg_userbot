@@ -169,9 +169,8 @@ async def _execute(raw):
     return "\n".join(lines)
 
 
-async def command_reply(cmd_text, record=True):
-    """/sh <…> → 回复文本。record=False 供菜单目录导航等内部调用，
-    不污染命令行历史（/cmdhis 只收用户真发过的命令）。"""
+async def command_reply(cmd_text):
+    """/sh <…> → 回复文本。"""
     raw = cmd_text[len("/sh"):].strip()
     if not raw:
         return USAGE_TEXT
@@ -181,57 +180,7 @@ async def command_reply(cmd_text, record=True):
         return f"❌ /sh：命令解析失败：{e}"
     if not tokens:
         return USAGE_TEXT
-    if record:
-        record_command_history(raw)
     return await _reply_for(raw, tokens)
-
-
-# ------------------------------------------------------------
-# 命令行历史（/cmdhis，2026-09-24）：记录实际执行的 /sh 命令。
-# 量小（≤50 条）纯个人数据 → JSON 原子写落盘，不进 runtime DB 免 schema
-# 变更；读写失败只告警，绝不影响命令本身。
-# ------------------------------------------------------------
-SHELL_HISTORY_MAX = 50
-
-
-def _history_path():
-    return getattr(config, "SHELL_HISTORY_FILE", "")
-
-
-def load_command_history(path=None):
-    """读命令行历史（新→旧）；文件缺失/损坏按空处理。"""
-    p = path or _history_path()
-    if not p:
-        return []
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return [str(x) for x in data if str(x).strip()]
-    except FileNotFoundError:
-        return []
-    except Exception as e:
-        logger.warning(f"命令行历史读取失败（按空处理）：{e}")
-        return []
-
-
-def record_command_history(raw, path=None):
-    """追加一条命令（头部插入 = 新→旧；与上一条相同则跳过；截到 50 条）。"""
-    p = path or _history_path()
-    if not p:
-        return
-    try:
-        items = load_command_history(p)
-        if items and items[0] == raw:
-            return
-        items.insert(0, raw)
-        del items[SHELL_HISTORY_MAX:]
-        tmp = p + ".tmp"
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(items, f, ensure_ascii=False)
-        os.replace(tmp, p)
-    except Exception as e:
-        logger.warning(f"命令行历史写入失败（不影响命令执行）：{e}")
 
 
 def load_shell_cwd():
