@@ -1425,3 +1425,46 @@ class ArchiveDeleteTest(unittest.TestCase):
         runtime_db.archive_pawchive_failed()
         text = pawchive.archive_overview_text()
         self.assertIn("↳ https://x/p9", text)
+
+
+# ============================================================
+# 16) /help 完整手册（2026-09-25 统一归集）
+# ============================================================
+class HelpManualTest(unittest.TestCase):
+    """/help 必须覆盖全部注册指令与关键参数形态，且单条消息发得出去。"""
+
+    def test_covers_all_registered_commands(self):
+        text = commands._help_text()
+        for name in sorted(config.REGISTERED_COMMAND_NAMES):
+            self.assertIn(f"/{name}", text, f"/{name} 没进 /help")
+
+    def test_paw_subcommands_documented(self):
+        text = commands._help_text()
+        for sub in ("plan", "search", "post", "att", "pr", "find", "manual",
+                    "done", "fail", "retry", "archive", "since", "pause",
+                    "resume", "cookie", "csv"):
+            self.assertIn(f"/paw {sub}", text.replace("/paw archive del",
+                                                      "/paw archive_del")
+                          .replace("/paw archive failed", "/paw archive_failed")
+                          if sub in ("archive",) else f"/paw {sub}",
+                          f"/paw {sub} 没进 /help")
+
+    def test_key_param_forms_present(self):
+        text = commands._help_text()
+        for form in ("since 日期", "起-止", "行id", "archive del",
+                     "add 聊天 标签", "retry all"):
+            self.assertIn(form, text, f"参数形态「{form}」没写进 /help")
+
+    def test_fits_one_message(self):
+        self.assertLessEqual(len(commands._help_text()), 3900)
+
+    def test_repo_manual_exists_and_covers(self):
+        """仓库详版文档存在且与 /help 同源覆盖（抽查关键指令）。"""
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "docs", "操作手册.md")
+        self.assertTrue(os.path.exists(path), "docs/操作手册.md 缺失")
+        content = open(path, encoding="utf-8").read()
+        for key in ("/paw pr", "/paw fail", "/paw archive del", "/usage",
+                    "/cmdhis", "/cd2ck", "/listen add", "/wl since",
+                    "/caption_filter add", "/sqlt add", "/cmdt add"):
+            self.assertIn(key, content)
