@@ -1529,3 +1529,73 @@ class CleanButtonsBudgetTest(unittest.TestCase):
     def test_empty_still_none(self):
         self.assertIsNone(text_mod.clean_buttons([]))
         self.assertIsNone(text_mod.clean_buttons(None))
+
+
+# ============================================================
+# 18) /paw progress 按作者处理进度（2026-09-25）
+# ============================================================
+class AuthorProgressTest(unittest.TestCase):
+    """author_progress_text：状态计数/文件产出/完成率/待处理明细/未知作者。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_prog_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        # 作者A：1 完成 + 1 失败（非死链） + 1 归档死链
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "MofuMochii", [{
+                "post_id": f"p{i}", "title": f"帖{i}",
+                "published": "2026-09-01T00:00:00",
+                "post_url": f"https://x/p{i}",
+                "subdir": f"Pawchive/MofuMochii/p{i}",
+                "files": [{"url": f"https://f/p{i}.png",
+                           "filename": f"{i}.png"}],
+                "ext_links": [],
+            } for i in (1, 2, 3)], scan_batch="t")
+        for i in (1, 2, 3):
+            post = runtime_db.claim_next_pawchive_post(now=1000)
+            f = runtime_db.list_pawchive_files(post["id"])[0]
+            if i == 1:
+                runtime_db.mark_pawchive_file_done(f["id"], size_bytes=1024)
+                runtime_db.finalize_pawchive_post(
+                    post["id"], runtime_db.PAW_POST_COMPLETED)
+            elif i == 2:
+                runtime_db.mark_pawchive_file_failed(
+                    f["id"], error="HTTP 429")
+                runtime_db.finalize_pawchive_post(
+                    post["id"], runtime_db.PAW_POST_FAILED)
+            else:
+                runtime_db.mark_pawchive_file_failed(
+                    f["id"], error=runtime_db.PAW_DEAD_LINK_MARK + " 404")
+                runtime_db.finalize_pawchive_post(
+                    post["id"], runtime_db.PAW_POST_FAILED)
+        runtime_db.archive_pawchive_failed()
+
+    def test_full_view(self):
+        text = pawchive.author_progress_text("MofuMochii")
+        self.assertIn("帖子 3 个：✅ 完成 1", text)
+        self.assertIn("完成率 33%", text)
+        self.assertIn("🗄 已归档 1", text)
+        self.assertIn("✅ 1 个 / 1.00 KB", text)
+        self.assertIn("站点死链 1 个", text)
+        # 待处理只列可行动状态（归档死链帖不占待办版面）
+        self.assertIn("待处理", text)
+        self.assertIn("⚠️ 可重投 1 个", text)     # 非死链失败单独亮出
+        self.assertIn("#2 ❌ 失败｜帖2", text)
+        self.assertNotIn("帖3", text)   # 归档的帖3 不进明细
+
+    def test_case_insensitive_and_unknown(self):
+        """小写输入也命中，标题显示 DB 规范名。"""
+        text = pawchive.author_progress_text("mofumochii")
+        self.assertIn("MofuMochii 处理进度", text)
+        self.assertIn("没有叫", pawchive.author_progress_text("不存在"))
+        self.assertIn("用法", pawchive.author_progress_text(""))
+
+    def test_wiring(self):
+        self.assertEqual(pawchive.parse_paw_command("/paw progress MofuMochii"),
+                         ("progress", "MofuMochii"))

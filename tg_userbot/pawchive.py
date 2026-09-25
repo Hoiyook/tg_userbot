@@ -166,6 +166,66 @@ def set_default_since(value):
     os.replace(tmp, _since_path())
 
 
+def author_progress_text(name):
+    """/paw progress <作者名>：按作者的处理进度总览（只读）。
+
+    帖子状态计数 + 文件级产出（含死链占比）+ 最近未完成明细（行 id 可接
+    /paw pr / /paw retry）。归档帖如实单列——它们是「站点侧已不存在」，
+    不是待办。"""
+    q = str(name or "").strip()
+    if not q:
+        return (f"{TEXT_PREFIX}\n用法：/paw progress <作者名>\n"
+                "例：/paw progress MofuMochii")
+    try:
+        display, posts, files, recent = runtime_db.author_progress(q)
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if not posts:
+        return (f"{TEXT_PREFIX}\n❌ 没有叫「{q}」的扫描记录\n"
+                "（先 /paw plan <作者名> 扫描；不确定用 /paw search <词>）")
+
+    done_n = posts.get(runtime_db.PAW_POST_COMPLETED, 0)
+    total = sum(posts.values())
+    lines = [f"{TEXT_PREFIX}：{display} 处理进度", "",
+             f"帖子 {total} 个：✅ 完成 {done_n}"]
+    for st, n in sorted(posts.items()):
+        if st == runtime_db.PAW_POST_COMPLETED:
+            continue
+        lines.append(f"　　{_STATUS_LABELS.get(st, st)} {n}")
+    if total:
+        pct = done_n * 100 // total
+        lines.append(f"完成率 {pct}%")
+
+    fdone = files.get(runtime_db.PAW_FILE_DONE, [0, 0])
+    ffail = files.get(runtime_db.PAW_FILE_FAILED, [0, 0])
+    # 失败文件里死链/非死链两分（口径与 /paw fail 一致）
+    dead = non_dead = 0
+    try:
+        split = runtime_db.author_failed_split(display)
+        dead, non_dead = split
+    except runtime_db.DbUnavailable:
+        pass
+    from .naming import format_size
+    tail = ""
+    if dead:
+        tail += f"｜站点死链 {dead} 个"
+    if non_dead:
+        tail += f"｜⚠️ 可重投 {non_dead} 个"
+    lines.append(f"文件：✅ {fdone[0]} 个 / {format_size(fdone[1])}"
+                 + (tail if ffail[0] else ""))
+    lines.append("（本地目录可能已被 CD2 备份至 115 并删源）" if fdone[0] else "")
+
+    if recent:
+        lines.append("")
+        lines.append("待处理（最近 8 个）：")
+        for r in recent:
+            err = f"｜{str(r['last_error'])[:36]}" if r["last_error"] else ""
+            lines.append(f"  #{r['id']} {_STATUS_LABELS.get(r['status'], r['status'])}"
+                         f"｜{str(r['title'])[:26]}{err}")
+        lines.append("单帖详情 /paw pr <行id>｜重投 /paw retry <行id>")
+    return "\n".join(lines)[:3900]
+
+
 def fail_text(limit=20):
     """/paw fail：**非死链**失败的明细（404 死链不占版面——重投无意义）。
 
@@ -1453,7 +1513,7 @@ def parse_paw_command(text):
     head_l = head.lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
                   "resume", "manual", "done", "archive", "att", "post",
-                  "cookie", "csv", "find", "pr", "since", "fail"):
+                  "cookie", "csv", "find", "pr", "since", "fail", "progress"):
         return (head_l, rest.strip() or None)
     return ("help", None)
 
@@ -1507,6 +1567,9 @@ async def command_reply(event, cmd_text):
         return
     if action == "fail":
         await event.reply(fail_text(), link_preview=False)
+        return
+    if action == "progress":
+        await event.reply(author_progress_text(arg), link_preview=False)
         return
     if action == "pr":
         await event.reply(post_report_text(arg), link_preview=False)

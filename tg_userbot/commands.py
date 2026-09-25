@@ -176,6 +176,7 @@ def _help_text():
         "\n"
         "【Pawchive】\n"
         "/paw（=status）—— 状态/失败画像/Cookie/扫描进度\n"
+        "/paw progress 作者 —— 按作者进度（完成率/死链/待办）\n"
         "/paw plan 作者 [all]；plan 作者 since 日期 [all]\n"
         "/paw search 词；/paw post URL|ID\n"
         "/paw att URL|ID|行id —— 附件外链状态\n"

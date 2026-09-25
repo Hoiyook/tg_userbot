@@ -1659,6 +1659,61 @@ def archived_posts_overview(limit=15):
     return _read(do, "统计归档帖明细")
 
 
+def author_progress(creator_name):
+    """按作者聚合 Pawchive 处理进度（/paw progress，只读）。
+
+    返回 (posts, files, recent)：posts = {status: n}；files = {status:
+    [n, total_bytes]}；recent = 最近 8 个非 COMPLETED 帖 [{id, status,
+    title, published, attempts, last_error}]。名字大小写不敏感精确匹配。"""
+
+    def do(conn):
+        name = str(creator_name or "").strip()
+        canonical = _execute(
+            conn, "SELECT creator_name FROM pawchive_posts "
+            "WHERE creator_name = ? COLLATE NOCASE LIMIT 1",
+            (name,)).fetchone()
+        posts = dict(_execute(
+            conn, "SELECT status, COUNT(*) FROM pawchive_posts "
+            "WHERE creator_name = ? COLLATE NOCASE GROUP BY status",
+            (name,)).fetchall())
+        files = {}
+        for st, n, sz in _execute(
+                conn, "SELECT f.status, COUNT(*), COALESCE(SUM(f.size_bytes),0) "
+                "FROM pawchive_files f JOIN pawchive_posts p ON f.post_row=p.id "
+                "WHERE p.creator_name = ? COLLATE NOCASE GROUP BY f.status",
+                (name,)).fetchall():
+            files[st] = [int(n), int(sz or 0)]
+        # 「最近未完成」只列**可行动**状态（归档=站点侧已不存在，不是待办）
+        recent = _execute(
+            conn, "SELECT id, status, title, published, attempts, last_error "
+            "FROM pawchive_posts WHERE creator_name = ? COLLATE NOCASE "
+            "AND status NOT IN (?, ?) ORDER BY id DESC LIMIT 8",
+            (name, PAW_POST_COMPLETED, PAW_POST_ARCHIVED)).fetchall()
+        return (canonical[0] if canonical else name, posts, files,
+                [{"id": r[0], "status": r[1], "title": r[2],
+                  "published": r[3], "attempts": r[4], "last_error": r[5]}
+                 for r in recent])
+
+    return _read(do, "统计作者 Pawchive 进度")
+
+
+def author_failed_split(creator_name):
+    """某作者失败文件两分：(死链数, 非死链数)。/paw progress 用。"""
+
+    def do(conn):
+        rows = _execute(
+            conn, "SELECT f.error, COUNT(*) FROM pawchive_files f "
+            "JOIN pawchive_posts p ON f.post_row=p.id "
+            "WHERE f.status=? AND p.creator_name=? COLLATE NOCASE "
+            "GROUP BY f.error", (PAW_FILE_FAILED, creator_name)).fetchall()
+        dead = sum(n for err, n in rows
+                   if (err or "").startswith(PAW_DEAD_LINK_MARK))
+        total = sum(n for _e, n in rows)
+        return dead, total - dead
+
+    return _read(do, "两分作者失败文件")
+
+
 def failed_file_split():
     """失败文件两分：(死链数, 非死链数)。/paw fail 的总览行。"""
 
