@@ -407,12 +407,22 @@ def thread_menu_buttons():
     return rows
 
 
+# ls 目录按钮上限（含导航行算在 reply markup 总量里）。目录多的路径
+# （实测 200 子目录 → 101 行 ≈6.5KB）会撑爆 Telegram reply markup
+# （ReplyMarkupTooLongError，2026-09-25 实测），截断后未显示的目录仍可
+# 用 ✏️ 输入路径进入。
+MAX_LS_BUTTONS = 40
+
+
 def sh_ls_buttons(dirs, up_token=None, home_token=None):
     """ls 浏览器的目录按钮网格：2 个/行 + 可选导航行（⬆️ 上一级/🏠 根目录）。
 
-    dirs = [(显示名, hash8 回调键)]；回调数据 ≤64 字节由 hash8 保证。"""
+    dirs = [(显示名, hash8 回调键)]；回调数据 ≤64 字节由 hash8 保证。
+    目录数超过 MAX_LS_BUTTONS 时只保留前 40 个按钮（导航行始终保留）。"""
     rows = []
-    for i in range(0, len(dirs), 2):
+    budget = MAX_LS_BUTTONS - (2 if (up_token and home_token)
+                               else 1 if (up_token or home_token) else 0)
+    for i in range(0, min(len(dirs), budget), 2):
         row = []
         for name, token in dirs[i:i + 2]:
             label = "📁 " + (name if len(name) <= 26 else name[:25] + "…")

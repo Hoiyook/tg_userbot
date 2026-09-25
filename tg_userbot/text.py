@@ -60,8 +60,39 @@ def progress_text():
 def clean_buttons(rows):
     """空按钮列表降级为 None：telethon 发 buttons=[] 会被服务端以
     ReplyMarkupInvalid 拒收（2026-09-16 实测：/links 空态与标记完成后的
-    刷新视图因此全部「没反应」）。非空原样返回。"""
-    return rows or None
+    刷新视图因此全部「没反应」）。非空原样返回。
+
+    二道护栏（2026-09-25）：按钮总量超预算时从**倒数第二行**开始逐行丢弃
+    （保留首行数据与末行导航），防止 ReplyMarkupTooLongError——任何视图
+    的按钮行数失控（如 ls 目录网格）都在这里被兜住。单行就超预算则整体
+    降级 None（正文仍在，损失的是按钮）。"""
+    if not rows:
+        return None
+    budget = 5500   # Telegram reply markup 总量上限之下留余量
+
+    def _size(rs):
+        total = 0
+        for row in rs:
+            total += 4   # 行结构开销
+            for b in row:
+                total += 60   # 单按钮序列化固定开销（构造器名等）
+                total += len((getattr(b, "text", "") or "").encode("utf-8"))
+                d = getattr(getattr(b, "type", None), "data", None)
+                if isinstance(d, (bytes, str)):
+                    total += len(d)
+                u = getattr(getattr(b, "type", None), "url", None)
+                if u:
+                    total += len(u.encode("utf-8"))
+        return total
+
+    if _size(rows) <= budget:
+        return rows
+    trimmed = list(rows)
+    while len(trimmed) > 2 and _size(trimmed) > budget:
+        del trimmed[-2]          # 保末行（导航）与首行（最新数据）
+    if _size(trimmed) > budget:
+        return None
+    return trimmed
 
 
 def with_code_block(text):

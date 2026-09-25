@@ -26,6 +26,7 @@ atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import bot, cd2, commands, config, pawchive, runtime_db, state  # noqa: E402
+from tg_userbot import menu, text as text_mod  # noqa: E402
 from tg_userbot import pawchive_worker  # noqa: E402
 
 
@@ -1468,3 +1469,63 @@ class HelpManualTest(unittest.TestCase):
                     "/cmdhis", "/cd2ck", "/listen add", "/wl since",
                     "/caption_filter add", "/sqlt add", "/cmdt add"):
             self.assertIn(key, content)
+
+
+# ============================================================
+# 17) ReplyMarkupTooLong 双层修复（2026-09-25）
+# ============================================================
+class LsButtonsCapTest(unittest.TestCase):
+    """sh_ls_buttons 目录按钮上限：200 目录不再撑爆 reply markup。"""
+
+    def test_cap_at_40_buttons_with_nav(self):
+        dirs = [(f"目录{i}", f"{i:08x}") for i in range(200)]
+        rows = menu.sh_ls_buttons(dirs, up_token="abcdef01",
+                                  home_token="12345678")
+        flat = [b for row in rows for b in row]
+        self.assertLessEqual(len(flat), menu.MAX_LS_BUTTONS)
+        # 导航行始终保留
+        texts = [b.text for b in flat]
+        self.assertIn("⬆️ 上一级", texts)
+        self.assertIn("🏠 根目录", texts)
+        self.assertIn("📁 目录0", texts)     # 首（最新）保留
+
+    def test_small_listing_untouched(self):
+        dirs = [(f"d{i}", f"{i:08x}") for i in range(5)]
+        rows = menu.sh_ls_buttons(dirs, home_token="12345678")
+        self.assertEqual(len([b for r in rows for b in r]), 6)  # 5 目录+根
+
+
+class CleanButtonsBudgetTest(unittest.TestCase):
+    """clean_buttons 体积护栏：超预算裁行保导航，单行超限整体降级。"""
+
+    @staticmethod
+    def _big_rows(n_rows, label="目录名"):
+        from telethon import Button
+        rows = [[Button.inline(f"📁 {label}{i}", b"m:sh_ls:abcd1234")]
+                for i in range(n_rows)]
+        rows.append([Button.inline("🔙 返回主菜单", b"m:home")])
+        return rows
+
+    def test_small_pass_through(self):
+        rows = self._big_rows(5)
+        self.assertEqual(text_mod.clean_buttons(rows), rows)
+
+    def test_oversized_trimmed_keeps_first_and_nav(self):
+        rows = self._big_rows(300, label="很长的目录名字" * 4)
+        out = text_mod.clean_buttons(rows)
+        self.assertIsNotNone(out, "裁剪后应当能发出")
+        flat = [b for row in out for b in row]
+        texts = [b.text for b in flat]
+        self.assertIn("🔙 返回主菜单", texts)          # 末行导航保留
+        self.assertTrue(any(t.endswith("名字0") for t in texts),
+                        "首行数据保留")
+        self.assertLess(len(out), len(rows))
+
+    def test_single_row_over_budget_degrades_to_none(self):
+        from telethon import Button
+        huge = [[Button.inline("x" * 6000, b"m:home")]]
+        self.assertIsNone(text_mod.clean_buttons(huge))
+
+    def test_empty_still_none(self):
+        self.assertIsNone(text_mod.clean_buttons([]))
+        self.assertIsNone(text_mod.clean_buttons(None))
