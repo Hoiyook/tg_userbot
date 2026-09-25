@@ -619,6 +619,18 @@ def build_scan_records(creator, posts, faved_ids=None, scope="notfaved",
                 continue
         files = [_file_entry(a) for a in (p.get("attachments") or [])
                  if a and a.get("path")]
+        # 主文件字段（file）：部分帖（尤其 Patreon 导入）的封面/首图放在
+        # 这里而非 attachments——页面画廊显示它，漏记就是「3 张图只下了
+        # 2 个」（2026-09-25 帖 78212541 实测 twitter.png）。与附件按
+        # path 去重后并入。
+        fmain = p.get("file") or {}
+        if fmain.get("path") and not any(
+                a.get("path") == fmain["path"]
+                for a in (p.get("attachments") or [])):
+            files.insert(0, _file_entry({
+                "path": fmain["path"],
+                "name": fmain.get("name") or os.path.basename(fmain["path"]),
+            }))
         ext_links = extract_links(p)
         if not files and not ext_links:
             continue
@@ -944,10 +956,13 @@ async def post_reply_text(text):
             return f"{TEXT_PREFIX}\n⚠️ 帖子 {post_id} 对应多条记录，请用 URL 精确指定：\n{rows}"
         return _post_status_reply(existing[0])
 
-    # URL 输入：命中已入库记录同样按状态分流
+    # URL 输入：命中已入库记录 → **刷新**（站点可能后来补了 file 字段或
+    # 新附件——如帖 78212541 的 twitter.png）：重拉详情、按文件名差集补录
+    # 新附件行并重新入队；没有新增则回落原状态回复
     for r in existing:
         if r["service"] == service and r["creator_id"] == str(creator_id):
-            return _post_status_reply(r)
+            return await _refresh_existing_post(r, service, creator_id,
+                                                post_id)
 
     try:
         detail = await asyncio.to_thread(
@@ -975,6 +990,48 @@ async def post_reply_text(text):
                 f"｜外链 {len(rec['ext_links'])} 条\n"
                 f"worker 将自动下载，落盘 {rec['subdir']}")
     return _post_status_reply(runtime_db.find_pawchive_posts_by_post_id(post_id)[0])
+
+
+async def _refresh_existing_post(row, service, creator_id, post_id):
+    """/paw post 对已入库帖：重拉详情补录站点后来新增的附件（file 主文件
+    字段、补传的附件），有新增就重新入队只下缺的；没有则回落状态回复。"""
+    try:
+        detail = await asyncio.to_thread(
+            fetch_post_detail, service, creator_id, post_id,
+            config.PAWCHIVE_COOKIE or None)
+    except Exception as e:
+        logger.warning(f"🐾 刷新帖子详情失败（回落状态回复）：{e}")
+        return _post_status_reply(row)
+    d = detail[0] if isinstance(detail, list) else detail
+    files = [_file_entry(a) for a in (d.get("attachments") or [])
+             if a and a.get("path")]
+    fmain = d.get("file") or {}
+    if fmain.get("path") and not any(
+            a.get("path") == fmain["path"]
+            for a in (d.get("attachments") or [])):
+        files.insert(0, _file_entry({
+            "path": fmain["path"],
+            "name": fmain.get("name") or os.path.basename(fmain["path"]),
+        }))
+    existing_names = {f["filename"] for f in
+                      runtime_db.list_pawchive_files(row["id"])}
+    missing = [f for f in files if f["filename"] not in existing_names]
+    if not missing:
+        return _post_status_reply(row)
+    added = runtime_db.add_missing_pawchive_files(row["id"], missing)
+    # 终态帖显式重开（COMPLETED/ARCHIVED/MANUAL/FAILED → PENDING）；
+    # PENDING 本就在队列不动；PROCESSING 执行中本轮拿不到新行，提示稍后
+    if row["status"] == runtime_db.PAW_POST_PROCESSING:
+        return (f"{TEXT_PREFIX}\n🔎 发现 {added} 个新附件，已补录；"
+                "帖子正在下载中，完成后请再次 /paw post 补下新增部分")
+    reopened = runtime_db.reopen_pawchive_post(row["id"])
+    names = "、".join(str(f["filename"])[:30] for f in missing[:5])
+    msg = (f"{TEXT_PREFIX}\n🔎 刷新发现 {added} 个此前没有的附件：{names}\n"
+           + ("🔁 已重新入队（只下载新增的，已完成文件不动）"
+              if reopened or row["status"] == runtime_db.PAW_POST_PENDING
+              else "⚠️ 重新入队失败，稍后 /paw retry 重投"))
+    logger.info(f"🐾 刷新补录 [{row['id']}] {added} 个新附件")
+    return msg
 
 
 def _post_status_reply(row):

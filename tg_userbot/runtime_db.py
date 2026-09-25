@@ -1609,6 +1609,55 @@ def non_dead_failed_posts(limit=20):
     return _read(do, "统计非死链失败帖")
 
 
+def add_missing_pawchive_files(post_row, entries, now=None):
+    """为已入库帖补录新附件行（/paw post 刷新：站点后来补的 file 字段等）。
+
+    按 (url, filename) 现有行去重；新行 status=PENDING。返回新增条数。"""
+
+    def do(conn):
+        existing = {
+            (r["url"], r["filename"] or "")
+            for r in _execute(
+                conn, "SELECT url, filename FROM pawchive_files "
+                "WHERE post_row=?", (int(post_row),)).fetchall()
+        }
+        added = 0
+        for e in entries:
+            key = (str(e["url"]), str(e.get("filename") or ""))
+            if key in existing:
+                continue
+            _execute(
+                conn,
+                "INSERT INTO pawchive_files "
+                "(post_row, url, filename, status, updated_at) "
+                "VALUES(?,?,?,?,?)",
+                (int(post_row), key[0], key[1], PAW_FILE_PENDING, now))
+            existing.add(key)
+            added += 1
+        return added
+
+    return _write(do, f"补录 Pawchive 帖附件（{post_row}）")
+
+
+def reopen_pawchive_post(post_row, now=None):
+    """终态帖（COMPLETED/ARCHIVED/MANUAL/FAILED）→ PENDING（补录新附件后
+    的显式重开，/paw post 刷新路径）。PENDING/PROCESSING 不动（已在队列
+    或执行中，新附件行会被幂等跳过或下轮处理）。返回是否重开。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            f"UPDATE pawchive_posts SET status=?, next_retry_at=NULL, "
+            f"lease_until=NULL WHERE id=? AND status IN "
+            f"(?,?,?,?)",
+            (PAW_POST_PENDING, int(post_row), PAW_POST_COMPLETED,
+             PAW_POST_ARCHIVED, PAW_POST_MANUAL, PAW_POST_FAILED))
+        return cur.rowcount > 0
+
+    return _write(do, f"重开 Pawchive 帖（{post_row}）")
+
+
 def delete_archived_pawchive_post(row_id):
     """彻底删除**归档态**帖及其附件行（/paw archive del；不可逆）。
 

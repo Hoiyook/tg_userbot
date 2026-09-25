@@ -1599,3 +1599,86 @@ class AuthorProgressTest(unittest.TestCase):
     def test_wiring(self):
         self.assertEqual(pawchive.parse_paw_command("/paw progress MofuMochii"),
                          ("progress", "MofuMochii"))
+
+
+# ============================================================
+# 19) file 主文件字段捕获 + /paw post 刷新补录（2026-09-25 帖 78212541）
+# ============================================================
+class FileMainFieldTest(unittest.TestCase):
+    """build_scan_records：file 字段并入附件（与 attachments 按 path 去重）。"""
+
+    def test_file_field_added_when_not_in_attachments(self):
+        post = {"id": "1", "title": "t", "published": "2026-09-01T00:00:00",
+                "attachments": [{"name": "a.rar", "path": "/x/aa"}],
+                "file": {"name": "twitter.png", "path": "/y/bb"}}
+        recs = pawchive.build_scan_records(
+            {"id": "1", "name": "A", "service": "patreon"}, [post])
+        names = [f["filename"] for f in recs[0]["files"]]
+        self.assertEqual(names[0], "twitter.png")   # 主文件在最前
+        self.assertIn("a.rar", names)
+
+    def test_file_field_dedup_when_same_path(self):
+        post = {"id": "1", "title": "t", "published": "2026-09-01T00:00:00",
+                "attachments": [{"name": "a.png", "path": "/x/aa"}],
+                "file": {"name": "a.png", "path": "/x/aa"}}
+        recs = pawchive.build_scan_records(
+            {"id": "1", "name": "A", "service": "patreon"}, [post])
+        self.assertEqual(len(recs[0]["files"]), 1)
+
+    def test_no_file_field_untouched(self):
+        post = {"id": "1", "title": "t", "published": "2026-09-01T00:00:00",
+                "attachments": [{"name": "a.rar", "path": "/x/aa"}]}
+        recs = pawchive.build_scan_records(
+            {"id": "1", "name": "A", "service": "patreon"}, [post])
+        self.assertEqual(len(recs[0]["files"]), 1)
+
+
+class PostRefreshTest(unittest.TestCase):
+    """/paw post 对已入库帖：发现新附件 → 补录 + 重开入队；无新增回落状态。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_refresh_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "A", [{
+                "post_id": "p1", "title": "t",
+                "published": "2026-09-01T00:00:00",
+                "post_url": "https://x/p1",
+                "subdir": "Pawchive/A/p1",
+                "files": [{"url": "https://f/p1/a.rar", "filename": "a.rar"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        f = runtime_db.list_pawchive_files(post["id"])[0]
+        runtime_db.mark_pawchive_file_done(f["id"], size_bytes=10)
+        runtime_db.finalize_pawchive_post(post["id"],
+                                          runtime_db.PAW_POST_COMPLETED)
+        self.row_id = post["id"]
+
+    def test_reopen_helper_state_guard(self):
+        self.assertTrue(runtime_db.reopen_pawchive_post(self.row_id))
+        row = runtime_db.get_pawchive_post_row(self.row_id)
+        self.assertEqual(row["status"], "PENDING")
+        # 再重开（PENDING）= False
+        self.assertFalse(runtime_db.reopen_pawchive_post(self.row_id))
+
+    def test_add_missing_files(self):
+        added = runtime_db.add_missing_pawchive_files(self.row_id, [
+            {"url": "https://f/p1/twitter.png", "filename": "twitter.png"},
+            {"url": "https://f/p1/a.rar", "filename": "a.rar"},   # 已有
+        ])
+        self.assertEqual(added, 1)
+        names = [f["filename"] for f in
+                 runtime_db.list_pawchive_files(self.row_id)]
+        self.assertIn("twitter.png", names)
+
+    def test_reopen_fails_for_archived_deleted(self):
+        # 归档删除后重开 = False（行没了）
+        runtime_db.delete_pawchive_post(self.row_id)
+        self.assertFalse(runtime_db.reopen_pawchive_post(self.row_id))
