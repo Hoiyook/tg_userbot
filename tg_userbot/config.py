@@ -811,6 +811,9 @@ BOT_CHAT_KEEP_NOTIFICATIONS = 20
 # 自动清理执行间隔，默认 1 分钟，可通过 /setcleartime 修改
 DEFAULT_CLEAR_INTERVAL_SECONDS = 60
 CLEAR_TIME_CONFIG_FILE = os.path.join(RUNTIME_DIR, "clear_time.json")
+# bot 菜单对话清理开关（/botclean on|off，2026-09-17 用户要求）：
+# 关闭后自动清理不再动 bot 对话（进度面板/台账/菜单长驻），收藏夹清理不受影响
+BOT_CLEAN_CONFIG_FILE = os.path.join(RUNTIME_DIR, "bot_clean_config.json")
 
 # 已注册命令名全集（/ 开头的输入判「是不是命令」用）：bot 按钮面板注册的
 # + 仅收藏夹跑的（CLEAN_COMMANDS 除斜杠）。评论捕获的目录模式标注（/A#x）

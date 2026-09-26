@@ -124,6 +124,10 @@ WL_LAST_SCAN = None
 SQL_TEMPLATES = {}
 # 命令模板（cmd_templates.py，/cmdt）：名字 → shell 命令原文；启动时载入。
 CMD_TEMPLATES = {}
+# bot 对话自动清理开关（cleanup.py /botclean on|off，持久化 bot_clean_config.json）
+BOT_CHAT_CLEAN_ENABLED = True
+# 命令模板（cmd_templates.py，/cmdt）：名字 → shell 命令原文；启动时载入。
+CMD_TEMPLATES = {}
 # 「➕ 新增命令模板」输入窗口（bot 菜单）：与其它输入窗口互斥。
 CMDT_INPUT_UNTIL = 0.0
 # 「➕ 新增模板」输入窗口（菜单）：等待下一条文本的截止时刻（monotonic）。

@@ -24,6 +24,10 @@ import telethon  # noqa: E402
 from tg_userbot import bot, config, menu, state  # noqa: E402
 from tg_userbot import browser_cookies  # noqa: E402
 
+# 按钮属性兼容垫片（unittest discover 不加载 conftest.py——Telethon 1.45 起
+# 回调数据挪进 .type.data，这里补回顶层 .data/.url 让既有断言保持原样）
+import conftest as _btn_shim  # noqa: F401
+
 
 def _write_secrets(path, extra=None):
     data = {"api_id": 123, "api_hash": "h", "douyin_cookie": "old=1"}

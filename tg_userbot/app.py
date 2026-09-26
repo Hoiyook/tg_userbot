@@ -1358,6 +1358,7 @@ async def main():
 
     # 启动自动清理任务
     cleanup.load_clear_interval()
+    cleanup.load_bot_clean_config()
     state.CLEAR_TIME_CHANGED = asyncio.Event()
 
     cleanup_task = None

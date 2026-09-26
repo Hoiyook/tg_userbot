@@ -27,6 +27,7 @@ from . import listener
 from . import caption_filter
 from . import chrome_client
 from .config import (
+    BOT_CLEAN_CONFIG_FILE,
     BOT_CHAT_KEEP_NOTIFICATIONS,
     CLEANUP_DELETE_TIMEOUT,
     CLEANUP_FETCH_TIMEOUT,
@@ -280,6 +281,52 @@ async def cleanup_saved_messages_once():
         logger.exception(f"自动清理 Saved Messages 失败：{e}")
 
 
+# ---- bot 对话清理开关（/botclean on|off，持久化 bot_clean_config.json）----
+def load_bot_clean_config():
+    """启动载入 bot 对话清理开关；文件缺失/损坏默认开（兼容旧部署）。"""
+    try:
+        with open(BOT_CLEAN_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        state.BOT_CHAT_CLEAN_ENABLED = bool(data.get("enabled", True))
+    except FileNotFoundError:
+        state.BOT_CHAT_CLEAN_ENABLED = True
+    except Exception as e:
+        logger.warning(f"读取 bot 清理开关失败，默认开：{e}")
+        state.BOT_CHAT_CLEAN_ENABLED = True
+    return state.BOT_CHAT_CLEAN_ENABLED
+
+
+def save_bot_clean_config(enabled):
+    state.BOT_CHAT_CLEAN_ENABLED = bool(enabled)
+    try:
+        tmp = BOT_CLEAN_CONFIG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"enabled": bool(enabled)}, f)
+        os.replace(tmp, BOT_CLEAN_CONFIG_FILE)
+        return True
+    except Exception as e:
+        logger.warning(f"保存 bot 清理开关失败：{e}")
+        return False
+
+
+def is_botclean_command(text):
+    return text == "/botclean" or text.startswith("/botclean ")
+
+
+def botclean_reply(arg):
+    """/botclean [on|off]：返回回执文案。"""
+    a = str(arg or "").strip().lower()
+    if a in ("on", "开", "开启"):
+        save_bot_clean_config(True)
+        return "🧹 bot 菜单对话自动清理：✅ 已开启（进度面板等会被定时清理）"
+    if a in ("off", "关", "关闭"):
+        save_bot_clean_config(False)
+        return "🧹 bot 菜单对话自动清理：⏸ 已关闭（消息保留，收藏夹清理不受影响）"
+    cur = getattr(state, "BOT_CHAT_CLEAN_ENABLED", True)
+    return ("🧹 bot 菜单对话自动清理：{}\n"
+            "用法：/botclean on|off".format("开启" if cur else "关闭"))
+
+
 async def cleanup_loop():
     """后台定时清理任务。"""
     while True:
@@ -377,6 +424,10 @@ def plan_bot_chat_cleanup(messages, age_limit, keep_recent=None):
 
 
 async def cleanup_bot_chat_once():
+    # /botclean off：跳过 bot 对话清理（收藏夹清理不受影响）
+    if not getattr(state, "BOT_CHAT_CLEAN_ENABLED", True):
+        logger.info("🧹 bot 菜单对话清理已关闭（/botclean on 可恢复），跳过")
+        return
     """清理 bot 菜单对话：删除超时消息，保留最新一条带按钮的菜单。
 
     注意：必须用 userbot 账号（client）读写这个对话，peer 是 bot 的

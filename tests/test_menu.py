@@ -22,6 +22,10 @@ from tg_userbot import state, config  # noqa: E402
 from tg_userbot import menu, text, thread, cleanup, cd2, whitelist, bot  # noqa: E402
 from tg_userbot import shell, upload as upload_mod  # noqa: E402
 
+# 按钮属性兼容垫片（unittest discover 不加载 conftest.py——Telethon 1.45 起
+# 回调数据挪进 .type.data，这里补回顶层 .data/.url 让既有断言保持原样）
+import conftest as _btn_shim  # noqa: F401
+
 
 class MenuDataCodecTest(unittest.TestCase):
     """encode_menu_data / parse_menu_data：回调数据编解码。"""

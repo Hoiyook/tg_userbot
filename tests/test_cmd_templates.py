@@ -22,6 +22,10 @@ from tg_userbot import menu  # noqa: E402
 from tg_userbot import shell  # noqa: E402
 from tg_userbot import state  # noqa: E402
 
+# 按钮属性兼容垫片（unittest discover 不加载 conftest.py——Telethon 1.45 起
+# 回调数据挪进 .type.data，这里补回顶层 .data/.url 让既有断言保持原样）
+import conftest as _btn_shim  # noqa: F401
+
 
 class CmdTemplateStoreTest(unittest.TestCase):
     """增删查改 + 持久化（文件落在临时目录）。"""

@@ -32,6 +32,10 @@ from tg_userbot import pawchive_worker  # noqa: E402
 from tg_userbot import queue as test_queue_mod  # noqa: E402
 from tg_userbot import listener as listener_mod  # noqa: E402
 
+# 按钮属性兼容垫片（unittest discover 不加载 conftest.py——Telethon 1.45 起
+# 回调数据挪进 .type.data，这里补回顶层 .data/.url 让既有断言保持原样）
+import conftest as _btn_shim  # noqa: F401
+
 
 # ============================================================
 # 1) Cookie 校验

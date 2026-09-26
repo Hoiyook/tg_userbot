@@ -835,6 +835,12 @@ async def handle_command(event, cmd_text):
         logger.info("执行命令：/usage")
         return True
 
+    if cleanup.is_botclean_command(cmd_text):
+        arg = cmd_text.split(maxsplit=1)[1] if " " in cmd_text else None
+        await _reply(event, cleanup.botclean_reply(arg))
+        logger.info(f"执行命令：{cmd_text[:40]}")
+        return True
+
     if cmd_text == "/clean":
         count = cleanup.clean_temp_files()
         await _reply(event, f"🧹 清理完成，共删除 {count} 个临时文件")

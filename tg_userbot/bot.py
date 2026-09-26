@@ -113,6 +113,7 @@ BOT_COMMANDS = (
     ("usage", "功能使用统计：各功能使用次数与频率"),
     ("restart", "重启 bot（优雅停机 + 自动拉起，约 30 秒）"),
     ("cmdt", "命令模板列表"),
+    ("botclean", "bot 对话自动清理开关：/botclean on|off"),
     ("cmdt_add", "保存命令模板：/cmdt_add 名字 命令"),
     ("cmdt_del", "删除命令模板：/cmdt_del 名字"),
     ("cmdt_run", "执行命令模板：/cmdt_run 名字"),
