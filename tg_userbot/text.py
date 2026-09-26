@@ -35,26 +35,70 @@ def status_text():
 
 
 def progress_text():
-    """生成 /progress 回复文本。"""
-    if not state.ACTIVE_DOWNLOADS:
-        return ("📊 当前没有进行中的 Telegram 下载"
-                "（Pawchive 见 🐾 面板）")
-    lines = []
-    for info in sorted(
-        state.ACTIVE_DOWNLOADS.values(), key=lambda x: x["filename"]
-    ):
-        if info["percent"] is None:
-            prog = f"{format_size(info['downloaded'])}/未知大小"
-        else:
-            prog = (
-                f"{info['percent']}% "
-                f"({format_size(info['downloaded'])}/{format_size(info['total'])})"
-            )
-        line = f"[{info['label']}] {info['filename']} - {prog}"
-        if info.get("link"):
-            line += f"\n  来源：{info['link']}"
-        lines.append(line)
-    return "📊 当前下载进度：\n\n" + "\n".join(lines)
+    """生成 /progress 回复文本（2026-09-26 UX3：全局聚合视图）。
+
+    只读各模块现有状态，绝不重写 worker：普通下载有明细（百分比），
+    其余模块给计数——某模块拿不到就跳过，不伪造。"""
+    sections = []
+
+    # 📥 普通下载：有明细
+    if state.ACTIVE_DOWNLOADS:
+        lines = []
+        for info in sorted(
+            state.ACTIVE_DOWNLOADS.values(), key=lambda x: x["filename"]
+        ):
+            if info["percent"] is None:
+                prog = f"{format_size(info['downloaded'])}/未知大小"
+            else:
+                prog = (
+                    f"{info['percent']}% "
+                    f"({format_size(info['downloaded'])}/{format_size(info['total'])})"
+                )
+            line = f"[{info['label']}] {info['filename']} - {prog}"
+            if info.get("link"):
+                line += f"\n  来源：{info['link']}"
+            lines.append(line)
+        sections.append("📥 普通下载\n" + "\n".join(lines))
+
+    # 🐾 Pawchive：状态计数 + 当前帖
+    try:
+        from . import runtime_db
+        counts = runtime_db.pawchive_status_counts()
+        proc = counts.get("PROCESSING", 0)
+        pend = counts.get("PENDING", 0)
+        if proc or pend:
+            line = f"🐾 Pawchive：处理中 {proc} · 待处理 {pend}"
+            from . import pawchive_worker
+            inflight = pawchive_worker.current_post_label()
+            if inflight:
+                line += f"\n  当前：{inflight}"
+            sections.append(line)
+    except Exception:
+        pass
+
+    # 📡 标签监听：待处理
+    try:
+        from . import runtime_db as _rdb
+        stats = _rdb.get_listener_stats(origin="listen")
+        if stats.get("pending"):
+            sections.append(f"📡 标签监听：待处理 {stats['pending']}")
+    except Exception:
+        pass
+
+    # 🌐 Chrome：进行中
+    try:
+        from . import chrome_agent, config as _cfg
+        tasks = chrome_agent.load_tasks(_cfg.CHROME_TASKS_FILE)
+        n = sum(1 for t in tasks
+                if t.get("status") in ("RUNNING", "PENDING", "RETRY_WAIT"))
+        if n:
+            sections.append(f"🌐 Chrome：进行中 {n}")
+    except Exception:
+        pass
+
+    if not sections:
+        return "📊 当前没有进行中的任务（各模块均空闲）"
+    return "📊 实时进度\n\n" + "\n\n".join(sections)
 
 
 def clean_buttons(rows):

@@ -116,7 +116,7 @@ _COMMAND_SUBS = {
              "cookie", "csv", "find", "pr", "since", "fail",
              "progress", "backfill", "notify"},
     "/listen": {"on", "off", "scan", "list", "add", "del", "interval",
-                "edit"},
+                "edit", "failed", "retry"},
     "/wl": {"list", "add", "del", "scan", "since"},
     "/retry": {"all", "del"},
     "/queue": {"del"},
@@ -242,6 +242,7 @@ def _help_text():
         "/sql 一条SQL —— 诊断控制台\n"
         "/sqlt 列表｜/sqlt_add 名 SQL｜/sqlt_del 名｜/sqlt 名\n"
         "/listen 列表｜/listen_on｜/listen_off｜/listen_scan\n"
+        "/listen_failed —— 失败任务明细（/listen_retry 行id 重试）\n"
         "/listen_add 聊天 标签 [目标,目标] [on|off]｜/listen_edit 序号\n"
         "/listen_del 序号｜/listen_interval 分钟\n"
         "/wl 列表｜/wl_add ID或@名｜/wl_del ID或序号｜/wl_scan\n"
@@ -676,6 +677,12 @@ async def handle_command(event, cmd_text):
     if parsed_listen is not None:
         action, arg = parsed_listen
         logger.info(f"执行命令：/listen {action}")
+        if action == "failed":
+            await _reply(event, listener.failed_tasks_text())
+            return True
+        if action == "retry":
+            await _reply(event, listener.retry_failed_task(arg))
+            return True
         await _reply(event, await listener.command_reply(action, arg),
                           link_preview=False)
         return True

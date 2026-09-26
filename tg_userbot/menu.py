@@ -64,6 +64,20 @@ def build_main_menu_text():
     today = collect_stats(1)
 
     lines = ["🤖菜单", ""]
+    # 系统健康行（2026-09-26 UX3）：一眼知道连接/磁盘/有没有失败
+    try:
+        conn_ok = bool(state.client and state.client.is_connected())
+    except Exception:
+        conn_ok = False
+    lines.append("🟢 连接正常" if conn_ok else "🔴 连接断开（自动重连中）")
+    for probe in (config.DOWNLOAD_DIR, "/Volumes"):
+        try:
+            import shutil
+            free = shutil.disk_usage(probe).free / 1024 ** 3
+            lines.append(f"💾 磁盘剩余 {free:.0f} GB")
+            break
+        except Exception:
+            continue
     has_any = bool(in_flight or pending or to_retry or today["success_count"])
     if has_any:
         lines.append(
@@ -82,11 +96,24 @@ def build_main_menu_text():
         counts = runtime_db.pawchive_status_counts()
         paw_proc = counts.get(runtime_db.PAW_POST_PROCESSING, 0)
         paw_pend = counts.get(runtime_db.PAW_POST_PENDING, 0)
+        paw_fail = counts.get(runtime_db.PAW_POST_FAILED, 0)
+        part = []
         if paw_proc or paw_pend:
-            sys_lines.append(f"🐾 Pawchive：处理 {paw_proc} / 待 {paw_pend}")
-        pend = runtime_db.count_pending_listener_tasks()
-        if pend:
-            sys_lines.append(f"📡 标签监听：待处理 {pend}")
+            part.append(f"处理 {paw_proc} / 待 {paw_pend}")
+        if paw_fail:
+            part.append(f"❌ 失败 {paw_fail}")
+        if part:
+            sys_lines.append("🐾 Pawchive：" + " / ".join(part))
+        stats = runtime_db.get_listener_stats(origin="listen")
+        lis_pend = stats.get("pending", 0)
+        lis_fail = stats.get("failed", 0)
+        lis_part = []
+        if lis_pend:
+            lis_part.append(f"待处理 {lis_pend}")
+        if lis_fail:
+            lis_part.append(f"❌ 失败 {lis_fail}")
+        if lis_part:
+            sys_lines.append("📡 标签监听：" + " / ".join(lis_part))
     except Exception:
         pass                      # 总览失败绝不挡菜单
     try:

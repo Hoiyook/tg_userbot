@@ -831,6 +831,7 @@ REGISTERED_COMMAND_NAMES = frozenset({name for name in (
     "paw_since", "paw_fail", "paw_progress", "paw_backfill", "paw_notify",
     # 其余多词指令标准形
     "listen_on", "listen_off", "listen_scan", "listen_list", "listen_add",
+    "listen_failed", "listen_retry",
     "listen_del", "listen_edit", "listen_interval",
     "wl_list", "wl_add", "wl_del", "wl_scan", "wl_since",
     "retry_all", "retry_del", "queue_del",

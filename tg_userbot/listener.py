@@ -1299,6 +1299,43 @@ def _rule_oneline(rule) -> str:
     return f"{name} {rule.get('tag')} → {targets}"
 
 
+def failed_tasks_text(limit=15):
+    """❌ 失败任务明细（/listen_failed）：原因 + 行 id，重试走
+    runtime_db.retry_listener_task（既有 API，立刻到期）。"""
+    from . import runtime_db
+    try:
+        tasks = runtime_db.list_listener_tasks(status="FAILED", limit=limit)
+    except runtime_db.DbUnavailable as e:
+        return f"{LISTEN_NOTIFY_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if not tasks:
+        return f"{LISTEN_NOTIFY_PREFIX}\n✅ 当前没有失败任务"
+    lines = [f"{LISTEN_NOTIFY_PREFIX} · ❌ 失败任务 {len(tasks)} 条", ""]
+    for t in tasks:
+        err = (t.get("last_error") or "")[:60]
+        lines.append(f"#{t['id']} {str(t.get('payload') or '')[:40]}")
+        if err:
+            lines.append(f"   原因：{err}")
+    lines.append("")
+    lines.append("重试：/listen_retry <行id>")
+    return "\n".join(lines)[:3900]
+
+
+def retry_failed_task(arg):
+    """/listen_retry <行id>：失败任务立即回 PENDING（既有 API）。"""
+    from . import runtime_db
+    raw = str(arg or "").strip()
+    if not raw.isdigit():
+        return f"{LISTEN_NOTIFY_PREFIX}\n用法：/listen_retry <行id>"
+    try:
+        ok = runtime_db.retry_listener_task(
+            int(raw), next_retry_at=__import__("time").time())
+    except runtime_db.DbUnavailable as e:
+        return f"{LISTEN_NOTIFY_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if ok:
+        return f"{LISTEN_NOTIFY_PREFIX}\n🔁 任务 #{raw} 已重试（回到待处理）"
+    return f"{LISTEN_NOTIFY_PREFIX}\n❌ 任务 #{raw} 不存在或不是失败态"
+
+
 def view_text() -> str:
     """监听视图正文（/listen 无参与菜单共用）。"""
     lines = [LISTEN_NOTIFY_PREFIX, ""]
@@ -1325,6 +1362,20 @@ def view_text() -> str:
         lines.append(
             f"上轮扫描：{last.get('ts', '-')} 命中 {last.get('matched', 0)} 条"
             f" / 入队 {last.get('created', 0)} 条")
+    # 任务区（2026-09-26 UX3：规则与任务分开看；失败要能被发现）
+    try:
+        from . import runtime_db as _rdb
+        stats = _rdb.get_listener_stats(origin="listen")
+        pending = stats.get("pending", 0)
+        processing = stats.get("processing", 0)
+        failed = stats.get("failed", 0)
+        lines.append("")
+        lines.append(f"任务：⏳ 待处理 {pending} · 🔄 处理中 {processing}"
+                     f" · ❌ 失败 {failed}")
+        if failed:
+            lines.append(f"查看失败任务：/listen_failed（可重试）")
+    except Exception:
+        pass
     else:
         lines.append("上轮扫描：尚未扫描")
     # 待执行/处理中/成败存量来自 SQLite（队列与 checkpoint 的真相所在），
@@ -1406,7 +1457,7 @@ def parse_listen_command(text):
     head, _, rest = body.partition(" ")
     head = head.strip().lstrip("_").lower()   # /listen_add（标准）兼容
     rest = rest.strip()
-    if head in ("on", "off", "scan", "list"):
+    if head in ("on", "off", "scan", "list", "failed", "retry"):
         return (head, None)
     if head in ("add", "del", "interval", "edit"):
         return (head, rest)
@@ -1729,17 +1780,21 @@ async def draft_save() -> tuple:
 
 
 def input_prompt(step) -> str:
-    """向导某一步的提示文本（窗口内下一条文本即输入）。"""
+    """向导某一步的提示文本（窗口内下一条文本即输入）。
+
+    带 ①②③ 步骤条（2026-09-26 UX3）：用户随时知道自己在哪一步。"""
     seconds = config.LISTEN_INPUT_WINDOW_SECONDS
+    steps = "① 来源聊天 ✅\n② 标签 🔄\n③ 目标与保存 ⬜" if step == "tag" \
+        else "① 来源聊天 🔄\n② 标签 ⬜\n③ 目标与保存 ⬜"
     if step == "chat":
         return (
-            f"{LISTEN_NOTIFY_PREFIX} · 第 1 步：来源聊天\n\n"
+            f"{LISTEN_NOTIFY_PREFIX} · 新建监听\n\n{steps}\n\n"
             "请发送要监听的聊天（@用户名 或 数字 ID，发到本对话）。\n\n"
             f"{seconds} 秒内有效，发送 / 开头的命令可取消。"
         )
     if step == "tag":
         return (
-            f"{LISTEN_NOTIFY_PREFIX} · 第 2 步：标签\n\n"
+            f"{LISTEN_NOTIFY_PREFIX} · 新建监听\n\n{steps}\n\n"
             "请发送要匹配的标签（须以 # 开头，如 #01musume）。\n\n"
             f"{seconds} 秒内有效，发送 / 开头的命令可取消。"
         )

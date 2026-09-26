@@ -503,14 +503,13 @@ def load_requests(path=None):
 
 
 def save_requests(reqs, path=None):
+    """原子写请求文件；**失败上抛**——提交回执必须以落盘成功为准
+    （吞掉异常会让用户看到假「已提交」，2026-09-26 任务书 二十一）。"""
     path = path or CHROME_REQUESTS_FILE
-    try:
-        temp_path = path + ".tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump({"requests": reqs}, f, ensure_ascii=False, indent=2)
-        os.replace(temp_path, path)
-    except Exception as e:
-        logger.warning(f"保存 Chrome 请求文件失败：{e}")
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump({"requests": reqs}, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
 
 
 def add_request(task_id, url, user_id, chat_id, message_id, path=None,
@@ -830,11 +829,18 @@ async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
         logger.info(f"执行命令：/chrome 网盘页可见打开：{url[:60]}")
         return True
     task_id = chrome_agent.new_task_id()
-    add_request(task_id, url,
-                user_id=sender if sender is not None else owner_id,
-                chat_id=owner_id,  # Saved Messages：通知发回收藏夹
-                message_id=getattr(event, "id", 0) or 0,
-                label=label, download_subdir=download_subdir)
+    try:
+        add_request(task_id, url,
+                    user_id=sender if sender is not None else owner_id,
+                    chat_id=owner_id,  # Saved Messages：通知发回收藏夹
+                    message_id=getattr(event, "id", 0) or 0,
+                    label=label, download_subdir=download_subdir)
+    except Exception as e:
+        logger.exception(f"Chrome 任务落盘失败：{e}")
+        await event.reply(
+            f"{CHROME_TEXT_PREFIX}\n❌ 任务提交失败：任务状态无法保存"
+            f"（{type(e).__name__}），请稍后重试。")
+        return True
     await event.reply(submit_text(task_id, url, label, download_subdir))
     logger.info(
         f"执行命令：/chrome {url}（task {task_id[:8]}"

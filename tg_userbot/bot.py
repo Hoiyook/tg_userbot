@@ -74,6 +74,7 @@ BOT_COMMANDS = (
     ("listen_interval", "设置扫描周期：/listen_interval 分钟"),
     ("listen_on", "开启标签监听"),
     ("listen_off", "关闭标签监听"),
+    ("listen_failed", "监听失败任务明细与重试"),
     ("wl", "查看下载白名单"),
     ("wl_add", "加入白名单：/wl_add ID或@用户名"),
     ("wl_del", "移出白名单：/wl_del ID或序号"),
@@ -279,8 +280,11 @@ async def handle_menu_action(action, arg, event):
     """按按钮动作执行并返回 (新文本, 新按钮)；返回 (None, None) 表示不改动消息。"""
     if action == "home":
         # 回主菜单 = 离开一切输入模式：窗口不清掉的话，菜单看起来已经
-        # 「正常」了，下一条普通文本仍会被旧窗口吃掉（UX Round1 P0-3）
+        # 「正常」了，下一条普通文本仍会被旧窗口吃掉（UX Round1 P0-3）；
+        # 监听向导草稿一并作废（重新进入时 draft_start 本就会重置，
+        # 这里清是防半途残留被后续动作误读）
         _clear_input_states()
+        listener.draft_cancel()
         return menu.build_main_menu_text(), menu.main_menu_buttons()
     if action == "status":
         return text_mod.status_text(), menu.back_home_buttons()
@@ -475,8 +479,10 @@ async def handle_menu_action(action, arg, event):
         return f"{body}\n\n{view_text}", rows
     if action == "paw_done_view":
         # 统一外链看板里的 paw ✅：标记完成后回统一看板（区别于 /paw done）
-        import pawchive as _paw
-        reply = _paw.mark_manual_done(arg)
+        # （此前函数内 import pawchive as _paw 是顶层绝对导入——包内运行
+        #  必 ModuleNotFoundError，点 ✅ 即报错；改用模块顶部已导入的
+        #  pawchive，2026-09-26 修复）
+        reply = pawchive.mark_manual_done(arg)
         view_text, rows = manual_links.unified_view()
         return f"{manual_links.TEXT_PREFIX}\n{reply}\n\n{view_text}", rows
     if action == "paw_csv":
@@ -879,6 +885,7 @@ async def handle_menu_action(action, arg, event):
         )
     if action == "back":
         _clear_input_states()
+        listener.draft_cancel()
         return menu.build_main_menu_text(), menu.main_menu_buttons()
     return None, None
 

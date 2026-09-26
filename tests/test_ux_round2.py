@@ -12,6 +12,7 @@
 不联网：HTTP 全部 monkeypatch；DB 落进程级临时目录。
 """
 import asyncio
+import sqlite3
 import atexit
 import json
 import os
@@ -29,6 +30,7 @@ from tg_userbot import bot, cd2, commands, config, pawchive, runtime_db, state  
 from tg_userbot import menu, text as text_mod  # noqa: E402
 from tg_userbot import pawchive_worker  # noqa: E402
 from tg_userbot import queue as test_queue_mod  # noqa: E402
+from tg_userbot import listener as listener_mod  # noqa: E402
 
 
 # ============================================================
@@ -2723,3 +2725,172 @@ class UnclaimedDisplayTest(unittest.TestCase):
                      if r["task_id"] not in known
                      and not r.get("notified_at")]
         self.assertEqual([r["task_id"] for r in unclaimed], ["t2"])
+
+
+# ============================================================
+# 26) UX Round 3（2026-09-26）：首页健康行 / 进度聚合 / Listener 失败入口
+# ============================================================
+class MenuHeaderHealthTest(unittest.TestCase):
+    """首页头：连接行 + 磁盘 + Pawchive/监听失败聚合。"""
+
+    def test_header_lines_present(self):
+        from tg_userbot import runtime_db as _r
+        self.dir = tempfile.mkdtemp(prefix="ux3_menu_", dir=_TMP)
+        p = mock.patch.object(config, "RUNTIME_DB_FILE",
+                              os.path.join(self.dir, "db.sqlite"))
+        p.start()
+        self.addCleanup(p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        saved_client = state.client
+        cli = mock.MagicMock()
+        cli.is_connected = lambda: True
+        state.client = cli
+        try:
+            t = menu.build_main_menu_text()
+        finally:
+            state.client = saved_client
+        self.assertIn("🟢 连接正常", t)
+        self.assertIn("磁盘剩余", t)
+
+
+class GlobalProgressTest(unittest.TestCase):
+    """progress_text：普通下载明细 + Pawchive/监听/Chrome 计数聚合。"""
+
+    def test_idle_message(self):
+        saved = state.ACTIVE_DOWNLOADS
+        state.ACTIVE_DOWNLOADS = {}
+        try:
+            t = text_mod.progress_text()
+            self.assertIn("均空闲", t)
+        finally:
+            state.ACTIVE_DOWNLOADS = saved
+
+
+class ListenFailedViewTest(unittest.TestCase):
+    """failed_tasks_text / retry_failed_task / 路由注册。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux3_lf_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def _mk_failed(self, task_id="t1"):
+        con = sqlite3.connect(config.RUNTIME_DB_FILE)
+        con.execute(
+            "INSERT INTO listener_tasks (source_chat_id, message_id, "
+            "target_type, status, attempts, created_at, last_error, origin) "
+            "VALUES (-100, 1, 'saved_messages', 'FAILED', 3, "
+            "strftime('%s','now'), 'FloodWait 30s', 'listen')")
+        con.commit()
+        rid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        con.close()
+        return rid
+
+    def test_empty(self):
+        self.assertIn("没有失败任务", listener_mod.failed_tasks_text())
+
+    def test_list_and_retry(self):
+        from tg_userbot import listener as listener_local
+        rid = self._mk_failed()
+        text = listener_mod.failed_tasks_text()
+        self.assertIn(f"#{rid}", text)
+        self.assertIn("FloodWait", text)
+        reply = listener_mod.retry_failed_task(str(rid))
+        self.assertIn("已重试", reply)
+        con = sqlite3.connect(config.RUNTIME_DB_FILE)
+        st = con.execute("SELECT status FROM listener_tasks WHERE id=?",
+                         (rid,)).fetchone()[0]
+        con.close()
+        self.assertEqual(st, "PENDING")
+
+    def test_retry_bad_input(self):
+        self.assertIn("用法", listener_mod.retry_failed_task("abc"))
+
+    def test_registered(self):
+        for n in ("listen_failed", "listen_retry"):
+            self.assertIn(n, config.REGISTERED_COMMAND_NAMES)
+        self.assertEqual(listener_mod.parse_listen_command("/listen_failed"),
+                         ("failed", None))
+
+
+class ListenerWizardStepTest(unittest.TestCase):
+    """input_prompt 带 ①②③ 步骤条。"""
+
+    def test_step_indicator(self):
+        p1 = listener_mod.input_prompt("chat")
+        self.assertIn("① 来源聊天", p1)
+        p2 = listener_mod.input_prompt("tag")
+        self.assertIn("① 来源聊天 ✅", p2)
+        self.assertIn("② 标签 🔄", p2)
+
+
+class HomeClearsListenerDraftTest(unittest.IsolatedAsyncioTestCase):
+    """home/back 清监听向导草稿（与 input_cancel 同面）。"""
+
+    async def test_home_cancels_draft(self):
+        from tg_userbot import listener as lm
+        saved = state.MY_ID
+        state.MY_ID = 123
+        lm.draft_start()
+        self.assertTrue(lm.draft_active())
+        try:
+            await bot.handle_menu_action("home", None, mock.MagicMock())
+            self.assertFalse(lm.draft_active())
+            lm.draft_start()
+            await bot.handle_menu_action("back", None, mock.MagicMock())
+            self.assertFalse(lm.draft_active())
+        finally:
+            state.MY_ID = saved
+            lm.draft_cancel()
+
+
+class PawDoneViewImportTest(unittest.TestCase):
+    """paw_done_view 不再用顶层绝对导入（包内运行必炸的潜伏 bug）。"""
+
+    def test_no_local_top_level_import(self):
+        import inspect
+        from tg_userbot import bot
+        src = inspect.getsource(bot.handle_menu_action)
+        self.assertNotIn("\n        import pawchive as _paw", src)
+
+
+class ChromeSaveFailureTest(unittest.TestCase):
+    """save_requests 失败必须上抛（提交回执以落盘为准）。"""
+
+    def test_save_failure_raises(self):
+        import tg_userbot.chrome_client as cc
+        bad = os.path.join(_TMP, "no_such_dir_xyz", "req.json")
+        with self.assertRaises(Exception):
+            cc.save_requests([{"task_id": "t"}], path=bad)
+
+
+class StatusLightContractTest(unittest.TestCase):
+    """任务书 Test1/Test2：健康灯随连接状态走，禁止「绿正常+实际断开」。"""
+
+    def _status(self, connected):
+        saved = state.client
+        cli = mock.MagicMock()
+        cli.is_connected = lambda: connected
+        state.client = cli
+        try:
+            return text_mod.status_text()
+        finally:
+            state.client = saved
+
+    def test_connected_green(self):
+        t = self._status(True)
+        self.assertIn("🟢", t)
+        self.assertIn("连接：正常", t)
+
+    def test_disconnected_red(self):
+        t = self._status(False)
+        self.assertIn("🔴", t)
+        self.assertIn("连接：断开", t)
+        self.assertNotIn("状态正常", t)
