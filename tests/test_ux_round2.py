@@ -2656,3 +2656,50 @@ class RestartCommandTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("restart", config.REGISTERED_COMMAND_NAMES)
         self.assertTrue(any(n == "restart" for n, _ in bot.BOT_COMMANDS))
         self.assertIn("/restart", commands._help_text())
+
+
+# ============================================================
+# 24) 完成通知的大小统计修复（2026-09-26 0.00 B 案例）
+# ============================================================
+class CompletionSizeTest(unittest.IsolatedAsyncioTestCase):
+    """完成通知的总大小必须反映下载结果（内存同步 size_bytes）。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_size_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "くらしっく", [{
+                "post_id": "p1", "title": "水着",
+                "published": "2026-09-01T00:00:00",
+                "post_url": "https://x/p1",
+                "subdir": "Pawchive/くらしっく/p1",
+                "files": [{"url": "https://f/p1.png", "filename": "1.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        self.post = runtime_db.claim_next_pawchive_post(now=1000)
+        self._sent = []
+        self._np = mock.patch.object(
+            pawchive_worker.notify, "notify_user",
+            mock.AsyncMock(side_effect=lambda t: self._sent.append(t)))
+        self._np.start()
+        self.addCleanup(self._np.stop)
+
+    async def test_downloaded_size_shown_in_completion(self):
+        from tg_userbot.naming import sanitize_filename_bounded as _sb
+        files = runtime_db.list_pawchive_files(self.post["id"])
+        f = files[0]
+        # 模拟下载循环：下载器返回真实大小，mark 落库
+        status, size, err = ("done", 3366775, None)
+        runtime_db.mark_pawchive_file_done(f["id"], size_bytes=size)
+        f["status"] = runtime_db.PAW_FILE_DONE
+        f["size_bytes"] = size                                  # 内存同步（修复点）
+        await pawchive_worker._finalize(self.post, files)
+        text = self._sent[0] if self._sent else ""
+        self.assertIn("3.21 MB", text)                          # 3366775 字节
+        self.assertNotIn("0.00 B", text)

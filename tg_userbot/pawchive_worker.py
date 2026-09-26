@@ -423,6 +423,7 @@ async def _download_post_files(post, files):
             if status == "done":
                 runtime_db.mark_pawchive_file_done(f["id"], size_bytes=size)
                 f["status"] = runtime_db.PAW_FILE_DONE
+                f["size_bytes"] = size   # 内存同步：完成通知的统计读这里
                 logger.info(
                     f"🐾 文件完成：{f['filename']}（{size or '?'} bytes）")
             elif status == "dead":
