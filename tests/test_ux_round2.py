@@ -2598,3 +2598,61 @@ class NotifyOnProcessTest(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self):
         pawchive.set_notify_each_post(True)
+
+
+# ============================================================
+# 23) /restart 重启指令（2026-09-25）
+# ============================================================
+class RestartCommandTest(unittest.IsolatedAsyncioTestCase):
+    """/restart：回执 + 调度（绝不真杀进程）；未注册形态不触发。"""
+
+    async def test_reply_and_schedule(self):
+        ev = mock.MagicMock()
+        ev.reply = mock.AsyncMock()
+        with mock.patch.object(commands, "_schedule_restart") as sched:
+            await commands.handle_command(ev, "/restart")
+        reply = ev.reply.await_args.args[0]
+        self.assertIn("重启中", reply)
+        self.assertTrue(sched.called or sched.await_count)
+
+    def test_schedule_spawns_detached_helper_and_schedules_term(self):
+        """_schedule_restart 本体：派生脱离进程组的 sh 守护 + 定时 SIGTERM。"""
+        import subprocess
+        import threading
+        spawned, timers = [], []
+
+        class FakeTimer:
+            def __init__(self, delay, fn):
+                timers.append((delay, fn))
+
+            def start(self):
+                pass
+
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with mock.patch("os.getpid", return_value=424242), \
+                mock.patch("os.kill") as fake_kill, \
+                mock.patch("subprocess.Popen",
+                           side_effect=lambda a, **kw: spawned.append(a)), \
+                mock.patch("threading.Timer", FakeTimer):
+            commands._schedule_restart(delay=2.0)
+            # FakeTimer 不自跑：在补丁内手动触发，验证到点对自己发 SIGTERM
+            timers[0][1]()
+            fake_kill.assert_called_once_with(424242, 15)
+        self.assertTrue(spawned, "应派生 sh 守护脚本")
+        script = " ".join(spawned[0])
+        self.assertIn("run.sh start", script)
+        self.assertIn("kill -0 424242", script)
+        self.assertTrue(timers and timers[0][0] == 2.0, "应有 2s 定时 SIGTERM")
+
+    async def test_not_triggered_without_command(self):
+        ev = mock.MagicMock()
+        ev.reply = mock.AsyncMock()
+        with mock.patch.object(commands, "_schedule_restart",
+                               mock.AsyncMock()) as sched:
+            await commands.handle_command(ev, "/status")
+        sched.assert_not_called()
+
+    def test_registered_everywhere(self):
+        self.assertIn("restart", config.REGISTERED_COMMAND_NAMES)
+        self.assertTrue(any(n == "restart" for n, _ in bot.BOT_COMMANDS))
+        self.assertIn("/restart", commands._help_text())

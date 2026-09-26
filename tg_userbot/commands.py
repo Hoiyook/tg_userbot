@@ -250,13 +250,44 @@ def _help_text():
         "/caption_filter_del 序号｜/caption_filter_test 原文\n"
         "/clean｜/clearmsg｜/setcleartime 30s|1m|1h|off\n"
         "/origin —— 解析失败账本；/cd2ck —— 115 备份对账\n"
+        "/restart —— 重启 bot（优雅停机，约 30 秒）\n"
         "/help2 —— 数据表与配置文件字典\n"
         "注：/paw_plan 与 /paw plan 两种写法等效（下划线为标准形）"
     )
 
 
 
+def _schedule_restart(delay=2.0):
+    """延时优雅重启自身：派生脱离进程组的守护脚本，等本进程退出后跑
+    ./run.sh start（userbot 拉起；Chrome Agent 本就独立运行，不受影响）。
+
+    关键点：helper 必须 start_new_session 脱离本进程组——否则本进程退出
+    连带杀掉等待中的 helper，重启就断了。SIGTERM 走既有优雅停机处理器
+    （保存状态/断开 worker/释放租约），与 run.sh stop 同一退出路径。"""
+    import os
+    import signal
+    import subprocess
+    import threading
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pid = os.getpid()
+    helper = (
+        f"sleep {delay + 1:.0f}; "
+        f"while kill -0 {pid} 2>/dev/null; do sleep 1; done; "
+        f"cd '{repo}' && ./run.sh start "
+        f">>'{config.RUNTIME_DIR}/restart.log' 2>&1"
+    )
+    subprocess.Popen(["sh", "-c", helper], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _term():
+        os.kill(pid, signal.SIGTERM)
+
+    threading.Timer(delay, _term).start()
+
+
 async def handle_command(event, cmd_text):
+
     # 多词指令规范化（2026-09-25）：/paw plan 与 /paw_plan 归一为下划线
     # 标准形，此后全链路（审计/分发）只见标准形
     cmd_text = _canonical_command(cmd_text)
@@ -767,6 +798,15 @@ async def handle_command(event, cmd_text):
             except Exception:
                 pass
 
+        return True
+
+    if cmd_text == "/restart":
+        await _reply(event,
+                     "🔁 重启中……预计 20~40 秒恢复（自动拉起，无需手动操作）\n"
+                     "期间消息不丢：队列/监听 checkpoint 已持久化，"
+                     "恢复后自动继续。")
+        logger.info("执行命令：/restart —— 触发优雅重启")
+        _schedule_restart()
         return True
 
     if cmd_text == "/usage":
