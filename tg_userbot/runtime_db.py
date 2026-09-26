@@ -1514,18 +1514,21 @@ def delete_pawchive_post(post_row):
 
 
 def complete_pawchive_manual_post(post_row, now=None):
-    """外链人工处理完成：MANUAL → COMPLETED。
+    """人工关账：MANUAL/FAILED → COMPLETED（/paw_done）。
 
-    只允许从 MANUAL 流转（PENDING/PROCESSING 不能跳过下载直接标完成）；
+    MANUAL = 外链处理完的正常出口；FAILED = 人工确认无需重试的显式覆盖
+    （2026-09-26：全死链/失败帖想「关账」此前只能无限留 FAILED，用户
+    需要一个明确出口）。PENDING/PROCESSING 仍不能跳过下载直接标完成；
     已是 COMPLETED 返回 False（幂等友好）。返回是否发生流转。"""
     def do(conn):
         cur = _execute(
             conn,
             "UPDATE pawchive_posts SET status=?, completed_at=?, "
-            "lease_until=NULL WHERE id=? AND status=?",
-            (PAW_POST_COMPLETED, _now(now), int(post_row), PAW_POST_MANUAL))
+            "lease_until=NULL WHERE id=? AND status IN (?,?)",
+            (PAW_POST_COMPLETED, _now(now), int(post_row),
+             PAW_POST_MANUAL, PAW_POST_FAILED))
         return cur.rowcount > 0
-    return _write(do, f"标记 Pawchive 外链帖完成（{post_row}）")
+    return _write(do, f"标记 Pawchive 帖完成（{post_row}）")
 
 
 def list_pawchive_files(post_row):

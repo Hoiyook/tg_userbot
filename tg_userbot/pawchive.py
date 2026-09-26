@@ -1577,10 +1577,11 @@ def manual_text(limit=10):
 
 
 def mark_manual_done(arg):
-    """/paw done：把 MANUAL 帖标成 COMPLETED（人工处理完外链）。
+    """/paw done：人工关账 MANUAL/FAILED 帖 → COMPLETED。
 
     三种形态：<#行id>（单条）/ <起-止区间>（批量行 id）/ <作者名>
-    （该作者全部 MANUAL 帖）。已完成的幂等提示；不存在/非 MANUAL 报错。"""
+    （该作者全部待关账帖）。FAILED 帖关账 = 人工确认不再重试（文件没
+    下全也接受）；PENDING/PROCESSING 不吃。已完成的幂等提示。"""
     raw = str(arg or "").lstrip("#").strip()
     # 区间形态：105-120
     m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", raw)
@@ -1633,7 +1634,12 @@ def mark_manual_done(arg):
     row = runtime_db.get_pawchive_post_row(int(raw))
     if row and row["status"] == runtime_db.PAW_POST_COMPLETED:
         return f"{TEXT_PREFIX}\nℹ️ #{raw} 已经标记过了"
-    return f"{TEXT_PREFIX}\n❌ #{raw} 不存在或不是待人工状态（只允许 MANUAL → 完成）"
+    if row and row["status"] in (runtime_db.PAW_POST_PENDING,
+                                 runtime_db.PAW_POST_PROCESSING):
+        return (f"{TEXT_PREFIX}\n❌ #{raw} 当前状态 "
+                f"{row['status']}：还在处理中，等下完再关账"
+                "（急停可用 /paw_pause）")
+    return f"{TEXT_PREFIX}\n❌ #{raw} 不存在或状态不支持关账"
 
 
 

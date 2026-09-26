@@ -2894,3 +2894,66 @@ class StatusLightContractTest(unittest.TestCase):
         self.assertIn("🔴", t)
         self.assertIn("连接：断开", t)
         self.assertNotIn("状态正常", t)
+
+
+# ============================================================
+# 27) /paw_done 支持 FAILED 关账（2026-09-26 帖 3541 案例）
+# ============================================================
+class DoneAcceptsFailedTest(unittest.TestCase):
+    """FAILED 帖人工关账：/paw_done 行id → COMPLETED（显式覆盖）；
+    PENDING 仍拒绝。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_done_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def _seed(self, post_id, fail_error):
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "ABP_ART", [{
+                "post_id": post_id, "title": f"帖{post_id}",
+                "published": "2026-09-01T00:00:00",
+                "post_url": f"https://x/{post_id}",
+                "subdir": f"Pawchive/A/{post_id}",
+                "files": [{"url": f"https://f/{post_id}.png",
+                           "filename": f"{post_id}.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        f = runtime_db.list_pawchive_files(post["id"])[0]
+        runtime_db.mark_pawchive_file_failed(f["id"], error=fail_error)
+        runtime_db.finalize_pawchive_post(post["id"],
+                                          runtime_db.PAW_POST_FAILED)
+        return post["id"]
+
+    def test_failed_post_done(self):
+        rid = self._seed("p1", "HTTP 429")
+        reply = pawchive.mark_manual_done(str(rid))
+        self.assertIn("完成", reply)
+        row = runtime_db.get_pawchive_post_row(rid)
+        self.assertEqual(row["status"], "COMPLETED")
+
+    def test_dead_failed_post_done_too(self):
+        rid = self._seed("p2", runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404")
+        pawchive.mark_manual_done(str(rid))
+        self.assertEqual(runtime_db.get_pawchive_post_row(rid)["status"],
+                         "COMPLETED")
+
+    def test_pending_still_rejected(self):
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "ABP_ART", [{
+                "post_id": "p9", "title": "t",
+                "published": "2026-09-01T00:00:00", "post_url": "https://x/p9",
+                "subdir": "Pawchive/A/p9",
+                "files": [{"url": "https://f/p9.png", "filename": "9.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        reply = pawchive.mark_manual_done(
+            str(runtime_db.find_pawchive_posts_by_post_id("p9")[0]["id"]))
+        self.assertIn("PENDING", reply)     # 如实说明当前状态
+        self.assertIn("还在处理中", reply)
