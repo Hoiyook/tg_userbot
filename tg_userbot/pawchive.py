@@ -464,7 +464,7 @@ def fetch_creator_posts(service, creator_id, cookie=None, progress=None,
     while True:
         page = _http_get_json(
             f"{config.PAWCHIVE_API_BASE}/api/v1/{service}/user/{creator_id}"
-            f"/posts?o={offset}", cookie=cookie)
+            f"/posts?o={offset}", cookie=cookie, timeout=90)
         posts.extend(page)
         if progress:
             progress(f"已拉取 {len(posts)} 条")
