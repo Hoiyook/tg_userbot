@@ -552,7 +552,12 @@ def init_db(path=None) -> bool:
             if _OPEN_PATH == target:
                 return True
             close_db()
-        conn = sqlite3.connect(target)
+        # check_same_thread=False：连接由 init_db（主线程）创建，但部分
+        # 调用走 asyncio.to_thread（如 Pawchive 已知集预载）——2026-09-26
+        # 实测偶发「created in a thread can only be used in that same
+        # thread」。并发纪律仍由 _LOCK 单写锁 + WAL 保证，这里只是放开
+        # 线程归属检查。
+        conn = sqlite3.connect(target, check_same_thread=False)
         conn.row_factory = sqlite3.Row
 
         # WAL：读回**实际**生效的模式。安卓外部存储（FUSE）上可能拿不到 wal，
