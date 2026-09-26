@@ -2703,3 +2703,23 @@ class CompletionSizeTest(unittest.IsolatedAsyncioTestCase):
         text = self._sent[0] if self._sent else ""
         self.assertIn("3.21 MB", text)                          # 3366775 字节
         self.assertNotIn("0.00 B", text)
+
+
+# ============================================================
+# 25) 状态视图「待入队请求」过滤已走完生命周期的请求（2026-09-26）
+# ============================================================
+class UnclaimedDisplayTest(unittest.TestCase):
+    """unclaimed 计算必须排除已通知过的请求（出窗后不算幽灵）。"""
+
+    def test_filter_excludes_notified(self):
+        known = {"t1"}
+        reqs = [
+            {"task_id": "t1", "url": "https://x/1"},               # 在窗内
+            {"task_id": "t2", "url": "https://x/2"},               # 未认领
+            {"task_id": "t3", "url": "https://x/3",
+             "notified_at": "2026-09-24 12:00:00"},                # 出窗老请求
+        ]
+        unclaimed = [r for r in reqs
+                     if r["task_id"] not in known
+                     and not r.get("notified_at")]
+        self.assertEqual([r["task_id"] for r in unclaimed], ["t2"])

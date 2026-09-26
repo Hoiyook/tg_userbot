@@ -660,8 +660,13 @@ async def status_view():
     cdp_ok = await cdp_available()
     tasks = chrome_agent.load_tasks(CHROME_TASKS_FILE)
     known = {t.get("task_id") for t in tasks}
+    # 待入队 = 没认领过**且没走完生命周期**的请求——请求文件只进不出，
+    # 任务台账只留 200 条；老请求出窗后被误算「待入队」（2026-09-26 实测
+    # 显示 11 条幽灵）。已通知过的请求与 claim_new_requests 的跳过判据
+    # 同源，永不认领也不该显示。
     unclaimed = [r for r in load_requests(CHROME_REQUESTS_FILE)
-                 if r.get("task_id") not in known]
+                 if r.get("task_id") not in known
+                 and not r.get("notified_at")]
     return status_text(agent_up, chrome_running, cdp_ok, tasks, download_dir(),
                        unclaimed=unclaimed)
 
