@@ -308,6 +308,8 @@ Telegram ──► listener.Scanner ──► SQLite 任务表 ──► listene
 
 配套：`tests/test_queue_wiring.py` 旧「DB 失败内存为准」契约测试改写为新契约（回滚+拒绝+不 spawn）；`tests/test_listener_worker.py` 新增 FORWARDED 对账用例；`tests/test_dedup.py` 新增 pending 2 项；`tests/test_pawchive_worker.py` 新增错误大小重下/410/500 三项。**坑**：测试里 `mock.patch.stopall` 会把其他文件 import 期启动的全局补丁一并停掉（dedup 的 cleanup 曾杀死 follow/reply_inherit 的重试延迟归零补丁，套件真实退避 30s×2 卡死）——补丁清理必须定点 stop，全仓库禁用 stopall。
 
+**CD2 API 备份对账（2026-09-17，场景 1 落地）。** 新模块 `cd2_api.py`：用 CD2 官方 gRPC API（`clouddrive.CloudDriveFileSrv`，明文端口 127.0.0.1:19798——19799 是网页端口）替代纯日志解析的备份判断。认证：API 令牌（tg_secrets.json `cd2.api_token`，CD2 网页 → 设置 → API 令牌 创建），metadata `authorization: Bearer`。官方 proto（v1.0.17）生成桩在 `cd2_proto/`（`grpcio-tools` 生成后把 `clouddrive_pb2` 导入改为包内相对）。核心能力：`backup_tasks()`（源→目标映射，BackupGetAll 返回 BackupStatus 包 Backup）、`local_to_remote_root()`（DOWNLOAD_DIR → /115open/Nekogram）、`reconcile()`（本地成品文件逐个核对远端镜像：存在+大小一致=已备份；只对账静置 ≥10 分钟的文件——刚完成的还在备份队列）、`get_space_info()`（115 容量）。`/cd2check` 命令输出对账报告 + 容量（gRPC 阻塞调用经 asyncio.to_thread 下放）；🐾 进度面板附 115 容量行。**实战首查即抓真问题**：CD2 备份规则扩展名白名单是 `mp4,jpg,png,pdf,zip,rar,psd`——**没有 jpeg**，大量 .jpeg 文件永远不会被备份（对账报告自带扩展名诊断行提示此点）。grpcio 为新依赖（.venv 已装）。
+
 ## 磁盘回收：媒体经 CloudDrive2 自动搬到 115（外部配置）
 
 本地磁盘只留最近下载，**已完成的媒体**由 CloudDrive2（CD2，本机 WebDAV 端口 19798）的「备份」任务自动搬到 115 后删本地。这不是本仓库代码逻辑，是 CD2 侧的一次性运维配置，记录如下便于日后对照/排查：

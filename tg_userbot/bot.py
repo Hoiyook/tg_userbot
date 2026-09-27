@@ -114,6 +114,7 @@ BOT_COMMANDS = (
     ("restart", "重启 bot（优雅停机 + 自动拉起，约 30 秒）"),
     ("cmdt", "命令模板列表"),
     ("botclean", "bot 对话自动清理开关：/botclean on|off"),
+    ("cd2check", "CloudDrive2 备份对账：本地媒体 vs 115 远端"),
     ("cmdt_add", "保存命令模板：/cmdt_add 名字 命令"),
     ("cmdt_del", "删除命令模板：/cmdt_del 名字"),
     ("cmdt_run", "执行命令模板：/cmdt_run 名字"),

@@ -815,6 +815,9 @@ CLEAR_TIME_CONFIG_FILE = os.path.join(RUNTIME_DIR, "clear_time.json")
 # bot 菜单对话清理开关（/botclean on|off，2026-09-17 用户要求）：
 # 关闭后自动清理不再动 bot 对话（进度面板/台账/菜单长驻），收藏夹清理不受影响
 BOT_CLEAN_CONFIG_FILE = os.path.join(RUNTIME_DIR, "bot_clean_config.json")
+# CloudDrive2 API 令牌（cd2_api.py 备份对账用；CD2 网页 → 设置 → API 令牌 创建）
+# 从 tg_secrets.json 的 cd2.api_token 读取（time-variant：运行时改密钥文件即时生效）
+CD2_API_TOKEN = (_SECRET_CONFIG.get("cd2") or {}).get("api_token", "")
 
 # 已注册命令名全集（/ 开头的输入判「是不是命令」用）：bot 按钮面板注册的
 # + 仅收藏夹跑的（CLEAN_COMMANDS 除斜杠）。评论捕获的目录模式标注（/A#x）
