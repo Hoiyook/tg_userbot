@@ -98,7 +98,18 @@ def progress_text():
 
     if not sections:
         return "📊 当前没有进行中的任务（各模块均空闲）"
-    return "📊 实时进度\n\n" + "\n\n".join(sections)
+    return fit_4096("📊 实时进度\n\n" + "\n\n".join(sections))
+
+
+def fit_4096(text, limit=3900):
+    """视图文本超长截断（Telegram 单条 4096 硬顶，留余量）。
+
+    所有动态视图的统一出口护栏——2026-09-26 实测 /progress 在批量下载期
+    无护栏即 MessageTooLongError。"""
+    t = str(text or "")
+    if len(t) <= limit:
+        return t
+    return t[:limit] + "\n……（内容过长已截断）"
 
 
 def clean_buttons(rows):

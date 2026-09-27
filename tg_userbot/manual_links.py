@@ -84,6 +84,7 @@ def _split_note(text):
 
 
 def observe(text, now=None):
+    from .text import fit_4096
     """登记一条消息里的链接并生成查重回复（文本, 按钮行）。
 
     支持「URL + 备注」（恰好 1 个 URL 时其余文本为备注；重发同链接带新
@@ -156,7 +157,7 @@ def observe(text, now=None):
                     "🌐 在Chrome打开",
                     encode_menu_data("mlink_open", str(row["id"]))))
             rows.append(row_btns)
-    return "\n".join(lines), rows
+    return fit_4096("\n".join(lines)), rows
 
 
 def unified_view(limit=20):
@@ -236,6 +237,7 @@ def delete_paw_post(post_row):
 
 
 def links_view(limit=20, keyword=None):
+    from .text import fit_4096
     """/links 视图：无参 = 未处理清单（✅ 按钮逐条）+ 已完成计数；
     带关键词 = 搜索（备注或 URL 子串、大小写不敏感、含已完成——
     按备注找回外链，2026-09-17 需求），命中行带终态标记与 ✅（未处理）。"""
@@ -259,7 +261,7 @@ def links_view(limit=20, keyword=None):
                     rows.append([Button.inline(
                         "✅ " + _short(row["url"]),
                         encode_menu_data("mlink_done", str(row["id"])))])
-            return "\n".join(lines), rows
+            return fit_4096("\n".join(lines)), rows
         pending = runtime_db.list_manual_links(
             status="PENDING", limit=limit)
     except runtime_db.DbUnavailable as e:
@@ -279,7 +281,7 @@ def links_view(limit=20, keyword=None):
         rows.append([Button.inline(
             "✅ " + _short(row["url"]),
             encode_menu_data("mlink_done", str(row["id"])))])
-    return "\n".join(lines), rows
+    return fit_4096("\n".join(lines)), rows
 
 
 async def done_reply(arg):
