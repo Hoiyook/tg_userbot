@@ -1391,6 +1391,9 @@ async def bot_callback_handler(event):
         pass
     action, arg = menu.parse_menu_data(event.data)
     logger.info(f"🤖 bot 菜单回调：{action} {arg or ''}")
+    if action == "unknown":
+        # unknown 时把原始回调数据记下来（否则无法排查是哪个旧按钮）
+        logger.warning(f"🤖 bot 菜单回调 unknown：原始数据 {event.data!r}")
     try:
         reply, buttons = await handle_menu_action(action, arg, event)
         if reply is not None or buttons is not None:
