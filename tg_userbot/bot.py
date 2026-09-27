@@ -655,6 +655,9 @@ async def handle_menu_action(action, arg, event):
         return await cd2.cd2_start_or_status(), menu.cd2_menu_buttons()
     if action == "cd2_stop":
         return await cd2.cd2_stop_or_status(), menu.cd2_menu_buttons()
+    if action == "bak_status":
+        return await asyncio.to_thread(cd2.backup_status_text), \
+            menu.cd2_menu_buttons()
     if action == "bak":
         return cd2.backup_records_text(), menu.cd2_menu_buttons()
     if action == "cd2ck":

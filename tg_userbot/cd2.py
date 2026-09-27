@@ -10,6 +10,7 @@
 超时 SIGKILL 兜底。备份记录解析 backup.<日期>.log 里的逐文件删除源行。
 进程句柄 state._CD2_PROC 仅防后台进程被 GC 回收。
 """
+import json
 import os
 import re
 import time
@@ -258,6 +259,67 @@ def read_cd2_backup_records(log_dir=None, days=7, limit=15):
         except (OSError, ValueError):
             continue
     return parse_backup_log_lines(lines)[:limit]
+
+
+# 实时备份状态文件（CD2 维护，分钟级更新；2026-09-26 发现并接入）。
+# 结构：[{"source": "/V1/downloads",
+#         "destinations": [{"path": "/115open/Nekogram",
+#                           "last_finish_time": {secs_since_epoch, ...}}]}]
+BACKUP_STATUS_FILE = os.path.join(
+    os.path.expanduser("~/Waytech/CloudDrive2"), "backup_status.json")
+
+
+def read_backup_status(path=None):
+    """读实时备份状态：[(源目录, [目标路径...), (最近完成 epoch...)]) ...]。
+
+    文件缺失/损坏返回 None（调用方如实提示）。"""
+    p_ = os.path.expanduser(path or BACKUP_STATUS_FILE)
+    try:
+        with open(p_, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    out = []
+    for entry in data if isinstance(data, list) else []:
+        src_path = str(entry.get("source") or "")
+        dests = entry.get("destinations") or []
+        d_paths = [str(d.get("path") or "") for d in dests if d.get("path")]
+        last = [d.get("last_finish_time") or {} for d in dests]
+        last_secs = max(
+            (int(t.get("secs_since_epoch") or 0) for t in last), default=0)
+        out.append((src_path, d_paths, last_secs))
+    return out
+
+
+def backup_status_text():
+    """🔴 实时状态（backup_status.json，CD2 分钟级维护）：
+    备份源 → 目标、最近完成时间、今日已删源数量（交叉日志）。"""
+    st = read_backup_status()
+    if st is None:
+        return ("🔴 CD2 实时状态不可读\n"
+                f"（{BACKUP_STATUS_FILE} 缺失或损坏）")
+    if not st:
+        return "🔴 CD2 实时状态：未配置备份任务"
+    lines = ["🔴 CD2 实时备份状态", ""]
+    for src_path, d_paths, last_secs in st:
+        ago = ""
+        if last_secs:
+            mins = int((time.time() - last_secs) / 60)
+            ago = (f"{mins} 分钟前" if mins < 1440
+                   else f"{mins // 1440} 天前")
+        lines.append(f"📂 {src_path}")
+        lines.append(f"   → {'、'.join(d_paths) or '（无目标）'}"
+                     + (f"｜最近完成：{ago}" if ago else "｜尚无完成记录"))
+    # 今日删除源数量（交叉备份日志，与 /cd2ck 同源）
+    lines_ = _read_backup_log_lines(days=1) or []
+    import re as _re
+    n_del = sum(1 for ln in lines_
+                if "delete file and remove" in ln)
+    if lines_:
+        lines.append(f"今日已备份删源：{n_del} 个文件")
+    lines.append("")
+    lines.append("（CD2 分钟级维护此状态；逐文件记录见 🗂 备份记录）")
+    return "\n".join(lines)[:3900]
 
 
 def backup_records_text(days=7, limit=15):
