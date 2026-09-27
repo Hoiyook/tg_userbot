@@ -3082,3 +3082,27 @@ def sql_templates_menu_buttons():
 
 def cmdt_menu_buttons_alias():
     return cmdt.menu_buttons()
+
+
+# ============================================================
+# 30) 死按钮审计：MENU_ACTIONS ⊆ handle_menu_action 分支（举一反三）
+# ============================================================
+class DeadButtonAuditTest(unittest.TestCase):
+    """注册了的按钮 action 必须有 handler 分支——否则点了假死
+    （wl_scan 未注册 / paw_archive 无分支 两个实例后的固化）。"""
+
+    def test_every_registered_action_has_handler(self):
+        import re
+        import inspect
+        from tg_userbot import bot
+        src = inspect.getsource(bot.handle_menu_action)
+        handled = set(re.findall(r'action == "([\w_]+)"', src))
+        for tup in re.findall(r"action in \(([^)]+)\)", src):
+            handled |= set(re.findall(r'"([\w_]+)"', tup))
+        dead = set(config.MENU_ACTIONS) - handled
+        self.assertEqual(dead, set(),
+                         f"注册但无 handler 的假死按钮: {sorted(dead)}")
+
+    def test_wl_scan_now_registered(self):
+        self.assertIn("wl_scan", config.MENU_ACTIONS)
+        self.assertIn("paw_archive", config.MENU_ACTIONS)

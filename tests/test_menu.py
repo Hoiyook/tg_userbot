@@ -1033,7 +1033,8 @@ class ShMenuViewTest(unittest.TestCase):
         for arg in run_args:
             self.assertIn(arg, shell.PRESET_COMMANDS)
         self.assertTrue(any(action == "sh_input" for action, _ in actions))
-        self.assertTrue(any(action == "home" for action, _ in actions))
+        self.assertTrue(any(action == "tools" for action, _ in actions),
+                        "⬅️ 高级工具")
 
     def test_every_preset_key_executes_without_error(self):
         """回归（2026-09-15）：每个预设键就是可执行命令——曾把按钮文字当
@@ -1064,7 +1065,8 @@ class UpMenuViewTest(unittest.TestCase):
         self.assertEqual(file_btns, [("0", "📄 一.txt"), ("1", "📄 二.bin")])
         self.assertTrue(any(action == "up_input" for action, _ in actions))
         self.assertTrue(any(action == "up" for action, _ in actions))
-        self.assertTrue(any(action == "home" for action, _ in actions))
+        self.assertTrue(any(action == "tools" for action, _ in actions),
+                        "⬅️ 高级工具")
 
 
 class ShUpMenuActionTest(unittest.IsolatedAsyncioTestCase):

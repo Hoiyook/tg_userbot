@@ -226,7 +226,8 @@ def cd2_menu_buttons():
          Button.inline("🛑 停止", encode_menu_data("cd2_stop"))],
         [Button.inline("🗂 备份记录", encode_menu_data("bak")),
          Button.inline("🔍 115 对账", encode_menu_data("cd2ck"))],
-        [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
+        [Button.inline("⬅️ 设置", encode_menu_data("settings")),
+         Button.inline("🏠 首页", encode_menu_data("home"))],
     ]
 
 
@@ -271,7 +272,7 @@ def tools_menu_buttons(candidates):
         Button.inline("🧾 解析账本", encode_menu_data("origin")),
         Button.inline("🗑 清程序消息", encode_menu_data("clearmsg")),
     ])
-    rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
+    rows.append([Button.inline("🏠 首页", encode_menu_data("home"))])
     return rows
 
 
@@ -298,7 +299,7 @@ def chrome_menu_buttons(tasks):
         Button.inline("🔄 刷新", encode_menu_data("chrome_tasks")),
         Button.inline("ℹ️ Agent 状态", encode_menu_data("chrome_status")),
     ])
-    rows.append([Button.inline("🏠 返回主菜单", encode_menu_data("home"))])
+    rows.append([Button.inline("🏠 首页", encode_menu_data("home"))])
     return rows
 
 
@@ -318,7 +319,8 @@ def caption_filter_menu_buttons():
         [Button.inline("🧪 测试清洗", encode_menu_data("capf_test"))],
         [Button.inline("♻️ 恢复默认", encode_menu_data("capf_reset")),
          Button.inline("🗑 清空规则", encode_menu_data("capf_clear"))],
-        [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
+        [Button.inline("⬅️ 设置", encode_menu_data("settings")),
+         Button.inline("🏠 首页", encode_menu_data("home"))],
     ]
 
 
@@ -333,7 +335,7 @@ def stats_menu_buttons(days=1):
 
     return [
         [_btn(1), _btn(3), _btn(LOG_RETENTION_DAYS)],
-        [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
+        [Button.inline("🏠 首页", encode_menu_data("home"))],
     ]
 
 
@@ -355,7 +357,8 @@ def dedup_menu_buttons():
     toggle_label = "⏸ 关闭去重" if dedup.state.DEDUP_ENABLED else "▶️ 开启去重"
     return [
         [Button.inline(toggle_label, encode_menu_data("dedup_toggle"))],
-        [Button.inline("🏠 返回主菜单", encode_menu_data("home"))],
+        [Button.inline("⬅️ 设置", encode_menu_data("settings")),
+         Button.inline("🏠 首页", encode_menu_data("home"))],
     ]
 
 
@@ -370,7 +373,8 @@ def queue_menu_buttons():
         )
     rows.append([
         Button.inline("🔄 刷新", encode_menu_data("queue")),
-        Button.inline("🔙 返回主菜单", encode_menu_data("home")),
+        Button.inline("⬅️ 下载中心", encode_menu_data("downloads")),
+        Button.inline("🏠 首页", encode_menu_data("home")),
     ])
     return rows
 
@@ -410,9 +414,20 @@ def retry_menu_buttons(page=1):
     rows.append(nav)
     rows.append([
         Button.inline("♻️ 全部重放", encode_menu_data("retry_all")),
-        Button.inline("🔙 返回主菜单", encode_menu_data("home")),
+        Button.inline("⬅️ 下载中心", encode_menu_data("downloads")),
+        Button.inline("🏠 首页", encode_menu_data("home")),
     ])
     return rows
+
+
+def back_rows(parent_action, parent_label):
+    """⬅️ 返回上级 + 🏠 首页 的导航尾行（2026-09-27 UX3：每页都有上级）。
+
+    parent_action 用标准回调动作（downloads/settings/tools/listen/paw…），
+    由各子页面的 builder 拼在按钮尾部。"""
+    return [[Button.inline(f"⬅️ {parent_label}",
+                           encode_menu_data(parent_action)),
+             Button.inline("🏠 首页", encode_menu_data("home"))]]
 
 
 def back_home_buttons():
@@ -446,7 +461,8 @@ def cookie_menu_buttons():
         [Button.inline("🌐 Chrome", encode_menu_data("cookie_imp", "chrome")),
          Button.inline("🌐 Edge", encode_menu_data("cookie_imp", "edge")),
          Button.inline("🌐 Firefox", encode_menu_data("cookie_imp", "firefox"))],
-        [Button.inline("🔙 返回主菜单", encode_menu_data("home"))],
+        [Button.inline("⬅️ 设置", encode_menu_data("settings")),
+         Button.inline("🏠 首页", encode_menu_data("home"))],
     ]
 
 
@@ -460,7 +476,7 @@ def wl_menu_buttons():
         rows.append(
             [Button.inline(f"➖ {title}", encode_menu_data("wl_del", str(cid)))]
         )
-    rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
+    rows.append([Button.inline("🏠 首页", encode_menu_data("home"))])
     return rows
 
 
@@ -471,7 +487,8 @@ def thread_menu_buttons():
         [Button.inline(str(p), encode_menu_data("thread", str(p))) for p in presets[i:i + 3]]
         for i in range(0, len(presets), 3)
     ]
-    rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
+    rows.append([Button.inline("⬅️ 设置", encode_menu_data("settings")),
+                 Button.inline("🏠 首页", encode_menu_data("home"))])
     return rows
 
 
@@ -524,7 +541,7 @@ def sh_menu_buttons():
         [Button.inline("✏️ 自定义命令", encode_menu_data("sh_input"))])
     rows.append([
         Button.inline("📜 管理模板", encode_menu_data("cmdt")),
-        Button.inline("🔙 返回主菜单", encode_menu_data("home")),
+        Button.inline("⬅️ 高级工具", encode_menu_data("tools")),
     ])
     return rows
 
@@ -547,7 +564,7 @@ def up_menu_buttons(candidates):
     rows.append([Button.inline("✏️ 输入路径", encode_menu_data("up_input"))])
     rows.append([
         Button.inline("🔄 刷新", encode_menu_data("up")),
-        Button.inline("🔙 返回主菜单", encode_menu_data("home")),
+        Button.inline("⬅️ 高级工具", encode_menu_data("tools")),
     ])
     return rows
 

@@ -490,6 +490,10 @@ async def handle_menu_action(action, arg, event):
         reply = pawchive.mark_manual_done(arg)
         view_text, rows = manual_links.unified_view()
         return f"{manual_links.TEXT_PREFIX}\n{reply}\n\n{view_text}", rows
+    if action == "paw_archive":
+        # 🐾 面板的归档入口：无参=明细视图（与 /paw archive 一致）
+        return (pawchive.archive_overview_text(),
+                menu.back_home_buttons())
     if action == "paw_csv":
         msg = await pawchive.csv_reply()
         return (msg, pawchive.menu_buttons())

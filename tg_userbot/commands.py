@@ -678,7 +678,11 @@ async def handle_command(event, cmd_text):
         action, arg = parsed_listen
         logger.info(f"执行命令：/listen {action}")
         if action == "failed":
-            await _reply(event, listener.failed_tasks_text())
+            from .menu import encode_menu_data as _enc
+            await _reply(event, listener.failed_tasks_text(),
+                         buttons=[[Button.inline(
+                             "⬅️ 标签监听", _enc("listen")),
+                             Button.inline("🏠 首页", _enc("home"))]])
             return True
         if action == "retry":
             await _reply(event, listener.retry_failed_task(arg))

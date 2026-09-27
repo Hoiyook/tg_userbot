@@ -639,7 +639,7 @@ MENU_ACTIONS = (
     "home", "status", "progress", "done", "wl", "wl_add",
     "wl_del", "wl_since", "thread", "clean", "back",
     "queue", "queue_del", "retry", "retry_run", "retry_del", "retry_all",
-    "cd2", "cd2_stop", "bak", "stats",
+    "cd2", "cd2_stop", "bak", "stats", "wl_scan",
     "cookie", "cookie_set", "cookie_clear", "cookie_imp",
     "dedup", "dedup_toggle",
     "find",

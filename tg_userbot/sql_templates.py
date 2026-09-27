@@ -200,5 +200,6 @@ def menu_buttons():
             Button.inline(f"▶️ {name}", encode_menu_data("sqlt_run", name)),
             Button.inline("🗑", encode_menu_data("sqlt_del", name)),
         ])
-    rows.append([Button.inline("🔙 返回主菜单", encode_menu_data("home"))])
+    rows.append([Button.inline("⬅️ 设置", encode_menu_data("settings")),
+                 Button.inline("🏠 首页", encode_menu_data("home"))])
     return rows
