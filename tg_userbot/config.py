@@ -673,6 +673,7 @@ MENU_ACTIONS = (
     "cmdt", "cmdt_add", "cmdt_run", "cmdt_del",
     # CD2 子菜单视图与「命令行/上传」合并工具箱视图
     "cd2_menu", "tools",
+    "downloads", "settings",
     # 115 备份对账：本地滞留媒体 × 近期备份日志交叉（2026-09-24）
     "cd2ck",
     # 面板补缺（2026-09-24 指令↔按钮全量盘点）：SQL 控制台输入窗口 /

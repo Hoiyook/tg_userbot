@@ -91,9 +91,11 @@ class CookieMenuViewTest(unittest.TestCase):
         config.DOUYIN_COOKIE = self._orig
 
     def test_main_menu_contains_cookie_button(self):
-        datas = [
-            b.data for row in menu.main_menu_buttons() for b in row
-        ]
+        # 一级 → ⚙️ 设置 子面板承载（2026-09-27 两级菜单）
+        datas = [b.data for row in menu.main_menu_buttons()
+                 for b in row]
+        datas += [b.data for row in menu.settings_menu_buttons()
+                  for b in row]
         self.assertIn(b"m:cookie", datas)
 
     def test_status_text_configured(self):

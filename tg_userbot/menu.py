@@ -149,29 +149,66 @@ def main_menu_buttons():
     📋 白名单，用户必须能明显区分两套系统）——放进工具区独立成对。
     CD2 的启停/备份记录在其子菜单（2026-09-15 菜单合并）。
     """
+    # 2026-09-27 UX3（任务书 六）：两级菜单——一级按用户任务模型分 5 行，
+    # 低频项收进「📥 下载中心 / ⚙️ 设置」子面板；全部动作保留，只是入口
+    # 归位（旧入口动作不变，老按钮回调继续有效）
     return [
-        # 监控
-        [Button.inline("📊 状态", encode_menu_data("status")),
-         Button.inline("📊 台账", encode_menu_data("stats"))],
-        [Button.inline("📈 进度", encode_menu_data("progress")),
-         Button.inline("🔍 查询", encode_menu_data("find"))],
-        # 管理
-        [Button.inline("📥 队列", encode_menu_data("queue")),
-         Button.inline("🔁 待重试", encode_menu_data("retry"))],
-        [Button.inline("🧵 并发", encode_menu_data("thread")),
-         Button.inline("📜 记录", encode_menu_data("done"))],
-        [Button.inline("📋 白名单", encode_menu_data("wl")),
-         Button.inline("📡 监听", encode_menu_data("listen"))],
-        # 工具
-        [Button.inline("🛡 去重", encode_menu_data("dedup")),
-         Button.inline("🍪 Cookie", encode_menu_data("cookie"))],
-        [Button.inline("🧹 Caption", encode_menu_data("capf")),
-         Button.inline("📐 SQL模板", encode_menu_data("sqlt"))],
-        # 子系统
+        [Button.inline("📊 总览", encode_menu_data("status")),
+         Button.inline("📈 实时进度", encode_menu_data("progress"))],
+        [Button.inline("📥 下载中心", encode_menu_data("downloads")),
+         Button.inline("🔍 找文件", encode_menu_data("find"))],
         [Button.inline("🐾 Pawchive", encode_menu_data("paw")),
-         Button.inline("☁️ CD2", encode_menu_data("cd2_menu"))],
+         Button.inline("📡 标签监听", encode_menu_data("listen"))],
         [Button.inline("🌐 Chrome", encode_menu_data("chrome_tasks")),
-         Button.inline("🖥 命令行", encode_menu_data("tools"))],
+         Button.inline("📋 白名单", encode_menu_data("wl"))],
+        [Button.inline("⚙️ 设置", encode_menu_data("settings")),
+         Button.inline("🛠 高级工具", encode_menu_data("tools"))],
+    ]
+
+
+def downloads_menu_text():
+    """📥 下载中心正文：四个核心计数（全部来自既有统计，不伪造）。"""
+    from .stats import collect_stats
+    in_flight = len(state.ACTIVE_DOWNLOADS) if state.ACTIVE_DOWNLOADS else 0
+    pending = len(state.QUEUE.get("tasks", [])) if state.QUEUE else 0
+    to_retry = len(state.QUEUE.get("retry", [])) if state.QUEUE else 0
+    today = collect_stats(1)
+    from .naming import format_size
+    return (
+        "📥 下载中心\n\n"
+        f"进行中：{in_flight}\n"
+        f"待处理：{pending}\n"
+        f"失败重试：{to_retry}\n"
+        f"今日完成：{today['success_count']}（{format_size(today['success_bytes'])}）"
+    )
+
+
+def downloads_menu_buttons():
+    return [
+        [Button.inline("▶️ 当前下载", encode_menu_data("progress")),
+         Button.inline("📋 下载队列", encode_menu_data("queue"))],
+        [Button.inline("🔁 待重试", encode_menu_data("retry")),
+         Button.inline("✅ 最近完成", encode_menu_data("done"))],
+        [Button.inline("🏠 首页", encode_menu_data("home"))],
+    ]
+
+
+def settings_menu_text():
+    """⚙️ 设置正文。"""
+    return ("⚙️ 设置\n\n"
+            "并发 / 去重 / Cookie / Caption 清洗 / CD2——"
+            "点按钮进入对应设置面板。")
+
+
+def settings_menu_buttons():
+    return [
+        [Button.inline("🧵 并发", encode_menu_data("thread")),
+         Button.inline("🛡 去重", encode_menu_data("dedup"))],
+        [Button.inline("🍪 Cookie", encode_menu_data("cookie")),
+         Button.inline("🧹 Caption", encode_menu_data("capf"))],
+        [Button.inline("☁️ CD2", encode_menu_data("cd2_menu")),
+         Button.inline("📐 SQL模板", encode_menu_data("sqlt"))],
+        [Button.inline("🏠 首页", encode_menu_data("home"))],
     ]
 
 
@@ -223,6 +260,10 @@ def tools_menu_buttons(candidates):
     rows.append([
         Button.inline("🔗 外链台账", encode_menu_data("mlink_view")),
         Button.inline("📜 命令模板", encode_menu_data("cmdt")),
+    ])
+    rows.append([
+        Button.inline("📊 台账", encode_menu_data("stats")),
+        Button.inline("📜 记录", encode_menu_data("done")),
     ])
     # 低频排查/维护入口（2026-09-24 指令↔按钮盘点补缺）：
     # /origin 解析失败账本、/clearmsg 清程序消息

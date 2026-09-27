@@ -70,14 +70,16 @@ class MenuTextTest(unittest.TestCase):
 
     def test_main_menu_buttons_contain_all_entries(self):
         texts = [b.text for row in menu.main_menu_buttons() for b in row]
-        for label in ("📊 状态", "📈 进度", "📜 记录",
-                      "📋 白名单", "🧵 并发",
-                      "☁️ CD2", "🖥 命令行", "🐾 Pawchive"):
+        for label in ("📊 总览", "📈 实时进度", "📥 下载中心",
+                      "🔍 找文件", "📋 白名单",
+                      "🌐 Chrome", "🛠 高级工具", "🐾 Pawchive"):
             self.assertIn(label, texts)
 
     def test_main_menu_has_dedup_entry(self):
-        texts = [b.text for row in menu.main_menu_buttons() for b in row]
-        self.assertIn("🛡 去重", texts)
+        # 设置子面板承载（一级 → ⚙️ 设置）
+        pools = [b.text for row in menu.main_menu_buttons() for b in row]
+        pools += [b.text for row in menu.settings_menu_buttons() for b in row]
+        self.assertIn("🛡 去重", pools)
 
     def test_dedup_menu_buttons(self):
         rows = menu.dedup_menu_buttons()
@@ -212,8 +214,10 @@ class RefreshButtonsTest(unittest.TestCase):
         self.assertIn(("retry", "1"), actions)
 
     def test_main_menu_has_ledger_entry(self):
-        texts = [b.text for row in menu.main_menu_buttons() for b in row]
-        self.assertIn("📊 台账", texts)
+        # 台账入口归位到 🛠 高级工具
+        pools = [b.text for row in menu.main_menu_buttons() for b in row]
+        pools += [b.text for row in menu.tools_menu_buttons([]) for b in row]
+        self.assertIn("📊 台账", pools)
 
 
 class ListenMenuTest(unittest.TestCase):
@@ -221,13 +225,13 @@ class ListenMenuTest(unittest.TestCase):
 
     def test_main_menu_has_listen_entry(self):
         texts = [b.text for row in menu.main_menu_buttons() for b in row]
-        self.assertIn("📡 监听", texts)
+        self.assertIn("📡 标签监听", texts)
 
     def test_main_menu_still_has_whitelist_separately(self):
         """两套系统必须各有各的入口，用户要能明显区分。"""
         texts = [b.text for row in menu.main_menu_buttons() for b in row]
         self.assertIn("📋 白名单", texts)
-        self.assertIn("📡 监听", texts)
+        self.assertIn("📡 标签监听", texts)
 
     def test_listen_view_buttons_registered(self):
         from tg_userbot import listener
@@ -704,7 +708,7 @@ class FindMenuEntryTest(unittest.TestCase):
     def test_main_menu_has_find_entry(self):
         rows = menu.main_menu_buttons()
         texts = [b.text for row in rows for b in row]
-        self.assertTrue(any("查询" in t for t in texts))
+        self.assertTrue(any("找文件" in t for t in texts))
         actions = [menu.parse_menu_data(b.data)[0]
                    for row in rows for b in row]
         self.assertIn("find", actions)
@@ -715,6 +719,7 @@ class CaptionFilterMenuTest(unittest.TestCase):
 
     def test_main_menu_has_caption_filter_entry(self):
         rows = menu.main_menu_buttons()
+        rows += menu.settings_menu_buttons()
         texts = [b.text for row in rows for b in row]
         actions = [menu.parse_menu_data(b.data)[0] for row in rows for b in row]
         self.assertTrue(any("Caption" in t for t in texts), texts)
@@ -953,6 +958,8 @@ class SqlTemplateMenuTest(unittest.TestCase):
     def test_main_menu_has_sqlt_entry(self):
         rows = menu.main_menu_buttons()
         labels = [b.text for row in rows for b in row]
+        labels += [b.text for row in menu.settings_menu_buttons()
+                   for b in row]
         self.assertTrue(any("SQL模板" in t for t in labels))
 
     def test_template_view_buttons(self):
@@ -989,8 +996,10 @@ class ShUpMainMenuTest(unittest.TestCase):
         labels = [(b.text, b.data)
                   for row in menu.main_menu_buttons() for b in row]
         texts = [t for t, _ in labels]
-        # 两个入口已合并为一个「🖥 命令行/上传」（tools 子视图内保留 sh/up）
-        self.assertTrue(any("命令行" in t for t in texts))
+        # 入口归位 🛠 高级工具（tools 子视图内保留 sh/up）
+        texts += [b.text for row in menu.settings_menu_buttons()
+                  for b in row]
+        self.assertTrue(any("高级工具" in t for t in texts))
         actions = {menu.parse_menu_data(d)[0] for _, d in labels}
         self.assertIn("tools", actions)
         self.assertNotIn("sh", actions)
@@ -1201,35 +1210,20 @@ def _make_file(name, content=b"x", mtime=None):
 
 
 class MainMenuLayoutTest(unittest.TestCase):
-    """主菜单按使用频率分组（2026-09-17 用户要求：看起来乱 → 分区重排）。
-
-    布局契约：
-      第 1 区「监控」：状态/进度/台账/记录 —— 看数据，最常用
-      第 2 区「下载管理」：队列/待重试/并发 —— 管任务
-      第 3 区「来源与工具」：白名单/标签监听/查询/去重/Cookie/Caption
-      第 4 区「子系统」：Pawchive/CD2/Chrome/命令行
-    每区一行一个主题、成对排布，整屏 ≤10 行。
+    """主菜单两级布局（2026-09-27 UX3 任务书 六）：一级 5 行按用户任务
+    模型分组；低频入口收进 📥 下载中心 / ⚙️ 设置 子面板（动作不删）。
     """
 
     def setUp(self):
         self.rows = menu.main_menu_buttons()
         self.texts = [[b.text for b in row] for row in self.rows]
 
-    def _row_texts(self, i):
-        return self.texts[i] if i < len(self.texts) else []
-
-    def test_monitor_row_first(self):
-        """第 1 行 = 状态 + 台账（看数据最频繁的两个）。"""
-        self.assertIn("📊 状态", self._row_texts(0))
-        self.assertIn("📊 台账", self._row_texts(0))
-
-    def test_zone_rows(self):
-        flat = [t for row in self.texts for t in row]
-        for label in ("📈 进度", "📜 记录", "📥 队列", "🔁 待重试",
-                      "🧵 并发", "📋 白名单", "📡 监听", "🔍 查询",
-                      "🛡 去重", "🐾 Pawchive", "☁️ CD2", "🖥 命令行",
-                      "🌐 Chrome", "🍪 Cookie", "🧹 Caption"):
-            self.assertIn(label, flat, f"缺按钮 {label}")
+    def test_five_task_model_rows(self):
+        self.assertEqual(self.texts[0], ["📊 总览", "📈 实时进度"])
+        self.assertEqual(self.texts[1], ["📥 下载中心", "🔍 找文件"])
+        self.assertEqual(self.texts[2], ["🐾 Pawchive", "📡 标签监听"])
+        self.assertEqual(self.texts[3], ["🌐 Chrome", "📋 白名单"])
+        self.assertEqual(self.texts[4], ["⚙️ 设置", "🛠 高级工具"])
 
     def test_compact_within_ten_rows(self):
         self.assertLessEqual(len(self.rows), 10)
@@ -1237,6 +1231,42 @@ class MainMenuLayoutTest(unittest.TestCase):
     def test_no_duplicate_entries(self):
         flat = [t for row in self.texts for t in row]
         self.assertEqual(len(flat), len(set(flat)))
+
+    def test_old_entries_preserved_somewhere(self):
+        """旧一级入口全部仍有按钮可达（动作不删，只是归位）。"""
+        pools = [t for row in self.texts for t in row]
+        pools += [b.text for row in menu.tools_menu_buttons([]) for b in row]
+        pools += [b.text for row in menu.settings_menu_buttons()
+                  for b in row]
+        for label in ("📊 台账", "📜 记录", "☁️ CD2", "📐 SQL模板"):
+            self.assertIn(label, pools, f"{label} 在新布局中丢失")
+
+
+class DownloadsCenterTest(unittest.IsolatedAsyncioTestCase):
+    """📥 下载中心子面板（任务书 七）+ 导航链路（任务书 Test 8）。"""
+
+    def test_text_counts(self):
+        saved = state.ACTIVE_DOWNLOADS
+        state.ACTIVE_DOWNLOADS = {}
+        try:
+            t = menu.downloads_menu_text()
+        finally:
+            state.ACTIVE_DOWNLOADS = saved
+        for key in ("进行中", "待处理", "失败重试", "今日完成"):
+            self.assertIn(key, t)
+
+    async def test_navigation_flow(self):
+        for action, marker in (("downloads", "下载中心"),
+                               ("settings", "设置")):
+            reply, buttons = await bot.handle_menu_action(
+                action, None, mock.MagicMock())
+            self.assertIn(marker, reply)
+            self.assertTrue(buttons)
+            home_reply, home_buttons = await bot.handle_menu_action(
+                "home", None, mock.MagicMock())
+            self.assertIn("🤖菜单", home_reply)
+            self.assertTrue(any(
+                b.text == "📥 下载中心" for row in home_buttons for b in row))
 
 
 class InputCancelTest(unittest.IsolatedAsyncioTestCase):

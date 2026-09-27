@@ -287,6 +287,10 @@ async def handle_menu_action(action, arg, event):
         _clear_input_states()
         listener.draft_cancel()
         return menu.build_main_menu_text(), menu.main_menu_buttons()
+    if action == "downloads":
+        return (menu.downloads_menu_text(), menu.downloads_menu_buttons())
+    if action == "settings":
+        return (menu.settings_menu_text(), menu.settings_menu_buttons())
     if action == "status":
         return text_mod.status_text(), menu.back_home_buttons()
     if action == "progress":
