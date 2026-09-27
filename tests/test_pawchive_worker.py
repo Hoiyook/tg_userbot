@@ -141,7 +141,8 @@ class PrecheckTest(_WorkerDbTestCase):
         self.assertEqual(
             runtime_db.get_pawchive_post(post["id"])["status"],
             runtime_db.PAW_POST_COMPLETED)
-        self.assertEqual(len(self._notifies), 1)
+        # 基座默认关帖子通知（NotifyOnProcessTest 正向覆盖开关行为）
+        self.assertEqual(self._notifies, [])
         self.assertEqual([f["url"] for _, f in self._downloads],
                          ["https://x/alive.mp4"])
 
