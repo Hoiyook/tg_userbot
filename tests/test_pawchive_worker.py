@@ -136,10 +136,11 @@ class PrecheckTest(_WorkerDbTestCase):
         self.assertIn("站点缺文件", rows["https://x/dead.jpg"]["error"])
         self.assertEqual(rows["https://x/alive.mp4"]["status"],
                          runtime_db.PAW_FILE_DONE)
-        # 死链+活链混合 → 帖子 FAILED 且通知
+        # 死链+活链混合：死链文件保留 FAILED 行（不进下载器），活链下载；
+        # 帖子按 2026-09-26 决策「404 不计入失败」→ COMPLETED
         self.assertEqual(
             runtime_db.get_pawchive_post(post["id"])["status"],
-            runtime_db.PAW_POST_FAILED)
+            runtime_db.PAW_POST_COMPLETED)
         self.assertEqual(len(self._notifies), 1)
         self.assertEqual([f["url"] for _, f in self._downloads],
                          ["https://x/alive.mp4"])
