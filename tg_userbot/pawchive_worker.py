@@ -450,13 +450,34 @@ async def _finalize(post, files):
     label = f"{post['creator_name']} #{post['id']}"
     title = (post.get("title") or "")[:50]
     if failed:
-        # 全部文件都是站点死链（一个都没下成）→ 不可行动（重试也一样 404），
-        # 只落库不刷屏；只要还有下载成功的内容就通知，让用户知道丢了哪些
-        all_missing = (
-            not any(f["status"] == runtime_db.PAW_FILE_DONE for f in files)
-            and all((f.get("error") or "").startswith(_MISSING_MARK)
-                    for f in failed))
-        if all_missing:
+        # 2026-09-26 用户决策：**404 死链不计入失败**——除死链外全部完成
+        # 的帖子直接 COMPLETED（死链附件从未存在于站点，不影响内容完整性）。
+        # 仅剩死链、一个可用文件都没有的帖（纯死链）仍标 FAILED，走
+        # /paw_archive 归档——标「完成」但零内容会误导。
+        non_dead_failed = [f for f in failed
+                           if not (f.get("error") or "").startswith(_MISSING_MARK)]
+        if not non_dead_failed:
+            done_n = sum(1 for f in files
+                         if f["status"] == runtime_db.PAW_FILE_DONE)
+            if done_n:
+                err = (f"✅ 除 {len(failed)} 个站点死链附件外全部完成"
+                       f"（{_MISSING_MARK}）")
+                runtime_db.finalize_pawchive_post(
+                    post["id"], runtime_db.PAW_POST_COMPLETED, error=err)
+                logger.info(
+                    f"🐾 帖子完成（含 {len(failed)} 个死链附件不计失败）："
+                    f"{label}｜{title}")
+                _bump_milestone("completed")
+                await _milestone_notify_if_due()
+                return
+            err = (f"{len(failed)}/{len(files)} 个文件是站点死链"
+                   f"（{_MISSING_MARK}）")
+            runtime_db.finalize_pawchive_post(
+                post["id"], runtime_db.PAW_POST_FAILED, error=err)
+            logger.warning(f"🐾 帖子全部为站点死链，标失败：{label}｜{title}")
+            _bump_milestone("failed")
+            await _milestone_notify_if_due()
+            return
             err = (f"{len(failed)}/{len(files)} 个文件是站点死链"
                    f"（{_MISSING_MARK}）")
             runtime_db.finalize_pawchive_post(

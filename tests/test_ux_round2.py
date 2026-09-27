@@ -2961,3 +2961,73 @@ class DoneAcceptsFailedTest(unittest.TestCase):
             str(runtime_db.find_pawchive_posts_by_post_id("p9")[0]["id"]))
         self.assertIn("PENDING", reply)     # 如实说明当前状态
         self.assertIn("还在处理中", reply)
+
+
+# ============================================================
+# 28) 404 不计入失败：除死链外全完成 → COMPLETED（2026-09-26 用户决策）
+# ============================================================
+class DeadNotCountedAsFailureTest(unittest.IsolatedAsyncioTestCase):
+    """_finalize 新判定：混合死链 + 全部非死链完成 → COMPLETED；
+    纯死链（零可用文件）仍 FAILED 走归档。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_dnc_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        self._sent = []
+        self._np = mock.patch.object(
+            pawchive_worker.notify, "notify_user",
+            mock.AsyncMock(side_effect=lambda t: self._sent.append(t)))
+        self._np.start()
+        self.addCleanup(self._np.stop)
+
+    def _seed(self, post_id, file_specs):
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "ABP_ART", [{
+                "post_id": post_id, "title": f"帖{post_id}",
+                "published": "2026-09-01T00:00:00",
+                "post_url": f"https://x/{post_id}",
+                "subdir": f"Pawchive/A/{post_id}",
+                "files": [{"url": f"https://f/{i}.png", "filename": f"{i}.png"}
+                          for i in range(len(file_specs))],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        for f, spec in zip(runtime_db.list_pawchive_files(post["id"]),
+                           file_specs):
+            if spec == "done":
+                runtime_db.mark_pawchive_file_done(f["id"], size_bytes=10)
+                f["status"] = runtime_db.PAW_FILE_DONE
+            elif spec == "dead":
+                runtime_db.mark_pawchive_file_failed(
+                    f["id"], error=runtime_db.PAW_DEAD_LINK_MARK + " HTTP 404")
+                f["status"] = runtime_db.PAW_FILE_FAILED
+                f["error"] = runtime_db.PAW_DEAD_LINK_MARK
+            else:
+                runtime_db.mark_pawchive_file_failed(f["id"], error=spec)
+                f["status"] = runtime_db.PAW_FILE_FAILED
+                f["error"] = spec
+        return post
+
+    async def test_mixed_dead_plus_all_done_is_completed(self):
+        post = self._seed("p1", ["done", "dead"])
+        await pawchive_worker._finalize(post, files=files_of(post["id"]))
+        self.assertEqual(status_of(post["id"]), "COMPLETED")
+
+    async def test_pure_dead_still_failed(self):
+        post = self._seed("p2", ["dead", "dead"])
+        await pawchive_worker._finalize(post, files=files_of(post["id"]))
+        self.assertEqual(status_of(post["id"]), "FAILED")
+
+
+def files_of(post_row):
+    return runtime_db.list_pawchive_files(post_row)
+
+
+def status_of(post_row):
+    return runtime_db.get_pawchive_post_row(post_row)["status"]
