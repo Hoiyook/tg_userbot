@@ -1248,6 +1248,26 @@ async def find_reply(term):
     return "\n".join(sections)
 
 
+async def offline_reply(urls):
+    """/paw offline <磁力|ED2K|HTTP 链接（\n 分隔）>：丢给 CD2 离线下载到 115。"""
+    from . import cd2_api
+    urls = [u.strip() for u in str(urls or "").splitlines() if u.strip()]
+    if not urls:
+        return (f"{TEXT_PREFIX}\n用法：/paw offline <链接（可多行）>\n"
+                "支持磁力/ED2K/HTTP 直链，CD2 离线下载到 /115open/云下载")
+    joined = "\n".join(urls)
+    try:
+        ok, err = await asyncio.to_thread(
+            cd2_api.add_offline_download, joined, "/115open/云下载")
+    except Exception as e:
+        return f"{TEXT_PREFIX}\n❌ 提交失败：{e}"
+    if ok:
+        logger.info(f"🐾 Pawchive 离线下载已提交 {len(urls)} 条")
+        return (f"{TEXT_PREFIX}\n✅ 已提交 {len(urls)} 条离线下载到 "
+                "/115open/云下载（CD2 面板可看进度）")
+    return f"{TEXT_PREFIX}\n❌ 提交失败：{err}"
+
+
 async def notify_user(text):
     """统一通知出口（bot 控制面板对话）。函数内导入避免 app↔本模块成环。"""
     from . import notify
@@ -1716,7 +1736,7 @@ def parse_paw_command(text):
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
                   "resume", "manual", "done", "archive", "att", "post",
                   "cookie", "csv", "find", "pr", "since", "fail",
-                  "progress", "backfill", "notify"):
+                  "progress", "backfill", "notify", "offline"):
         return (head_l, rest.strip() or None)
     return ("help", None)
 
@@ -1810,6 +1830,9 @@ async def command_reply(event, cmd_text):
     if action == "find":
         await event.reply(await find_reply(arg), link_preview=False)
         return
+    if action == "offline":
+        await event.reply(await offline_reply(arg), link_preview=False)
+        return
     await event.reply(_help_text(), link_preview=False)
 
 
@@ -1825,6 +1848,7 @@ def _help_text():
         "该日之后的帖）\n"
         "  /paw post <帖子URL|ID> —— 单独获取指定帖子的附件\n"
         "  /paw find <关键词> —— 按名称查扫描记录与当前目录文件\n"
+        "  /paw offline <链接> —— 磁力/直链丢给 CD2 离线到 115\n"
         "  /paw manual —— 待人工处理的帖子（含外链清单与 ✅ 按钮）\n"
         "  /paw manual export —— 全部待处理外链导出为工作清单\n"
         "  /paw att <URL|帖子ID|行id> —— 查帖子的附件与外链状态\n"

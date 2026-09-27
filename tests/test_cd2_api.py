@@ -128,5 +128,70 @@ class ReconcileTest(_ReconcileBase):
         self.assertEqual(r["too_new"], 1)
 
 
+class TasksAndOfflineTest(unittest.TestCase):
+    """上传任务摘要（排序/过滤完成项）与离线下载提交。"""
+
+    def _fake_upload_list(self, files):
+        class Resp:
+            uploadFiles = files
+        return Resp
+
+    def test_summary_filters_finished_and_sorts(self):
+        from google.protobuf import empty_pb2
+
+        def fake(status, pct_done, size):
+            f = mock.MagicMock()
+            f.status = status
+            f.size = size
+            f.transferedBytes = pct_done
+            f.key = f"/src/{status}_{pct_done}.mp4"
+            f.destPath = "/115open/Nekogram/x"
+            return f
+
+        files = [
+            fake("Finish", 100, 100),        # 完成项应被过滤
+            fake("Error", 0, 100),           # 失败排最前
+            fake("Transfer", 500, 1000),     # 进行中 50%
+        ]
+        stub = mock.MagicMock()
+        stub.GetUploadFileList.return_value = type("R", (), {"uploadFiles": files})()
+
+        with mock.patch.object(cd2_api, "_stub", return_value=(stub, "tk")), \
+                mock.patch.object(cd2_api, "_md", return_value=(stub, ()),):
+            # _md 返回 (stub, md)——这里 stub 复用即可
+            total, out = cd2_api.upload_files_summary()
+        self.assertEqual(total, 2)               # Finish 被过滤
+        self.assertEqual(out[0]["status"], "Error")
+        self.assertEqual(out[1]["pct"], 50)
+
+    def test_offline_download_ok(self):
+        from google.protobuf import wrappers_pb2
+        op = mock.MagicMock()
+        op.success = True
+        op.errorMessage = ""
+        stub = mock.MagicMock()
+        stub.AddOfflineFiles.return_value = op
+        with mock.patch.object(cd2_api, "_stub", return_value=(stub, "tk")), \
+                mock.patch.object(cd2_api, "_md", return_value=(stub, ())):
+            ok, err = cd2_api.add_offline_download("magnet:?xt=1")
+        self.assertTrue(ok)
+        # toFolder 应指向云下载目录
+        req = stub.AddOfflineFiles.call_args[0][0]
+        self.assertEqual(req.toFolder, "/115open/云下载")
+        self.assertIn("magnet:", req.urls)
+
+    def test_offline_download_error(self):
+        op = mock.MagicMock()
+        op.success = False
+        op.errorMessage = "链接无效"
+        stub = mock.MagicMock()
+        stub.AddOfflineFiles.return_value = op
+        with mock.patch.object(cd2_api, "_stub", return_value=(stub, "tk")), \
+                mock.patch.object(cd2_api, "_md", return_value=(stub, ())):
+            ok, err = cd2_api.add_offline_download("magnet:?x")
+        self.assertFalse(ok)
+        self.assertIn("链接无效", err)
+
+
 if __name__ == "__main__":
     unittest.main()

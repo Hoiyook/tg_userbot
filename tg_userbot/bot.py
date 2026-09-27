@@ -115,6 +115,7 @@ BOT_COMMANDS = (
     ("cmdt", "命令模板列表"),
     ("botclean", "bot 对话自动清理开关：/botclean on|off"),
     ("cd2check", "CloudDrive2 备份对账：本地媒体 vs 115 远端"),
+    ("cd2tasks", "CD2 上传任务：查看正在往 115 传输的文件"),
     ("cmdt_add", "保存命令模板：/cmdt_add 名字 命令"),
     ("cmdt_del", "删除命令模板：/cmdt_del 名字"),
     ("cmdt_run", "执行命令模板：/cmdt_run 名字"),

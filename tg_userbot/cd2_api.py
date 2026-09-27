@@ -21,6 +21,11 @@
 """
 import os
 
+# gRPC 的 C 核心会在 fork 出的子进程（/sh 子命令等）里打印初始化日志污染输出，
+# 并需要显式开启 fork 支持——必须在 import grpc 之前设置这两个环境变量
+os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+
 from . import config
 from .log import logger
 
@@ -208,6 +213,33 @@ def reconcile(limit=30, min_age_minutes=10):
             "remote_root": remote_root, "local_root": local_root}
 
 
+async def tasks_reply(limit=10):
+    """/cd2tasks：CD2 上传任务视图（在途/失败明细 + 任务计数）。"""
+    import asyncio
+    from .naming import format_size
+    try:
+        total, files = await asyncio.to_thread(upload_files_summary, limit)
+        counts = await asyncio.to_thread(tasks_count)
+    except RuntimeError as e:
+        return f"☁ CD2 上传任务\n❌ {e}"
+    lines = ["☁ CD2 上传任务"]
+    if counts:
+        lines.append(f"计数：⬇️下载 {counts['download']} | "
+                     f"⬆️上传 {counts['upload']} | 复制 {counts['copy']}")
+    if not files:
+        lines.append("（没有在途/失败的上传任务）")
+        return "\n".join(lines)
+    lines.append(f"在途/失败 {len(files)} 个（失败优先，按进度排序）：")
+    for f in files:
+        lines.append(f"  [{f['status']}] {f['pct']}% {f['name']}")
+        if "Error" in f["status"] or "Fatal" in f["status"]:
+            lines.append(f"     → {f['dest']}")
+    if total and total > len(files):
+        lines.append(f"  … 其余 {total - len(files)} 个略")
+    lines.append("完整列表看 CD2 网页（127.0.0.1:19799）")
+    return "\n".join(lines)
+
+
 async def reconcile_reply(limit=20):
     """/cd2check：对账 + 容量的人话报告（阻塞 gRPC 下放线程）。"""
     import asyncio
@@ -237,8 +269,84 @@ async def reconcile_reply(limit=20):
         total, used, free = sp
         lines.append(f"115 容量：已用 {format_size(used)} / {format_size(total)}"
                      f"（余 {format_size(free)}）")
+    counts = await asyncio.to_thread(tasks_count)
+    if counts and (counts["upload"] or counts["copy"]):
+        lines.append(f"CD2 任务：⬆️上传 {counts['upload']} | 复制 {counts['copy']}（/cd2tasks 看明细）")
     lines.append("说明：本地文件静置 ≥10 分钟才对账（刚完成的还在备份队列）")
     return "\n".join(lines)
+
+
+def restart_backup_walkthrough(source="/V1/downloads"):
+    """重启备份遍历（自愈：CD2 卡在扫描时让任务重新走一遍）。返回是否成功。"""
+    from google.protobuf import wrappers_pb2
+    stub, md = _md()
+    try:
+        stub.BackupRestartWalkingThrough(
+            wrappers_pb2.StringValue(value=source), metadata=md, timeout=20)
+        logger.info(f"_cd2 已重启备份遍历：{source}")
+        return True
+    except Exception as e:
+        logger.warning(f"_cd2 重启备份遍历失败：{e}")
+        return False
+
+
+def upload_files_summary(limit=10):
+    """上传任务摘要（正在进行/排队，含进度）。
+
+    返回 (total, [ {dest, name, pct, done, size, status} ])；失败 (None, [])。
+    """
+    from .cd2_proto import clouddrive_pb2 as pb
+    stub, md = _md()
+    try:
+        resp = stub.GetUploadFileList(
+            pb.GetUploadFileListRequest(getAll=True), metadata=md, timeout=30)
+    except Exception as e:
+        logger.warning(f"_cd2 上传列表查询失败：{e}")
+        return None, []
+    files = []
+    for f in resp.uploadFiles if hasattr(resp, "uploadFiles") else []:
+        if f.status in ("Finish", "Skipped", "Cancelled", "Ignored"):
+            continue   # 只看在途/失败
+        total = f.size or 0
+        done = f.transferedBytes or 0
+        pct = min(int(done * 100 / total), 100) if total else 0
+        files.append({
+            "dest": (f.destPath or "")[:80],
+            "name": (f.key or "").rsplit("/", 1)[-1][:60],
+            "pct": pct, "done": done, "size": total,
+            "status": f.status,
+        })
+    # 排序：失败/错误优先，其次进行中
+    # 失败优先展示，其次按进度倒序
+    files.sort(key=lambda x: (not ("Error" in x["status"]
+                                   or "Fatal" in x["status"]), -x["pct"]))
+    return len(files), files[:limit]
+
+
+def tasks_count():
+    """全任务计数（download/upload/copy）；失败 None。"""
+    from google.protobuf import empty_pb2
+    stub, md = _md()
+    try:
+        c = stub.GetAllTasksCount(empty_pb2.Empty(), metadata=md, timeout=20)
+        return {"download": c.downloadCount, "upload": c.uploadCount,
+                "copy": c.copyTaskCount}
+    except Exception as e:
+        logger.warning(f"_cd2 任务计数查询失败：{e}")
+        return None
+
+
+def add_offline_download(urls, to_folder="/115open/云下载"):
+    """离线下载：磁力/ED2K/HTTP 直链（\n 分隔）丢给 CD2 下到网盘目录。"""
+    from .cd2_proto import clouddrive_pb2 as pb
+    stub, md = _md()
+    try:
+        r = stub.AddOfflineFiles(
+            pb.AddOfflineFileRequest(urls=urls, toFolder=to_folder),
+            metadata=md, timeout=30)
+        return r.success, (r.errorMessage or "")[:120]
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 def space_text():

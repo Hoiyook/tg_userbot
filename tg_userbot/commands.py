@@ -839,7 +839,13 @@ async def handle_command(event, cmd_text):
         logger.info("执行命令：/usage")
         return True
 
-    if cmd_text == "/cd2check" or cmd_text.startswith("/cd2check "):
+    if cmd_text == "/cd2tasks" or cmd_text.startswith("/cd2tasks "):
+        from . import cd2_api
+        logger.info("执行命令：/cd2tasks")
+        await _reply(event, await cd2_api.tasks_reply())
+        return True
+
+    if cleanup.is_botclean_command(cmd_text):
         from . import cd2_api
         logger.info("执行命令：/cd2check")
         await _reply(event, await cd2_api.reconcile_reply())
