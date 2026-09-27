@@ -637,7 +637,7 @@ BOT_SESSION_NAME = SESSION_NAME + "_bot"
 # 菜单回调 action 全集（encode_menu_data 生成 m:<action>[:<arg>] 载荷）
 MENU_ACTIONS = (
     "home", "status", "progress", "done", "wl", "wl_add",
-    "wl_del", "thread", "clean", "back",
+    "wl_del", "wl_since", "thread", "clean", "back",
     "queue", "queue_del", "retry", "retry_run", "retry_del", "retry_all",
     "cd2", "cd2_stop", "bak", "stats",
     "cookie", "cookie_set", "cookie_clear", "cookie_imp",

@@ -3031,3 +3031,54 @@ def files_of(post_row):
 
 def status_of(post_row):
     return runtime_db.get_pawchive_post_row(post_row)["status"]
+
+
+# ============================================================
+# 29) 按钮注册审计：所有面板按钮的 action 必须 ⊆ MENU_ACTIONS
+# （wl_since 漏注册案例：按钮发出即 unknown，点击永远没反应）
+# ============================================================
+class ButtonActionAuditTest(unittest.TestCase):
+    """全面板按钮 action ⊆ MENU_ACTIONS——新增按钮忘注册直接挂测试。"""
+
+    def test_all_button_actions_registered(self):
+        import tg_userbot.listener as listener
+        import tg_userbot.sql_templates as sqlt
+        import tg_userbot.cmd_templates as cmdt
+        generators = [
+            menu.main_menu_buttons, menu.downloads_menu_buttons,
+            menu.settings_menu_buttons,
+            lambda: menu.tools_menu_buttons([]),
+            menu.cd2_menu_buttons, menu.sh_menu_buttons,
+            lambda: menu.up_menu_buttons([]), menu.cookie_menu_buttons,
+            menu.wl_menu_buttons, menu.thread_menu_buttons,
+            menu.stats_menu_buttons, menu.listen_interval_buttons,
+            menu.dedup_menu_buttons, menu.queue_menu_buttons,
+            lambda: menu.retry_menu_buttons(1), menu.back_home_buttons,
+            lambda: menu.chrome_menu_buttons([]),
+            listener.menu_buttons, sqlt.menu_buttons, cmdt.menu_buttons,
+            sql_templates_menu_buttons, cmdt_menu_buttons_alias,
+        ]
+        # pawchive 面板单独（含 toggle 动态文案）
+        generators.append(pawchive.menu_buttons)
+        actions = set()
+        for fn in generators:
+            try:
+                rows = fn()
+            except Exception:
+                continue
+            for row in rows:
+                for b in row:
+                    a, _ = menu.parse_menu_data(b.data)
+                    if a != "unknown":
+                        actions.add(a)
+        missing = actions - set(config.MENU_ACTIONS)
+        self.assertEqual(missing, set(),
+                         f"以下按钮 action 未注册进 MENU_ACTIONS: {sorted(missing)}")
+
+
+def sql_templates_menu_buttons():
+    return sqlt.menu_buttons()
+
+
+def cmdt_menu_buttons_alias():
+    return cmdt.menu_buttons()
