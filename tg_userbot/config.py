@@ -674,7 +674,7 @@ MENU_ACTIONS = (
     "mlink_paw_del", "paw_done_view",
     "input_cancel",
     "paw_retry_all",
-    "paw_post", "paw_find",
+    "paw_post", "paw_find", "paw_recover",
     "cmdt", "cmdt_add", "cmdt_run", "cmdt_del",
     # CD2 子菜单视图与「命令行/上传」合并工具箱视图
     "cd2_menu", "tools",

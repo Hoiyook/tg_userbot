@@ -1315,6 +1315,63 @@ def pawchive_known_post_ids(service, creator_id):
     return {r["post_id"] for r in rows}
 
 
+def list_pawchive_dead_thumbs(limit=300):
+    """死链文件分批清单（含帖子 subdir）：缩略图追回的数据源。
+
+    只取 FAILED + error 以站点缺文件开头的行，按 id 升序（处理顺序稳定）。
+    """
+    rows = _read(lambda c: _execute(
+        c,
+        "SELECT f.id, f.url, f.filename, f.post_row, p.subdir, p.status "
+        "AS post_status FROM pawchive_files f "
+        "JOIN pawchive_posts p ON p.id=f.post_row "
+        "WHERE f.status=? AND f.error LIKE ? ORDER BY f.id LIMIT ?",
+        (PAW_FILE_FAILED, PAW_DEAD_LINK_MARK + "%", int(limit))).fetchall(),
+        "列 Pawchive 死链文件（缩略图追回）")
+    return [dict(r) for r in rows]
+
+
+def complete_pawchive_post_if_all_done(post_row, now=None):
+    """帖内文件全部 DONE（缩略图追回后可能达成）且帖子非终态 → COMPLETED。
+
+    ARCHIVED/FAILED 的帖子全文件补齐后翻转，返回是否发生流转。
+    """
+    now = _now(now)
+
+    def do(conn):
+        row = _execute(
+            conn, "SELECT status FROM pawchive_posts WHERE id=?",
+            (int(post_row),)).fetchone()
+        if row is None or row["status"] not in (PAW_POST_FAILED,
+                                                PAW_POST_ARCHIVED):
+            return False
+        remaining = _execute(
+            conn,
+            "SELECT COUNT(*) FROM pawchive_files WHERE post_row=? AND "
+            "status != ?",
+            (int(post_row), PAW_FILE_DONE)).fetchone()[0]
+        if remaining:
+            return False
+        cur = _execute(
+            conn,
+            "UPDATE pawchive_posts SET status=?, completed_at=COALESCE("
+            "completed_at, ?), lease_until=NULL WHERE id=?",
+            (PAW_POST_COMPLETED, now, int(post_row)),
+        )
+        return bool(cur.rowcount)
+
+    return _write(do, "Pawchive 帖子补齐完成（缩略图追回）")
+
+
+def count_pawchive_dead_thumbs():
+    """死链文件总数（缩略图追回的待办量）。"""
+    row = _read(lambda c: _execute(
+        c, "SELECT COUNT(*) FROM pawchive_files WHERE status=? AND "
+           "error LIKE ?", (PAW_FILE_FAILED, PAW_DEAD_LINK_MARK + "%")
+    ).fetchone(), "统计 Pawchive 死链文件")
+    return int(row[0])
+
+
 def pawchive_status_counts():
     """各状态帖子计数（/paw status 视图）。"""
     rows = _read(lambda c: _execute(

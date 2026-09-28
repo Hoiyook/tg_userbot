@@ -248,7 +248,7 @@ def open_input_window(kind):
             time.monotonic() + config.LISTEN_INPUT_WINDOW_SECONDS
         )
     elif kind in ("paw_search", "paw_cookie", "paw_post", "paw_find",
-                  "paw_pr", "cmdt_add"):
+                  "paw_pr", "paw_recover", "cmdt_add"):
         if kind == "cmdt_add":
             # 「📜 命令模板」窗口：一条文本 = 「<名字> <命令>」（同名即覆盖）
             state.CMDT_INPUT_UNTIL = (
@@ -521,6 +521,16 @@ async def handle_menu_action(action, arg, event):
             f"{config.PAWCHIVE_INPUT_WINDOW_SECONDS} 秒内有效，"
             "发送 / 开头的命令可取消。",
             input_cancel_buttons(),
+        )
+    if action == "paw_recover":
+        open_input_window("paw_recover")
+        return (
+            "🖼 追回历史缩略图\n\n"
+            "发送 on 开始 / off 停止。\n"
+            "原理：死链文件的缩略图仍挂在站点缩略图服务器上（实测 ~100% 残留），"
+            "分批抓回落盘存档（低分辨率 jpeg 替代，非原图）。\n"
+            f"{config.PAWCHIVE_INPUT_WINDOW_SECONDS} 秒内有效。",
+            pawchive.menu_buttons(),
         )
     if action == "paw_pick":
         # 搜索结果按钮：arg 是序号，完整 creator 从 state 候选里取
@@ -1243,6 +1253,13 @@ async def _handle_paw_input(step, text):
     """Pawchive 输入窗口：search 当作者名、cookie 存密钥文件、post 入队单帖。"""
     if step == "post":
         msg = await pawchive.post_reply_text(text.strip())
+        await state.bot_client.send_message(state.MY_ID, msg, link_preview=False)
+        return
+    if step == "recover":
+        a = text.strip().lower()
+        msg = await pawchive.recoverthumbs_reply(
+            "on" if a in ("on", "开", "启动", "开始") else
+            ("off" if a in ("off", "关", "停止") else ""))
         await state.bot_client.send_message(state.MY_ID, msg, link_preview=False)
         return
     if step == "pr":

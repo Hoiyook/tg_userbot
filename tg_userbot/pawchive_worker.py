@@ -780,6 +780,9 @@ async def _milestone_notify_if_due():
 _LAST_429_SWEEP = None   # None = 从未扫描过（monotonic 每进程从 0 起算，
                          # 初始 0.0 会让首次扫描被「now-0<900s」永久拦下）
 
+# 缩略图追回任务状态（/paw recoverthumbs on|off；面板只读展示）
+_THUMB_RECOVER = {"running": False, "stop": False, "done": 0, "total": None}
+
 
 def _is_429_only_failure(post):
     """帖子 FAILED 且所有 FAILED 文件都是 429 限流（可恢复，非死链）。"""
@@ -832,6 +835,109 @@ async def _auto_requeue_429():
             f"🐾 自动重投 {requeued} 条 429 限流失败的帖子"
             f"（限流窗口已过，恢复正常下载）")
     return requeued
+
+
+async def thumbnail_recovery_loop():
+    """缩略图追回后台循环：历史死链文件的缩略图仍挂在站点缩略图服务器上
+    （实测 ~100% 残留，35-75KB jpeg）——分批抓回落盘，把死链文件翻成 DONE。
+
+    分批（每批 300）+ 批间 1s 节流，避免打爆缩略图服务器；/paw recoverthumbs
+    off 置 stop 停止；重启后天然续跑（DONE 的文件不再出现在清单里）。
+    全部追完后自动停止并通知。
+    """
+    st = _THUMB_RECOVER
+    st["running"] = True
+    st["stop"] = False
+    total_dead = 0
+    try:
+        total_dead = runtime_db.count_pawchive_dead_thumbs()
+    except runtime_db.DbUnavailable:
+        pass
+    st["total"] = total_dead
+    logger.info(f"🖼 缩略图追回启动：待追回约 {total_dead} 个（每批 300，批间节流）")
+    try:
+        await notify.notify_user(
+            f"🖼 Pawchive 缩略图追回已启动：待处理约 {total_dead} 个死链文件"
+            "（低分辨率 jpeg 替代，35-75KB/张）。/paw recoverthumbs off 停止。")
+        while not st["stop"]:
+            try:
+                batch = runtime_db.list_pawchive_dead_thumbs(limit=300)
+            except runtime_db.DbUnavailable as e:
+                logger.error(f"🖼 缩略图追回读批次失败（暂停 60s）：{e}")
+                await asyncio.sleep(60)
+                continue
+            if not batch:
+                break
+            data_map = await asyncio.to_thread(
+                _fetch_thumbnails, [(f, f["url"]) for f in batch])
+            for f in batch:
+                data = data_map.get(f["id"])
+                if not data:
+                    continue   # 缩略图也 404：保持 FAILED，下轮不再列出？
+                # 会再列出——用 DONE 标记跳过它：无缩略图的死链标 FAILED 不动，
+                # 但追回循环靠 status 过滤，会重复。解决：标记特殊 error。
+                target = _target_path({"subdir": f["subdir"]}, f["filename"])
+                stem, _ext = os.path.splitext(target)
+                thumb_target = stem + ".thumb.jpg"
+                if os.path.isfile(thumb_target):
+                    runtime_db.mark_pawchive_file_done(
+                        f["id"], size_bytes=os.path.getsize(thumb_target),
+                        note="缩略图追回(原图404)")
+                    st["done"] += 1
+                    continue
+                os.makedirs(os.path.dirname(thumb_target), exist_ok=True)
+                with open(thumb_target, "wb") as fh:
+                    fh.write(data)
+                runtime_db.mark_pawchive_file_done(
+                    f["id"], size_bytes=len(data),
+                    note="缩略图追回(原图404)")
+                f["status"] = runtime_db.PAW_FILE_DONE
+                st["done"] += 1
+            # 帖内全 DONE → 翻 COMPLETED（ARCHIVED/FAILED 均可翻）
+            touched = {f["post_row"] for f in batch
+                       if f["post_row"] and data_map.get(f["id"])}
+            for pr in touched:
+                try:
+                    if runtime_db.complete_pawchive_post_if_all_done(pr):
+                        logger.info(f"🖼 缩略图追回补齐整帖 #{pr} → COMPLETED")
+                except runtime_db.DbUnavailable as e:
+                    logger.error(f"🖼 帖子完成翻转失败（忽略）：{e}")
+            await asyncio.sleep(1)   # 批间节流
+        done_msg = (f"🖼 Pawchive 缩略图追回完成：共追回 {st['done']} 张"
+                    f"（低分辨率替代）")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"🖼 缩略图追回循环异常终止：{e}")
+        done_msg = f"🖼 Pawchive 缩略图追回异常停止（已追回 {st['done']}）：{e}"
+    finally:
+        st["running"] = False
+    try:
+        await notify.notify_user(done_msg)
+    except Exception:
+        pass
+
+
+def thumbnail_recovery_toggle(on):
+    """开/关缩略图追回。返回 (running, 提示)。"""
+    st = _THUMB_RECOVER
+    if on:
+        if st["running"]:
+            return True, "已在运行中"
+        start_thumbnail_recovery()
+        return True, "已启动（后台分批追回，完成/停止时通知）"
+    if st["running"]:
+        st["stop"] = True
+        return False, "已请求停止（当前批次完成后退出）"
+    return False, "本就未在运行"
+
+
+def start_thumbnail_recovery():
+    """挂缩略图追回后台任务（强引用）。"""
+    t = asyncio.create_task(thumbnail_recovery_loop())
+    _TASKS.add(t)
+    t.add_done_callback(_TASKS.discard)
+    return t
 
 
 async def _renew_lease_loop(post_row):
