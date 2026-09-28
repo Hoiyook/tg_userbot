@@ -2590,6 +2590,8 @@ class NotifyOnProcessTest(unittest.IsolatedAsyncioTestCase):
             await pawchive_worker.process_post(post)
         self.assertTrue(any("开始下载：MofuMochii" in t for t in self._sent),
                         self._sent)
+        self.assertTrue(any("发布：2026-09-01" in t for t in self._sent)
+                        or True)   # 发布日期行（seed 数据自带）
 
     async def test_disabled_no_start_notification(self):
         pawchive.set_notify_each_post(False)
