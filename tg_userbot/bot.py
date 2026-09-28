@@ -399,6 +399,9 @@ async def handle_menu_action(action, arg, event):
         return (f"{pawchive.TEXT_PREFIX}\n{mark} Cookie 校验：{detail}{hint}",
                 pawchive.menu_buttons())
     if action == "paw_pr":
+        # 带行 id（开始下载通知的 📋 按钮）→ 直接出报告，不再问引用
+        if arg and arg.isdigit():
+            return (pawchive.post_report_text(arg), input_cancel_buttons())
         # 📋 帖子报告（/paw pr 的面板入口）：下一条文本 = 帖子引用
         open_input_window("paw_pr")
         return (
