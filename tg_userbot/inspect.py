@@ -121,13 +121,21 @@ def run_inspection():
     lines.append(f"进程：{proc_line}")
     lines.append(f"磁盘：{disk_line}")
 
+    con = None
     try:
-        sec = _section_counters(_open_read_conn())
+        con = _open_read_conn()
+        sec = _section_counters(con)
     except runtime_db.DbUnavailable:
         sec = None
     except Exception as e:
         logger.warning(f"巡检子系统计数失败：{e}")
         sec = None
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
 
     if sec:
         q = sec["queue"]

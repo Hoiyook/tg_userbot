@@ -167,7 +167,7 @@ class SubdirLabelSplitTest(unittest.TestCase):
         """目录名里的非法字符清洗掉（/ 作分隔符保留，其余非法字符清）。"""
         label, sub = app.split_label_subdir("/A:B#tag")
         self.assertEqual(label, "tag")
-        self.assertEqual(sub, "AB".replace("AB", "AB") if False else
+        self.assertEqual(sub,
                          app.sanitize_dirname("A:B"))
         self.assertNotIn(":", sub)
 

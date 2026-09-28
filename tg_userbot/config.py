@@ -395,6 +395,12 @@ PAWCHIVE_429_AUTO_RETRY_MAX_ATTEMPTS = 5
 # 附件压缩包自动解压（2026-09-28 用户要求）：Pawchive 下载完成的 .zip/.rar
 # 若无需密码则串行解压到同名文件夹，成功后删除压缩包；需密码/失败则原样保留。
 # 串行 = 全局一次只解一个（避免多帖并发解压打爆磁盘）；CD2 会把解压产物一并备份
+# ZIP 安全限制（P1-7，2026-09-28）：文件数/单文件/压缩比，防 zip 炸弹。
+# 取值宽裕：正常设计资源包不会触达
+PAWCHIVE_ZIP_MAX_ENTRIES = 20000
+PAWCHIVE_ZIP_MAX_MEMBER_BYTES = 8 * 1024 ** 3
+PAWCHIVE_ZIP_MAX_RATIO = 200
+
 PAWCHIVE_EXTRACT_ARCHIVES = True
 PAWCHIVE_EXTRACT_TIMEOUT_SECONDS = 3600
 PAWCHIVE_MILESTONE_POSTS = 50

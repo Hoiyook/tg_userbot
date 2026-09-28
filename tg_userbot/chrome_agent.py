@@ -167,34 +167,64 @@ def get_task_download_dir(root_dir, task):
 # 任务持久化（chrome_tasks.json，Agent 独占写；规格 24/25）
 # ------------------------------------------------------------
 
-def load_tasks(path):
-    """读任务列表；缺失/损坏/形状不对一律回空列表（任务事实以文件为准，
-    坏文件宁可从空开始也不能带崩 Agent）。"""
+def _load_tasks_file(path):
+    """读单个文件 → tasks 列表；**缺失或损坏一律返回 None**（调用方凭此
+    判断是否需要 bak 恢复）；有效但空返回 []。"""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
-        return []
+        return None
     except Exception as e:
-        logger.warning(f"读取 Chrome 任务文件失败，从空开始：{e}")
-        return []
+        logger.warning(f"Chrome 任务文件损坏（{path}）：{e}")
+        return None
     if not isinstance(data, dict):
-        return []
+        return None
     tasks = data.get("tasks") or []
-    if not isinstance(tasks, list):
-        return []
-    return [t for t in tasks if isinstance(t, dict) and t.get("task_id")]
+    return tasks if isinstance(tasks, list) else []
+
+
+def load_tasks(path):
+    """读任务列表，primary 损坏时自动从 .bak 恢复（P1-3，2026-09-28）。
+
+    语义：
+    - primary 正常 → 用 primary；
+    - primary 缺失/损坏 + .bak 正常 → 用 .bak 并立即回写 primary（自愈）；
+    - 两者都不可读 → 高声报错并返回 []，**保留现场**（save 前人工可恢复），
+      绝不静默当空列表后被覆盖。"""
+    tasks = _load_tasks_file(path)
+    if tasks is not None:
+        return [t for t in tasks if isinstance(t, dict) and t.get("task_id")]
+    # primary 缺失或损坏 → .bak 恢复
+    bak = path + ".bak"
+    tasks_bak = _load_tasks_file(bak)
+    if tasks_bak is not None:
+        logger.error(
+            f"Chrome 任务文件 {path} 缺失/损坏，已从 {bak} 恢复 "
+            f"{len(tasks_bak)} 条任务")
+        save_tasks(tasks_bak, path)
+        return tasks_bak
+    logger.error(f"Chrome 任务文件与备份均不可读：{path}——保留现场")
+    return []
 
 
 def save_tasks(tasks, path):
-    """原子写任务列表（temp + os.replace；失败仅告警）。"""
-    try:
-        temp_path = path + ".tmp"
+    """原子写任务列表 + 同步刷新 .bak 备份。
+
+    失败**上抛**（P1-4，2026-09-28）：调用方（create/retry/cancel/complete
+    等关键状态变更）必须感知落盘失败，绝不静默假成功。.bak 刷新失败只
+    告警（主文件已成功）。"""
+    def _write(target):
+        temp_path = target + ".tmp"
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump({"tasks": tasks}, f, ensure_ascii=False, indent=2)
-        os.replace(temp_path, path)
+        os.replace(temp_path, target)
+
+    _write(path)
+    try:
+        _write(path + ".bak")
     except Exception as e:
-        logger.warning(f"保存 Chrome 任务文件失败：{e}")
+        logger.warning(f"Chrome 任务 .bak 刷新失败（主文件已写成功）：{e}")
 
 
 def get_task(tasks, task_id):

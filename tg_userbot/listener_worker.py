@@ -311,8 +311,31 @@ async def execute_task(task):
             # P0-2：转发成功后先落持久化事实（FORWARDED + 副本 id），再入队
             # 下载。此前「转发成功、入队失败 → 任务照标 SUCCESS」会让副本永远
             # 没人下载；现在停在 FORWARDED 的任务由对账器补建入队，不重转发。
-            _safe(lambda: runtime_db.mark_listener_forwarded(
-                task_id, [c.id for c in copies]))
+            # 2026-09-28 加固：FORWARDED 事实**落库失败**时不得继续 enqueue
+            # ——否则 Telegram 已转发而 DB 无记录，任务保持 PROCESSING，
+            # 恢复后会再次转发产生重复消息。落库失败 → 提前返回，任务留在
+            # PROCESSING 由租约回收（lease 过期后重回 PENDING，对账器接管）。
+            persisted = False
+            for attempt in range(3):   # DbUnavailable 多为瞬时，先尽力重写
+                try:
+                    runtime_db.mark_listener_forwarded(
+                        task_id, [c.id for c in copies])
+                    persisted = True
+                    break
+                except Exception as e:
+                    import asyncio as _a
+                    logger.error(
+                        f"📡 任务 #{task_id} FORWARDED 落库失败"
+                        f"（{attempt + 1}/3）：{e}")
+                    await _a.sleep(1.5)
+            if not persisted:
+                # 不得继续 enqueue：Telegram 已转发而 DB 无 FORWARDED 记录，
+                # 继续走会让租约回收后再次转发 → 重复消息。保持 PROCESSING
+                # 等租约回收由对账器接管（宁可补建入队，不重复转发）。
+                logger.error(
+                    f"📡 任务 #{task_id} FORWARDED 三次落库均失败——"
+                    "不入队下载，保持 PROCESSING 待对账器接管")
+                return False
             failed = await _enqueue_download_copies(task, messages, copies)
             if failed:
                 delay = int(config.LISTEN_ENQUEUE_RETRY_DELAY_SECONDS)

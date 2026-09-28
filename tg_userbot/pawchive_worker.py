@@ -297,10 +297,31 @@ def _extract_archive_sync(archive_path):
                 if any(zi.flag_bits & 0x1 for zi in infos):
                     return "password", "zip 成员加密"
                 total_unc = sum(zi.file_size for zi in infos)
+                total_comp = sum(zi.compress_size for zi in infos)
+                if len(infos) > config.PAWCHIVE_ZIP_MAX_ENTRIES:
+                    return ("failed",
+                            f"zip 成员数 {len(infos)} 超限"
+                            f"（>{config.PAWCHIVE_ZIP_MAX_ENTRIES}，疑似炸弹）")
+                biggest = max((zi.file_size for zi in infos), default=0)
+                if biggest > config.PAWCHIVE_ZIP_MAX_MEMBER_BYTES:
+                    return ("failed",
+                            f"zip 单成员 {biggest/1e9:.1f}GB 超限"
+                            f"（>{config.PAWCHIVE_ZIP_MAX_MEMBER_BYTES/1e9:.0f}GB）")
+                if total_comp and total_unc / total_comp > \
+                        config.PAWCHIVE_ZIP_MAX_RATIO:
+                    return ("failed",
+                            f"压缩比 {total_unc // max(total_comp,1)}x 超限"
+                            f"（>{config.PAWCHIVE_ZIP_MAX_RATIO}x，疑似炸弹）")
                 if total_unc and total_unc > free - margin:
                     return ("no-space",
                             f"解压需 {total_unc/1e9:.1f}GB 超出磁盘余量")
-                z.extractall(dest)
+                # P1-8：staging 目录解压，成功后整体改名——失败留下的
+                # 半成品不会混进正式目录
+                staging = dest + ".extracting"
+                if os.path.isdir(staging):
+                    shutil.rmtree(staging, ignore_errors=True)
+                z.extractall(staging)
+                os.replace(staging, dest)
         except RuntimeError as e:
             # stdlib 读到加密成员时的典型异常
             return "password", str(e)[:120]
@@ -344,15 +365,29 @@ def _extract_archive_sync(archive_path):
 
 
 async def _extract_archive_serial(archive_path):
-    """串行解压入口（持全局锁 + 线程下放 + 超时保护）。"""
+    """串行解压入口（持全局锁 + 线程下放 + 超时保护）。
+
+    P1-6 语义修正（2026-09-28）：wait_for 超时只取消 **等待**，to_thread
+    里的解压线程仍会继续跑——若此时释放 guard，下一个解压就会与它并发。
+    因此 guard 的释放以「线程真正结束」为准：超时后本协程继续在后台等
+    线程收尾（持有 guard），向调用方先返回超时结果。"""
     import asyncio as _a
     async with _extract_guard():
+        thread_task = asyncio.ensure_future(
+            asyncio.to_thread(_extract_archive_sync, archive_path))
+        timeout_at = float(config.PAWCHIVE_EXTRACT_TIMEOUT_SECONDS)
         try:
             return await _a.wait_for(
-                asyncio.to_thread(_extract_archive_sync, archive_path),
-                timeout=float(config.PAWCHIVE_EXTRACT_TIMEOUT_SECONDS))
+                _a.shield(thread_task), timeout=timeout_at)
         except _a.TimeoutError:
-            return "failed", f"解压超时（>{config.PAWCHIVE_EXTRACT_TIMEOUT_SECONDS}s）"
+            timeout_note = (f"解压超时（>{timeout_at:.0f}s，"
+                            "后台线程继续，串行锁保持至其结束）")
+            logger.warning(f"🗜 {timeout_note}")
+            result = await thread_task        # 等线程真正结束（持锁）
+            if result[0] == "extracted":
+                return ("extracted_timeout",
+                        f"超时后完成：{result[1]}")
+            return ("failed", timeout_note)
 
 
 def _thumb_url(file_url):
@@ -361,6 +396,10 @@ def _thumb_url(file_url):
     if i < 0:
         return None
     return "https://img.pawchive.pw/thumbnail" + file_url[i + len("/data"):].split("?")[0]
+
+
+# 缩略图大小上限：实测 35-75KB/张，2MB 已是数十倍余量
+_THUMB_MAX_BYTES = 2 * 1024 * 1024
 
 
 def _fetch_thumbnails(targets):
@@ -384,8 +423,26 @@ def _fetch_thumbnails(targets):
             req = urllib.request.Request(thumb)
             req.add_header("User-Agent", "Mozilla/5.0 tg-userbot-pawchive")
             with urllib.request.urlopen(req, timeout=30) as r:
-                if r.status == 200:
-                    return f["id"], r.read()
+                if r.status != 200:
+                    return
+                # P2-1 大小保护：Content-Length 超限直接拒；无 CL 流式读
+                # 累计超限同样拒（2026-09-28 远端异常防超大内容）
+                cl = r.headers.get("Content-Length")
+                if cl and int(cl) > _THUMB_MAX_BYTES:
+                    logger.warning(
+                        f"🖼 缩略图超大（{cl}B > {_THUMB_MAX_BYTES}B），拒绝")
+                    return
+                buf = b""
+                while True:
+                    chunk = r.read(64 * 1024)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if len(buf) > _THUMB_MAX_BYTES:
+                        logger.warning(
+                            f"🖼 缩略图超限（>{_THUMB_MAX_BYTES}B），拒绝")
+                        return
+                return f["id"], buf
         except Exception:
             return
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
@@ -599,10 +656,9 @@ async def _download_post_files(post, files):
                     target = _target_path(post, f["filename"])
                     try:
                         est, detail = await _extract_archive_serial(target)
-                        if est == "extracted":
+                        if est in ("extracted", "extracted_timeout"):
                             logger.info(
                                 f"🗜 解压完成：{f['filename']} → {detail}")
-                        elif est == "password":
                             logger.info(
                                 f"🗜 压缩包需密码，保留原样：{f['filename']}")
                         else:
@@ -701,7 +757,6 @@ async def _finalize(post, files):
         return
     runtime_db.finalize_pawchive_post(post["id"], runtime_db.PAW_POST_COMPLETED)
     logger.info(f"🐾 帖子完成：{label}｜{title}（{len(files)} 个文件）")
-    _bump_milestone("completed")
     # 完成通知（同一开关；批量扫描嫌吵就 /paw notify off）
     from . import pawchive   # 函数内导入避免环
     if pawchive.notify_each_post_enabled():
@@ -717,8 +772,6 @@ async def _finalize(post, files):
                 f"{_files_breakdown(files)} / {format_size(total)}\n"
                 f"落盘 {config.DOWNLOAD_DIR}/{post.get('subdir') or ''}"
                 + done_url)
-        except Exception as e:
-            logger.warning(f"完成通知发送失败（忽略）：{e}")
         except Exception as e:
             logger.warning(f"完成通知发送失败（忽略）：{e}")
     _bump_milestone("completed")

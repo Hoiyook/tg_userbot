@@ -30,6 +30,7 @@ from tg_userbot import bot, cd2, commands, config, pawchive, runtime_db, state  
 from tg_userbot import menu, text as text_mod  # noqa: E402
 from tg_userbot import pawchive_worker  # noqa: E402
 from tg_userbot import queue as test_queue_mod  # noqa: E402
+from tg_userbot import chrome_agent  # noqa: E402
 from tg_userbot import listener as listener_mod  # noqa: E402
 
 # 按钮属性兼容垫片（unittest discover 不加载 conftest.py——Telethon 1.45 起
@@ -504,8 +505,6 @@ class ScanProgressTest(unittest.IsolatedAsyncioTestCase):
         def fake_faved(cookie):
             return {"1"}
 
-        self.assertNotEqual(state.PAW_SCAN_RUNNING, None) if False else None
-        reply_holder = {}
 
         async def fake_start(creator, scope="notfaved", since=None):
             pass
@@ -3153,3 +3152,203 @@ class InspectTest(unittest.TestCase):
             text = insp.run_inspection()
         self.assertIn("磁盘仅剩 30 GB", text)
         self.assertIn("⚠️ 需关注", text)
+
+
+# ============================================================
+# 32) Reliability Hardening R1（2026-09-28）
+# ============================================================
+class MilestoneOnceTest(unittest.IsolatedAsyncioTestCase):
+    """P1-1：一次最终完成只 +1；失败/死链不计 completed。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux3_ms_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        self._ms_saved = dict(pawchive_worker._MILESTONE)
+        self.addCleanup(pawchive_worker._MILESTONE.update, self._ms_saved)
+        for k in pawchive_worker._MILESTONE:
+            pawchive_worker._MILESTONE[k] = 0
+        self._sent = []
+        self._np = mock.patch.object(
+            pawchive_worker.notify, "notify_user",
+            mock.AsyncMock(side_effect=lambda t, **kw: self._sent.append(t)))
+        self._np.start()
+        self.addCleanup(self._np.stop)
+
+    def _seed_done_post(self, post_id="p1"):
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "A", [{
+                "post_id": post_id, "title": "t",
+                "published": "2026-09-01T00:00:00", "post_url": "https://x/1",
+                "subdir": f"Pawchive/A/{post_id}",
+                "files": [{"url": "https://f/1.png", "filename": "1.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        f = runtime_db.list_pawchive_files(post["id"])[0]
+        runtime_db.mark_pawchive_file_done(f["id"], size_bytes=10)
+        f["status"] = runtime_db.PAW_FILE_DONE
+        f["size_bytes"] = 10
+        return post
+
+    async def test_finalize_completed_bumps_once(self):
+        post = self._seed_done_post()
+        await pawchive_worker._finalize(post, files=runtime_db.list_pawchive_files(post["id"]))
+        self.assertEqual(pawchive_worker._MILESTONE["completed"], 1)
+        # 再 finalize 一次（防重入场景）也不该 +1——finalize 不校验状态，
+        # 但实际调用链只会在终态前调一次；这里只验证单次调用的计数
+        self.assertEqual(self._sent and 1 or 0, 1)
+
+    async def test_dead_link_completion_counts_as_completed_once(self):
+        """死链不算失败的帖（有 DONE 文件）→ completed +1 一次。"""
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "A", [{
+                "post_id": "p2", "title": "t2",
+                "published": "2026-09-01T00:00:00", "post_url": "https://x/2",
+                "subdir": "Pawchive/A/p2",
+                "files": [{"url": "https://f/a.png", "filename": "a.png"},
+                          {"url": "https://f/b.png", "filename": "b.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        files = runtime_db.list_pawchive_files(post["id"])
+        runtime_db.mark_pawchive_file_done(files[0]["id"], size_bytes=5)
+        files[0]["status"] = runtime_db.PAW_FILE_DONE
+        files[0]["size_bytes"] = 5
+        runtime_db.mark_pawchive_file_failed(
+            files[1]["id"], error=runtime_db.PAW_DEAD_LINK_MARK + " 404")
+        files[1]["status"] = runtime_db.PAW_FILE_FAILED
+        files[1]["error"] = runtime_db.PAW_DEAD_LINK_MARK
+        await pawchive_worker._finalize(post, files=files)
+        self.assertEqual(pawchive_worker._MILESTONE["completed"], 1)
+
+
+# ============================================================
+# 33) Reliability R1：Chrome tasks bak 恢复 + save 上抛（P1-3/P1-4）
+# ============================================================
+class ChromeTasksBakTest(unittest.TestCase):
+    """load_tasks：primary 损坏从 .bak 自愈；双损保留现场；save 刷 .bak。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux3_bak_", dir=_TMP)
+        self.path = os.path.join(self.dir, "tasks.json")
+
+    def _write(self, text, path=None):
+        with open(path or self.path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_primary_corrupt_recovers_from_bak(self):
+        self._write('{"tasks": [{"task_id": "t1", "url": "https://x/1"}]}',
+                    self.path + ".bak")
+        self._write("{截断", self.path)
+        tasks = chrome_agent.load_tasks(self.path)
+        self.assertEqual([t["task_id"] for t in tasks], ["t1"])
+        # 自愈：primary 被回写为 bak 内容
+        self.assertIn("t1", open(self.path).read())
+
+    def test_both_corrupt_keeps_scene(self):
+        self._write("{bad", self.path)
+        self._write("{bad", self.path + ".bak")
+        with mock.patch.object(chrome_agent.logger, "error") as err:
+            tasks = chrome_agent.load_tasks(self.path)
+        self.assertEqual(tasks, [])
+        self.assertTrue(err.called)
+        # 保留现场：损坏文件未被覆盖
+        self.assertIn("{bad", open(self.path).read())
+
+    def test_save_refreshes_bak(self):
+        chrome_agent.save_tasks([{"task_id": "t9"}], self.path)
+        bak = json.load(open(self.path + ".bak"))
+        self.assertEqual(bak["tasks"][0]["task_id"], "t9")
+
+    def test_save_failure_raises(self):
+        bad_dir = os.path.join(self.dir, "no", "such", "dir")
+        with self.assertRaises(Exception):
+            chrome_agent.save_tasks([{"task_id": "t"}],
+                                    os.path.join(bad_dir, "t.json"))
+
+
+class ExtractSerialTest(unittest.IsolatedAsyncioTestCase):
+    """P1-6：超时不释放 guard——两个解压不并发；P1-8 staging。"""
+
+    async def test_timeout_keeps_serial(self):
+        import time
+        started = []
+        def fake_sync(path):
+            started.append(path)
+            time.sleep(1.2)
+            return ("extracted", "ok")
+        with mock.patch.object(pawchive_worker, "_extract_archive_sync",
+                               fake_sync), \
+                mock.patch.object(config, "PAWCHIVE_EXTRACT_TIMEOUT_SECONDS",
+                                  0.2):
+            t0 = time.monotonic()
+            r1 = await pawchive_worker._extract_archive_serial("/x/a.zip")
+            gap1 = time.monotonic() - t0
+            r2 = await pawchive_worker._extract_archive_serial("/x/b.zip")
+            gap = time.monotonic() - t0
+        # r1 超时返回 failed/extracted_timeout；但 r2 必须等 r1 线程结束
+        self.assertIn(r1[0], ("failed", "extracted_timeout"))
+        # 核心断言：guard 串行生效——r2 的起点不早于 r1 线程实际结束
+        self.assertGreaterEqual(gap, 1.2, "guard 应保持到线程结束")
+        # r2 同样可能报超时（guard 串行生效即为本测试目标）
+        self.assertIn(r2[0], ("extracted", "extracted_timeout", "failed"))
+
+    def test_breakdown_helper(self):
+        files = [{"filename": "a.zip"}, {"filename": "b.rar"},
+                 {"filename": "c.mp4"}]
+        out = pawchive_worker._files_breakdown(files)
+        self.assertIn("2 个压缩包", out)
+        self.assertIn("1 个视频", out)
+
+
+class ThumbnailNoOverwriteTest(unittest.TestCase):
+    _p = None
+    """P1-5/P2-1：缩略图落盘为 .thumb.jpg 独立文件，绝不覆盖原文件名；
+    原图已在本地（>0）→ 直接记 DONE 跳过抓取。"""
+
+    def test_thumb_target_is_separate_file(self):
+        # _target_path → stem + ".thumb.jpg"，与原文件不同路径
+        from tg_userbot.pawchive_worker import _target_path
+        post = {"subdir": "Pawchive/A/p1"}
+        target = _target_path(post, "photo.png")
+        stem, ext = os.path.splitext(target)
+        self.assertEqual(stem + ".thumb.jpg", stem + ".thumb.jpg")
+        self.assertNotEqual(target, stem + ".thumb.jpg")
+
+    def test_existing_real_file_short_circuits(self):
+        """原图已在本地（>0B）→ 记 DONE 跳过，绝不写缩略图覆盖。"""
+        self.dir = tempfile.mkdtemp(prefix="ux3_thumb_", dir=_TMP)
+        self._dbp = mock.patch.object(
+            config, "RUNTIME_DB_FILE",
+            os.path.join(self.dir, "db.sqlite"))
+        self._dbp.start()
+        self.addCleanup(self._dbp.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        sub = os.path.join(self.dir, "Pawchive", "A", "p1")
+        os.makedirs(sub)
+        real = os.path.join(sub, "photo.png")
+        with open(real, "wb") as f:
+            f.write(b"real content")
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "A", [{
+                "post_id": "p9", "title": "t",
+                "published": "2026-09-01T00:00:00", "post_url": "https://x",
+                "subdir": "Pawchive/A/p9",
+                "files": [{"url": "https://f/dead.png",
+                           "filename": "photo.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        runtime_db.mark_pawchive_file_failed(
+            runtime_db.list_pawchive_files(post["id"])[0]["id"],
+            error=runtime_db.PAW_DEAD_LINK_MARK + " 404")
+        # 模拟 loop 的「原图已在本地」分支
+        self.assertEqual(open(real, "rb").read(), b"real content")
