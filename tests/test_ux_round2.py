@@ -35,6 +35,8 @@ from tg_userbot import listener as listener_mod  # noqa: E402
 
 # 按钮属性兼容垫片（unittest discover 不加载 conftest.py——Telethon 1.45 起
 # 回调数据挪进 .type.data，这里补回顶层 .data/.url 让既有断言保持原样）
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import conftest as _btn_shim  # noqa: F401
 
 
@@ -3397,3 +3399,65 @@ class TorrentDocumentTest(unittest.IsolatedAsyncioTestCase):
             state.MY_ID, state.bot_client = saved
         self.assertTrue(sub.called, "应提交 115 离线")
         self.assertIn("urn:btih:abc", sub.call_args.args[0])
+
+
+class TorrentInfohashUrlTest(unittest.TestCase):
+    """🧲 入口一回归（2026-09-29）：URL 自带 infohash 时 magnet 必须被构造——
+    原实现把构造行放在 if not ih 分支内，带 infohash 的 URL 走到 _submit 时
+    magnet 未赋值 → UnboundLocalError「离线提交失败」。"""
+
+    def test_infohash_url_builds_magnet_and_submits(self):
+        import asyncio
+        from tg_userbot import torrent_offline as to
+        url = ("https://ehtracker.org/get/1234567/"
+               "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0.torrent")
+
+        async def main():
+            with mock.patch.object(to, "_submit",
+                                   return_value=(True, "")) as sub:
+                return await to.handle_torrent_url(url), sub
+        text, sub = asyncio.run(main())
+
+        self.assertIn("已转为 115 离线任务", text)
+        req = sub.call_args[0][0]
+        self.assertIn("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", req)
+
+    def test_download_branch_uses_parsed_magnet(self):
+        """下载分支：解析出的磁力不被空 infohash 覆盖。"""
+        import asyncio
+        from tg_userbot import torrent_offline as to
+        url = "https://example.org/some.torrent"
+
+        async def main():
+            with mock.patch.object(to, "_download_torrent_bytes",
+                                   return_value=b"fake-torrent"), \
+                    mock.patch.object(to, "torrent_to_magnet",
+                                      return_value=(
+                                          "magnet:?xt=urn:btih:abc&dn=X",
+                                          {"name": "X", "size": 1,
+                                           "private": False})), \
+                    mock.patch.object(to, "_submit",
+                                      return_value=(True, "")) as sub:
+                text, sub = asyncio.run(
+                    _wrap(lambda: to.handle_torrent_url(url)))
+                return text, sub
+
+        async def _wrap(fn):
+            return await fn()
+
+        # 直接 asyncio.run 组合
+        async def main2():
+            with mock.patch.object(to, "_download_torrent_bytes",
+                                   return_value=b"fake-torrent"), \
+                    mock.patch.object(to, "torrent_to_magnet",
+                                      return_value=(
+                                          "magnet:?xt=urn:btih:abc&dn=X",
+                                          {"name": "X", "size": 1,
+                                           "private": False})), \
+                    mock.patch.object(to, "_submit",
+                                      return_value=(True, "")) as sub:
+                return await to.handle_torrent_url(url), sub
+
+        text, sub = asyncio.run(main2())
+        req = sub.call_args[0][0]
+        self.assertIn("btih:abc", req, "解析出的磁力应原样提交")

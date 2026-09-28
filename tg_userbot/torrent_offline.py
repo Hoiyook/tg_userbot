@@ -48,7 +48,10 @@ async def handle_torrent_url(url):
     ih = torrent_util.infohash_from_url(url)
     name, info = (os.path.basename(
         urlsplit(url).path)[:-len(".torrent")]), None
-    if not ih:
+    if ih:
+        # URL 尾段自带 infohash（ehtracker 形态）：直接构造磁力，免下载
+        magnet = torrent_util.magnet_from(name, ih)
+    else:
         try:
             data = await asyncio.to_thread(_download_torrent_bytes, url)
             magnet, info = torrent_to_magnet(data)
@@ -58,7 +61,6 @@ async def handle_torrent_url(url):
         except Exception as e:
             logger.warning(f"🧲 种子下载失败：{e}")
             return f"🧲 种子下载失败：{e}"
-        magnet = torrent_util.magnet_from(name, ih)
     try:
         ok, err = await asyncio.to_thread(_submit, magnet)
     except Exception as e:
