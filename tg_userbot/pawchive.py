@@ -256,7 +256,7 @@ async def backfill_author(name):
                     continue
                 d = detail[0] if isinstance(detail, list) else detail
                 files = [_file_entry(a) for a in (d.get("attachments") or [])
-                         if a and a.get("path")]
+                         if a and (a.get("path") or a.get("temp_url"))]
                 fmain = d.get("file") or {}
                 if fmain.get("path") and not any(
                         a.get("path") == fmain["path"]
@@ -709,7 +709,14 @@ def _file_entry(att):
     """附件 → {url, filename}：直链指向 file 服务器原始文件（非缩略图）。
 
     2026-09-24 起站点 CDN 对**无扩展名**路径一律 404（此前曾返回不带扩展
-    名的 path）——path 缺扩展名时从文件名补上，否则预检/下载全数误判死链。"""
+    名的 path）——path 缺扩展名时从文件名补上，否则预检/下载全数误判死链。
+
+    deferred 附件（2026-09-28 发现）：部分附件没有 path，只有签名的
+    temp_url（t1.pawchive.pw/f/{token}，如帖 162189348 的未删减版 mp4）——
+    直接用 temp_url 作为下载地址（GET 可下、支持 Range；HEAD 会 403，
+    预检需跳过）。签名有有效期，扫描入队后应尽快下载。"""
+    if not att.get("path") and att.get("temp_url"):
+        return {"url": att["temp_url"], "filename": att.get("name")}
     path = att["path"]
     name = att.get("name") or os.path.basename(path)
     if "." not in os.path.basename(path):
@@ -756,7 +763,7 @@ def build_scan_records(creator, posts, faved_ids=None, scope="notfaved",
             if scope == "faved" and pid not in faved_ids:
                 continue
         files = [_file_entry(a) for a in (p.get("attachments") or [])
-                 if a and a.get("path")]
+                 if a and (a.get("path") or a.get("temp_url"))]
         # 主文件字段（file）：部分帖（尤其 Patreon 导入）的封面/首图放在
         # 这里而非 attachments——页面画廊显示它，漏记就是「3 张图只下了
         # 2 个」（2026-09-25 帖 78212541 实测 twitter.png）。与附件按

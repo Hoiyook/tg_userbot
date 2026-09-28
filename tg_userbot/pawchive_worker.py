@@ -1239,8 +1239,11 @@ async def process_post(post):
 
     # 3) 死链预检（HTTP 在线程池跑，DB 写留在本线程）
     if config.PAWCHIVE_PRECHECK_HEAD:
+        # deferred 签名直链（t1.pawchive.pw/f/…）对 HEAD 返回 403，不能预检——
+        # 直接进下载（GET 自带签名，有效期到 temp_expires，入队即下不会过期）
         targets = [(f, f["url"]) for f in files
-                   if f["status"] == runtime_db.PAW_FILE_PENDING]
+                   if f["status"] == runtime_db.PAW_FILE_PENDING
+                   and "/f/" not in f["url"]]
         dead_ids, repaired = await asyncio.to_thread(_head_dead_ids, targets)
         for f in files:
             if f["status"] != runtime_db.PAW_FILE_PENDING:

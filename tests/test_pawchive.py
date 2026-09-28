@@ -224,6 +224,31 @@ class EarlyStopTest(unittest.TestCase):
         self.assertEqual(calls, [0, 50])
 
 
+class DeferredAttachmentTest(unittest.TestCase):
+    """deferred 附件（无 path，有签名 temp_url）→ 正常入队可下载。"""
+
+    def test_deferred_attachment_captured(self):
+        creator = {"service": "patreon", "id": "42", "name": "C"}
+        posts = [{
+            "id": "5", "title": "双视频帖", "published": "2026-09-20T00:00:00",
+            "attachments": [
+                {"name": "Censored Ver.mp4", "path": "/9a/28/9a28.mp4"},
+                {"name": "Full Ver.mp4", "deferred": True,
+                 "temp_url": "https://t1.pawchive.pw/f/c41fc732/Full%20Ver.mp4"
+                             "?e=1790613841&s=471197"},
+            ],
+            "content": "", "embed": {},
+        }]
+        records = pawchive.build_scan_records(creator, posts,
+                                              faved_ids=None, scope="all")
+        self.assertEqual(len(records), 1)
+        urls = [f["url"] for f in records[0]["files"]]
+        self.assertTrue(any(u.startswith(
+            "https://t1.pawchive.pw/f/c41fc732/Full%20Ver.mp4") for u in urls))
+        # 有 path 的照常入清单
+        self.assertEqual(len(records[0]["files"]), 2)
+
+
 class ParsePostRefTest(unittest.TestCase):
 
     def test_full_url(self):
