@@ -1374,6 +1374,48 @@ def count_pawchive_dead_thumbs():
     return int(row[0])
 
 
+def list_pawchive_post_rows_after(last_row_id, limit=100):
+    """按行 id 游标分批读帖子（deferred 补扫用）。"""
+    rows = _read(lambda c: _execute(
+        c, "SELECT id, service, creator_id, post_id, status FROM pawchive_posts "
+           "WHERE id>? ORDER BY id LIMIT ?",
+        (int(last_row_id), int(limit))).fetchall(),
+        "分批列 Pawchive 帖子")
+    return [dict(r) for r in rows]
+
+
+def insert_pawchive_deferred_file(post_row, url, filename, now=None):
+    """补插 deferred 附件（PENDING），并在帖已完成/失败/归档时重投 PENDING。
+
+    返回 (文件是否新插入, 帖子是否重投)。
+    """
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "INSERT OR IGNORE INTO pawchive_files "
+            "(post_row, url, filename, status, updated_at) VALUES(?,?,?,?,?)",
+            (int(post_row), url, filename, PAW_FILE_PENDING, now))
+        if not cur.rowcount:
+            return False, False
+        row = _execute(
+            conn, "SELECT status FROM pawchive_posts WHERE id=?",
+            (int(post_row),)).fetchone()
+        requeued = False
+        if row and row["status"] in (PAW_POST_COMPLETED, PAW_POST_MANUAL,
+                                     PAW_POST_FAILED, PAW_POST_ARCHIVED):
+            cur2 = _execute(
+                conn,
+                "UPDATE pawchive_posts SET status=?, completed_at=NULL, "
+                "lease_until=NULL WHERE id=? AND status=?",
+                (PAW_POST_PENDING, now, int(post_row), row["status"]))
+            requeued = bool(cur2.rowcount)
+        return True, requeued
+
+    return _write(do, "补插 Pawchive deferred 附件")
+
+
 def pawchive_status_counts():
     """各状态帖子计数（/paw status 视图）。"""
     rows = _read(lambda c: _execute(

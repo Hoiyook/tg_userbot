@@ -850,6 +850,18 @@ async def handle_command(event, cmd_text):
         logger.info("执行命令：/usage")
         return True
 
+    if cmd_text.startswith("/paw_backfill"):
+        arg = cmd_text.split(maxsplit=1)[1] if " " in cmd_text else ""
+        a = arg.strip().lower()
+        if a in ("on", "开", "启动", ""):
+            await _reply(event, pawchive.backfill_start())
+        elif a in ("off", "停", "停止"):
+            await _reply(event, pawchive.backfill_stop())
+        else:
+            await _reply(event, pawchive.backfill_status_text())
+        logger.info(f"执行命令：/paw_backfill {a}")
+        return True
+
     if cmd_text == "/cd2tasks" or cmd_text.startswith("/cd2tasks "):
         from . import cd2_api
         logger.info("执行命令：/cd2tasks")

@@ -1275,6 +1275,141 @@ async def offline_reply(urls):
     return f"{TEXT_PREFIX}\n❌ 提交失败：{err}"
 
 
+# deferred 补扫状态（/paw backfill on|off|status）
+_BACKFILL = {"running": False, "stop": False, "scanned": 0,
+             "posts_added": 0, "files_added": 0, "skipped_inflight": 0}
+
+
+async def _fetch_post_detail_safe(service, creator_id, post_id):
+    import urllib.error
+    try:
+        return _http_get_json(
+            f"{config.PAWCHIVE_API_BASE}/api/v1/{service}/user/{creator_id}"
+            f"/post/{post_id}", timeout=30)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {"_gone": True}   # 帖子已从站点删除：视为无新数据
+        raise
+    except Exception as e:
+        raise RuntimeError(f"{type(e).__name__}: {e}")
+
+
+_BACKFILL_TASK = None
+
+
+_BACKFILL_TASK = None
+
+
+def backfill_start():
+    """启动 deferred 补扫后台任务（单实例防重）。返回提示。"""
+    global _BACKFILL_TASK
+    if _BACKFILL.get("running"):
+        return "🧩 deferred 补扫已在运行中"
+
+    async def _runner():
+        _BACKFILL["running"] = True
+        try:
+            await backfill_deferred_pass()
+        finally:
+            _BACKFILL["running"] = False
+
+    _BACKFILL_TASK = asyncio.create_task(_runner())
+    return "🧩 deferred 补扫已启动（后台逐帖补插，完成时通知）"
+
+
+def backfill_stop():
+    """请求停止补扫。"""
+    if _BACKFILL_TASK and not _BACKFILL_TASK.done():
+        _BACKFILL_TASK.cancel()
+        return "🧩 已请求停止"
+    return "本就未在运行"
+
+
+def backfill_status_text():
+    st = _BACKFILL
+    if st["running"]:
+        return f"🧩 deferred 补扫：运行中，已扫描 {st['scanned']} 帖"
+    return "🧩 deferred 补扫：未运行"
+
+
+async def backfill_deferred_pass():
+    """deferred 补扫一遍：逐帖重调详情 API，把漏扫的 deferred 附件补插入库。
+
+    游标存 schema_meta（可断点续跑）；PROCESSING 帖跳过（在途，下轮处理）。
+    """
+    last = int(runtime_db.get_schema_meta(
+        "pawchive_deferred_backfill_last_row_id") or 0)
+    _BACKFILL["scanned"] = 0
+    logger.info(f"🧩 deferred 补扫启动：游标 {last}")
+    while True:
+        rows = runtime_db.list_pawchive_post_rows_after(last, 100)
+        if not rows:
+            runtime_db.set_schema_meta(
+                "pawchive_deferred_backfill_last_row_id", "0")
+            logger.info("🧩 deferred 补扫完成：全库已覆盖")
+            try:
+                await notify_user("🧩 Pawchive deferred 补扫完成：全库已覆盖")
+            except Exception:
+                pass
+            return
+        for row in rows:
+            if _BACKFILL["stop"]:
+                logger.info("🧩 deferred 补扫被停止")
+                return
+            if row["status"] == "PROCESSING":
+                continue   # 在途帖：worker 正在处理，下轮再补
+            _BACKFILL["scanned"] += 1
+            try:
+                detail = await asyncio.to_thread(
+                    _fetch_post_detail_safe, row["service"],
+                    row["creator_id"], row["post_id"])
+            except Exception as e:
+                logger.warning(
+                    f"🧩 帖 {row['post_id']} 详情拉取失败（跳过）：{e}")
+                last = row["id"]
+                runtime_db.set_schema_meta(
+                    "pawchive_deferred_backfill_last_row_id", str(last))
+                continue
+            if detail.get("_gone"):
+                last = row["id"]
+                runtime_db.set_schema_meta(
+                    "pawchive_deferred_backfill_last_row_id", str(last))
+                continue
+            atts = detail.get("attachments") or []
+            new_atts = [a for a in atts
+                        if a.get("temp_url") and not a.get("path")]
+            if not new_atts:
+                last = row["id"]
+                runtime_db.set_schema_meta(
+                    "pawchive_deferred_backfill_last_row_id", str(last))
+                continue
+            added = await _insert_deferred_files(row["id"], new_atts)
+            if added:
+                _BACKFILL["posts_added"] += 1
+                _BACKFILL["files_added"] += added
+                await notify_user(
+                    f"🧩 Pawchive 补扫：帖 {row['post_id']} 补入 {added} 个"
+                    f"deferred 附件（将自动下载）")
+            last = row["id"]
+            runtime_db.set_schema_meta(
+                "pawchive_deferred_backfill_last_row_id", str(last))
+        await asyncio.sleep(0.5)   # API 礼貌节流
+
+
+async def _insert_deferred_files(post_row, new_atts):
+    """把新发现的 deferred 附件补插入库；返回插入数（帖重投自动发生）。"""
+    added = 0
+    for a in new_atts:
+        try:
+            inserted, _requeued = runtime_db.insert_pawchive_deferred_file(
+                post_row, a["temp_url"], a.get("name"))
+            if inserted:
+                added += 1
+        except runtime_db.DbUnavailable as e:
+            logger.error(f"🧩 补插失败（DB 不可用）：{e}")
+    return added
+
+
 async def notify_user(text):
     """统一通知出口（bot 控制面板对话）。函数内导入避免 app↔本模块成环。"""
     from . import notify
