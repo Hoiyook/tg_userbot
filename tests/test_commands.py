@@ -580,3 +580,17 @@ class Help2ContentTest(unittest.TestCase):
         self.assertTrue(ok)
         body = "\n".join(ev.replies)
         self.assertNotIn("数据库表", body)
+
+class HelpCoverageTest(unittest.TestCase):
+    """用户要求（2026-09-28）：所有新增命令必须维护进 /help。
+    BOT_COMMANDS 里的每个命令都必须出现在 HELP_TEXT 中。"""
+
+    def test_help_covers_all_bot_commands(self):
+        from tg_userbot import bot as bot_mod
+        help_text = commands._help_text()
+        missing = [name for name, _ in bot_mod.BOT_COMMANDS
+                   if f"/{name}" not in help_text]
+        self.assertEqual(missing, [],
+                         f"以下命令未维护进 /help：{missing}——"
+                         "新增命令必须同步维护 /help 文案")
+

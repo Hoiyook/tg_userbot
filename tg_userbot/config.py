@@ -392,6 +392,11 @@ PAWCHIVE_MAX_INFLIGHT_POSTS = 8  # 4→8（2026-09-18：CDN 每 53s 掐断流，
 PAWCHIVE_429_WAIT_SECONDS = 60
 PAWCHIVE_429_SWEEP_SECONDS = 900
 PAWCHIVE_429_AUTO_RETRY_MAX_ATTEMPTS = 5
+# 附件压缩包自动解压（2026-09-28 用户要求）：Pawchive 下载完成的 .zip/.rar
+# 若无需密码则串行解压到同名文件夹，成功后删除压缩包；需密码/失败则原样保留。
+# 串行 = 全局一次只解一个（避免多帖并发解压打爆磁盘）；CD2 会把解压产物一并备份
+PAWCHIVE_EXTRACT_ARCHIVES = True
+PAWCHIVE_EXTRACT_TIMEOUT_SECONDS = 3600
 PAWCHIVE_MILESTONE_POSTS = 50
 # --- 评论跟进（2026-09-12）---
 # 命中标签的帖子会进「关注列表」，之后按天跟进它的评论区并取回新出现的媒体

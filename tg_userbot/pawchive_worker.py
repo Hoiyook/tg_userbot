@@ -269,6 +269,91 @@ def _head_dead_ids(targets):
     return {t[0]["id"] for t in still_dead}, repaired
 
 
+def _archive_dest(archive_path):
+    """压缩包 → 解压目标文件夹（同名去扩展名）。"""
+    return os.path.splitext(archive_path)[0]
+
+
+def _extract_archive_sync(archive_path):
+    """解压单个压缩包（阻塞，线程内执行）。返回 (status, detail)。
+
+    status: "extracted"（成功，压缩包已删）/ "password"（需密码，保留）/
+            "failed"（解压出错，保留）/ "no-space"（磁盘不足，保留）
+    规则（用户 2026-09-28）：zip 用 stdlib（加密位检测+zip 炸弹守卫）；
+    rar 用 bsdtar（先列表探测，失败=需密码/损坏 → 保留）；解压成功且目标
+    目录非空才删除压缩包，绝不丢数据。
+    """
+    import zipfile
+    lower = archive_path.lower()
+    dest = _archive_dest(archive_path)
+    free = shutil.disk_usage(os.path.dirname(archive_path)).free
+    margin = int(config.PAWCHIVE_MIN_FREE_GB) * 1024 ** 3
+
+    if lower.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(archive_path) as z:
+                infos = z.infolist()
+                if any(zi.flag_bits & 0x1 for zi in infos):
+                    return "password", "zip 成员加密"
+                total_unc = sum(zi.file_size for zi in infos)
+                if total_unc and total_unc > free - margin:
+                    return ("no-space",
+                            f"解压需 {total_unc/1e9:.1f}GB 超出磁盘余量")
+                z.extractall(dest)
+        except RuntimeError as e:
+            # stdlib 读到加密成员时的典型异常
+            return "password", str(e)[:120]
+        except Exception as e:
+            return "failed", f"{type(e).__name__}: {e}"
+    else:  # .rar → bsdtar（macOS/Termux 自带；列表探测失败=需密码/损坏）
+        import subprocess
+        try:
+            probe = subprocess.run(
+                ["bsdtar", "-tf", archive_path],
+                capture_output=True, timeout=120,
+                stdin=subprocess.DEVNULL)
+            if probe.returncode != 0:
+                # 加密/损坏 rar 无法列出成员 → 需密码，原样保留
+                return "password", (probe.stderr.decode("utf-8", "replace")
+                                    or "list failed")[:120]
+        except subprocess.TimeoutExpired:
+            return "password", "list 超时（疑似加密卷）"
+        except FileNotFoundError:
+            return "failed", "bsdtar 不可用"
+
+        try:
+            os.makedirs(dest, exist_ok=True)
+            p = subprocess.run(
+                ["bsdtar", "-xf", archive_path, "-C", dest],
+                capture_output=True, timeout=600,
+                stdin=subprocess.DEVNULL)
+            if p.returncode != 0:
+                return "failed", p.stderr.decode("utf-8", "replace")[:120]
+        except subprocess.TimeoutExpired:
+            return "failed", "bsdtar 解压超时"
+        except FileNotFoundError:
+            return "failed", "bsdtar 不可用"
+
+    # 成功判定：目标目录非空
+    extracted = [n for _, _, ns in os.walk(dest) for n in ns]
+    if not extracted:
+        return "failed", "解压后目录为空"
+    os.remove(archive_path)
+    return "extracted", f"{len(extracted)} 个文件 → {os.path.basename(dest)}"
+
+
+async def _extract_archive_serial(archive_path):
+    """串行解压入口（持全局锁 + 线程下放 + 超时保护）。"""
+    import asyncio as _a
+    async with _extract_guard():
+        try:
+            return await _a.wait_for(
+                asyncio.to_thread(_extract_archive_sync, archive_path),
+                timeout=float(config.PAWCHIVE_EXTRACT_TIMEOUT_SECONDS))
+        except _a.TimeoutError:
+            return "failed", f"解压超时（>{config.PAWCHIVE_EXTRACT_TIMEOUT_SECONDS}s）"
+
+
 def _thumb_url(file_url):
     """原文件 URL → 对应缩略图 URL（img.pawchive.pw/thumbnail/data{同路径}）。"""
     i = file_url.find("/data")
@@ -480,6 +565,27 @@ async def _download_post_files(post, files):
                 f["size_bytes"] = size   # 内存同步：完成通知的统计读这里
                 logger.info(
                     f"🐾 文件完成：{f['filename']}（{size or '?'} bytes）")
+                # 附件压缩包自动解压（2026-09-28 用户要求）：串行、需密码跳过、
+                # 成功后删压缩包；解压产物随 CD2 一并备份到 115
+                fname_l = (f["filename"] or "").lower()
+                if (config.PAWCHIVE_EXTRACT_ARCHIVES
+                        and fname_l.endswith((".zip", ".rar"))):
+                    target = _target_path(post, f["filename"])
+                    try:
+                        est, detail = await _extract_archive_serial(target)
+                        if est == "extracted":
+                            logger.info(
+                                f"🗜 解压完成：{f['filename']} → {detail}")
+                        elif est == "password":
+                            logger.info(
+                                f"🗜 压缩包需密码，保留原样：{f['filename']}")
+                        else:
+                            logger.warning(
+                                f"🗜 解压未完成（{est}），压缩包保留："
+                                f"{f['filename']}（{detail}）")
+                    except Exception as e:
+                        logger.warning(
+                            f"🗜 解压异常（压缩包保留）：{f['filename']}：{e}")
             elif status == "dead":
                 _mark_dead(f)
                 logger.warning(f"🐾 死链（下载期 404/410）：{f['filename']}")
@@ -782,6 +888,20 @@ _LAST_429_SWEEP = None   # None = 从未扫描过（monotonic 每进程从 0 起
 
 # 缩略图追回任务状态（/paw recoverthumbs on|off；面板只读展示）
 _THUMB_RECOVER = {"running": False, "stop": False, "done": 0, "total": None}
+
+# 附件解压：全局串行锁（多帖并发的解压排队执行，一次一个）
+_EXTRACT_LOCK = None
+_EXTRACT_LOCK_LOOP = None
+
+
+def _extract_guard():
+    """解压串行锁（懒建 + 循环守卫，与 _fetch_gate 同款纪律）。"""
+    global _EXTRACT_LOCK, _EXTRACT_LOCK_LOOP
+    loop = asyncio.get_running_loop()
+    if _EXTRACT_LOCK is None or _EXTRACT_LOCK_LOOP is not loop:
+        _EXTRACT_LOCK = asyncio.Lock()
+        _EXTRACT_LOCK_LOOP = loop
+    return _EXTRACT_LOCK
 
 
 def _is_429_only_failure(post):
