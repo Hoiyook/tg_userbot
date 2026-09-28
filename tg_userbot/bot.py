@@ -21,6 +21,7 @@ from telethon.utils import get_peer_id
 from . import state
 from . import text as text_mod
 from . import manual_links
+from . import torrent_offline
 from . import menu
 from . import queue
 from . import dedup
@@ -114,6 +115,7 @@ BOT_COMMANDS = (
     ("restart", "重启 bot（优雅停机 + 自动拉起，约 30 秒）"),
     ("inspect", "系统巡检：连接/任务/产出/失败/备份 一屏"),
     ("cmdt", "命令模板列表"),
+    ("memo", "备忘录：/memo 内容 随手记；/memo 查看列表"),
     ("botclean", "bot 对话自动清理开关：/botclean on|off"),
     ("cd2check", "CloudDrive2 备份对账：本地媒体 vs 115 远端"),
     ("cd2tasks", "CD2 上传任务：查看正在往 115 传输的文件"),
@@ -1098,6 +1100,26 @@ async def bot_message_handler(event):
     if text.startswith("/"):
         if await commands.handle_command(event, text):
             return
+
+    # 种子直链（.torrent 结尾）→ 转 115 离线（不走外链台账/普通下载）
+    torrent_urls = [u for u in manual_links.extract_urls(text)
+                    if torrent_offline.is_torrent_url(u)]
+    if torrent_urls:
+        out = await torrent_offline.handle_torrent_url(torrent_urls[0])
+        await _send_owner(out, menu.back_home_buttons())
+        return
+
+    # .torrent 文件（Document）→ 下载字节转磁力 → 115 离线
+    doc = getattr(message, "document", None)
+    doc_name = getattr(getattr(message, "file", None), "name", None)
+    if doc is not None and isinstance(doc_name, str) \
+            and doc_name.lower().endswith(".torrent"):
+        import io
+        buf = io.BytesIO()
+        await state.bot_client.download_media(message, out=buf)
+        out = await torrent_offline.handle_torrent_bytes(buf.getvalue())
+        await _send_owner(out, menu.back_home_buttons())
+        return
 
     # 非命令文本里带 http(s) 链接 → 手动外链台账（记录/查重），不回落主菜单
     if manual_links.extract_urls(text):

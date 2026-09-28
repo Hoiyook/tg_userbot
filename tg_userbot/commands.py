@@ -226,6 +226,8 @@ def _help_text():
         "/paw_retry 行ID|all；/paw_pause｜/paw_resume\n"
         "/paw_archive —— 归档明细；/paw_archive_del 行id|起-止\n"
         "/paw_backfill 作者 —— 回填历史帖（补站点后补的数据）\n"
+        "/memo 内容 —— 备忘录：随手记；/memo 查看列表\n"
+        "/memo del 序号｜/memo clear —— 删除/清空\n"
         "/paw_since 日期|off —— 默认时间下限\n"
         "/paw_cookie Cookie —— 会话 Cookie\n"
         "/paw_notify on|off —— 帖子开始/完成通知开关\n"

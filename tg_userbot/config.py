@@ -297,6 +297,8 @@ DEDUP_INDEX_FILE = os.path.join(RUNTIME_DIR, "dedup_index.txt")
 DEDUP_PENDING_FILE = os.path.join(RUNTIME_DIR, "dedup_pending.jsonl")
 # 命令模板（cmd_templates.py，/cmdt）：名字 → shell 命令原文
 CMD_TEMPLATES_FILE = os.path.join(RUNTIME_DIR, "command_templates.json")
+# 备忘录（memo.py，/memo）：随手记
+MEMO_FILE = os.path.join(RUNTIME_DIR, "memo.json")
 DEDUP_CONFIG_FILE = os.path.join(RUNTIME_DIR, "dedup_config.json")
 DEDUP_MAX_ENTRIES = 10000
 

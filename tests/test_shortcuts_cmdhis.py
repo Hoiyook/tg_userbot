@@ -70,8 +70,11 @@ class ShortcutRoutingBotChatTest(unittest.IsolatedAsyncioTestCase):
         ev.message.message = text
         ev.message.fwd_from = None
         ev.delete = mock.AsyncMock()
+        ev.message.document = None
         state.bot_client = mock.MagicMock()
         state.bot_client.send_message = mock.AsyncMock()
+        state.bot_client.download_media = mock.AsyncMock()
+        state.bot_client.download_media = mock.AsyncMock()
         with mock.patch.object(bot.commands, "handle_command",
                                mock.AsyncMock(return_value=True)) as hc, \
                 mock.patch.object(bot.logger, "info"):
@@ -309,8 +312,10 @@ class BotHandlerRecordsHistoryTest(unittest.IsolatedAsyncioTestCase):
         ev.message.message = text
         ev.message.fwd_from = None
         ev.delete = mock.AsyncMock()
+        ev.message.document = None
         state.bot_client = mock.MagicMock()
         state.bot_client.send_message = mock.AsyncMock()
+        state.bot_client.download_media = mock.AsyncMock()
         with mock.patch.object(bot.commands, "handle_command",
                                mock.AsyncMock(return_value=True)), \
                 mock.patch.object(bot.msg_history, "_history_path",
