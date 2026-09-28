@@ -682,13 +682,20 @@ async def _finalize(post, files):
         runtime_db.finalize_pawchive_post(
             post["id"], runtime_db.PAW_POST_MANUAL)
         lines = [f"👤 Pawchive 帖子待人工处理：{label}｜{title}",
+                 f"行id #{post['id']}｜发布："
+                 f"{(post.get('published') or '')[:10]}",
                  post.get("post_url") or "",
                  f"直链已全部下载，另有 {len(ext_links)} 条外链："]
         for l in ext_links[:8]:
             lines.append(f"  · [{l.get('domain')}] {l['url']}")
         if len(ext_links) > 8:
             lines.append(f"  … 等 {len(ext_links) - 8} 条（/paw manual 查看全部）")
-        await notify.notify_user("\n".join(lines))
+        # ✅ 关账按钮：外链处理完点击即 /paw_done 行id（MANUAL → COMPLETED）
+        from .menu import encode_menu_data
+        btn_rows = [[Button.inline(
+            "✅ 关账（外链已完成）",
+            encode_menu_data("paw_done", str(post["id"])))]]
+        await notify.notify_user("\n".join(lines), buttons=btn_rows)
         _bump_milestone("manual")
         await _milestone_notify_if_due()
         return

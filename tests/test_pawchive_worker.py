@@ -94,7 +94,7 @@ class _WorkerDbTestCase(unittest.IsolatedAsyncioTestCase):
         state.MY_ID = 12345
         self.addCleanup(setattr, state, "MY_ID", None)
 
-    async def _capture_notify(self, text):
+    async def _capture_notify(self, text, buttons=None):
         self._notifies.append(text)
 
     def _patch_downloader(self, result=None):
