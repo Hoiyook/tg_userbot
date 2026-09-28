@@ -365,8 +365,6 @@ class RateLimitTest(_WorkerDbTestCase):
         with mock.patch.object(worker.httpx, "Client",
                                side_effect=lambda **kw: real_client(
                                    transport=transport, **kw)), \
-                mock.patch.object(worker.asyncio, "sleep",
-                                  side_effect=fake_sleep), \
                 mock.patch.object(worker.time, "sleep",
                                   new=lambda s: sleeps.append(s)):
             result = await asyncio.to_thread(
@@ -376,6 +374,8 @@ class RateLimitTest(_WorkerDbTestCase):
                 lambda c, t: None)
         self.assertEqual(result[0], "failed")
         self.assertIn("429", result[2])
+        # 429 每次等满 60s；12 次硬上限内不消耗无进展额度
+        self.assertEqual(sleeps, [60.0] * 12)
         self.assertTrue(any(s == config.PAWCHIVE_429_WAIT_SECONDS
                             for s in sleeps), "429 应等满 60s")
 
@@ -406,6 +406,56 @@ class RateLimitTest(_WorkerDbTestCase):
             runtime_db.PAW_POST_PENDING)
         self.assertEqual(
             runtime_db.get_pawchive_post(p302["id"])["status"],
+            runtime_db.PAW_POST_FAILED)
+
+
+class ThumbnailFallbackTest(_WorkerDbTestCase):
+    """原文件 404 → 缩略图替代存档（用户 2026-09-28 要求）。"""
+
+    async def test_dead_link_falls_back_to_thumbnail(self):
+        """原文件 404、缩略图 200 → 缩略图落盘，文件标 DONE+备注；帖子 COMPLETED。"""
+        post, _ = self._seed_and_claim(_post(
+            "601", files=[
+                {"url": "https://x/dead.jpg", "filename": "dead.jpg"},
+                {"url": "https://x/alive.mp4", "filename": "alive.mp4"},
+            ]))
+        codes = {"https://x/dead.jpg": 404, "https://x/alive.mp4": 200}
+        thumbs = {"https://x/dead.jpg": b"thumb-bytes"}
+
+        with mock.patch.object(worker, "_head_status",
+                               side_effect=lambda u: codes[u]), \
+                mock.patch.object(worker, "_fetch_thumbnails",
+                                  side_effect=lambda targets: {
+                                      f["id"]: thumbs.get(f["url"])
+                                      for f, u in targets}), \
+                self._patch_downloader(("done", 5, None)):
+            ok = await worker.process_post(post)
+        self.assertTrue(ok)
+        by_url = {f["url"]: f for f in runtime_db.list_pawchive_files(post["id"])}
+        # 死链文件的缩略图已存档（DONE + 备注）
+        d = by_url["https://x/dead.jpg"]
+        self.assertEqual(d["status"], runtime_db.PAW_FILE_DONE)
+        self.assertIn("缩略图替代", d["error"])
+        target = worker._target_path(post, "dead.jpg")
+        self.assertTrue(os.path.isfile(target))
+        with open(target, "rb") as fh:
+            self.assertEqual(fh.read(), b"thumb-bytes")
+        # 帖子：可下载文件全部完成 → COMPLETED（死链已存档不算失败）
+        self.assertEqual(
+            runtime_db.get_pawchive_post(post["id"])["status"],
+            runtime_db.PAW_POST_COMPLETED)
+
+    async def test_thumbnail_404_marks_failed(self):
+        """缩略图也没有 → 维持死链 FAILED。"""
+        post, _ = self._seed_and_claim(_post(
+            "602", files=[{"url": "https://x/dead.jpg",
+                           "filename": "dead.jpg"}]))
+        with mock.patch.object(worker, "_head_status", return_value=404), \
+                mock.patch.object(worker, "_fetch_thumbnails", return_value={}):
+            ok = await worker.process_post(post)
+        self.assertTrue(ok)
+        self.assertEqual(
+            runtime_db.get_pawchive_post(post["id"])["status"],
             runtime_db.PAW_POST_FAILED)
 
 

@@ -269,6 +269,46 @@ def _head_dead_ids(targets):
     return {t[0]["id"] for t in still_dead}, repaired
 
 
+def _thumb_url(file_url):
+    """原文件 URL → 对应缩略图 URL（img.pawchive.pw/thumbnail/data{同路径}）。"""
+    i = file_url.find("/data")
+    if i < 0:
+        return None
+    return "https://img.pawchive.pw/thumbnail" + file_url[i + len("/data"):].split("?")[0]
+
+
+def _fetch_thumbnails(targets):
+    """并发抓取死链文件的缩略图（纯 HTTP，线程内跑；不碰 DB）。
+
+    targets: [(file_row, original_url)]。返回 {file_id: bytes}——只含抓到的。
+    """
+    import concurrent.futures
+    import urllib.request
+
+    if not targets:
+        return {}
+    out = {}
+
+    def one(item):
+        f, _url = item
+        thumb = _thumb_url(f["url"])
+        if not thumb:
+            return
+        try:
+            req = urllib.request.Request(thumb)
+            req.add_header("User-Agent", "Mozilla/5.0 tg-userbot-pawchive")
+            with urllib.request.urlopen(req, timeout=30) as r:
+                if r.status == 200:
+                    return f["id"], r.read()
+        except Exception:
+            return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        for res in ex.map(one, targets):
+            if res:
+                out[res[0]] = res[1]
+    return out
+
+
 def _mark_dead(file_row, code=404):
     """死链就地标 FAILED（只在事件循环线程调用——DB 连接属主线程）。"""
     runtime_db.mark_pawchive_file_failed(
@@ -860,6 +900,29 @@ async def process_post(post):
             elif f["id"] in dead_ids:
                 _mark_dead(f)
                 logger.warning(f"🐾 死链预检跳过：{f['filename']}")
+        # 缩略图替代（2026-09-28 用户要求）：原文件 404 时抓对应缩略图存档——
+        # 站点删原图后缩略图常残留（实测 200），有总比没有强
+        dead_files = [f for f in files
+                      if f["status"] == runtime_db.PAW_FILE_FAILED
+                      and (f.get("error") or "").startswith(_MISSING_MARK)]
+        if dead_files:
+            data_map = await asyncio.to_thread(
+                _fetch_thumbnails,
+                [(f, f["url"]) for f in dead_files])
+            for f in dead_files:
+                data = data_map.get(f["id"])
+                if not data:
+                    continue
+                target = _target_path(post, f["filename"])
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "wb") as fh:
+                    fh.write(data)
+                runtime_db.mark_pawchive_file_done(
+                    f["id"], size_bytes=len(data),
+                    note=f"缩略图替代(原图404) {len(data)}B")
+                f["status"] = runtime_db.PAW_FILE_DONE
+                logger.info(
+                    f"🖼 缩略图替代完成：{f['filename']}（{len(data)}B）")
 
     # 4) 并发下载 + 周期续租（单帖可能跑很久）
     renew = asyncio.create_task(_renew_lease_loop(post["id"]))

@@ -1558,16 +1558,18 @@ def mark_pawchive_file_submitted(file_id, chrome_task_id, now=None):
     return _write(do, "标记 Pawchive 文件已提交")
 
 
-def mark_pawchive_file_done(file_id, size_bytes=None, now=None):
+def mark_pawchive_file_done(file_id, size_bytes=None, note=None, now=None):
+    """文件完成；note 非空时写入 error 列（如「缩略图替代(原图404)」）。"""
     now = _now(now)
 
     def do(conn):
         cur = _execute(
             conn,
-            "UPDATE pawchive_files SET status=?, size_bytes=?, error=NULL, "
+            "UPDATE pawchive_files SET status=?, size_bytes=?, error=?, "
             "updated_at=? WHERE id=?",
             (PAW_FILE_DONE,
              (None if size_bytes is None else int(size_bytes)),
+             (None if note is None else str(note)[:200]),
              now, int(file_id)),
         )
         return bool(cur.rowcount)
