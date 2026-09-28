@@ -288,14 +288,15 @@ async def execute_task(task):
     try:
         messages = await listener_fetch(state, task["source_chat_id"], member_ids)
         if not messages:
-            # 取不回源消息：多为原消息已被删除。这是**永久**失败——
-            # 重试多少次都取不回来，不能让它反复占队列。
+            # 取不回源消息：多为瞬时故障（代理抖动/瞬时限流），也可能是原消息
+            # 真被删除。用户要求（2026-09-28）：所有失败都走退避重试——
+            # 走 retry_listener_task 计入 attempts，重试上限后转 FAILED，
+            # 不再单次判定永久失败。
             logger.warning(
-                f"📡 任务 #{task_id} 的源消息取不回（可能已删除），标记为永久失败："
-                f"{label}"
+                f"📡 任务 #{task_id} 的源消息取不回，转退避重试：{label}"
             )
-            _safe(lambda: runtime_db.fail_listener_task(
-                task_id, error="源消息不可读（可能已删除）"))
+            await _handle_failure(
+                task, TimeoutError("源消息取不回（可能已删除或瞬时不可达）"))
             return False
 
         is_saved = task.get("target_type") == "saved_messages"

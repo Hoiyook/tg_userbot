@@ -278,14 +278,19 @@ class ExecuteTaskTest(_WorkerTestCase):
         await lw.execute_task(task)
         self.assertEqual(self.copies[0][2], "#a 相册说明")
 
-    async def test_missing_source_message_is_permanent_failure(self):
-        """源消息被删（取不回）→ 永久失败，不做无谓重试。"""
+    async def test_missing_source_message_goes_to_retry(self):
+        """源消息取不回 → 走退避重试（用户 2026-09-28 要求：所有失败都重试）。
+
+        09-20 事故：代理抖动导致取源消息瞬时失败被判「永久」，实际消息仍在。
+        重试 8 次上限内给恢复机会；超限才 FAILED（人工 /listen 场景可再触发）。"""
         ids = self._seed([FakeMessage(101, "#a")])
         state.client = FakeClient([])          # 消息已不存在
         task = runtime_db.claim_listener_task()
         await lw.execute_task(task)
-        self.assertEqual(runtime_db.get_listener_task(ids[0])["status"],
-                         "FAILED")
+        rec = runtime_db.get_listener_task(ids[0])
+        self.assertEqual(rec["status"], "PENDING")
+        self.assertIsNotNone(rec["next_retry_at"])
+        self.assertIn("源消息取不回", rec["last_error"])
 
     async def test_transient_failure_goes_to_retry(self):
         ids = self._seed([FakeMessage(101, "#a")])
