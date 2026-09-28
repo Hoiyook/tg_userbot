@@ -164,7 +164,8 @@ class CmdhisCommandTest(unittest.TestCase):
         text = ev.reply.await_args.args[0]
         self.assertIn("2/2 条", text)
         self.assertLess(text.index("/paw plan MofuMochii"), text.index("你好"))
-        self.assertIn("```", text)   # with_code_block：整块可复制
+        # 2026-09-28：不再包围栏（链接可点优先于等宽复制）
+        self.assertNotIn("```", text)
 
     def test_limit_param(self):
         ev = mock.MagicMock()

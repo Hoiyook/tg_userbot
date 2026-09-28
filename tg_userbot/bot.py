@@ -1422,6 +1422,8 @@ async def bot_callback_handler(event):
         logger.warning(f"🤖 bot 菜单回调 unknown：原始数据 {event.data!r}")
     try:
         reply, buttons = await handle_menu_action(action, arg, event)
+        if reply is not None:
+            reply = text_mod.fit_4096(reply)   # 全局长度护栏（面板出口）
         if reply is not None or buttons is not None:
             # 功能使用审计：面板按钮也是「使用功能」，与指令同一套账
             try:

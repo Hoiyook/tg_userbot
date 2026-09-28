@@ -151,14 +151,12 @@ def clean_buttons(rows):
 
 
 def with_code_block(text):
-    """指令回复统一代码块化：多行回复的首行（前缀行）留在围栏外——自动
-    清理白名单按 startswith 匹配依赖它；其余正文包进 ``` 围栏（Telegram
-    客户端自动渲染成可复制的等宽块）。已含围栏（/sh 输出）与单行回复
-    （确认类短消息）原样不动。"""
-    if not text or "```" in text or "\n" not in text:
-        return text
-    first, rest = text.split("\n", 1)
-    return f"{first}\n```\n{rest}\n```"
+    """指令回复出口（2026-09-28 用户决策：不再包 ``` 围栏）。
+
+    此前包围栏是为了等宽可复制，但围栏内链接/按钮语境全部失效，用户
+    要求换回普通消息。函数保留为「直通」以维持全部调用点与测试形状；
+    自动清理白名单按消息首行前缀匹配——直通后首行即整条首行，语义不变。"""
+    return text or ""
 
 
 def done_reply_text(n, keyword=None):

@@ -22,12 +22,10 @@ from tg_userbot import text  # noqa: E402
 
 
 class TestWithCodeBlock(unittest.TestCase):
-    def test_multiline_wrapped_first_line_outside(self):
+    def test_multiline_passthrough_no_fence(self):
+        """2026-09-28 用户决策：不再包围栏——链接可点。直通返回。"""
         src = "📥 下载队列（共 2 条）：\n\n1. 视频.mp4\n2. 音频.mp3"
-        out = text.with_code_block(src)
-        self.assertTrue(out.startswith("📥 下载队列（共 2 条）：\n```"))
-        self.assertTrue(out.endswith("```"))
-        self.assertIn("1. 视频.mp4", out)
+        self.assertEqual(text.with_code_block(src), src)
 
     def test_single_line_unchanged(self):
         self.assertEqual(text.with_code_block("✅ 已从白名单移除"),

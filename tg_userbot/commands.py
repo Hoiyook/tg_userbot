@@ -52,7 +52,7 @@ async def _reply(event, payload, **kwargs):
     text.with_code_block）。全部 handle_command 分支的回复都走这里。"""
     if "buttons" in kwargs:
         kwargs["buttons"] = text.clean_buttons(kwargs["buttons"])
-    await event.reply(text.with_code_block(payload), **kwargs)
+    await event.reply(text.fit_4096(text.with_code_block(payload)), **kwargs)
 
 
 def _help2_text():
