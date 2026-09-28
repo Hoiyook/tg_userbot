@@ -868,9 +868,25 @@ async def thumbnail_recovery_loop():
                 continue
             if not batch:
                 break
-            data_map = await asyncio.to_thread(
-                _fetch_thumbnails, [(f, f["url"]) for f in batch])
+            # 「原图已在本地」的不抓缩略图（用户 2026-09-28 要求）：
+            # 死链前可能已下载过同名文件（同帖早期尝试/同作者其他帖），
+            # 原件在就直接记账，省一次缩略图请求
+            need_thumb = []
             for f in batch:
+                target = _target_path({"subdir": f["subdir"]}, f["filename"])
+                if os.path.isfile(target) and os.path.getsize(target) > 0:
+                    runtime_db.mark_pawchive_file_done(
+                        f["id"], size_bytes=os.path.getsize(target),
+                        note="原图已在本地(死链前已下载)")
+                    f["status"] = runtime_db.PAW_FILE_DONE
+                    st["done"] += 1
+                    logger.info(
+                        f"🖼 原图已在本地，跳过缩略图：{f['filename']}")
+                    continue
+                need_thumb.append(f)
+            data_map = await asyncio.to_thread(
+                _fetch_thumbnails, [(f, f["url"]) for f in need_thumb])
+            for f in need_thumb:
                 data = data_map.get(f["id"])
                 if not data:
                     continue   # 缩略图也 404：保持 FAILED，下轮不再列出？

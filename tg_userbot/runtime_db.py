@@ -1325,7 +1325,9 @@ def list_pawchive_dead_thumbs(limit=300):
         "SELECT f.id, f.url, f.filename, f.post_row, p.subdir, p.status "
         "AS post_status FROM pawchive_files f "
         "JOIN pawchive_posts p ON p.id=f.post_row "
-        "WHERE f.status=? AND f.error LIKE ? ORDER BY f.id LIMIT ?",
+        "WHERE f.status=? AND f.error LIKE ? "
+        "ORDER BY CASE p.status WHEN 'PROCESSING' THEN 0 WHEN 'PENDING' "
+        "THEN 1 ELSE 2 END, f.id LIMIT ?",
         (PAW_FILE_FAILED, PAW_DEAD_LINK_MARK + "%", int(limit))).fetchall(),
         "列 Pawchive 死链文件（缩略图追回）")
     return [dict(r) for r in rows]
