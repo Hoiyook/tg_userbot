@@ -3352,3 +3352,48 @@ class ThumbnailNoOverwriteTest(unittest.TestCase):
             error=runtime_db.PAW_DEAD_LINK_MARK + " 404")
         # 模拟 loop 的「原图已在本地」分支
         self.assertEqual(open(real, "rb").read(), b"real content")
+
+
+class TorrentDocumentTest(unittest.IsolatedAsyncioTestCase):
+    """发 .torrent 文件（Document）→ 转磁力提交 115 离线。"""
+
+    async def test_torrent_document_submits_offline(self):
+        sent = []
+        doc = mock.MagicMock()
+        doc.name = "[AI] Asuna Chinatown.zip.torrent"
+        msg = mock.MagicMock()
+        msg.message = ""                   # 文本为空 → 不触发台账/指令
+        msg.document = doc
+        msg.file = doc                     # bot.py 读 message.file.name
+        msg.file.name = doc.name
+        msg.fwd_from = None
+        saved = (state.MY_ID, state.bot_client)
+        state.MY_ID = 123
+        state.bot_client = mock.MagicMock()
+        state.bot_client.send_message = mock.AsyncMock()
+        async def fake_dl(message, out=None, **kw):
+            out.write(b"d" * 100)      # Telethon 语义：写进 out 并返回它
+            return out
+        state.bot_client.download_media = fake_dl
+        ev = mock.MagicMock()
+        ev.chat_id = 123
+        ev.out = False
+        ev.message = msg
+        async def fake_dl(message, out=None, **kw):
+            out.write(b"d" * 100)
+            return out
+        try:
+            with mock.patch.object(
+                    bot.torrent_offline, "torrent_to_magnet",
+                    return_value=("magnet:?xt=urn:btih:abc&dn=x", {
+                        "name": doc.name, "size": 100, "private": False})), \
+                    mock.patch.object(bot.torrent_offline, "_submit",
+                                      return_value=(True, "")) as sub, \
+                    mock.patch.object(state.bot_client, "download_media",
+                                      fake_dl):
+                from tg_userbot import bot as bot_mod
+                await bot_mod.bot_message_handler(ev)
+        finally:
+            state.MY_ID, state.bot_client = saved
+        self.assertTrue(sub.called, "应提交 115 离线")
+        self.assertIn("urn:btih:abc", sub.call_args.args[0])
