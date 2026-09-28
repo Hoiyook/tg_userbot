@@ -37,7 +37,8 @@ class _FakeTG:
     def is_connected(self):
         return self._connected
 
-    async def send_message(self, target, text, link_preview=False):
+    async def send_message(self, target, text, link_preview=False,
+                           buttons=None):
         if self.error:
             raise self.error
         self.sent.append((target, text))

@@ -2561,7 +2561,7 @@ class NotifyOnProcessTest(unittest.IsolatedAsyncioTestCase):
         self._sent = []
         self._patch_notify = mock.patch.object(
             pawchive_worker.notify, "notify_user",
-            mock.AsyncMock(side_effect=lambda t: self._sent.append(t)))
+            mock.AsyncMock(side_effect=lambda t, **kw: self._sent.append(t)))
         self._patch_notify.start()
         self.addCleanup(self._patch_notify.stop)
 
@@ -2590,8 +2590,9 @@ class NotifyOnProcessTest(unittest.IsolatedAsyncioTestCase):
             await pawchive_worker.process_post(post)
         self.assertTrue(any("开始下载：MofuMochii" in t for t in self._sent),
                         self._sent)
-        self.assertTrue(any("发布：2026-09-01" in t for t in self._sent)
-                        or True)   # 发布日期行（seed 数据自带）
+        self.assertTrue(any("1 个图片" in t for t in self._sent),
+                        "附件按类型细分")
+        self.assertTrue(any("行id #" in t for t in self._sent), "帖行id")
 
     async def test_disabled_no_start_notification(self):
         pawchive.set_notify_each_post(False)

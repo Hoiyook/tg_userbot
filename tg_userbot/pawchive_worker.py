@@ -42,6 +42,7 @@ from . import runtime_db
 from . import state
 from . import text as text_mod
 from .log import logger
+from telethon import Button
 
 # 强制直连：系统代理（socks5）会让 urllib 秒抛 ValueError（2026-09-15 实测）
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -405,6 +406,31 @@ def _mark_dead(file_row, code=404):
 # ============================================================
 # 内置下载器（httpx 直连 + 并发）
 # ============================================================
+
+
+def _files_breakdown(files):
+    """附件按扩展名细分：「3 个压缩包 · 2 个 mp4 · 1 个图片」。
+
+    压缩包(zip/rar/7z)、视频(mp4/mkv/mov/webm)、图片(jpg/png/gif/webp)、
+    文档(pdf/psd/clip/txt)、其余归「其他」。无文件返回空串。"""
+    import os as _os
+    buckets = collections.Counter()
+    for f in files:
+        ext = _os.path.splitext(str(f.get("filename") or ""))[1] \
+            .lstrip(".").lower()
+        if ext in ("zip", "rar", "7z"):
+            buckets["压缩包"] += 1
+        elif ext in ("mp4", "mkv", "mov", "webm"):
+            buckets["视频"] += 1
+        elif ext in ("jpg", "jpeg", "png", "gif", "webp"):
+            buckets["图片"] += 1
+        elif ext in ("pdf", "psd", "clip", "txt"):
+            buckets["文档"] += 1
+        else:
+            buckets["其他"] += 1
+    return " · ".join(f"{v} 个{k}" for k, v in buckets.items())
+
+
 def _target_path(post, filename):
     """落盘绝对路径：DOWNLOAD_DIR/<subdir=「Pawchive/作者/帖子」>/<文件名>。
 
@@ -679,10 +705,13 @@ async def _finalize(post, files):
                         if post.get("post_url") else "")
             await notify.notify_user(
                 f"✅ Pawchive 完成：{post['creator_name']}｜{title}\n"
-                f"发布：{(post.get('published') or '')[:10]}｜"
-                f"{len(files)} 个文件 / {format_size(total)}\n"
+                f"行id #{post['id']}｜发布："
+                f"{(post.get('published') or '')[:10]}\n"
+                f"{_files_breakdown(files)} / {format_size(total)}\n"
                 f"落盘 {config.DOWNLOAD_DIR}/{post.get('subdir') or ''}"
                 + done_url)
+        except Exception as e:
+            logger.warning(f"完成通知发送失败（忽略）：{e}")
         except Exception as e:
             logger.warning(f"完成通知发送失败（忽略）：{e}")
     _bump_milestone("completed")
@@ -1113,19 +1142,30 @@ async def process_post(post):
     files = runtime_db.list_pawchive_files(post["id"])
 
     # 开始通知（2026-09-25 用户要求与转发链路一致）；/paw notify off 可关
-    # 2026-09-28 用户要求完善：带发布日期与原帖链接（可点）
+    # 2026-09-28 用户要求完善：帖行id + 发布日期 + 原帖链接 +
+    # 附件按类型细分（xx 个压缩包、xx 个 mp4…），并挂 📋 详情按钮
+    # （点击等同 /paw_pr 行id）
     from . import pawchive   # 函数内导入：pawchive → worker 已有环，避免模块级
     if pawchive.notify_each_post_enabled() and files:
         try:
+            from .menu import encode_menu_data
             start_url = (post.get("post_url") + "\n"
                          if post.get("post_url") else "")
+            btn_rows = [[Button.inline(
+                "📋 帖子详情",
+                encode_menu_data("paw_pr", str(post["id"])))]]
+            if post.get("post_url"):
+                btn_rows[0].append(
+                    Button.url("🔗 原帖", post["post_url"]))
             await notify.notify_user(
                 f"🐾 开始下载：{post['creator_name']}｜"
                 f"{(post.get('title') or '')[:40]}\n"
-                f"发布：{(post.get('published') or '')[:10]}｜"
-                f"附件 {len(files)} 个\n"
+                f"行id #{post['id']}｜发布："
+                f"{(post.get('published') or '')[:10]}\n"
+                f"{_files_breakdown(files)}\n"
                 + start_url
-                + "（/paw status 看进度）")
+                + "（/paw status 看进度）",
+                buttons=btn_rows)
         except Exception as e:
             logger.warning(f"开始通知发送失败（忽略）：{e}")
 

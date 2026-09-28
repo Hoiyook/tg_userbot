@@ -243,7 +243,8 @@ class _FakeClient:
     def is_connected(self):
         return True
 
-    async def send_message(self, target, text, link_preview=False):
+    async def send_message(self, target, text, link_preview=False,
+                           buttons=None):
         if self.send_error:
             raise self.send_error
         self.sent.append((target, text))
@@ -263,7 +264,7 @@ class _HangingClient(_FakeClient):
         super().__init__()
         self.attempts = []
 
-    async def send_message(self, target, text):
+    async def send_message(self, target, text, buttons=None):
         self.attempts.append(text)
         await asyncio.sleep(30)          # 由收口的超时取消掉
 

@@ -32,15 +32,16 @@ def _bot_can_send():
     return bool(bot is not None and state.MY_ID and bot.is_connected())
 
 
-async def notify_user(text, link_preview=False):
+async def notify_user(text, link_preview=False, buttons=None):
     """发一条程序主动通知；返回 True=已发出，False=两边都没发出去。
 
     优先 bot 账号 → 控制面板对话；否则回落主账号 → 收藏夹。
-    """
+    buttons：可选内联按钮行（rows of Button），走通知链路时一并携带。"""
     if _bot_can_send():
         sent = await netio.shielded(
             lambda: state.bot_client.send_message(
-                state.MY_ID, text, link_preview=link_preview),
+                state.MY_ID, text, link_preview=link_preview,
+                buttons=buttons),
             NOTIFY_TIMEOUT_SECONDS,
             "发送通知（控制面板）",
         )
@@ -52,7 +53,8 @@ async def notify_user(text, link_preview=False):
     if client is None:
         return False
     sent = await netio.shielded(
-        lambda: client.send_message("me", text, link_preview=link_preview),
+        lambda: client.send_message("me", text, link_preview=link_preview,
+                                    buttons=buttons),
         NOTIFY_TIMEOUT_SECONDS,
         "发送通知（收藏夹）",
     )
