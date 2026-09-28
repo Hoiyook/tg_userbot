@@ -331,6 +331,7 @@ def _download_one(post, f, progress):
             break
         offset = os.path.getsize(part) if os.path.isfile(part) else 0
         exc = None        # except as e 在块尾会被删除——捕获到变量再判定
+        rate_limited = False
         try:
             headers = {"User-Agent": "Mozilla/5.0 tg-userbot-pawchive"}
             if offset:
@@ -364,6 +365,10 @@ def _download_one(post, f, progress):
             last_err = f"HTTP {e.response.status_code}"
             if e.response.status_code in _DEAD_STATUS:
                 return ("dead", None, last_err)
+            if e.response.status_code == 429:
+                # 限流是暂时性的：等 60s 再试，不消耗无进展额度
+                #（total_attempts 硬上限仍防死循环）
+                rate_limited = True
         except Exception as e:   # noqa: BLE001 —— 网络类错误统一重试
             exc = e
             last_err = f"{type(e).__name__}: {e}"
@@ -371,7 +376,15 @@ def _download_one(post, f, progress):
         progressed = gained > 0 and isinstance(
             exc, (httpx.RemoteProtocolError, httpx.ReadError,
                   ConnectionError, TimeoutError))
-        if progressed:
+        rate_limited = rate_limited or (
+            exc is not None and "429" in str(exc))
+        if rate_limited:
+            # 429 限流：不消耗额度，等满 60s（服务端要求的节奏）
+            logger.warning(
+                f"🐾 限流（429），{config.PAWCHIVE_429_WAIT_SECONDS}s 后"
+                f"断点续传：{f['filename']}")
+            time.sleep(float(config.PAWCHIVE_429_WAIT_SECONDS))
+        elif progressed:
             # 有进账的断流：不消耗重试额度，退避后从断点继续——
             # 大视频在抖动 CDN 上就是这样一段段搬完的
             logger.warning(
@@ -386,7 +399,8 @@ def _download_one(post, f, progress):
                 + ("，退避后重试" if attempts < _DOWNLOAD_ATTEMPTS else ""))
         if attempts >= _DOWNLOAD_ATTEMPTS:
             break
-        time.sleep(min(30, 5 * (attempts or 1)))
+        if not rate_limited:
+            time.sleep(min(30, 5 * (attempts or 1)))
     return ("failed", None, last_err)
 
 
@@ -470,14 +484,6 @@ async def _finalize(post, files):
                 _bump_milestone("completed")
                 await _milestone_notify_if_due()
                 return
-            err = (f"{len(failed)}/{len(files)} 个文件是站点死链"
-                   f"（{_MISSING_MARK}）")
-            runtime_db.finalize_pawchive_post(
-                post["id"], runtime_db.PAW_POST_FAILED, error=err)
-            logger.warning(f"🐾 帖子全部为站点死链，标失败：{label}｜{title}")
-            _bump_milestone("failed")
-            await _milestone_notify_if_due()
-            return
             err = (f"{len(failed)}/{len(files)} 个文件是站点死链"
                    f"（{_MISSING_MARK}）")
             runtime_db.finalize_pawchive_post(
@@ -731,6 +737,63 @@ async def _milestone_notify_if_due():
     return True
 
 
+_LAST_429_SWEEP = None   # None = 从未扫描过（monotonic 每进程从 0 起算，
+                         # 初始 0.0 会让首次扫描被「now-0<900s」永久拦下）
+
+
+def _is_429_only_failure(post):
+    """帖子 FAILED 且所有 FAILED 文件都是 429 限流（可恢复，非死链）。"""
+    files = runtime_db.list_pawchive_files(post["id"])
+    failed = [f for f in files if f["status"] == runtime_db.PAW_FILE_FAILED]
+    if not failed:
+        return False
+    return all("429" in (f.get("error") or "") for f in failed)
+
+
+async def _auto_requeue_429():
+    """定期重投「仅因 429 限流失败」的帖子（自动恢复，不再等手动 retry）。
+
+    节流：每 PAWCHIVE_429_SWEEP_SECONDS 扫一次；attempts 超过
+    PAWCHIVE_429_AUTO_RETRY_MAX_ATTEMPTS 的不再自动投（防无限循环，
+    人工 /paw retry 仍可用）。429 文件本身不动——worker 重领后会重新
+    预检/下载。
+    """
+    global _LAST_429_SWEEP
+    now = time.monotonic()
+    if _LAST_429_SWEEP is not None and \
+            now - _LAST_429_SWEEP < float(config.PAWCHIVE_429_SWEEP_SECONDS):
+        return 0
+    _LAST_429_SWEEP = now
+    try:
+        rows = runtime_db.list_pawchive_posts(
+            status=runtime_db.PAW_POST_FAILED, limit=200)
+    except runtime_db.DbUnavailable as e:
+        logger.error(f"🐾 429 自动重投扫描失败（本轮跳过）：{e}")
+        return 0
+    targets = []
+    for p in rows:
+        dbg_files = runtime_db.list_pawchive_files(p["id"])
+        logger.warning(
+            f"DBG sweep: #{p['id']} attempts={p.get('attempts')} "
+            f"files={[(f['status'], f.get('error')) for f in dbg_files]}")
+        if int(p.get("attempts") or 0) > int(
+                config.PAWCHIVE_429_AUTO_RETRY_MAX_ATTEMPTS):
+            logger.warning("DBG sweep: 跳过（超限）")
+            continue
+        if _is_429_only_failure(p):
+            logger.warning(f"DBG sweep: 命中 target #{p['id']}")
+            targets.append(p["id"])
+    if not targets:
+        logger.warning("DBG sweep: 无 target")
+        return 0
+    requeued = runtime_db.retry_pawchive_posts(row_ids=targets)
+    if requeued:
+        logger.info(
+            f"🐾 自动重投 {requeued} 条 429 限流失败的帖子"
+            f"（限流窗口已过，恢复正常下载）")
+    return requeued
+
+
 async def _renew_lease_loop(post_row):
     """单帖下载期间每 PAWCHIVE_LEASE_RENEW_SECONDS 续一次租。"""
     try:
@@ -887,6 +950,7 @@ async def worker_loop():
         while True:
             try:
                 recover_expired()
+                await _auto_requeue_429()
                 spawned = 0
                 while len(_INFLIGHT) < int(
                         config.PAWCHIVE_MAX_INFLIGHT_POSTS):

@@ -346,6 +346,69 @@ class PanelGuardTest(unittest.TestCase):
         self.assertIn('"🐾 Pawchive 进度"', src)
 
 
+class RateLimitTest(_WorkerDbTestCase):
+    """429 限流感知：等待不烧额度；纯 429 失败帖自动重投。"""
+
+    async def test_429_uses_long_wait_not_budget(self):
+        """429：等 60s（服务端节奏），不消耗 3 次额度。"""
+        post, _ = self._seed_and_claim()
+        sleeps = []
+
+        async def fake_sleep(sec):
+            sleeps.append(sec)
+
+        def handler(request):
+            return httpx.Response(429, text="slow down")
+
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.Client
+        with mock.patch.object(worker.httpx, "Client",
+                               side_effect=lambda **kw: real_client(
+                                   transport=transport, **kw)), \
+                mock.patch.object(worker.asyncio, "sleep",
+                                  side_effect=fake_sleep), \
+                mock.patch.object(worker.time, "sleep",
+                                  new=lambda s: sleeps.append(s)):
+            result = await asyncio.to_thread(
+                worker._download_one, post,
+                {"id": 1, "url": "https://x/a.mp4", "filename": "a.mp4",
+                 "status": runtime_db.PAW_FILE_PENDING},
+                lambda c, t: None)
+        self.assertEqual(result[0], "failed")
+        self.assertIn("429", result[2])
+        self.assertTrue(any(s == config.PAWCHIVE_429_WAIT_SECONDS
+                            for s in sleeps), "429 应等满 60s")
+
+    async def test_429_auto_requeue_sweep(self):
+        """纯 429 失败帖：扫描自动重投；attempts 超限的不动。"""
+        runtime_db.enqueue_pawchive_posts("patreon", "42", "C", [
+            _post("301"), _post("302")])
+        rows = runtime_db.list_pawchive_posts(limit=10)
+        p301 = next(r for r in rows if r["post_id"] == "301")
+        p302 = next(r for r in rows if r["post_id"] == "302")
+        for row, attempts in ((p301, 1), (p302, 9)):
+            runtime_db.claim_next_pawchive_post()
+            for f in runtime_db.list_pawchive_files(row["id"]):
+                runtime_db.mark_pawchive_file_failed(
+                    f["id"], error="HTTP 429")
+            runtime_db.finalize_pawchive_post(
+                row["id"], runtime_db.PAW_POST_FAILED, error="429")
+            # 直接写 attempts（p302 超限不再自动投）
+            runtime_db._write(
+                lambda conn, _rid=row["id"]: conn.execute(
+                    "UPDATE pawchive_posts SET attempts=? WHERE id=?",
+                    (attempts, _rid)),
+                "测试：设置 attempts")
+        requeued, _skipped = await worker._auto_requeue_429()
+        self.assertEqual(requeued, 1)   # 301 重投；302 attempts=9 > 5 跳过
+        self.assertEqual(
+            runtime_db.get_pawchive_post(p301["id"])["status"],
+            runtime_db.PAW_POST_PENDING)
+        self.assertEqual(
+            runtime_db.get_pawchive_post(p302["id"])["status"],
+            runtime_db.PAW_POST_FAILED)
+
+
 class InflightCleanupTest(_WorkerDbTestCase):
     """_INFLIGHT 泄漏修复（面板曾显示早已终态的帖子）：成功/失败/取消都要
     清在途标记；面板只显示仍处 PROCESSING 的帖子。"""

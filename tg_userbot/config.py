@@ -387,6 +387,11 @@ ORIGIN_FAILURES_FILE = os.path.join(RUNTIME_DIR, "origin_failures.jsonl")
 PAWCHIVE_PANEL_INTERVAL_SECONDS = 60
 # 多帖并发：worker 同时处理的帖子数上限（帖内文件并发仍由 /thread 信号量总控）
 PAWCHIVE_MAX_INFLIGHT_POSTS = 8  # 4→8（2026-09-18：CDN 每 53s 掐断流，更多并发流摊平吞吐）
+# 429 限流感知（2026-09-28 巡检：Falling Sakee 海量图集触发站点限流）
+# 429 是暂时性的——等 60s 再试不烧重试额度；仅 429 失败的帖子定期自动重投
+PAWCHIVE_429_WAIT_SECONDS = 60
+PAWCHIVE_429_SWEEP_SECONDS = 900
+PAWCHIVE_429_AUTO_RETRY_MAX_ATTEMPTS = 5
 PAWCHIVE_MILESTONE_POSTS = 50
 # --- 评论跟进（2026-09-12）---
 # 命中标签的帖子会进「关注列表」，之后按天跟进它的评论区并取回新出现的媒体
