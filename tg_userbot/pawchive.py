@@ -228,8 +228,9 @@ async def backfill_author(name):
     except runtime_db.DbUnavailable as e:
         return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
     if not rows:
-        return (f"{TEXT_PREFIX}\n❌ 没有叫「{label}」的扫描记录"
-                "（不确定用 /paw search <词>）")
+        return (f"{TEXT_PREFIX}\n❌ 没有叫「{label}」的扫描记录\n"
+                "注意：backfill 是**按作者名**回填历史帖（如 /paw backfill SillyTeshii）；"
+                "多词作者名直接跟在后面。先 /paw search <词> 确认名字")
     state.PAW_SCAN_RUNNING = f"回填 {rows[0]['creator_name']}"
     state.PAW_SCAN_PROGRESS = {
         "started": time.monotonic(), "stage": "回填详情", "detail": "0/0"}
