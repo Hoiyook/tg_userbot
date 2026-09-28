@@ -609,10 +609,12 @@ class DailyCookieNotifyOnlyOnRealInvalidTest(unittest.IsolatedAsyncioTestCase):
         async def fake_sleep(seconds):
             raise asyncio.CancelledError
 
+        from tg_userbot import inspect as _insp
         with mock.patch.object(maintenance, "daily_maintenance", fake_daily), \
              mock.patch.object(pawchive, "cookie_check_cached", fake_check), \
              mock.patch.object(notify, "notify_user", fake_notify), \
              mock.patch.object(config, "PAWCHIVE_COOKIE", "sessionid=X"), \
+             mock.patch.object(_insp, "run_inspection", lambda: None), \
              mock.patch.object(app_mod.asyncio, "sleep", fake_sleep):
             task = asyncio.ensure_future(app_mod._maintenance_loop())
             with self.assertRaises(asyncio.CancelledError):
@@ -3106,3 +3108,45 @@ class DeadButtonAuditTest(unittest.TestCase):
     def test_wl_scan_now_registered(self):
         self.assertIn("wl_scan", config.MENU_ACTIONS)
         self.assertIn("paw_archive", config.MENU_ACTIONS)
+
+
+# ============================================================
+# 31) /inspect 系统巡检（2026-09-28 功能抽象）
+# ============================================================
+class InspectTest(unittest.TestCase):
+    """run_inspection：分区渲染 + 结论区 + 容错（组件缺失不炸）。"""
+
+    def test_report_sections(self):
+        from tg_userbot import inspect as insp, runtime_db
+        self.dir = tempfile.mkdtemp(prefix="ux3_insp_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        text = insp.run_inspection()
+        for key in ("🔍 系统巡检", "连接：", "进程：", "磁盘：",
+                    "📥 下载队列", "🐾 Pawchive", "📡 标签监听",
+                    "🌐 Chrome", "🗄 今日 DB 备份"):
+            self.assertIn(key, text)
+        # 测试环境无今日 DB 备份文件 → 结论走 ⚠️ 分支；两种结论都合法
+        self.assertTrue("✅ 结论：系统健康" in text or "⚠️ 需关注" in text)
+        self.assertLessEqual(len(text), 3900)
+
+    def test_registered_everywhere(self):
+        self.assertIn("inspect", config.REGISTERED_COMMAND_NAMES)
+        self.assertTrue(any(n == "inspect" for n, _ in bot.BOT_COMMANDS))
+        self.assertIn("/inspect", commands._help_text())
+
+    def test_warning_on_low_disk(self):
+        from tg_userbot import inspect as insp
+        with mock.patch.object(insp, "_disk_free_gb", return_value=30.0), \
+                mock.patch.object(insp, "_today_disconnects",
+                                  return_value=0), \
+                mock.patch.object(insp, "_open_read_conn",
+                                  side_effect=RuntimeError("no db")):
+            text = insp.run_inspection()
+        self.assertIn("磁盘仅剩 30 GB", text)
+        self.assertIn("⚠️ 需关注", text)

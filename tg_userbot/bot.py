@@ -112,6 +112,7 @@ BOT_COMMANDS = (
     ("cmdhis", "最近发给 bot 的消息（整块可复制重发）"),
     ("usage", "功能使用统计：各功能使用次数与频率"),
     ("restart", "重启 bot（优雅停机 + 自动拉起，约 30 秒）"),
+    ("inspect", "系统巡检：连接/任务/产出/失败/备份 一屏"),
     ("cmdt", "命令模板列表"),
     ("botclean", "bot 对话自动清理开关：/botclean on|off"),
     ("cd2check", "CloudDrive2 备份对账：本地媒体 vs 115 远端"),

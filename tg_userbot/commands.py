@@ -254,6 +254,7 @@ def _help_text():
         "/cd2tasks —— CD2 上传任务明细\n"
         "/botclean on|off —— bot 对话自动清理开关\n"
         "/restart —— 重启 bot（优雅停机，约 30 秒）\n"
+        "/inspect —— 系统巡检（连接/任务/产出/失败/备份）\n"
         "/help2 —— 数据表与配置文件字典\n"
         "注：/paw_plan 与 /paw plan 两种写法等效（下划线为标准形）"
     )
@@ -811,6 +812,14 @@ async def handle_command(event, cmd_text):
             except Exception:
                 pass
 
+        return True
+
+    if cmd_text == "/inspect":
+        await _reply(event, "🔍 巡检中……")
+        from . import inspect as inspect_mod
+        out = await asyncio.to_thread(inspect_mod.run_inspection)
+        await _reply(event, out)
+        logger.info("执行命令：/inspect")
         return True
 
     if cmd_text == "/restart":

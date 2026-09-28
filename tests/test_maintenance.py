@@ -173,7 +173,9 @@ class MaintenanceLoopFirstIterationTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(pawchive, "cookie_check_cached", fake_check), \
              mock.patch.object(notify, "notify_user", fake_notify), \
              mock.patch.object(config, "PAWCHIVE_COOKIE", "sessionid=X"), \
-             mock.patch.object(app_mod.asyncio, "sleep", fake_sleep):
+             mock.patch.object(app_mod.asyncio, "sleep", fake_sleep), \
+             mock.patch.object(__import__("tg_userbot.inspect", fromlist=["x"]),
+                               "run_inspection", lambda: None):
             task = asyncio.ensure_future(app_mod._maintenance_loop())
             with self.assertRaises(asyncio.CancelledError):
                 await task

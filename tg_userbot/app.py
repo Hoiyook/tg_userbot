@@ -180,6 +180,17 @@ async def _maintenance_loop():
             raise
         except Exception as e:
             logger.warning(f"🗄 每日维护异常：{e}")
+        # 每日巡检报告（2026-09-28）：/inspect 的自动形态，一天一次
+        try:
+            from . import inspect as _insp
+            out = await asyncio.to_thread(_insp.run_inspection)
+            if out:
+                from . import notify
+                await notify.notify_user(out)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"🔍 每日巡检报告发送失败（不影响维护）：{e}")
         # Cookie 每日体检：已配置才查。只对「确认失效」（401/登录墙）提醒；
         # 网络抖动（校验失败）不是失效——站点慢时误报会吓到用户去重贴
         # Cookie（2026-09-24），这类明天自愈，只留日志
