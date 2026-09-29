@@ -18,15 +18,25 @@ class BencodeError(ValueError):
 
 
 def _decode(data, i):
-    """从 data[i] 解码一个值，返回 (值, 下一位置)。"""
+    """从 data[i] 解码一个值，返回 (值, 下一位置)。
+
+    所有读取都带越界校验：截断的种子（网络下载半途而废）必须快速失败并
+    给出明确原因，而不是静默产出垃圾数据（2026-09-29 实测：站点返回
+    截断的种子被"成功"解析出坏磁力）。"""
+    if i >= len(data):
+        raise BencodeError("种子数据被截断（文件不完整）")
     c = data[i:i + 1]
     if c == b"i":                                   # 整数 i<num>e
-        j = data.index(b"e", i)
+        j = data.find(b"e", i)
+        if j < 0:
+            raise BencodeError("种子数据被截断（整数无终止符）")
         return int(data[i + 1:j]), j + 1
     if c == b"l":                                   # 列表 l<...>e
         i += 1
         out = []
         while data[i:i + 1] != b"e":
+            if i >= len(data):
+                raise BencodeError("种子数据被截断（列表未闭合）")
             v, i = _decode(data, i)
             out.append(v)
         return out, i + 1
@@ -34,12 +44,19 @@ def _decode(data, i):
         i += 1
         out = {}
         while data[i:i + 1] != b"e":
+            if i >= len(data):
+                raise BencodeError("种子数据被截断（字典未闭合）")
             k, i = _decode(data, i)
             v, i = _decode(data, i)
             out[k] = v
         return out, i + 1
-    j = data.index(b":", i)                         # 字符串 <len>:<bytes>
+    j = data.find(b":", i)                          # 字符串 <len>:<bytes>
+    if j < 0:
+        raise BencodeError("种子数据被截断（字符串无长度分隔符）")
     n = int(data[i:j])
+    if j + 1 + n > len(data):
+        raise BencodeError(
+            f"种子数据被截断（字符串声明 {n}B 实际不足）")
     return data[j + 1:j + 1 + n], j + 1 + n
 
 
@@ -56,16 +73,29 @@ def bdecode(data):
 
 def _skip(data, i):
     """跳过 data[i] 起的一个完整值，返回结束位置（不构建对象，快）。"""
+    if i >= len(data):
+        raise BencodeError("种子数据被截断（skip 越界）")
     c = data[i:i + 1]
     if c == b"i":
-        return data.index(b"e", i) + 1
+        j = data.find(b"e", i)
+        if j < 0:
+            raise BencodeError("种子数据被截断（整数无终止符）")
+        return j + 1
     if c in b"ld":
         i += 1
         while data[i:i + 1] != b"e":
+            if i >= len(data):
+                raise BencodeError("种子数据被截断（容器未闭合）")
             i = _skip(data, i)
         return i + 1
-    j = data.index(b":", i)
-    return j + 1 + int(data[i:j])
+    j = data.find(b":", i)
+    if j < 0:
+        raise BencodeError("种子数据被截断（字符串无长度分隔符）")
+    n = int(data[i:j])
+    end = j + 1 + n
+    if end > len(data):
+        raise BencodeError("种子数据被截断（字符串声明长度超出文件）")
+    return end
 
 
 def parse_torrent(data):

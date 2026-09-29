@@ -3401,6 +3401,32 @@ class TorrentDocumentTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("urn:btih:abc", sub.call_args.args[0])
 
 
+class BencodeTruncationTest(unittest.TestCase):
+    """bencode 越界快速失败（2026-09-29）：截断的种子必须报明确错误，
+    不能静默解析出垃圾（曾把截断种子"成功"解析出坏磁力提交离线）。"""
+
+    def test_truncated_fails_fast_with_reason(self):
+        from tg_userbot import torrent_util
+        # 构造：声明 100B 字符串但只给 10B
+        data = b"d4:name100:short" + b"e"
+        with self.assertRaises(torrent_util.BencodeError) as cm:
+            torrent_util.bdecode(data)
+        self.assertIn("截断", str(cm.exception))
+
+    def test_complete_parses(self):
+        from tg_userbot import torrent_util
+        # 合法最小 bencode
+        data = b"d4:name4:abcd4:infod6:lengthi5eee"
+        val = torrent_util.bdecode(data)
+        self.assertEqual(val[b"name"], b"abcd")
+
+    def test_skip_bounds(self):
+        from tg_userbot import torrent_util
+        data = b"100:short"
+        with self.assertRaises(torrent_util.BencodeError):
+            torrent_util._skip(data, 0)
+
+
 class TorrentInfohashUrlTest(unittest.TestCase):
     """🧲 入口一回归（2026-09-29）：URL 自带 infohash 时 magnet 必须被构造——
     原实现把构造行放在 if not ih 分支内，带 infohash 的 URL 走到 _submit 时
