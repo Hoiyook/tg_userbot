@@ -648,10 +648,13 @@ async def run_once():
         raise
     except Exception as e:
         logger.exception(f"📡 任务 #{task.get('id')} 执行时未预期异常：{e}")
+        # 先把异常定格成字符串再进 lambda：except 名在块尾会被隐式 del，
+        # 延迟执行的闭包引用它会踩 NameError（pyflakes 也在提示这一点）
+        err = f"未预期异常：{type(e).__name__}: {e}"
         _safe(lambda: runtime_db.retry_listener_task(
             task["id"],
             next_retry_at=int(time.time()) + retry_delay_seconds(1),
-            error=f"未预期异常：{type(e).__name__}: {e}"))
+            error=err))
         return False
 
 

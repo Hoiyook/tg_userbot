@@ -8,6 +8,8 @@ import asyncio
 import os
 import urllib.request
 
+from . import config
+from . import notify
 from . import torrent_util
 from .log import logger
 
@@ -96,10 +98,21 @@ def snapshot_dir(to_folder):
 
 
 def spawn_watch(to_folder, label="", known_names=None):
-    """提交成功后启动完成守望。known_names 缺省用当前目录快照。"""
-    known = known_names if known_names is not None else set(
-        _dir_names(to_folder) or [])
-    return spawn_completion_watcher(to_folder, known, label=label)
+    """提交成功后启动完成守望（sync 入口，内部建任务）。
+
+    2026-09-29 修复：原来直接 ``return spawn_completion_watcher(...)``——
+    返回的协程没人 await，守望从未运行（RuntimeWarning 被刷在 stderr 里）。
+    现在在任务里先抓目录快照（_dir_names 是 CD2 gRPC 调用，放线程避免卡
+    事件循环）再进守望；任务强引用防 GC。"""
+    async def _run():
+        known = known_names if known_names is not None else set(
+            await asyncio.to_thread(_dir_names, to_folder) or [])
+        await spawn_completion_watcher(to_folder, known, label=label)
+
+    t = asyncio.ensure_future(_run())
+    _OFFLINE_WATCH_TASKS.add(t)
+    t.add_done_callback(_OFFLINE_WATCH_TASKS.discard)
+    return t
 
 
 def _submit(magnet):

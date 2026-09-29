@@ -30,6 +30,7 @@ from . import whitelist
 from . import cleanup
 from . import chrome_client
 from . import cd2
+from . import cd2_api
 from . import stats
 from . import finder
 from . import listener
@@ -362,7 +363,7 @@ async def handle_menu_action(action, arg, event):
         try:
             body = text_mod.format_sql_result(result)
         except runtime_db.DbUnavailable as e:
-            body = f"{text.SQL_TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+            body = f"{text_mod.SQL_TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
         return (body, [
             [Button.inline("🔙 返回模板", menu.encode_menu_data("sqlt"))],
             [Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
@@ -1117,8 +1118,8 @@ async def bot_message_handler(event):
     if torrent_urls:
         out = await torrent_offline.handle_torrent_url(torrent_urls[0])
         await _send_owner(out, [[
-            Button.inline("📋 离线任务", encode_menu_data("cd2tasks")),
-            Button.inline("🏠 首页", encode_menu_data("home"))]])
+            Button.inline("📋 离线任务", menu.encode_menu_data("cd2tasks")),
+            Button.inline("🏠 首页", menu.encode_menu_data("home"))]])
         return
 
     # .torrent 文件（Document）→ 下载字节转磁力 → 115 离线
