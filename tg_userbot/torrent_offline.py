@@ -150,7 +150,10 @@ async def handle_torrent_url(url):
         return f"🧲 离线提交失败：{e}"
     if not ok:
         if "10008" in (err or "") or "已存在" in (err or ""):
-            return "🧲 该种子已在 115 离线列表中（/cd2tasks 看进度）"
+            # 已在列表 ≠ 已完成：照样挂守望，完成后通知（否则重发链接
+            # 永远拿不到完成反馈）
+            spawn_watch("/115open/云下载", label=name)
+            return "🧲 该种子已在 115 离线列表中（完成后会通知你）"
         return f"🧲 离线提交被拒绝：{err}"
     lines = ["🧲 种子已转为 115 离线任务", f"名称：{name}"]
     if info:
@@ -178,7 +181,9 @@ async def handle_torrent_bytes(data):
         return f"🧲 离线提交失败：{e}"
     if not ok:
         if "10008" in (err or "") or "已存在" in (err or ""):
-            return "🧲 该种子已在 115 离线列表中（/cd2tasks 看进度）"
+            # 已在列表 ≠ 已完成：照样挂守望（同 handle_torrent_url）
+            spawn_watch("/115open/云下载", label=info["name"])
+            return "🧲 该种子已在 115 离线列表中（完成后会通知你）"
         return f"🧲 离线提交被拒绝：{err}"
     lines = ["🧲 种子已转为 115 离线任务", f"名称：{info['name']}",
              f"内容 {format_size(info['size'])}｜"
