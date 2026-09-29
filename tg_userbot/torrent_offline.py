@@ -67,13 +67,13 @@ async def handle_torrent_url(url):
         return f"🧲 离线提交失败：{e}"
     if not ok:
         if "10008" in (err or "") or "已存在" in (err or ""):
-            return "🧲 该种子已在 115 离线列表中（/paw_offline_tasks 看进度）"
+            return "🧲 该种子已在 115 离线列表中（/cd2tasks 看进度）"
         return f"🧲 离线提交被拒绝：{err}"
     lines = ["🧲 种子已转为 115 离线任务", f"名称：{name}"]
     if info:
         lines.append(f"内容 {format_size(info['size'])}｜"
                      f"{'⚠️ 私有种子' if info['private'] else '公开种子'}")
-    lines.append("CD2 离线拉取到 /115open/云下载（/paw_offline_tasks 看进度）")
+    lines.append("CD2 离线拉取到 /115open/云下载（/cd2tasks 看进度）")
     from .text import fit_4096
     return fit_4096("\n".join(lines))
 
@@ -94,7 +94,7 @@ async def handle_torrent_bytes(data):
         return f"🧲 离线提交失败：{e}"
     if not ok:
         if "10008" in (err or "") or "已存在" in (err or ""):
-            return "🧲 该种子已在 115 离线列表中（/paw_offline_tasks 看进度）"
+            return "🧲 该种子已在 115 离线列表中（/cd2tasks 看进度）"
         return f"🧲 离线提交被拒绝：{err}"
     lines = ["🧲 种子已转为 115 离线任务", f"名称：{info['name']}",
              f"内容 {format_size(info['size'])}｜"

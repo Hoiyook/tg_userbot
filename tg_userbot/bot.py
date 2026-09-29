@@ -665,6 +665,16 @@ async def handle_menu_action(action, arg, event):
         head = ("🤖 Chrome Agent 已停止\n\nChrome（含专用实例）保持运行，不受影响。"
                 if stopped else "ℹ️ Chrome Agent 未在运行")
         return f"{head}{_chrome_body_sep()}", _chrome_view_buttons()
+    if action == "cd2tasks":
+        # ☁️ CD2 上传任务：正在往 115 传输的文件（cd2_api gRPC 实时）
+        try:
+            text = await cd2_api.tasks_reply()
+        except Exception as e:
+            text = f"☁ CD2 上传任务\n❌ 查询失败：{e}"
+        return (text, [
+            [Button.inline("🔄 刷新", menu.encode_menu_data("cd2tasks")),
+             Button.inline("🔙 返回主菜单", menu.encode_menu_data("home"))],
+        ])
     if action == "cd2_menu":
         return menu.cd2_menu_text(), menu.cd2_menu_buttons()
     if action == "cd2":
@@ -1106,7 +1116,9 @@ async def bot_message_handler(event):
                     if torrent_offline.is_torrent_url(u)]
     if torrent_urls:
         out = await torrent_offline.handle_torrent_url(torrent_urls[0])
-        await _send_owner(out, menu.back_home_buttons())
+        await _send_owner(out, [[
+            Button.inline("📋 离线任务", encode_menu_data("cd2tasks")),
+            Button.inline("🏠 首页", encode_menu_data("home"))]])
         return
 
     # .torrent 文件（Document）→ 下载字节转磁力 → 115 离线

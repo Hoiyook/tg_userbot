@@ -720,13 +720,17 @@ async def download_file(message, source_override=None, caption_override=None,
             logger.info(f"文件大小：{format_size(size)}")
             logger.info(f"保存目录：{folder}")
 
-            # 开始下载即发通知（程序消息稍后会被自动清理）
+            # 开始下载即发通知（程序消息稍后会被自动清理）。
+            # 用户要求（2026-09-28）：带原消息链接，可跳回查看。
+            link = message_source_link(message, message.chat_id)
             try:
                 await notify.notify_user(
                     "📥 开始下载\n\n"
                     f"来源：{source}\n"
                     f"文件：{os.path.basename(final_path)}\n"
-                    f"大小：{format_size(size)}",
+                    f"大小：{format_size(size)}"
+                    + (f"\n原消息：{link}" if link else ""),
+                    link_preview=False,
                 )
             except Exception as e:
                 logger.warning(f"发送下载开始通知失败：{e}")
