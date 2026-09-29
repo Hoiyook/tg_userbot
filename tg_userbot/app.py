@@ -262,6 +262,11 @@ async def _main_serve():
                 await start_with_retry(state.client)
                 delay = SERVE_RECONNECT_BASE_DELAY
                 logger.info("🔁 主客户端连接已恢复")
+                # 补拉断连间隙漏掉的更新（用户消息不静默丢失）
+                try:
+                    await state.client.catch_up()
+                except Exception as e:
+                    logger.warning(f"主客户端 catch_up 失败（更新可能有缺口）：{e}")
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as e:
@@ -316,6 +321,12 @@ async def _bot_keepalive():
         try:
             await _await_child_task(child)
             logger.info("🤖 bot 菜单已重新连接")
+            # 补拉断连间隙漏掉的更新：代理抖动频繁（一天数百次断连），
+            # 断连窗口内 owner 发的消息若不补拉就会静默丢失
+            try:
+                await bot.catch_up()
+            except Exception as e:
+                logger.warning(f"🤖 bot catch_up 失败（更新可能有缺口）：{e}")
         except ChildCancelledError:
             logger.warning(
                 "🤖 bot 菜单重连被网络层取消（连接抖动），下轮探活重试")
