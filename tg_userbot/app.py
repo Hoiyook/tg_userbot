@@ -18,6 +18,7 @@ from telethon import TelegramClient, events
 from telethon.network.connection import ConnectionTcpFull, ConnectionTcpObfuscated
 
 from . import state
+from . import netio
 from . import notify
 from . import commands
 from . import caption_filter
@@ -221,27 +222,75 @@ async def _keepalive_ping_loop():
     2026-09-18 实测：代理凌晨 03:00-07:00 按 60s 周期切断空闲 TCP（断开
     精确 60s + 6s 重连，每小时 ~50 次）。55s 间隔 ping（低于回收线）让
     链路持续有流量；ping 失败静默（真正的断线由 _main_serve 的重连守护
-    处理，两者职责分离）。被 main 取消时原样上抛。"""
+    处理，两者职责分离）。被 main 取消时原样上抛。
+
+    2026-09-29 追加更新缺口自愈：ping 用的 GetStateRequest 本来就带回服务端
+    pts——顺手与本地 MessageBox 的 pts 对比，「连接活着但更新流卡死」（收不到
+    任何新消息、请求却正常）从此可检测：连续落后 → catch_up 补拉；补拉两轮
+    仍落后（更新循环已死时 catch_up 经队列唤醒是空操作）→ 断开连接，让
+    _main_serve 重连换一个全新的更新循环。"""
+    behind_rounds = 0
     try:
         while True:
             await asyncio.sleep(KEEPALIVE_PING_SECONDS)
             if state.client is None or not state.client.is_connected():
                 continue        # 掉线期间交给 _main_serve，不抢
             try:
-                await asyncio.wait_for(
+                server_state = await asyncio.wait_for(
                     _ping_caller(state.client), timeout=15)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 pass            # ping 失败 = 链路抖动，下轮再试
+                continue
+            behind_rounds = await _heal_update_gap(server_state,
+                                                   behind_rounds)
     except asyncio.CancelledError:
         raise
+
+
+async def _heal_update_gap(server_state, behind_rounds):
+    """服务端 pts 领先本地 = 存在更新缺口（停机窗口或更新流卡死）。
+
+    返回新的连续落后计数：追平即清零；落后两轮触发一次 catch_up；落后四轮
+    （两次补拉无效，更新循环多半已死）断开连接交 _main_serve 重连。任何
+    异常都只当「这轮没做成」，绝不打断保活心跳。
+    """
+    try:
+        box_state, _ = state.client._message_box.session_state
+        local_pts = int(box_state.get("pts") or 0)
+        server_pts = int(getattr(server_state, "pts", 0) or 0)
+    except Exception:
+        return 0        # 读不到状态（结构变化等）不猜，交给下一轮
+    if server_pts <= local_pts:
+        return 0
+    behind_rounds += 1
+    logger.warning(
+        f"📬 检测到更新缺口（服务端 pts {server_pts} > 本地 {local_pts}，"
+        f"连续 {behind_rounds} 轮）")
+    if behind_rounds == 2 or behind_rounds == 3:
+        try:
+            await netio.shielded(state.client.catch_up, 90,
+                                 "补拉更新缺口")
+            logger.info("📬 已触发 catch_up 补拉更新缺口")
+        except Exception:
+            pass
+    elif behind_rounds >= 4:
+        logger.error(
+            "📬 两次补拉后更新缺口仍在（更新循环可能已卡死），"
+            "断开主客户端交给重连守护换新循环…")
+        behind_rounds = 0       # 重连后重新计数
+        try:
+            await state.client.disconnect()
+        except Exception:
+            pass
+    return behind_rounds
 
 
 async def _ping_caller(client):
     """telethon 的轻量保活请求（GetState 即可，响应小、不触发更新）。"""
     from telethon.tl.functions.updates import GetStateRequest
-    await client(GetStateRequest())
+    return await client(GetStateRequest())
 
 
 async def _main_serve():
@@ -1344,6 +1393,16 @@ async def main():
         f"✅ 登录成功 | 用户：{me.first_name or ''} "
         f"{me.last_name or ''} | ID={state.MY_ID}"
     )
+
+    # 启动补拉（2026-09-29）：_main_serve 的 catch_up 只覆盖「运行中断线
+    # 重连」，覆盖不到「启动」——进程停机/登录重试窗口内 owner 发的消息
+    # （如 .torrent 直链）不补拉就静默丢失。此处事件处理器已注册（1294），
+    # catch_up 经更新循环拉回的增量能正常进处理链。失败只告警不断启动。
+    try:
+        await state.client.catch_up()
+        logger.info("📬 启动补拉完成（停机窗口内的消息已追上）")
+    except Exception as e:
+        logger.warning(f"启动 catch_up 失败（停机窗口的消息可能有缺口）：{e}")
 
     # 建立多 worker 下载池：DOWNLOAD_CONCURRENCY 条独立连接并发拉文件，
     # 破掉主客户端单 socket 的聚合瓶颈。失败自动降级回单连接（功能不丢）。
