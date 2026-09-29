@@ -39,6 +39,7 @@ from . import stats
 from . import thread
 from . import whitelist
 from . import platform
+from . import torrent_offline
 from . import cleanup
 from . import bot
 from . import workers
@@ -638,6 +639,31 @@ async def new_message_handler(event):
                         message, douyin_urls, instagram_urls
                     )
                 )
+                return
+
+            # 种子直链（.torrent 结尾）→ 转 115 离线（bot 对话同款；
+            # 收藏夹发链接同样可用——2026-09-29 用户反馈 bot 断连丢消息）
+            torrent_urls = [u for u in manual_links.extract_urls(text)
+                            if torrent_offline.is_torrent_url(u)]
+            if torrent_urls:
+                logger.info(
+                    f"🧲 Saved Messages 收到种子直链：{torrent_urls[0][:60]}")
+
+                _torrent_urls = torrent_urls
+
+                async def _torrent_job():
+                    out = await torrent_offline.handle_torrent_url(
+                        _torrent_urls[0])
+                    try:
+                        await event.reply(out, link_preview=False)
+                    except Exception as e:
+                        logger.warning(f"🧲 离线结果回帖失败：{e}")
+                    try:
+                        await notify.notify_user(out)
+                    except Exception as e:
+                        logger.warning(f"🧲 离线结果通知失败：{e}")
+
+                asyncio.create_task(_torrent_job())
                 return
 
             # 非抖音/IG 的外链（MEGA/网盘等）→ 手动外链台账：登记（默认
