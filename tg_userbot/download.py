@@ -14,9 +14,15 @@ import hashlib
 from datetime import datetime
 from itertools import count
 
-from telethon.errors import AuthBytesInvalidError, RPCError
+from telethon.errors import (
+    AuthBytesInvalidError,
+    FileReferenceExpiredError,
+    RPCError,
+)
+from telethon.errors.rpcerrorlist import LocationInvalidError
 
 from . import state
+from . import netio
 from . import notify
 from . import workers
 from . import config
@@ -531,6 +537,33 @@ async def _sleep_and_reconnect(worker):
         logger.exception(f"重新连接 Telegram 失败：{e}")
 
 
+async def _refresh_message(message):
+    """重取消息拿新鲜的 file_reference（引用失效类错误后的重试前置）。
+
+    LocationInvalid / FILE_REFERENCE_EXPIRED 表示消息内嵌的媒体引用已被服务端
+    作废——用同一个 message 对象重试只会原样再败（2026-09-29 SINEDAHH 任务
+    三轮 9 次全败、每次都死在 ~9% 的根因）。重取失败（网络抖动/消息已删）
+    返回原消息，行为与从前一致；失败原因照常走上限与队列退避。
+    """
+    chat_id = getattr(message, "chat_id", None)
+    msg_id = getattr(message, "id", None)
+    if chat_id is None or not isinstance(msg_id, int) or msg_id <= 0:
+        return message
+    fresh = await netio.shielded(
+        lambda: state.client.get_messages(chat_id, ids=msg_id),
+        config.QUEUE_FETCH_TIMEOUT,
+        "重取消息刷新文件引用",
+    )
+    if fresh is not None:
+        logger.info(
+            f"🔁 文件引用已失效，已重取消息 #{msg_id}"
+            "（新 file_reference）后重试"
+        )
+        return fresh
+    logger.warning("🔁 重取消息失败，沿用原引用重试")
+    return message
+
+
 def _reserve_final_path(folder, filename):
     """挑选并占位一条最终下载路径（并发安全 + 磁盘重名去重）。
 
@@ -931,6 +964,12 @@ async def download_file(message, source_override=None, caption_override=None,
                         )
                     if attempt >= cap:
                         break
+                    if isinstance(
+                        e, (LocationInvalidError, FileReferenceExpiredError)
+                    ):
+                        # 引用已作废：先重取消息换新 file_reference 再重试，
+                        # 否则同一失效引用会把剩余重试次数原样烧完
+                        message = await _refresh_message(message)
                     await _sleep_and_reconnect(worker)
 
                 except Exception as e:
