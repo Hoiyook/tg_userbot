@@ -1271,8 +1271,11 @@ async def offline_reply(urls):
         return f"{TEXT_PREFIX}\n❌ 提交失败：{e}"
     if ok:
         logger.info(f"🐾 Pawchive 离线下载已提交 {len(urls)} 条")
+        from . import torrent_offline
+        torrent_offline.spawn_watch("/115open/云下载",
+                                    label=f"离线 {len(urls)} 条")
         return (f"{TEXT_PREFIX}\n✅ 已提交 {len(urls)} 条离线下载到 "
-                "/115open/云下载（CD2 面板可看进度）")
+                "/115open/云下载（完成后会通知）")
     return f"{TEXT_PREFIX}\n❌ 提交失败：{err}"
 
 

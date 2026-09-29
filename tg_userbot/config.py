@@ -394,6 +394,10 @@ PAWCHIVE_MAX_INFLIGHT_POSTS = 8  # 4→8（2026-09-18：CDN 每 53s 掐断流，
 PAWCHIVE_429_WAIT_SECONDS = 60
 PAWCHIVE_429_SWEEP_SECONDS = 900
 PAWCHIVE_429_AUTO_RETRY_MAX_ATTEMPTS = 5
+# 离线下载完成守望（2026-09-29 用户要求：离线完成要有反馈）
+# 提交成功后轮询目标网盘目录，发现新增文件即通知；超时则提示仍在离线中
+OFFLINE_WATCH_POLL_SECONDS = 30
+OFFLINE_WATCH_TIMEOUT_SECONDS = 1800
 # 附件压缩包自动解压（2026-09-28 用户要求）：Pawchive 下载完成的 .zip/.rar
 # 若无需密码则串行解压到同名文件夹，成功后删除压缩包；需密码/失败则原样保留。
 # 串行 = 全局一次只解一个（避免多帖并发解压打爆磁盘）；CD2 会把解压产物一并备份
