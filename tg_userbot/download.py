@@ -836,6 +836,7 @@ async def download_file(message, source_override=None, caption_override=None,
             # 断点续传状态（跨尝试累计；.part 保留在磁盘上，队列重试时从
             # 磁盘锚点继续，等效跨轮次累计）：
             gained_total = 0          # 本次执行累计推进字节
+            stall_rounds = 0          # 连续零推进尝试数（续传停滞判定用）
             saw_dead_location = False  # 出现过引用失效类错误
             can_stream = False         # 本次尝试是否走 iter_download 泵
             terminal_reason = None     # 终结性失败原因（写给队列/通知）
@@ -1027,10 +1028,43 @@ async def download_file(message, source_override=None, caption_override=None,
                     last_err = f"{type(e).__name__}: {e}"
                     gained = _part_size(temp_path) - part_offset
                     gained_total += max(gained, 0)
+                    if gained > 0:
+                        stall_rounds = 0
+                    else:
+                        stall_rounds += 1
                     if isinstance(
                         e, (LocationInvalidError, FileReferenceExpiredError)
                     ):
                         saw_dead_location = True
+                    # 终结性判定（2026-09-30，Evanescia 案例）：引用失效类
+                    # 错误 + 续传停滞 = 媒体数据不完整。两种形态（都先给
+                    # _refresh_message 至少一次机会——「引用过期 + 刷新后
+                    # 恢复」是可修复场景，不能误杀）：
+                    # a) 从未拿到任何字节，连续 2 轮零推进（中间已刷新过
+                    #    引用）→ 文件整体已失效；
+                    # b) 能拿到开头、续传点之后连续 3 轮零推进 → 服务器
+                    #    数据在断点处截断（上传不完整或被清理）。
+                    # 二者重试与重新转发都无法恢复。
+                    if saw_dead_location and (
+                        (stall_rounds >= 3 and part_offset > 0)
+                        or (stall_rounds >= 2 and gained_total <= 0)
+                    ):
+                        if gained_total <= 0:
+                            terminal_reason = (
+                                "刷新文件引用后仍无法读取任何字节"
+                                "（LocationInvalid）——媒体在 Telegram "
+                                "服务器端已失效，通常因原文件被服务器清理"
+                                "或源资源已删除")
+                        else:
+                            terminal_reason = (
+                                f"服务器在已下载的 {format_size(part_offset)} "
+                                "处之后不再提供数据（连续 3 次刷新引用后均"
+                                "在同一位置失效）——媒体数据不完整，通常是"
+                                "上传未完成或文件已被服务器清理")
+                        logger.error(
+                            f"☠️ 判定终结性失败（媒体数据不完整/失效）："
+                            f"{os.path.basename(final_path)}")
+                        break
                     # 上限：AuthBytesInvalid 竞态便宜多给几次；本次执行有
                     # 字节推进（续传在推进）放宽到 +RESUME_EXTRA_RETRIES；
                     # 零进展维持 DOWNLOAD_RETRIES 快速止损
@@ -1073,29 +1107,26 @@ async def download_file(message, source_override=None, caption_override=None,
 
             logger.error("❌ 已达到最大重试次数，下载失败")
 
-            # 终结性判定（2026-09-30，Evanescia 案例）：刷新引用后仍读不到
-            # 任何字节 = 媒体在 Telegram 服务器端已失效（原文件被清理/源
-            # 删除），重试与重新转发都无法恢复。登记给队列移除止损；非队列
-            # 下载只影响通知文案。
-            if gained_total <= 0 and saw_dead_location:
+            # 终结性登记（多为 break 早退时已置 terminal_reason；上限耗尽
+            # 后仍满足零字节条件时在此补判）
+            if terminal_reason is None and gained_total <= 0 \
+                    and saw_dead_location:
                 terminal_reason = (
                     "刷新文件引用后仍无法读取任何字节（LocationInvalid）"
                     "——媒体在 Telegram 服务器端已失效，"
                     "通常因原文件被服务器清理或源资源已删除")
+            if terminal_reason:
                 if task_id:
                     TERMINAL_FAILURES[task_id] = terminal_reason
-                logger.error(
-                    f"☠️ 判定终结性失败（媒体服务器端失效）："
-                    f"{os.path.basename(final_path)}")
                 try:
-                    os.remove(temp_path)   # 死文件的半成品没有续传价值
+                    os.remove(temp_path)   # 残缺数据没有续传/落盘价值
                 except Exception:
                     pass
 
             try:
                 if terminal_reason:
                     await notify.notify_user(
-                        "❌ 文件无法下载（媒体已失效）\n\n"
+                        "❌ 文件无法下载（媒体数据不完整/已失效）\n\n"
                         f"来源：{source}\n"
                         f"文件：{os.path.basename(final_path)}\n"
                         f"原因：{terminal_reason}\n"

@@ -226,23 +226,47 @@ class TestTerminalDeadMedia(_Base):
         self.assertIn("LocationInvalid", reason)
         self.assertIsNone(download.pop_terminal_failure("t1"))  # 取走即清
         text = notify_mock.await_args.args[0]
-        self.assertIn("媒体已失效", text)
+        self.assertIn("文件无法下载", text)
+        self.assertIn("已失效", text)
         self.assertIn("无法恢复", text)
-        self.assertNotIn("再转发一次", text)
 
     async def test_progress_made_not_terminal(self):
         msg = _FakeMessage(size=4096)
         client = _FakeStreamClient([
-            (b"abcd", LocationInvalidError(request="")),
-            (None, LocationInvalidError(request="")),
-            (None, LocationInvalidError(request="")),
+            ((b"abcd", LocationInvalidError(request="")),),
+            ((None, LocationInvalidError(request="")),),
+            ((None, LocationInvalidError(request="")),),
         ])
         with mock.patch.object(download, "_refresh_message",
                                new=mock.AsyncMock(return_value=msg)), \
              mock.patch.object(download, "DOWNLOAD_RETRIES", 1):
             await self._run_download(client, msg)
-        # 有过字节推进（第一次推进 4B）→ 不判终结（引用失效也能是断流假象）
+        # 仅有 2 轮停滞（<3）→ 还不够判截断，不登记终结
         self.assertEqual(download.TERMINAL_FAILURES, {})
+
+    async def test_truncated_media_terminal_after_3_stalls(self):
+        """Evanescia 形态：开头能拿、续传点之后连续 3 次立即失效 → 终结。"""
+        msg = _FakeMessage(size=4096)
+        client = _FakeStreamClient([
+            ((b"ABCDEFGH", LocationInvalidError(request=""))),  # 拿到 8B
+            ((None, LocationInvalidError(request=""))),         # 停滞 1
+            ((None, LocationInvalidError(request=""))),         # 停滞 2
+            ((None, LocationInvalidError(request=""))),         # 停滞 3 → 终结
+        ])
+        with mock.patch.object(download, "_refresh_message",
+                               new=mock.AsyncMock(return_value=msg)):
+            result, notify_mock = await self._run_download(client, msg)
+        self.assertFalse(result)
+        self.assertEqual(len(client.calls), 4)   # 第 4 次停滞即 break（上限 15 用不满）
+        reason = download.pop_terminal_failure("t1")
+        self.assertIsNotNone(reason)
+        self.assertIn("数据不完整", reason)
+        self.assertIn("8.00 B", reason)
+        text = notify_mock.await_args.args[0]
+        self.assertIn("媒体数据不完整/已失效", text)
+        # 残缺半成品被清掉（截断数据没有续传/落盘价值）
+        part = os.path.join(_TMP, "测试源", "视频.mp4.download")
+        self.assertFalse(os.path.exists(part))
 
 
 class TestTerminalQueueRemoval(unittest.IsolatedAsyncioTestCase):

@@ -162,27 +162,27 @@ class TestLocationInvalidWiring(_Base):
         ) as refresh:
             result, notify_mock = await self._run_download(worker, orig)
         self.assertFalse(result)
-        self.assertEqual(refresh.await_count, 2)   # 第 3 次到上限，不再白取
-        self.assertEqual(worker.seen_messages,
-                         [orig, fresh, fresh])
+        # 连续 2 轮零推进（中间刷新过一次引用）→ 终结，不再烧第 3 次
+        self.assertEqual(refresh.await_count, 1)
+        self.assertEqual(worker.seen_messages, [orig, fresh])
         # 失败通知真的发出且带原因（netio 缺 import 时代这行从未可达）。
         # 三次全败且零字节 + 引用失效 → 2026-09-30 起走终结性文案（媒体失效）。
         text = notify_mock.await_args.args[0]
-        self.assertIn("❌ 文件无法下载（媒体已失效）", text)
+        self.assertIn("❌ 文件无法下载", text)
         self.assertIn("原因：", text)
         self.assertIn("LocationInvalid", text)
         self.assertIn("无法恢复", text)
 
     async def test_file_reference_expired_also_refreshes(self):
         worker = _FakeWorker([FileReferenceExpiredError(request=""),
-                              FileReferenceExpiredError(request=""),
                               FileReferenceExpiredError(request="")])
         with mock.patch.object(
             download, "_refresh_message",
             new=mock.AsyncMock(return_value=_FakeMessage()),
         ) as refresh:
             await self._run_download(worker, _FakeMessage())
-        self.assertEqual(refresh.await_count, 2)
+        # 第 1 轮失败刷新一次，第 2 轮仍零推进 → 终结
+        self.assertEqual(refresh.await_count, 1)
 
     async def test_connection_error_does_not_refresh(self):
         worker = _FakeWorker([ConnectionError("断连"),
