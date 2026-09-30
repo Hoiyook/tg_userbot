@@ -318,20 +318,31 @@ class ThreadLimitTest(unittest.TestCase):
 
 
 class CleanTempFilesTest(unittest.TestCase):
-    """clean_temp_files：清理 .download 临时文件。"""
+    """clean_temp_files：清理 .download 临时文件（2026-09-30 起年龄感知——
+    新鲜半成品是断点续传锚点，绝不能动；只清超龄孤儿）。"""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="tg_clean_test_")
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
-        for name in ("a.mp4.download", "b.jpg.download", "keep.mp4"):
+        for name in ("fresh.mp4.download", "keep.mp4"):
             with open(os.path.join(self.dir, name), "w") as f:
                 f.write("x")
+        aged = os.path.join(self.dir, "old.mp4.download")
+        with open(aged, "w") as f:
+            f.write("x")
+        old = time.time() - 8 * 24 * 3600
+        os.utime(aged, (old, old))
 
-    def test_removes_download_files_only(self):
+    def test_keeps_fresh_anchor_removes_aged_orphan(self):
         count = cleanup.clean_temp_files(self.dir)
+        self.assertEqual(count, 1)
+        self.assertEqual(sorted(os.listdir(self.dir)),
+                         ["fresh.mp4.download", "keep.mp4"])
+
+    def test_min_age_zero_restores_legacy_full_wipe(self):
+        count = cleanup.clean_temp_files(self.dir, min_age_secs=0)
         self.assertEqual(count, 2)
-        remaining = sorted(os.listdir(self.dir))
-        self.assertEqual(remaining, ["keep.mp4"])
+        self.assertEqual(sorted(os.listdir(self.dir)), ["keep.mp4"])
 
 
 class CD2ConfigTest(unittest.TestCase):

@@ -12,7 +12,9 @@ import os
 import re
 import json
 import asyncio
+import time
 
+from . import config
 from . import state
 from . import netio
 from . import queue
@@ -364,15 +366,29 @@ async def cleanup_loop():
             await asyncio.sleep(30)
 
 
-def clean_temp_files(root=None):
-    """删除 .download 临时文件，返回删除数量。命令与 bot 菜单共用。"""
+def clean_temp_files(root=None, min_age_secs=None):
+    """删除 .download 临时文件，返回删除数量。命令与 bot 菜单共用。
+
+    2026-09-30 起语义收窄：.download 不再只是「崩溃孤儿」，更是**断点续传
+    锚点**（队列重试/重启恢复都从它继续，删掉 = GB 级进度清零重下——启动
+    清理曾把 NIMA 461MB 的锚点删掉，下载从 0 白烧）。因此清理只针对超过
+    min_age_secs（缺省 7 天）的陈旧锚点：正常轮转中的半成品（几分钟到几
+    小时）绝不动；真正该清的「任务已移除却没人收尸」的孤儿，7 天后也会被
+    兜住。传 min_age_secs=0 恢复旧行为（全删）。"""
     root = root or DOWNLOAD_DIR
+    if min_age_secs is None:
+        min_age_secs = getattr(config, "TEMP_PART_MAX_AGE_SECONDS",
+                               7 * 24 * 3600)
+    now = time.time()
     count = 0
     for dirpath, dirs, files in os.walk(root):
         for filename in files:
             if filename.endswith(".download"):
                 path = os.path.join(dirpath, filename)
                 try:
+                    if min_age_secs \
+                            and now - os.path.getmtime(path) < min_age_secs:
+                        continue   # 新鲜锚点：正在为续传服务，绝不动
                     os.remove(path)
                     count += 1
                 except Exception as e:
