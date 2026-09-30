@@ -35,6 +35,7 @@ from .config import (
     EXPORT_RACE_EXTRA_RETRIES,
     MAX_FILENAME_BYTES,
     PROGRESS_STEP,
+    RESUME_EXTRA_RETRIES,
     DOWNLOAD_DIR,
 )
 from .log import logger
@@ -564,6 +565,57 @@ async def _refresh_message(message):
     return message
 
 
+# 终结性失败登记（task_id → 原因）：download_file 判定「媒体在服务器端已
+# 失效（刷新引用后读不到任何字节）」时写入，由队列在失败处理时取出——
+# 确认过一次重试仍零字节即移出队列，不再无限重投打扰。非队列下载（task_id
+# 为空）不登记，只影响通知文案。
+TERMINAL_FAILURES = {}
+
+
+def pop_terminal_failure(task_id):
+    """取走（并清除）任务的终结性失败原因；没有返回 None。"""
+    if not task_id:
+        return None
+    return TERMINAL_FAILURES.pop(task_id, None)
+
+
+def _part_size(temp_path):
+    """半成品当前字节数；文件不存在/不可读返回 0。"""
+    try:
+        return os.path.getsize(temp_path)
+    except OSError:
+        return 0
+
+
+async def _pump_iter(client, media, path, total, start, progress):
+    """iter_download 断点续传泵：从 path 已有字节（start）后继续拉。
+
+    比 download_media 少一层封装、换来 offset 续传能力——代理定期掐断长
+    传输的环境里，这是 GB 级文件能走完的唯一方式（download_media 每次都
+    从 0 开始，掐一次白一次）。dc_id 取自 media 位置；跨 DC 时 telethon
+    内部做授权导出，AuthBytesInvalidError 竞态由上层重试兜住。
+
+    服务器提前收流（loop 正常结束但字节数不够）转成 ConnectionError 走
+    重试分支续传——静默短读会造出不完整文件，违背数据准确性优先原则。
+    成功返回 path（与 download_media 的成功返回值对齐）。
+    """
+    from telethon.utils import get_input_location
+    dc_id, _ = get_input_location(media)
+    offset = start
+    progress(offset, total)      # 续传基线立即上报（UI + 看门狗心跳）
+    with open(path, "ab" if start else "wb") as f:
+        async for chunk in client.iter_download(
+            media, offset=offset, file_size=total, dc_id=dc_id,
+        ):
+            f.write(chunk)
+            offset += len(chunk)
+            progress(offset, total)
+    if total and offset < total:
+        raise ConnectionError(
+            f"下载数据提前结束（{offset}/{total} 字节），转续传重试")
+    return path
+
+
 def _reserve_final_path(folder, filename):
     """挑选并占位一条最终下载路径（并发安全 + 磁盘重名去重）。
 
@@ -694,6 +746,12 @@ async def download_file(message, source_override=None, caption_override=None,
             logger.info(
                 f"✅ 目标文件已存在且大小一致（上次下载后收尾前中断），"
                 f"跳过重新下载：{final_filename}")
+            # 顺手清掉伴随的陈旧半成品（任务已终结，续传锚点没有意义）
+            try:
+                if os.path.exists(_candidate + ".download"):
+                    os.remove(_candidate + ".download")
+            except Exception:
+                pass
             if task_id:
                 stats.emit_event(
                     "SUCCESS", task_id=task_id, bytes=actual_size,
@@ -769,18 +827,30 @@ async def download_file(message, source_override=None, caption_override=None,
                 logger.warning(f"发送下载开始通知失败：{e}")
 
             # 重试不是固定 range(DOWNLOAD_RETRIES)，而是「成功即出、上限按错误
-            # 类型给」的手数循环：AuthBytesInvalidError（跨 DC 首次导出竞态，见
-            # config 的 EXPORT_RACE_EXTRA_RETRIES）秒级失败、可多试几次等竞争消散；
-            # 其余失败仍按 DOWNLOAD_RETRIES 封顶。任何一次尝试成功都直接 return，
-            # 到达各自上限的失败 break 到下方统一「达到最大重试次数」处理。
+            # 类型与进展给」的手数循环：AuthBytesInvalidError（跨 DC 首次导出
+            # 竞态，见 config 的 EXPORT_RACE_EXTRA_RETRIES）秒级失败、可多试几
+            # 次等竞争消散；断点续传场景（每次尝试都有字节推进）放宽到
+            # DOWNLOAD_RETRIES + RESUME_EXTRA_RETRIES——代理掐流只损失尾部，
+            # 不再从 0 白烧；零进展的失败维持 DOWNLOAD_RETRIES 快速止损。任何
+            # 一次尝试成功都直接 return，到达上限的失败 break 到下方统一处理。
+            # 断点续传状态（跨尝试累计；.part 保留在磁盘上，队列重试时从
+            # 磁盘锚点继续，等效跨轮次累计）：
+            gained_total = 0          # 本次执行累计推进字节
+            saw_dead_location = False  # 出现过引用失效类错误
+            can_stream = False         # 本次尝试是否走 iter_download 泵
+            terminal_reason = None     # 终结性失败原因（写给队列/通知）
             for attempt in count(1):
                 try:
-                    # 清理上一次失败留下的临时文件
-                    if os.path.exists(temp_path):
-                        try:
-                            os.remove(temp_path)
-                        except Exception:
-                            pass
+                    # 续传锚点：保留 .download 半成品（不再删除），仅当超过
+                    # 声明大小（错位/损坏）才推倒重来
+                    part_offset = _part_size(temp_path)
+                    if size and part_offset > size:
+                        logger.warning(
+                            f"⚠️ 半成品（{format_size(part_offset)}）超过声明"
+                            f"大小（{format_size(size)}），视为损坏推倒重下"
+                        )
+                        os.remove(temp_path)
+                        part_offset = 0
 
                     last_percent = -1
                     last_activity = time.monotonic()  # 无进度看门狗的心跳
@@ -812,12 +882,19 @@ async def download_file(message, source_override=None, caption_override=None,
                     # 传字节的连接：池启用时用 worker（独立 socket，避开主客户端
                     # 单 socket 的聚合瓶颈）；否则沿用消息自带客户端（原行为）。
                     # 消息 media 的 dc_id/access_hash/file_reference 都内嵌在消息
-                    # 里，worker.download_media(message) 无需解析实体即可拉取。
+                    # 里。document/photo 走 _pump_iter 断点续传泵（iter_download
+                    # 带 offset）；其余媒体（罕见）退回 download_media 原路径。
                     # 调用包成 Task 再 await，外套「无进度看门狗」：请求没有读超时，
                     # 连接僵死时既不报错也不出数据，会永远占住信号量槽；超过
                     # DOWNLOAD_IDLE_TIMEOUT 无进度回调即取消本次、抛 TimeoutError
-                    # （走重试分支重连重下）。
-                    if worker is not None:
+                    # （走重试分支重连、从断点续传）。
+                    media = (getattr(message, "document", None)
+                             or getattr(message, "photo", None))
+                    can_stream = media is not None
+                    if can_stream:
+                        dl = _pump_iter(worker or state.client, media,
+                                        temp_path, size, part_offset, progress)
+                    elif worker is not None:
                         dl = worker.download_media(
                             message,
                             file=temp_path,
@@ -948,20 +1025,27 @@ async def download_file(message, source_override=None, caption_override=None,
 
                 except (ConnectionError, TimeoutError, OSError, RPCError) as e:
                     last_err = f"{type(e).__name__}: {e}"
+                    gained = _part_size(temp_path) - part_offset
+                    gained_total += max(gained, 0)
+                    if isinstance(
+                        e, (LocationInvalidError, FileReferenceExpiredError)
+                    ):
+                        saw_dead_location = True
+                    # 上限：AuthBytesInvalid 竞态便宜多给几次；本次执行有
+                    # 字节推进（续传在推进）放宽到 +RESUME_EXTRA_RETRIES；
+                    # 零进展维持 DOWNLOAD_RETRIES 快速止损
+                    cap = DOWNLOAD_RETRIES
+                    label = "下载失败"
                     if isinstance(e, AuthBytesInvalidError):
-                        # 跨 DC 首次授权导出竞态：失败在首字节前、秒级返回，重试极
-                        # 便宜；上限放宽到 DOWNLOAD_RETRIES + EXPORT_RACE_EXTRA_
-                        # RETRIES，等同一 DC 的竞争随成功者退出而消散后总有一次能赢。
-                        cap = DOWNLOAD_RETRIES + EXPORT_RACE_EXTRA_RETRIES
-                        logger.exception(
-                            f"❌ 下载失败（跨 DC 授权导出竞态），尝试第 {attempt} 次"
-                            f"（上限 {cap}）：{e}"
-                        )
-                    else:
-                        cap = DOWNLOAD_RETRIES
-                        logger.exception(
-                            f"❌ 下载失败，尝试第 {attempt} 次（上限 {cap}）：{e}"
-                        )
+                        cap += EXPORT_RACE_EXTRA_RETRIES
+                        label = "下载失败（跨 DC 授权导出竞态）"
+                    if gained_total > 0:
+                        cap += RESUME_EXTRA_RETRIES
+                    logger.exception(
+                        f"❌ {label}，尝试第 {attempt} 次（上限 {cap}，"
+                        f"本次推进 {format_size(max(gained, 0))}，累计 "
+                        f"{format_size(gained_total)}）：{e}"
+                    )
                     if attempt >= cap:
                         break
                     if isinstance(
@@ -974,36 +1058,73 @@ async def download_file(message, source_override=None, caption_override=None,
 
                 except Exception as e:
                     last_err = f"{type(e).__name__}: {e}"
+                    gained = _part_size(temp_path) - part_offset
+                    gained_total += max(gained, 0)
+                    cap = DOWNLOAD_RETRIES + (
+                        RESUME_EXTRA_RETRIES if gained_total > 0 else 0)
                     logger.exception(
                         f"❌ 下载出现未预期错误，尝试第 {attempt} 次"
-                        f"（上限 {DOWNLOAD_RETRIES}）：{e}"
+                        f"（上限 {cap}，累计推进 {format_size(gained_total)}）：{e}"
                     )
-                    if attempt >= DOWNLOAD_RETRIES:
+                    if attempt >= cap:
                         break
                     logger.info("🔄 3 秒后重试下载...")
                     await asyncio.sleep(3)
 
             logger.error("❌ 已达到最大重试次数，下载失败")
 
+            # 终结性判定（2026-09-30，Evanescia 案例）：刷新引用后仍读不到
+            # 任何字节 = 媒体在 Telegram 服务器端已失效（原文件被清理/源
+            # 删除），重试与重新转发都无法恢复。登记给队列移除止损；非队列
+            # 下载只影响通知文案。
+            if gained_total <= 0 and saw_dead_location:
+                terminal_reason = (
+                    "刷新文件引用后仍无法读取任何字节（LocationInvalid）"
+                    "——媒体在 Telegram 服务器端已失效，"
+                    "通常因原文件被服务器清理或源资源已删除")
+                if task_id:
+                    TERMINAL_FAILURES[task_id] = terminal_reason
+                logger.error(
+                    f"☠️ 判定终结性失败（媒体服务器端失效）："
+                    f"{os.path.basename(final_path)}")
+                try:
+                    os.remove(temp_path)   # 死文件的半成品没有续传价值
+                except Exception:
+                    pass
+
             try:
-                await notify.notify_user(
-                    "❌ 文件下载失败\n\n"
-                    f"来源：{source}\n"
-                    f"文件：{os.path.basename(final_path)}\n"
-                    f"原因：{netio.humanize_net_error(last_err)}\n"
-                    f"细节：{(last_err or '')[:140]}\n"
-                    "重试：把这条消息再转发一次即可重新下载",
-                )
+                if terminal_reason:
+                    await notify.notify_user(
+                        "❌ 文件无法下载（媒体已失效）\n\n"
+                        f"来源：{source}\n"
+                        f"文件：{os.path.basename(final_path)}\n"
+                        f"原因：{terminal_reason}\n"
+                        "结论：重试与重新转发都无法恢复，已从队列移除；"
+                        "若 caption 中有外链（如 Iwara/网盘），可从原站获取",
+                    )
+                else:
+                    await notify.notify_user(
+                        "❌ 文件下载失败\n\n"
+                        f"来源：{source}\n"
+                        f"文件：{os.path.basename(final_path)}\n"
+                        f"原因：{netio.humanize_net_error(last_err)}\n"
+                        f"细节：{(last_err or '')[:140]}\n"
+                        "重试：自动断点续传中，无需操作；"
+                        "也可把这条消息再转发一次加速重试",
+                    )
             except Exception:
                 pass
 
             return False
 
         finally:
-            # 所有退出路径都清理 .download 半成品：成功路径 os.replace 已把它改名
-            # 为最终文件（此处已不存在，no-op）；失败/取消路径由这里兜底删除，杜绝
-            # 异常退出（例如 CancelledError 曾直接打出函数体）残留孤儿临时文件。
-            if os.path.exists(temp_path):
+            # .download 半成品处置（2026-09-30 起改为断点续传语义）：可续传的
+            # 半成品保留在磁盘上——本次执行的后续尝试与队列重试/重启恢复都从
+            # 这个锚点继续，不再从 0 白烧。仅两类情况删除：终结性失败（死文件
+            # 的半成品没有价值，已在上方删过）与非续传路径（无 document/photo
+            # 的罕见媒体，download_media 不支持 offset）。成功路径 os.replace
+            # 已把它改名为最终文件（此处已不存在，no-op）。
+            if os.path.exists(temp_path) and (terminal_reason or not can_stream):
                 try:
                     os.remove(temp_path)
                 except Exception:

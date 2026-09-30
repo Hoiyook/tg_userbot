@@ -800,24 +800,57 @@ async def execute_queued_task(record):
                     ]
                 _save_after_mutation(record, "delete")
             else:
-                if in_retry:
-                    queue_retry_failed(state.QUEUE, record)
+                # 终结性失败（2026-09-30，Evanescia 案例）：download_file 判定
+                # 「媒体在服务器端已失效（刷新引用后零字节）」。队列重试已确认
+                # 过一次仍失败（attempts ≥ 2）→ 移出队列止损，不再无限重投。
+                # 首败仍走正常 retry（给瞬态服务器抖动一次复活机会）。
+                terminal = download.pop_terminal_failure(record.get("id"))
+                if terminal and record.get("attempts", 0) + 1 >= 2:
+                    state.QUEUE["tasks"] = [
+                        r for r in state.QUEUE["tasks"]
+                        if r.get("id") != record["id"]]
+                    state.QUEUE["retry"] = [
+                        r for r in state.QUEUE["retry"]
+                        if r.get("id") != record["id"]]
+                    _save_after_mutation(record, "delete")
+                    stats.emit_event("REMOVED", task_id=record["id"],
+                                     label=record.get("label"),
+                                     why="dead_media")
+                    logger.warning(
+                        f"☠️ 队列任务终结移除（媒体服务器端失效，不再重投）："
+                        f"{record.get('label') or record.get('url') or '(无)'}")
+                    state.DOWNLOAD_PROGRESS_SEEN.pop(record["id"], None)
+                elif terminal:
+                    logger.info(
+                        "☠️ 媒体疑似服务器端失效，按重试处理（再确认一次）")
+                    if in_retry:
+                        queue_retry_failed(state.QUEUE, record)
+                    else:
+                        queue_fail_to_retry(state.QUEUE, record)
+                    _save_after_mutation(
+                        record, "update_retry" if in_retry else "to_retry")
+                    stats.emit_event("RETRY", task_id=record["id"],
+                                     attempts=record.get("attempts", 0))
+                    state.DOWNLOAD_PROGRESS_SEEN.pop(record["id"], None)
                 else:
-                    queue_fail_to_retry(state.QUEUE, record)
-                # 原位累加（已在 retry）不动列表位置；首败转 retry 追加到尾部
-                _save_after_mutation(
-                    record, "update_retry" if in_retry else "to_retry")
-                # 失败尝试单独计次：SUCCESS/REMOVED/CANCELLED 由各自发点发，
-                # 这里只发 RETRY（次数）+ FAILED（任务停在待重试的终态）
-                stats.emit_event("RETRY", task_id=record["id"],
-                                 attempts=record.get("attempts", 0))
-                stats.emit_event("FAILED", task_id=record["id"],
-                                 label=record.get("label"))
-                # 死文件熔断标记：本次尝试零进度（起步即败）→ 记快速失败
-                # 时刻（AUTO_REPLAY 据此跳过）；有进度 → 清标记（链路类可重试）
-                _record_fail_fast(
-                    record, state.DOWNLOAD_PROGRESS_SEEN.get(record["id"], False))
-                state.DOWNLOAD_PROGRESS_SEEN.pop(record["id"], None)
+                    if in_retry:
+                        queue_retry_failed(state.QUEUE, record)
+                    else:
+                        queue_fail_to_retry(state.QUEUE, record)
+                    # 原位累加（已在 retry）不动列表位置；首败转 retry 追加到尾部
+                    _save_after_mutation(
+                        record, "update_retry" if in_retry else "to_retry")
+                    # 失败尝试单独计次：SUCCESS/REMOVED/CANCELLED 由各自发点发，
+                    # 这里只发 RETRY（次数）+ FAILED（任务停在待重试的终态）
+                    stats.emit_event("RETRY", task_id=record["id"],
+                                     attempts=record.get("attempts", 0))
+                    stats.emit_event("FAILED", task_id=record["id"],
+                                     label=record.get("label"))
+                    # 死文件熔断标记：本次尝试零进度（起步即败）→ 记快速失败
+                    # 时刻（AUTO_REPLAY 据此跳过）；有进度 → 清标记（链路类可重试）
+                    _record_fail_fast(
+                        record, state.DOWNLOAD_PROGRESS_SEEN.get(record["id"], False))
+                    state.DOWNLOAD_PROGRESS_SEEN.pop(record["id"], None)
     finally:
         state.EXECUTING.discard(record["id"])
         clear_trace()

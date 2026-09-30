@@ -619,8 +619,12 @@ class DownloadWorkerRoutingTest(unittest.IsolatedAsyncioTestCase):
 
         self.fake_message.download_media = hangy_download_media
 
+        # RESUME_EXTRA_RETRIES=0：hangy 每次尝试先落 7 字节再挂起，「有进展
+        # 放宽上限」的新逻辑会把重试撑到 1+12 次（每次 0.5s 看门狗 + 3s 退避），
+        # 远超本测试的 15s 预算。归零以维持「单次尝试即止损」的原始断言。
         with mock.patch.object(download, "DOWNLOAD_IDLE_TIMEOUT", 0.5), \
-                mock.patch.object(download, "DOWNLOAD_RETRIES", 1):
+                mock.patch.object(download, "DOWNLOAD_RETRIES", 1), \
+                mock.patch.object(download, "RESUME_EXTRA_RETRIES", 0):
             ok = await asyncio.wait_for(
                 download.download_file(self.fake_message, "测试来源"),
                 timeout=15,
