@@ -39,6 +39,9 @@ from .config import (
     QUEUE_KIND_LABELS,
 )
 from .log import clear_trace, logger, set_trace
+
+# serial url 任务（/dyu）的全局串行门：懒建，首个使用方在事件循环里创建
+_URL_SERIAL_LOCK = None
 from .sources import message_link
 
 # 对 create_task 产出的执行任务持有强引用：事件循环只对 Task 持有弱引用，任务在
