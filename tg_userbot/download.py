@@ -262,6 +262,12 @@ async def _delegate_url_task_to_bot(record, display_name):
     return "delegated"
 
 
+def _aweme_id_of(url):
+    """作品页链接 → aweme_id（盖戳对账用；认不出返回 None）。"""
+    m = re.search(r"/video/(\d+)", str(url or ""))
+    return m.group(1) if m else None
+
+
 async def download_url_media(record):
     """本地解析链的 HTTP 直链下载（队列 kind=url 任务执行体）。
 
@@ -316,6 +322,11 @@ async def download_url_media(record):
                 await platform.relay_links_to_parse_bot(
                     "douyin", [record.get("url") or ""])
                 logger.info("🎵 已转解析 bot，任务保留，60s 后重放核对")
+                # 盖在途目录戳：bot 回流的下一个视频直接落 <抖音>/<子目录>/，
+                # 不再进默认的去水印 bot 文件夹（owner 需求 2026-10-02）
+                from . import douyin_batch as _dyb
+                _dyb.stamp_next_bot_video(record.get("subdir"),
+                                          _aweme_id_of(record.get("url")))
             except Exception as e:
                 logger.warning(f"🎵 转解析 bot 失败：{e}")
             return False

@@ -16,6 +16,7 @@ f2 的 import 副作用（联网取 mssdk msToken，本机网络实测被重置�
 计算不受影响。补丁在 import 前打，只打一次。
 """
 import asyncio
+import time
 import uuid
 from datetime import datetime
 
@@ -131,6 +132,30 @@ def _work_url(aweme_id):
     """aweme_id → 作品页链接（AwemeIdFetcher 的 video/ 正则认得，刷新链
     用它重新解析直链）。"""
     return f"https://www.douyin.com/video/{aweme_id}"
+
+
+# 在途目录戳：转交解析 bot 的瞬间登记，bot 回流的**下一个**视频媒体
+# 消息盖作者目录章（20s/条串行转交 → 在途至多一条，一进一出可靠关联；
+# bot 回文本/超时不消费，TTL 过期自然作废，下一轮转交重盖）
+_BOT_STAMP = {"subdir": None, "aweme_id": None, "expires": 0.0}
+
+
+def stamp_next_bot_video(subdir, aweme_id, ttl=180.0):
+    """登记：解析 bot 即将回流的下一个视频落 <抖音>/<subdir>/。"""
+    if not subdir:
+        return
+    _BOT_STAMP.update(subdir=str(subdir), aweme_id=str(aweme_id or ""),
+                      expires=time.time() + ttl)
+    logger.info(f"🎵 已盖在途目录戳：抖音/{subdir}（等待解析 bot 回流）")
+
+
+def pop_bot_stamp():
+    """取走当前戳（一次性）；过期/未盖返回 None。"""
+    if _BOT_STAMP["subdir"] and time.time() <= _BOT_STAMP["expires"]:
+        subdir = _BOT_STAMP["subdir"]
+        _BOT_STAMP.update(subdir=None, aweme_id=None, expires=0.0)
+        return subdir
+    return None
 
 
 def status_text():

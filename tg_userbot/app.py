@@ -773,11 +773,25 @@ async def new_message_handler(event):
         if is_me:
             asyncio.create_task(_enqueue_me(message))
         else:
+            # /dyu 在途目录戳：解析 bot（用户名含 douyin）回流的下一个
+            # 视频盖作者目录章，落 <抖音>/<作者子目录>/ 而非默认 bot 文件夹
+            try:
+                _uname = (getattr(getattr(message, "chat", None),
+                                  "username", "") or "").lower()
+                if "douyin" in _uname:
+                    from . import douyin_batch as _dyb
+                    _stamped = _dyb.pop_bot_stamp()
+                    if _stamped:
+                        source_override = f"抖音/{_stamped}"
+                        logger.info(
+                            f"🎵 解析 bot 回流视频已盖目录戳：{source_override}")
+            except Exception:
+                pass
             # 白名单双通道（2026-09-13）：事件生产者只**记任务**，转发由
             # listener_worker 受控执行；停机漏掉的由 wl 扫描生产者按游标补。
             asyncio.create_task(
-                record_whitelist_media(message, event.chat_id, source_override)
-            )
+                record_whitelist_media(message, event.chat_id,
+                                       source_override))
 
     except Exception as e:
         logger.exception(f"❌ 消息处理异常：{e}")

@@ -106,6 +106,26 @@ class CookieRefreshTest(unittest.IsolatedAsyncioTestCase):
         loader.assert_not_called()
 
 
+class BotStampTest(unittest.TestCase):
+    """在途目录戳：一盖一取一次性，过期作废。"""
+
+    def test_stamp_and_pop_once(self):
+        douyin_batch._BOT_STAMP.update(subdir=None, aweme_id=None, expires=0)
+        douyin_batch.stamp_next_bot_video("作者X", "42")
+        self.assertEqual(douyin_batch.pop_bot_stamp(), "作者X")
+        self.assertIsNone(douyin_batch.pop_bot_stamp())   # 一次性
+
+    def test_expired_stamp_returns_none(self):
+        douyin_batch._BOT_STAMP.update(subdir=None, aweme_id=None, expires=0)
+        douyin_batch.stamp_next_bot_video("作者X", "42", ttl=-1)   # 已过期
+        self.assertIsNone(douyin_batch.pop_bot_stamp())
+
+    def test_empty_subdir_not_stamped(self):
+        douyin_batch._BOT_STAMP.update(subdir=None, aweme_id=None, expires=0)
+        douyin_batch.stamp_next_bot_video("", "42")
+        self.assertIsNone(douyin_batch.pop_bot_stamp())
+
+
 class HarvestHelpersTest(unittest.TestCase):
     """Chrome DOM 收割的纯函数：href 解析 / 停止判定 / cookie 合并。"""
 
