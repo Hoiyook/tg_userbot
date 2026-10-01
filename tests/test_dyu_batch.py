@@ -270,7 +270,7 @@ class ResolveFailureTest(unittest.IsolatedAsyncioTestCase):
         for p in self._patches:
             p.start()
         try:
-            ok = await download.download_url_media(self._record(attempts=4))
+            ok = await download.download_url_media(self._record(attempts=6))
         finally:
             for p in self._patches:
                 p.stop()

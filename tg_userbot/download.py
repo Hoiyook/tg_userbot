@@ -306,8 +306,12 @@ async def download_url_media(record):
             url = fresh
             refreshed = True
         else:
-            if int(record.get("attempts") or 0) >= 4:
+            if int(record.get("attempts") or 0) >= 6:
+                # 阈值 6：退避曲线（5/10/20/40/80 分钟）给风控约 2.5h 冷却窗，
+                # 多数任务会在窗口内恢复 f2 直连；确不恢复的才转第三方
+                # bot（87 条一窝蜂转交会砸挂解析 bot，节流 5s/条）
                 logger.warning("🎵 执行期解析屡次失败，转解析 bot 兜底")
+                await asyncio.sleep(5)
                 return await _delegate_url_task_to_bot(
                     record, final_filename)
             logger.warning("🎵 执行期解析失败（风控多半暂态），转退避重试")
