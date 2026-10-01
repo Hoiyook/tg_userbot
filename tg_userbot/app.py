@@ -985,6 +985,19 @@ async def record_whitelist_media(message, chat_id, source_override):
         await _record_single(message, chat_id, source_override)
 
 
+def _stamped_origin(origin, chat_id, source_override):
+    """/dyu 目录戳透传：handler 盖章的 source_override（≠ 白名单标题）时，
+    作为转发任务的 source_name 写进 payload——副本下载落 <抖音>/<子目录>/，
+    而非默认 bot 文件夹（2026-10-02 owner 需求）。"""
+    if not source_override:
+        return origin
+    if source_override == (state.WHITELIST_CHATS or {}).get(int(chat_id)):
+        return origin                     # 正常路径：没盖章
+    merged = dict(origin) if origin else {}
+    merged["source_name"] = source_override
+    return merged
+
+
 async def _record_single(message, chat_id, source_override):
     """单条媒体 → 一条收藏夹任务。"""
     if wl_scan.all_members_dedup_hit([message]):
@@ -992,6 +1005,7 @@ async def _record_single(message, chat_id, source_override):
             f"⏭️ 白名单媒体 {message.id} 已下载过（dedup 前置），不建转发任务")
         return
     origin = await resolve_origin_snapshot(message)
+    origin = _stamped_origin(origin, chat_id, source_override)
     caption = (message.message or "").strip()
     records = listener.build_saved_messages_task(
         chat_id, [message], caption, origin)
