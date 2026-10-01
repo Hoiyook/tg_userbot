@@ -85,6 +85,13 @@ async def _stream_url_to_file(client, url, temp_path, on_progress, hasher=None):
     """
     async with client.stream("GET", url, follow_redirects=True) as resp:
         resp.raise_for_status()
+        # HTML 守卫（2026-10-02 生产事故）：解析回退误拿页面链接时，下到
+        # 的是网页不是媒体——text/html 一律按失败处理，绝不落盘假文件
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if "text/html" in ctype:
+            raise IOError(
+                f"拿到的是 HTML 页面而非媒体（content-type: {ctype[:40]}）"
+                "——直链无效或解析失败回退了页面链接")
         total = int(resp.headers.get("content-length") or 0)
         current = 0
         with open(temp_path, "wb") as f:
@@ -289,10 +296,22 @@ async def download_url_media(record):
     refreshed = False
     if not record.get("direct_url") and record.get("resolve_first"):
         # /dyu 批量任务：入队时只有作品页链接（直链签名只活 ~3 小时，
-        # 枚举+排队等不起），执行时才解析。失败回退原链接走普通失败重试
-        refreshed = True
+        # 枚举+排队等不起），执行时才解析。解析失败（403 风控多为暂态）
+        # → 转退避重试等冷却，屡败（≥4 次）才转解析 bot 兜底——绝不拿
+        # 作品页链接当直链下载（2026-10-02 生产事故：15 条 HTML 假 mp4
+        # 被 CD2 搬上 115 又双向删除，历史/判重索引被污染）
         logger.info("🎵 批量任务执行期解析直链")
-        url = await _refresh_direct_url(record) or url
+        fresh = await _refresh_direct_url(record)
+        if fresh:
+            url = fresh
+            refreshed = True
+        else:
+            if int(record.get("attempts") or 0) >= 4:
+                logger.warning("🎵 执行期解析屡次失败，转解析 bot 兜底")
+                return await _delegate_url_task_to_bot(
+                    record, final_filename)
+            logger.warning("🎵 执行期解析失败（风控多半暂态），转退避重试")
+            return False
     if direct_url_needs_refresh(url):
         refreshed = True
         logger.info("⏰ 直链签名临近过期/已过期，先重新解析刷新再下载")

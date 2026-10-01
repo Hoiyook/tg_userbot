@@ -211,6 +211,102 @@ class DownloadSubdirResolveTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(f.read(), b"dyvideo-bytes")
 
 
+class ResolveFailureTest(unittest.IsolatedAsyncioTestCase):
+    """执行期解析失败：退避重试（不落盘）；屡败转解析 bot。"""
+
+    async def asyncSetUp(self):
+        self.old_sem = state.DOWNLOAD_SEMAPHORE
+        self.old_client = state.client
+        self.old_dedup = (state.DEDUP_INDEX, state.DEDUP_ENABLED)
+        state.DEDUP_INDEX = {}
+        state.DEDUP_ENABLED = True
+        state.DOWNLOAD_SEMAPHORE = config.AdjustableSemaphore(1)
+        fake = mock.MagicMock()
+        fake.send_message = mock.AsyncMock(return_value=None)
+        state.client = fake
+        self._patches = [
+            mock.patch.object(download, "append_history"),
+            mock.patch.object(download.notify, "notify_user",
+                              new=mock.AsyncMock()),
+        ]
+
+    async def asyncTearDown(self):
+        state.DOWNLOAD_SEMAPHORE = self.old_sem
+        state.client = self.old_client
+        state.DEDUP_INDEX, state.DEDUP_ENABLED = self.old_dedup
+
+    def _record(self, attempts):
+        return {
+            "id": "dyu-f1", "kind": "url", "platform": "douyin",
+            "url": "https://www.douyin.com/video/9",
+            "direct_url": None, "resolve_first": True, "serial": True,
+            "subdir": "X", "title": "t", "author": "a",
+            "final_name": "f.mp4", "source": "抖音作者合集",
+            "attempts": attempts,
+        }
+
+    async def test_resolve_fail_returns_false_no_file(self):
+        self._patches.append(mock.patch.object(
+            download, "_refresh_direct_url",
+            new=mock.AsyncMock(return_value=None)))
+        for p in self._patches:
+            p.start()
+        try:
+            ok = await download.download_url_media(self._record(attempts=1))
+        finally:
+            for p in self._patches:
+                p.stop()
+        self.assertFalse(ok)     # 退避重试，不是假成功
+        self.assertFalse(os.path.exists(
+            os.path.join(download._douyin_folder(), "X", "f.mp4")))
+
+    async def test_repeated_fail_delegates_to_bot(self):
+        delegated = mock.AsyncMock(return_value="delegated")
+        self._patches.append(mock.patch.object(
+            download, "_refresh_direct_url",
+            new=mock.AsyncMock(return_value=None)))
+        self._patches.append(mock.patch.object(
+            download, "_delegate_url_task_to_bot", delegated))
+        for p in self._patches:
+            p.start()
+        try:
+            ok = await download.download_url_media(self._record(attempts=4))
+        finally:
+            for p in self._patches:
+                p.stop()
+        delegated.assert_awaited_once()
+        self.assertEqual(ok, "delegated")
+
+    async def test_html_response_rejected(self):
+        """直链拿到 text/html：判失败绝不落盘（守卫）。"""
+        import httpx as _hx
+
+        class _T:
+            def handler(self, request):
+                return _hx.Response(200, content=b"<html>page</html>",
+                                    headers={"content-type": "text/html"})
+            def client(self):
+                return _hx.AsyncClient(
+                    transport=_hx.MockTransport(self.handler))
+        self._patches.append(mock.patch.object(
+            download, "_make_http_client",
+            side_effect=lambda t: _T().client()))
+        self._patches.append(mock.patch.object(
+            download, "_refresh_direct_url",
+            new=mock.AsyncMock(
+                return_value="https://v.douyinvod.com/fake/x/")))
+        for p in self._patches:
+            p.start()
+        try:
+            ok = await download.download_url_media(self._record(attempts=1))
+        finally:
+            for p in self._patches:
+                p.stop()
+        self.assertFalse(ok)
+        self.assertFalse(os.path.exists(
+            os.path.join(download._douyin_folder(), "X", "f.mp4")))
+
+
 class SerialGateTest(unittest.IsolatedAsyncioTestCase):
     """serial=True 的 url 任务一次只跑一条（全局串行门）。"""
 
