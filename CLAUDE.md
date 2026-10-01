@@ -311,6 +311,8 @@ Telegram ──► listener.Scanner ──► SQLite 任务表 ──► listene
 
 **新增命令的 /help 维护纪律（2026-09-28 用户硬性要求）。** 所有新增命令必须同步维护三处：`/help` 文案（`commands._help_text()`）、`bot.BOT_COMMANDS` 注册、（若带按钮）`config.MENU_ACTIONS`。机械保证：`tests/test_commands.py::HelpCoverageTest` 遍历 BOT_COMMANDS 断言每个 `/{name}` 出现在 `_help_text()` 输出——漏维护即红。注意 help 文案已是下划线标准形（`/cd2ck` 等空格别名为兼容形态）。
 
+**下载链路文档维护纪律（2026-10-02）。** 任何下载链路的命令/机制/参数/状态机变更，必须同步更新 `docs/下载链路操作指引.md`：递增版本号 + 在文末「更新记录」表加一行。`/manual` 命令发的就是这份文档——它是用户侧的唯一权威操作手册。
+
 **Pawchive 附件压缩包自动解压（2026-09-28）。** Pawchive 下载完成的 `.zip`/`.rar` 自动解压到**同名文件夹**（`_archive_dest` = 去扩展名），成功后删除压缩包；需密码/损坏/失败一律原样保留（绝不丢数据）。zip 用 stdlib zipfile（成员加密位 `flag_bits & 0x1` 检测 + 解压总量 vs 磁盘余量守卫）；rar 用 bsdtar（macOS/Termux 自带 libarchive；先 `-tf` 列表探测，失败=需密码 → 保留）。**串行**：全局 asyncio.Lock（`_extract_guard`，循环守卫同 `_fetch_gate`）——多帖并发的解压排队一次一个；单包硬顶 `PAWCHIVE_EXTRACT_TIMEOUT_SECONDS`(3600s)。开关 `PAWCHIVE_EXTRACT_ARCHIVES=True`。解压产物随 CD2 实时备份一并进 115。zip 炸弹防护：解压总量超磁盘余量-2GB 直接跳过保留压缩包。
 
 **CD2 API 备份对账（2026-09-17，场景 1 落地）。** 新模块 `cd2_api.py`：用 CD2 官方 gRPC API（`clouddrive.CloudDriveFileSrv`，明文端口 127.0.0.1:19798——19799 是网页端口）替代纯日志解析的备份判断。认证：API 令牌（tg_secrets.json `cd2.api_token`，CD2 网页 → 设置 → API 令牌 创建），metadata `authorization: Bearer`。官方 proto（v1.0.17）生成桩在 `cd2_proto/`（`grpcio-tools` 生成后把 `clouddrive_pb2` 导入改为包内相对）。核心能力：`backup_tasks()`（源→目标映射，BackupGetAll 返回 BackupStatus 包 Backup）、`local_to_remote_root()`（DOWNLOAD_DIR → /115open/Nekogram）、`reconcile()`（本地成品文件逐个核对远端镜像：存在+大小一致=已备份；只对账静置 ≥10 分钟的文件——刚完成的还在备份队列）、`get_space_info()`（115 容量）。`/cd2check` 命令输出对账报告 + 容量（gRPC 阻塞调用经 asyncio.to_thread 下放）；🐾 进度面板附 115 容量行。**实战首查即抓真问题**：CD2 备份规则扩展名白名单是 `mp4,jpg,png,pdf,zip,rar,psd`——**没有 jpeg**，大量 .jpeg 文件永远不会被备份（对账报告自带扩展名诊断行提示此点）。grpcio 为新依赖（.venv 已装）。
