@@ -74,6 +74,38 @@ class BuildRecordTest(unittest.TestCase):
             "https://www.douyin.com/video/42")
 
 
+class CookieRefreshTest(unittest.IsolatedAsyncioTestCase):
+    """浏览器 cookie 保鲜：成功持久化；失败/关闭时静默沿用现值。"""
+
+    async def test_success_persists(self):
+        saved = {}
+        with mock.patch(
+                "tg_userbot.browser_cookies.load_browser_cookie_string",
+                return_value=("msToken=fresh; sessionid=x", None)), \
+             mock.patch.object(config, "save_douyin_cookie",
+                               side_effect=lambda v: saved.update(v=v)
+                               or None):
+            ok = await douyin_batch.refresh_cookie_from_browser()
+        self.assertTrue(ok)
+        self.assertEqual(saved["v"], "msToken=fresh; sessionid=x")
+
+    async def test_failure_keeps_current(self):
+        with mock.patch(
+                "tg_userbot.browser_cookies.load_browser_cookie_string",
+                return_value=("", "读取 chrome cookie 失败：模拟")), \
+             mock.patch.object(config, "save_douyin_cookie") as save:
+            ok = await douyin_batch.refresh_cookie_from_browser()
+        self.assertFalse(ok)
+        save.assert_not_called()
+
+    async def test_disabled_via_config(self):
+        with mock.patch.object(config, "DYU_BROWSER_COOKIE", "off"), \
+             mock.patch("tg_userbot.browser_cookies"
+                        ".load_browser_cookie_string") as loader:
+            self.assertFalse(await douyin_batch.refresh_cookie_from_browser())
+        loader.assert_not_called()
+
+
 class _MockTransport:
     """httpx MockTransport 工厂：{url: (status, bytes)}。"""
 

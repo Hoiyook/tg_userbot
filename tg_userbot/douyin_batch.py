@@ -54,8 +54,37 @@ def load_f2():
         return None
 
 
+async def refresh_cookie_from_browser():
+    """从本地浏览器取新鲜 douyin cookie（含时效敏感的 msToken）。
+
+    2026-10-02 生产实测：secrets 里的陈旧 cookie 触发 403 风控——抖音的
+    msToken 几小时就过期。Chrome 路径 browser_cookie3 可在浏览器运行中读
+    （macOS 首次弹钥匙串授权框）。成功 → save_douyin_cookie 持久化 + 实时
+    生效（单链接解析链同时受益）；失败 → 保留现值，仅记日志。
+    """
+    browser = str(getattr(config, "DYU_BROWSER_COOKIE", "chrome")).lower()
+    if browser in ("", "off", "none"):
+        return False
+    from . import browser_cookies
+    try:
+        cookie_str, err = await asyncio.to_thread(
+            browser_cookies.load_browser_cookie_string, browser)
+    except Exception as e:
+        logger.info(f"🎵 浏览器 cookie 读取异常（沿用现值）：{e}")
+        return False
+    if err or not cookie_str:
+        logger.info(f"🎵 浏览器 cookie 不可用（沿用现值）：{err or '空'}")
+        return False
+    save_err = config.save_douyin_cookie(cookie_str)
+    if save_err:
+        logger.warning(f"🎵 浏览器 cookie 持久化失败（仅本次生效）：{save_err}")
+    else:
+        logger.info(f"🎵 已从 {browser} 保鲜 douyin cookie（含新 msToken）")
+    return True
+
+
 def _handler_kwargs():
-    """f2 DouyinHandler 配置：cookie 调用时读（/cookie 更新立即生效）。"""
+    """f2 DouyinHandler 配置：cookie 调用时读（/cookie 与浏览器保鲜立即生效）。"""
     return {
         "cookie": getattr(config, "DOUYIN_COOKIE", "") or "",
         "headers": dict(getattr(config, "DOUYIN_HEADERS", {})),
@@ -126,10 +155,31 @@ async def enumerate_author_posts(sec_user_id, max_pages=None):
     _SecUserIdFetcher, DouyinHandler = handles
     if max_pages is None:
         max_pages = int(getattr(config, "DYU_MAX_PAGES", 200))
-    handler = DouyinHandler(_handler_kwargs())
-    pages = 0
-    async for page in handler.fetch_user_post_videos(
-            sec_user_id, page_counts=20):
+    # 手动游标翻页（max_counts=page_counts 让生成器恰好产一页）：页级
+    # 403 可重试——生成器一旦抛异常即死，重建 handler 换同一游标再来
+    cursor, pages = 0, 0
+    while pages < max_pages:
+        page = None
+        for attempt in range(3):
+            try:
+                async for p in DouyinHandler(_handler_kwargs()) \
+                        .fetch_user_post_videos(
+                            sec_user_id, max_cursor=cursor,
+                            page_counts=20, max_counts=20):
+                    page = p
+                    break
+                break
+            except Exception as e:
+                transient = "403" in str(e) and attempt < 2
+                if not transient:
+                    raise
+                wait = 15 * (attempt + 1)
+                logger.warning(
+                    f"🎵 枚举被拒（403 风控），{wait}s 后重试"
+                    f"（{attempt + 1}/2，游标不动）：{str(e)[:80]}")
+                await asyncio.sleep(wait)
+        if page is None:
+            return
         pages += 1
         raw = page._to_raw() if hasattr(page, "_to_raw") else {}
         awemes = []
@@ -140,8 +190,9 @@ async def enumerate_author_posts(sec_user_id, max_pages=None):
                                "desc": a.get("desc") or "",
                                "create_time": a.get("create_time")})
         yield awemes, bool(raw.get("has_more"))
-        if pages >= max_pages or not raw.get("has_more"):
+        if not raw.get("has_more"):
             return
+        cursor = int(raw.get("max_cursor") or 0)
 
 
 async def fetch_author_nickname(sec_user_id):
@@ -178,13 +229,21 @@ async def run_dyu(url, subdir_raw):
         return "⏳ 已有一个 /dyu 枚举在进行中，稍后再发。"
     async with _ENUM_LOCK:
         try:
+            # 先保鲜 cookie（msToken 几小时过期，陈旧值是 403 主因）
+            await refresh_cookie_from_browser()
             return await _run_dyu_inner(url, subdir_raw)
         except Exception as e:
             logger.exception(f"🎵 /dyu 失败：{e}")
+            hint = ""
+            if "403" in str(e):
+                hint = ("\n\n💡 403 风控：cookie/msToken 已失效。用 Chrome "
+                        "登录 douyin.com 后重发命令（会自动取新 cookie），"
+                        "或 /cookie 手动更新。")
             try:
                 await notify.notify_user(
-                    f"❌ 抖音作者批量任务失败\n\n{type(e).__name__}: {e}\n"
-                    f"链接：{url}\n（已入队的部分不受影响）")
+                    f"❌ 抖音作者批量任务失败\n\n{type(e).__name__}: "
+                    f"{str(e)[:200]}\n链接：{url}{hint}\n"
+                    "（已入队的部分不受影响）")
             except Exception:
                 pass
             return f"❌ {type(e).__name__}: {e}"
