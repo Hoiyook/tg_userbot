@@ -308,7 +308,9 @@ async def download_url_media(record):
         attempts = int(record.get("attempts") or 0)
         if attempts <= 1:
             logger.info("🎵 第 1 顺位：转解析 bot（回复经白名单流下载）")
-            await asyncio.sleep(5)   # 节流：批量转交不打挂第三方 bot
+            # 节流 20s/条（owner 指令 2026-10-02）：批量转交不打挂第三方
+            # bot；串行门内睡眠，天然限住整批复交速率
+            await asyncio.sleep(20)
             try:
                 from . import platform
                 await platform.relay_links_to_parse_bot(
