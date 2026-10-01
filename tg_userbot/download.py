@@ -295,26 +295,45 @@ async def download_url_media(record):
     # 重复解析（刚试过仍失败，多半是 cookie 失效，几秒后再试也一样）。
     refreshed = False
     if not record.get("direct_url") and record.get("resolve_first"):
-        # /dyu 批量任务：入队时只有作品页链接（直链签名只活 ~3 小时，
-        # 枚举+排队等不起），执行时才解析。解析失败（403 风控多为暂态）
-        # → 转退避重试等冷却，屡败（≥4 次）才转解析 bot 兜底——绝不拿
-        # 作品页链接当直链下载（2026-10-02 生产事故：15 条 HTML 假 mp4
-        # 被 CD2 搬上 115 又双向删除，历史/判重索引被污染）
-        logger.info("🎵 批量任务执行期解析直链")
+        # /dyu 批量任务的逐条解析策略（owner 指令 2026-10-02）：
+        #   第 1 顺位 解析 bot —— 链接发给第三方 bot（自己服务端解析，
+        #     不吃本地风控），回复的视频走白名单流自动下载；任务**不删**
+        #     （转交 ≠ 送达），退避 60s 后重放核对
+        #   第 2 顺位 f2 本地直连 —— bot 没送到时（重放仍见本任务）解析
+        #     直链直接下；cookie 自动保鲜（msToken 滚新即恢复）
+        #   收尾 兜底转交 —— 8 次仍没完成则正式转交并按完成移除
+        #     （bot 若已送过，重复转交的回复会被内容判重拦下，不双下）
+        # 绝不拿作品页链接当直链下载（2026-10-02 生产事故：15 条 HTML
+        # 假 mp4 被 CD2 搬上 115 又双向删除，历史/判重索引被污染）
+        attempts = int(record.get("attempts") or 0)
+        if attempts <= 1:
+            logger.info("🎵 第 1 顺位：转解析 bot（回复经白名单流下载）")
+            await asyncio.sleep(5)   # 节流：批量转交不打挂第三方 bot
+            try:
+                from . import platform
+                await platform.relay_links_to_parse_bot(
+                    "douyin", [record.get("url") or ""])
+                logger.info("🎵 已转解析 bot，任务保留，60s 后重放核对")
+            except Exception as e:
+                logger.warning(f"🎵 转解析 bot 失败：{e}")
+            return False
+        if attempts >= 8:
+            logger.warning("🎵 多轮未完成，正式转交解析 bot 并收尾")
+            return await _delegate_url_task_to_bot(record, final_filename)
+        logger.info("🎵 第 2 顺位：f2 执行期解析直链")
         fresh = await _refresh_direct_url(record)
         if fresh:
             url = fresh
             refreshed = True
         else:
-            if int(record.get("attempts") or 0) >= 6:
-                # 阈值 6：退避曲线（5/10/20/40/80 分钟）给风控约 2.5h 冷却窗，
-                # 多数任务会在窗口内恢复 f2 直连；确不恢复的才转第三方
-                # bot（87 条一窝蜂转交会砸挂解析 bot，节流 5s/条）
-                logger.warning("🎵 执行期解析屡次失败，转解析 bot 兜底")
-                await asyncio.sleep(5)
-                return await _delegate_url_task_to_bot(
-                    record, final_filename)
-            logger.warning("🎵 执行期解析失败（风控多半暂态），转退避重试")
+            logger.warning("🎵 f2 解析失败，转退避重试")
+            # 顺带保鲜 cookie（有 msToken 守卫，无新值不覆盖）：owner 的
+            # Chrome 一旦刷过 douyin.com（msToken 滚新）即恢复直连
+            try:
+                from . import douyin_batch
+                await douyin_batch.refresh_cookie_from_browser()
+            except Exception as e:
+                logger.debug(f"🎵 重放期 cookie 保鲜失败：{e}")
             return False
     if direct_url_needs_refresh(url):
         refreshed = True

@@ -197,6 +197,7 @@ class DownloadSubdirResolveTest(unittest.IsolatedAsyncioTestCase):
             "direct_url": None, "resolve_first": True, "serial": True,
             "subdir": "作者合集", "title": "标题", "author": "作者",
             "final_name": "25-10-02 标题.mp4", "source": "抖音作者合集",
+            "attempts": 2,   # 第 1 顺位是解析 bot；f2 直连在重放轮生效
         }
         ok = await download.download_url_media(record)
         for p in self._patches:
@@ -245,10 +246,14 @@ class ResolveFailureTest(unittest.IsolatedAsyncioTestCase):
             "attempts": attempts,
         }
 
-    async def test_resolve_fail_returns_false_no_file(self):
+    async def test_first_attempt_relays_to_parse_bot_keeps_task(self):
+        """owner 指令（2026-10-02）：第 1 顺位解析 bot——转交但不删任务。"""
+        relayed = mock.AsyncMock()
+        from tg_userbot import platform
         self._patches.append(mock.patch.object(
-            download, "_refresh_direct_url",
-            new=mock.AsyncMock(return_value=None)))
+            platform, "relay_links_to_parse_bot", relayed))
+        self._patches.append(mock.patch.object(asyncio, "sleep",
+                                               new=mock.AsyncMock()))
         for p in self._patches:
             p.start()
         try:
@@ -256,21 +261,36 @@ class ResolveFailureTest(unittest.IsolatedAsyncioTestCase):
         finally:
             for p in self._patches:
                 p.stop()
-        self.assertFalse(ok)     # 退避重试，不是假成功
-        self.assertFalse(os.path.exists(
-            os.path.join(download._douyin_folder(), "X", "f.mp4")))
+        relayed.assert_awaited_once()   # 链接已发解析 bot
+        self.assertFalse(ok)            # 但任务按失败退避（转交≠送达）
 
-    async def test_repeated_fail_delegates_to_bot(self):
-        delegated = mock.AsyncMock(return_value="delegated")
+    async def test_second_attempt_f2_fail_returns_false_no_file(self):
         self._patches.append(mock.patch.object(
             download, "_refresh_direct_url",
             new=mock.AsyncMock(return_value=None)))
         self._patches.append(mock.patch.object(
-            download, "_delegate_url_task_to_bot", delegated))
+            asyncio, "sleep", new=mock.AsyncMock()))
         for p in self._patches:
             p.start()
         try:
-            ok = await download.download_url_media(self._record(attempts=6))
+            ok = await download.download_url_media(self._record(attempts=2))
+        finally:
+            for p in self._patches:
+                p.stop()
+        self.assertFalse(ok)     # 退避重试，不是假成功
+        self.assertFalse(os.path.exists(
+            os.path.join(download._douyin_folder(), "X", "f.mp4")))
+
+    async def test_final_attempt_delegates_and_closes(self):
+        delegated = mock.AsyncMock(return_value="delegated")
+        self._patches.append(mock.patch.object(
+            download, "_delegate_url_task_to_bot", delegated))
+        self._patches.append(mock.patch.object(asyncio, "sleep",
+                                               new=mock.AsyncMock()))
+        for p in self._patches:
+            p.start()
+        try:
+            ok = await download.download_url_media(self._record(attempts=8))
         finally:
             for p in self._patches:
                 p.stop()
