@@ -31,6 +31,7 @@ from . import sql_templates
 from . import shell
 from . import upload
 from . import pawchive
+from . import extract_worker
 from . import sources
 from . import cmd_templates
 from .config import (
@@ -123,6 +124,7 @@ _COMMAND_SUBS = {
     "/sqlt": {"add", "del"},
     "/cmdt": {"add", "del", "run"},
     "/caption_filter": {"add", "del", "test"},
+    "/115x": {"stop", "start", "retry", "del"},
 }
 
 
@@ -254,6 +256,8 @@ def _help_text():
         "/clean｜/clearmsg｜/setcleartime 30s|1m|1h|off\n"
         "/origin —— 解析失败账本；/cd2ck 日志对账；/cd2check —— API 实对账\n"
         "/cd2tasks —— CD2 上传任务明细\n"
+        "/115x <115路径> —— 115 解压回传（拉压缩包→解压→回传+对账）\n"
+        "/115x 状态｜/115x stop 暂停｜/115x start 恢复\n"
         "/botclean on|off —— bot 对话自动清理开关\n"
         "/restart —— 重启 bot（优雅停机，约 30 秒）\n"
         "/inspect —— 系统巡检（连接/任务/产出/失败/备份）\n"
@@ -640,6 +644,12 @@ async def handle_command(event, cmd_text):
     if cmd_text == "/origin":
         await _reply(event, sources.origin_failures_text())
         logger.info("执行命令：/origin")
+        return True
+
+    if extract_worker.is_extract_command(cmd_text):
+        # 115 解压回传：扫描入队 / 状态 / stop / retry / del
+        logger.info(f"执行命令：{cmd_text[:60]}")
+        await _reply(event, await extract_worker.command_reply(cmd_text))
         return True
 
     if pawchive.is_paw_command(cmd_text):

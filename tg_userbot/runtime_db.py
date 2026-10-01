@@ -101,6 +101,14 @@ PAW_FILE_SUBMITTED = "SUBMITTED"
 PAW_FILE_DONE = "DONE"
 PAW_FILE_FAILED = "FAILED"
 
+# 115 解压回传（schema v12）任务状态：FAILED 退避重试；TERMINAL 是
+# 不可恢复终态（需密码/炸弹/包损坏——重试一万次结果一样），只通知不重投。
+EXTRACT_PENDING = "PENDING"
+EXTRACT_PROCESSING = "PROCESSING"
+EXTRACT_COMPLETED = "COMPLETED"
+EXTRACT_FAILED = "FAILED"
+EXTRACT_TERMINAL = "TERMINAL"
+
 
 class DbUnavailable(RuntimeError):
     """Runtime DB 本次操作不可用（等锁超限 / 非 BUSY 类 SQL 错误）。
@@ -396,6 +404,41 @@ _SCHEMA = (
         last_at  INTEGER NOT NULL,
         PRIMARY KEY (name, day)
     )
+    """,
+    # ============================================================
+    # 115 解压回传任务（2026-09-30，schema v12）：<115目录> 顶层的压缩包
+    # 拉到本地解压后回传原目录。唯一键 (remote_dir, archive_name,
+    # archive_size) 幂等：重复 /115x 自动跳过已完成/在队。状态机：
+    # PENDING → PROCESSING（租约）→ COMPLETED / FAILED（退避重试）/
+    # TERMINAL（需密码/炸弹/损坏——不可恢复，不再重试）。
+    # ============================================================
+    """
+    CREATE TABLE IF NOT EXISTS extract_tasks (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        remote_dir     TEXT NOT NULL,
+        archive_name   TEXT NOT NULL,
+        archive_size   INTEGER NOT NULL,
+        status         TEXT NOT NULL,
+        staging_dir    TEXT,
+        uploaded_files INTEGER NOT NULL DEFAULT 0,
+        uploaded_bytes INTEGER NOT NULL DEFAULT 0,
+        attempts       INTEGER NOT NULL DEFAULT 0,
+        next_retry_at  INTEGER,
+        lease_until    INTEGER,
+        error          TEXT,
+        created_at     INTEGER NOT NULL,
+        started_at     INTEGER,
+        completed_at   INTEGER,
+        updated_at     INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_extract_task_unique
+        ON extract_tasks (remote_dir, archive_name, archive_size)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_extract_pickup
+        ON extract_tasks (status, next_retry_at)
     """,
 )
 
@@ -723,6 +766,9 @@ def migrate() -> int:
     if version < 11:
         # v10 → v11：新增 feature_usage（功能使用审计，按天计数）。纯建表。
         logger.info("🗄 Runtime DB 迁移：v11（+ feature_usage 功能使用审计）")
+    if version < 12:
+        # v11 → v12：新增 extract_tasks（115 解压回传）。纯建表。
+        logger.info("🗄 Runtime DB 迁移：v12（+ extract_tasks 115 解压回传）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -2195,6 +2241,294 @@ def recover_expired_pawchive_posts(now=None):
             "（worker 曾崩溃/被杀），已恢复待处理"
         )
     return len(rows)
+
+
+# ============================================================
+# 115 解压回传任务（schema v12）
+# ============================================================
+def _row_to_extract_task(row):
+    return dict(row)
+
+
+def enqueue_extract_tasks(remote_dir, archives, now=None):
+    """批量入队压缩包任务（INSERT OR IGNORE）。返回 (入队数, 跳过数)。
+
+    archives: [(archive_name, archive_size)]。唯一键 (remote_dir, name,
+    size) 幂等：重复 /115x、已完成、在队的都算「跳过」，绝不重复处理。
+    """
+    now = _now(now)
+    inserted = skipped = 0
+
+    def do(conn):
+        nonlocal inserted, skipped
+        for name, size in archives:
+            cur = _execute(
+                conn,
+                "INSERT OR IGNORE INTO extract_tasks"
+                "(remote_dir, archive_name, archive_size, status, "
+                " created_at, updated_at) VALUES(?,?,?,?,?,?)",
+                (str(remote_dir), str(name), int(size),
+                 EXTRACT_PENDING, now, now),
+            )
+            if cur.rowcount:
+                inserted += 1
+            else:
+                skipped += 1
+        return None
+
+    _write(do, "入队 115 解压回传任务")
+    return inserted, skipped
+
+
+def get_extract_task(task_id):
+    row = _read(lambda c: _execute(
+        c, "SELECT * FROM extract_tasks WHERE id=?",
+        (int(task_id),)).fetchone(),
+        "查 115 解压任务")
+    return _row_to_extract_task(row) if row else None
+
+
+def list_extract_tasks(status=None, limit=50):
+    """任务列表（按 id 升序）；status=None 列全部。"""
+    if status is None:
+        rows = _read(lambda c: _execute(
+            c, "SELECT * FROM extract_tasks ORDER BY id LIMIT ?",
+            (int(limit),)).fetchall(), "列 115 解压任务")
+    else:
+        rows = _read(lambda c: _execute(
+            c, "SELECT * FROM extract_tasks WHERE status=? ORDER BY id "
+               "LIMIT ?", (str(status), int(limit))).fetchall(),
+            "列 115 解压任务")
+    return [_row_to_extract_task(r) for r in rows]
+
+
+def extract_status_counts():
+    """各状态计数 {status: n}。"""
+    rows = _read(lambda c: _execute(
+        c, "SELECT status, COUNT(*) FROM extract_tasks GROUP BY status",
+        ()).fetchall(), "统计 115 解压任务")
+    return {r["status"]: int(r[1]) for r in rows}
+
+
+def claim_next_extract_task(now=None, lease_seconds=None):
+    """领一条 PENDING → PROCESSING + 租约（乐观锁，输家 rowcount=0）。"""
+    now = _now(now)
+    if lease_seconds is None:
+        lease_seconds = int(getattr(config, "EXTRACT_LEASE_SECONDS", 3600))
+    lease_until = now + max(60, int(lease_seconds))
+
+    def do(conn):
+        row = _execute(
+            conn,
+            "SELECT id FROM extract_tasks WHERE status=? "
+            "AND (next_retry_at IS NULL OR next_retry_at<=?) "
+            "ORDER BY id LIMIT 1",
+            (EXTRACT_PENDING, now),
+        ).fetchone()
+        if row is None:
+            return None
+        cur = _execute(
+            conn,
+            "UPDATE extract_tasks SET status=?, started_at=?, "
+            "lease_until=?, attempts=attempts+1 WHERE id=? AND status=?",
+            (EXTRACT_PROCESSING, now, lease_until,
+             row["id"], EXTRACT_PENDING),
+        )
+        if not cur.rowcount:
+            return None
+        return row["id"]
+
+    task_id = _write(do, "领取 115 解压任务")
+    if task_id is None:
+        return None
+    task = get_extract_task(task_id)
+    logger.info(
+        f"🗄 领取 115 解压任务 #{task_id}：{task['remote_dir']}"
+        f"/{task['archive_name']}（第 {task['attempts']} 次尝试）")
+    return task
+
+
+def renew_extract_lease(task_id, lease_seconds=None, now=None):
+    now = _now(now)
+    if lease_seconds is None:
+        lease_seconds = int(getattr(config, "EXTRACT_LEASE_SECONDS", 3600))
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE extract_tasks SET lease_until=? WHERE id=? AND status=?",
+            (now + max(60, int(lease_seconds)), int(task_id),
+             EXTRACT_PROCESSING),
+        )
+        return bool(cur.rowcount)
+
+    return _write(do, "续租 115 解压任务")
+
+
+def release_extract_task(task_id):
+    """PROCESSING → PENDING（优雅停机）。staging 保留，重领时幂等续用。"""
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE extract_tasks SET status=?, lease_until=NULL "
+            "WHERE id=? AND status=?",
+            (EXTRACT_PENDING, int(task_id), EXTRACT_PROCESSING),
+        )
+        return bool(cur.rowcount)
+
+    ok = _write(do, "释放 115 解压任务")
+    if ok:
+        logger.info(f"🗄 115 解压任务 #{task_id} 已放回待处理（优雅停机）")
+    return ok
+
+
+def recover_expired_extract_tasks(now=None):
+    """租约过期的 PROCESSING → PENDING（worker 崩溃自愈，启动时先跑一次）。"""
+    now = _now(now)
+
+    def do(conn):
+        rows = _execute(
+            conn,
+            "SELECT id FROM extract_tasks "
+            "WHERE status=? AND lease_until IS NOT NULL AND lease_until<?",
+            (EXTRACT_PROCESSING, now),
+        ).fetchall()
+        for row in rows:
+            _execute(
+                conn,
+                "UPDATE extract_tasks SET status=?, lease_until=NULL, "
+                "error=? WHERE id=?",
+                (EXTRACT_PENDING, "lease expired", row["id"]),
+            )
+        return [dict(r) for r in rows]
+
+    rows = _write(do, "恢复过期租约的 115 解压任务")
+    if rows:
+        logger.warning(f"🗄 {len(rows)} 条 115 解压任务租约过期，已恢复待处理")
+    return len(rows)
+
+
+def set_extract_staging(task_id, staging_dir, now=None):
+    """登记本地 staging 绝对路径（拷贝开始前；崩溃重领后据此幂等续用）。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE extract_tasks SET staging_dir=?, updated_at=? "
+            "WHERE id=?",
+            (str(staging_dir), now, int(task_id)),
+        )
+        return bool(cur.rowcount)
+
+    return _write(do, "登记 115 解压 staging")
+
+
+def set_extract_progress(task_id, files, bytes_done, now=None):
+    """上传进度（绝对值，worker 每文件后回写）。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE extract_tasks SET uploaded_files=?, uploaded_bytes=?, "
+            "updated_at=? WHERE id=?",
+            (int(files), int(bytes_done), now, int(task_id)),
+        )
+        return bool(cur.rowcount)
+
+    return _write(do, "回写 115 解压上传进度")
+
+
+def postpone_extract_task(task_id, next_retry_at, error=None, now=None):
+    """暂时性失败：PROCESSING → PENDING + next_retry_at（退避重试）。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE extract_tasks SET status=?, next_retry_at=?, "
+            "lease_until=NULL, error=?, updated_at=? "
+            "WHERE id=? AND status=?",
+            (EXTRACT_PENDING, int(next_retry_at),
+             (None if error is None else str(error)[:500]), now,
+             int(task_id), EXTRACT_PROCESSING),
+        )
+        return bool(cur.rowcount)
+
+    return _write(do, "115 解压任务转退避重试")
+
+
+def terminate_extract_task(task_id, error, now=None):
+    """不可恢复终态：PROCESSING → TERMINAL（需密码/炸弹/包损坏）。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE extract_tasks SET status=?, completed_at=?, "
+            "lease_until=NULL, error=?, updated_at=? "
+            "WHERE id=? AND status=?",
+            (EXTRACT_TERMINAL, now, str(error)[:500], now,
+             int(task_id), EXTRACT_PROCESSING),
+        )
+        return bool(cur.rowcount)
+
+    ok = _write(do, "115 解压任务转终结")
+    if ok:
+        logger.warning(f"🗄 115 解压任务 #{task_id} → TERMINAL：{error}")
+    return ok
+
+
+def complete_extract_task(task_id, now=None):
+    """PROCESSING → COMPLETED。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE extract_tasks SET status=?, completed_at=?, "
+            "lease_until=NULL, error=NULL, updated_at=? "
+            "WHERE id=? AND status=?",
+            (EXTRACT_COMPLETED, now, now, int(task_id), EXTRACT_PROCESSING),
+        )
+        return bool(cur.rowcount)
+
+    ok = _write(do, "115 解压任务完成")
+    if ok:
+        logger.info(f"🗄 115 解压任务 #{task_id} → COMPLETED")
+    return ok
+
+
+def retry_extract_task(task_id, now=None):
+    """TERMINAL/FAILED → PENDING（手动重投；staging/error 保留可溯源）。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE extract_tasks SET status=?, next_retry_at=NULL, "
+            "lease_until=NULL, updated_at=? WHERE id=? AND "
+            "status IN (?, ?)",
+            (EXTRACT_PENDING, now, int(task_id),
+             EXTRACT_FAILED, EXTRACT_TERMINAL),
+        )
+        return bool(cur.rowcount)
+
+    ok = _write(do, "重投 115 解压任务")
+    if ok:
+        logger.info(f"🗄 115 解压任务 #{task_id} 已重投")
+    return ok
+
+
+def delete_extract_task(task_id):
+    """移除任务记录（staging 清理由调用方负责）。"""
+    def do(conn):
+        cur = _execute(conn, "DELETE FROM extract_tasks WHERE id=?",
+                       (int(task_id),))
+        return bool(cur.rowcount)
+
+    return _write(do, "移除 115 解压任务")
 
 
 # ============================================================

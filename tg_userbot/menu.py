@@ -220,12 +220,24 @@ def cd2_menu_text():
         "备份记录展示最近 7 天的搬运日志。")
 
 
+def extract_menu_buttons():
+    """🗜 115 解压视图按钮组（/115x 的菜单形态）。"""
+    return [
+        [Button.inline("🔄 刷新", encode_menu_data("extract")),
+         Button.inline("⏸ 暂停领取", encode_menu_data("extract_stop"))],
+        [Button.inline("▶️ 恢复领取", encode_menu_data("extract_start")),
+         Button.inline("🔙 返回", encode_menu_data("cd2_menu"))],
+        [Button.inline("🏠 首页", encode_menu_data("home"))],
+    ]
+
+
 def cd2_menu_buttons():
     return [
         [Button.inline("🔴 实时状态", encode_menu_data("bak_status")),
          Button.inline("🛑 停止", encode_menu_data("cd2_stop"))],
         [Button.inline("🗂 备份记录", encode_menu_data("bak")),
          Button.inline("🔍 115 对账", encode_menu_data("cd2ck"))],
+        [Button.inline("🗜 115 解压", encode_menu_data("extract"))],
         [Button.inline("⬅️ 设置", encode_menu_data("settings")),
          Button.inline("🏠 首页", encode_menu_data("home"))],
     ]

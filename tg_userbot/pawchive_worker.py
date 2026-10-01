@@ -271,97 +271,23 @@ def _head_dead_ids(targets):
 
 
 def _archive_dest(archive_path):
-    """压缩包 → 解压目标文件夹（同名去扩展名）。"""
-    return os.path.splitext(archive_path)[0]
+    """压缩包 → 解压目标文件夹（同名去扩展名）。委托 extract_util。"""
+    from .extract_util import _archive_dest
+    return _archive_dest(archive_path)
 
 
 def _extract_archive_sync(archive_path):
     """解压单个压缩包（阻塞，线程内执行）。返回 (status, detail)。
 
-    status: "extracted"（成功，压缩包已删）/ "password"（需密码，保留）/
-            "failed"（解压出错，保留）/ "no-space"（磁盘不足，保留）
-    规则（用户 2026-09-28）：zip 用 stdlib（加密位检测+zip 炸弹守卫）；
-    rar 用 bsdtar（先列表探测，失败=需密码/损坏 → 保留）；解压成功且目标
-    目录非空才删除压缩包，绝不丢数据。
+    2026-09-30 起委托 extract_util.extract_archive（共享给 115 解压回传）：
+    本场景 dest=同名目录、成功即删压缩包（与原行为逐字一致）；成功/失败
+    判定、加密检测、炸弹守卫、staging 改名全部收在 extract_util 一处。
     """
-    import zipfile
-    lower = archive_path.lower()
-    dest = _archive_dest(archive_path)
-    free = shutil.disk_usage(os.path.dirname(archive_path)).free
-    margin = int(config.PAWCHIVE_MIN_FREE_GB) * 1024 ** 3
+    from .extract_util import extract_archive
+    status, detail, _files = extract_archive(
+        archive_path, dest=_archive_dest(archive_path), delete_source=True)
+    return status, detail
 
-    if lower.endswith(".zip"):
-        try:
-            with zipfile.ZipFile(archive_path) as z:
-                infos = z.infolist()
-                if any(zi.flag_bits & 0x1 for zi in infos):
-                    return "password", "zip 成员加密"
-                total_unc = sum(zi.file_size for zi in infos)
-                total_comp = sum(zi.compress_size for zi in infos)
-                if len(infos) > config.PAWCHIVE_ZIP_MAX_ENTRIES:
-                    return ("failed",
-                            f"zip 成员数 {len(infos)} 超限"
-                            f"（>{config.PAWCHIVE_ZIP_MAX_ENTRIES}，疑似炸弹）")
-                biggest = max((zi.file_size for zi in infos), default=0)
-                if biggest > config.PAWCHIVE_ZIP_MAX_MEMBER_BYTES:
-                    return ("failed",
-                            f"zip 单成员 {biggest/1e9:.1f}GB 超限"
-                            f"（>{config.PAWCHIVE_ZIP_MAX_MEMBER_BYTES/1e9:.0f}GB）")
-                if total_comp and total_unc / total_comp > \
-                        config.PAWCHIVE_ZIP_MAX_RATIO:
-                    return ("failed",
-                            f"压缩比 {total_unc // max(total_comp,1)}x 超限"
-                            f"（>{config.PAWCHIVE_ZIP_MAX_RATIO}x，疑似炸弹）")
-                if total_unc and total_unc > free - margin:
-                    return ("no-space",
-                            f"解压需 {total_unc/1e9:.1f}GB 超出磁盘余量")
-                # P1-8：staging 目录解压，成功后整体改名——失败留下的
-                # 半成品不会混进正式目录
-                staging = dest + ".extracting"
-                if os.path.isdir(staging):
-                    shutil.rmtree(staging, ignore_errors=True)
-                z.extractall(staging)
-                os.replace(staging, dest)
-        except RuntimeError as e:
-            # stdlib 读到加密成员时的典型异常
-            return "password", str(e)[:120]
-        except Exception as e:
-            return "failed", f"{type(e).__name__}: {e}"
-    else:  # .rar → bsdtar（macOS/Termux 自带；列表探测失败=需密码/损坏）
-        import subprocess
-        try:
-            probe = subprocess.run(
-                ["bsdtar", "-tf", archive_path],
-                capture_output=True, timeout=120,
-                stdin=subprocess.DEVNULL)
-            if probe.returncode != 0:
-                # 加密/损坏 rar 无法列出成员 → 需密码，原样保留
-                return "password", (probe.stderr.decode("utf-8", "replace")
-                                    or "list failed")[:120]
-        except subprocess.TimeoutExpired:
-            return "password", "list 超时（疑似加密卷）"
-        except FileNotFoundError:
-            return "failed", "bsdtar 不可用"
-
-        try:
-            os.makedirs(dest, exist_ok=True)
-            p = subprocess.run(
-                ["bsdtar", "-xf", archive_path, "-C", dest],
-                capture_output=True, timeout=600,
-                stdin=subprocess.DEVNULL)
-            if p.returncode != 0:
-                return "failed", p.stderr.decode("utf-8", "replace")[:120]
-        except subprocess.TimeoutExpired:
-            return "failed", "bsdtar 解压超时"
-        except FileNotFoundError:
-            return "failed", "bsdtar 不可用"
-
-    # 成功判定：目标目录非空
-    extracted = [n for _, _, ns in os.walk(dest) for n in ns]
-    if not extracted:
-        return "failed", "解压后目录为空"
-    os.remove(archive_path)
-    return "extracted", f"{len(extracted)} 个文件 → {os.path.basename(dest)}"
 
 
 async def _extract_archive_serial(archive_path):

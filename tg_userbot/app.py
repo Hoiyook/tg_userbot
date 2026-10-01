@@ -31,6 +31,7 @@ from . import queue
 from . import runtime_db
 from . import sql_templates
 from . import cmd_templates
+from . import extract_worker
 from . import memo
 from . import shell
 from . import reporter
@@ -1422,6 +1423,10 @@ async def main():
     stats.migrate_and_trim_events()
     history.migrate_history_to_db()
 
+    # 115 解压回传 worker（压缩包 → 本地解压 → 回传 + 对账）
+    extract_worker_task = asyncio.create_task(
+        extract_worker.extract_worker_loop())
+
     # Chrome Agent 结果通知轮询（读 chrome_tasks.json 终态 → 通知收藏夹）
     asyncio.create_task(chrome_client.notify_loop())
 
@@ -1535,12 +1540,12 @@ async def main():
         # 扫描/Reporter 主循环同理。
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task, pawchive_worker_task):
+                  wl_scan_task, pawchive_worker_task, extract_worker_task):
             if t is not None:
                 t.cancel()
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task, pawchive_worker_task):
+                  wl_scan_task, pawchive_worker_task, extract_worker_task):
             if t is not None:
                 try:
                     await t
@@ -1551,6 +1556,10 @@ async def main():
         # Worker 已在取消时把手上的任务放回 PENDING；这里兜底再释放一次
         listener_worker.release_inflight()
         pawchive_worker.release_inflight()
+        try:
+            extract_worker.release_inflight()
+        except Exception as e:
+            logger.warning(f"🗜 115 解压在途任务释放失败：{e}")
         runtime_db.close_db()
         # 断开下载 worker 连接（尽力而为，不影响主客户端退出）
         try:

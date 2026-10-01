@@ -453,7 +453,7 @@ REPORT_LISTEN = True
 # WAL 依赖 mmap 共享内存、在该文件系统上可能不可用；真机上若探测到 WAL 回落，
 # 可把 DB 挪到应用私有目录。注意：**只允许主进程写**，Chrome Agent 进程绝不
 # 能开连接（见 runtime_db 的「不做 import 期连接」）。
-RUNTIME_DB_SCHEMA_VERSION = 11  # v11：+ feature_usage 功能使用审计
+RUNTIME_DB_SCHEMA_VERSION = 12  # v12：+ extract_tasks 115 解压回传
 # 单条写事务等锁的上限（毫秒）与 SQLITE_BUSY/LOCKED 的有限重试（规格 §39：
 # 记日志 → 短暂等待 → 有限次数重试，绝不无限循环、绝不因此崩掉主进程）。
 RUNTIME_DB_BUSY_TIMEOUT_MS = 5000
@@ -677,6 +677,8 @@ MENU_ACTIONS = (
     # 外加 Agent 启停与状态（此前只在命令面板里，按钮菜单够不着）
     "chrome_tasks", "chrome_cancel", "chrome_start", "chrome_stop",
     "chrome_status",
+    # 115 解压回传（/115x 的菜单视图 + 暂停/恢复领取）
+    "extract", "extract_stop", "extract_start",
     # 标签监听：视图 / 增删改 / 立即扫描 / 周期 / 总开关 + 添加向导的
     # 目标勾选（listen_tgt 带目标键）、加目标、下载开关、保存、取消
     "listen", "listen_add", "listen_edit", "listen_del", "listen_scan",
@@ -1516,6 +1518,23 @@ PAWCHIVE_AGENT_RETRY_SECONDS = 30
 # 磁盘保护线（GB）：CHROME_DOWNLOAD_DIR 所在卷剩余低于它 → 暂停 worker
 # 并通知，/paw resume 手动恢复
 PAWCHIVE_MIN_FREE_GB = 2.0
+
+# ------------------------------------------------------------
+# 115 解压回传（2026-09-30，/115x）：拉 115 目录顶层压缩包到本地解压，
+# 逐文件回传 <原目录>/<压缩包名>/，完成后尺寸对账。
+EXTRACT_LEASE_SECONDS = 3600        # 单包处理租约（GB 级包拷贝+解压可达小时级）
+EXTRACT_MAX_ATTEMPTS = 5            # 退避重试上限；超过转 TERMINAL（人工重投）
+EXTRACT_BACKOFF_BASE_SECONDS = 300  # 首败退避 5 分钟
+EXTRACT_BACKOFF_MAX_SECONDS = 7200  # 封顶 2 小时
+EXTRACT_VERIFY_TRIES = 6            # 对账重试轮数（等 CD2 后台上传清空）
+EXTRACT_VERIFY_GAP_SECONDS = 10.0   # 对账轮间隔
+EXTRACT_POLL_SECONDS = 2.0          # worker 无任务时的轮询间隔
+# 本地工作区：压缩包副本 + 解压产物（DOWNLOAD_DIR 同卷，受磁盘保护线约束）
+EXTRACT_STAGING_ROOT = os.path.join(DOWNLOAD_DIR, "_115解压")
+# CD2 挂载点（挂载根 = 115 根；gRPC 路径 /115open/X ↔ 挂载 /X）。
+# 机器相关值，tg_secrets.json 的 cloud_mount_base 可覆盖。
+CLOUD_MOUNT_BASE = (_SECRET_CONFIG.get("cloud_mount_base")
+                    or "/Volumes/CloudDrive")
 # Cookie 输入窗口（秒）：/paw cookie 或菜单按钮后等下一条文本
 PAWCHIVE_INPUT_WINDOW_SECONDS = 120
 # /paw csv 单文件发收藏夹前的行数上限（保护 TG 消息/文件大小）

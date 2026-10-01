@@ -26,7 +26,7 @@ class AppWiringSmokeTest(unittest.TestCase):
                      "pawchive_worker", "runtime_db", "reporter", "queue",
                      "cleanup", "chrome_client", "workers", "thread", "dedup",
                      "whitelist", "platform", "stats", "notify", "commands",
-                     "bot", "state", "caption_filter"):
+                     "bot", "state", "caption_filter", "extract_worker"):
             self.assertTrue(hasattr(app, name),
                             f"app.{name} 未导入——main() 里用到会 NameError")
 

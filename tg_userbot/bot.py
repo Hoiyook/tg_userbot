@@ -30,6 +30,7 @@ from . import whitelist
 from . import cleanup
 from . import chrome_client
 from . import cd2
+from . import extract_worker
 from . import cd2_api
 from . import stats
 from . import finder
@@ -59,6 +60,7 @@ BOT_COMMANDS = (
     ("progress", "查看进行中下载的实时进度"),
     ("up", "上传文件到收藏夹：/up <路径>"),
     ("sh", "命令行：执行 shell 命令，如 /sh ls"),
+    ("115x", "115 解压回传：/115x <115路径>；裸命令看状态"),
     ("queue", "查看下载队列"),
     ("retry", "查看待重试列表"),
     ("retry_all", "重放全部待重试任务"),
@@ -678,6 +680,14 @@ async def handle_menu_action(action, arg, event):
         ])
     if action == "cd2_menu":
         return menu.cd2_menu_text(), menu.cd2_menu_buttons()
+    if action == "extract":
+        return extract_worker.status_text(), menu.extract_menu_buttons()
+    if action == "extract_stop":
+        extract_worker._PAUSED["paused"] = True
+        return extract_worker.status_text(), menu.extract_menu_buttons()
+    if action == "extract_start":
+        extract_worker._PAUSED["paused"] = False
+        return extract_worker.status_text(), menu.extract_menu_buttons()
     if action == "cd2":
         return await cd2.cd2_start_or_status(), menu.cd2_menu_buttons()
     if action == "cd2_stop":
