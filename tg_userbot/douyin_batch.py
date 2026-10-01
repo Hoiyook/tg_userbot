@@ -22,6 +22,7 @@ from datetime import datetime
 from . import config
 from . import dedup
 from . import notify
+from . import state
 from .log import logger
 from .naming import compute_url_filename, sanitize_filename
 
@@ -75,6 +76,13 @@ async def refresh_cookie_from_browser():
     if err or not cookie_str:
         logger.info(f"🎵 浏览器 cookie 不可用（沿用现值）：{err or '空'}")
         return False
+    # msToken 是 post 接口的硬门槛（false/缺失必 403，2026-10-02 生产
+    # 实测 bot 与 shell 同 cookie 表现分裂的最可疑差异点）：没有就不采用
+    if "mstoken=" not in cookie_str.lower():
+        logger.warning(
+            "🎵 浏览器 cookie 里没有 msToken（未采用，沿用现值）——"
+            "Chrome 里打开一次 douyin.com 让页面 JS 生成后再试")
+        return False
     save_err = config.save_douyin_cookie(cookie_str)
     if save_err:
         logger.warning(f"🎵 浏览器 cookie 持久化失败（仅本次生效）：{save_err}")
@@ -98,6 +106,56 @@ def _work_url(aweme_id):
     """aweme_id → 作品页链接（AwemeIdFetcher 的 video/ 正则认得，刷新链
     用它重新解析直链）。"""
     return f"https://www.douyin.com/video/{aweme_id}"
+
+
+def status_text():
+    """裸 /dyu：批量任务进度（队列在 SQLite，跨重启续跑）。"""
+    from . import queue as queue_mod
+    rows = list(state.QUEUE.get("tasks") or []) + \
+        list(state.QUEUE.get("retry") or [])
+    mine = [r for r in rows if r.get("serial")
+            and r.get("source") == "抖音作者合集"]
+    pending = [r for r in mine if r.get("id") not in state.EXECUTING]
+    executing = [r for r in mine if r.get("id") in state.EXECUTING]
+    retry = [r for r in mine if r in (state.QUEUE.get("retry") or [])]
+    lines = ["🎵 抖音作者批量进度", ""]
+    lines.append(f"待下载 {len(pending)} · 下载中 {len(executing)}"
+                 f" · 待重试 {len(retry)}")
+    for r in executing[:2]:
+        lines.append(f"🔄 正在：{r.get('final_name', '')[:46]}")
+    for r in pending[:3]:
+        lines.append(f"⏳ 排队：{r.get('final_name', '')[:46]}")
+    if len(pending) > 3:
+        lines.append(f"  … 共 {len(pending)} 条")
+    if retry:
+        for r in retry[:3]:
+            lines.append(f"🔁 重试：{r.get('final_name', '')[:40]}"
+                         f"（第 {r.get('attempts', 0)} 次）")
+    # 最近完成（runtime_db 只读查询，bot 进程内合法）
+    try:
+        import sqlite3
+        from . import runtime_db
+        def _q(c):
+            from .runtime_db import _execute
+            return _execute(
+                c,
+                "SELECT filename FROM download_history WHERE source LIKE ? "
+                "ORDER BY id DESC LIMIT 3",
+                ("抖音作者合集%",)).fetchall()
+        rows_done = runtime_db._read(_q, "查作者合集最近完成") \
+            if runtime_db.has_connection() else []
+        names = [r[0] for r in rows_done]
+        if names:
+            lines.append("")
+            lines.append("最近完成：")
+            for n in names:
+                lines.append(f"✅ {n[:46]}")
+    except Exception as e:
+        logger.debug(f"🎵 完成记录读取失败：{e}")
+    lines.append("")
+    lines.append("说明：任务全部持久化在 SQLite——重启/关机后自动续跑；"
+                 "已完成的凭 dyc: 判重永不重下。")
+    return "\n".join(lines)
 
 
 def parse_dyu_command(text):
@@ -170,14 +228,17 @@ async def enumerate_author_posts(sec_user_id, max_pages=None):
                     break
                 break
             except Exception as e:
-                transient = "403" in str(e) and attempt < 2
+                transient = "403" in str(e) and attempt < 3
                 if not transient:
                     raise
-                wait = 15 * (attempt + 1)
+                wait = (15, 30, 60)[attempt]
                 logger.warning(
                     f"🎵 枚举被拒（403 风控），{wait}s 后重试"
-                    f"（{attempt + 1}/2，游标不动）：{str(e)[:80]}")
+                    f"（{attempt + 1}/3，游标不动）：{str(e)[:80]}")
                 await asyncio.sleep(wait)
+                # 重试前重新保鲜：msToken 是滚动值，Chrome 若在访问
+                # douyin.com，cookie 里已是新一代
+                await refresh_cookie_from_browser()
         if page is None:
             return
         pages += 1

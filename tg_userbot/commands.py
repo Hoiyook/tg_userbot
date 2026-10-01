@@ -652,11 +652,25 @@ async def handle_command(event, cmd_text):
         logger.info(f"执行命令：/dyu {cmd_text[:60]}")
         url_arg, subdir_arg = douyin_batch.parse_dyu_command(cmd_text)
         if url_arg is None:
-            await _reply(event,
-                "🎵 /dyu 抖音作者批量下载（owner-only）\n\n"
-                "用法：/dyu <作者主页链接> [子目录]\n"
-                "例：/dyu https://v.douyin.com/xxxx 我的收藏\n"
-                "子目录省略时用作者昵称；已下载作品自动跳过（dyc 判重）。")
+            # 裸 /dyu：有批量任务在跑 → 进度视图；否则用法说明
+            try:
+                from tg_userbot import state as _st
+                rows = list(_st.QUEUE.get("tasks") or []) + \
+                    list(_st.QUEUE.get("retry") or [])
+                has_batch = any(r.get("serial")
+                                and r.get("source") == "抖音作者合集"
+                                for r in rows)
+            except Exception:
+                has_batch = False
+            if has_batch:
+                await _reply(event, douyin_batch.status_text())
+            else:
+                await _reply(event,
+                    "🎵 /dyu 抖音作者批量下载（owner-only）\n\n"
+                    "用法：/dyu <作者主页链接> [子目录]\n"
+                    "例：/dyu https://v.douyin.com/xxxx 我的收藏\n"
+                    "子目录省略时用作者昵称；已下载自动跳过。\n"
+                    "发 /dyu 可随时看批量进度。")
             return True
         # 先回执（枚举要几分钟），后台跑，进度走通知
         await _reply(event, f"🎵 开始枚举作者作品：{url_arg}\n"
