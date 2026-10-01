@@ -135,6 +135,37 @@ class ScanEnqueueTest(CmdBase):
         self.assertIn("命名的**目录**", out)
         self.assertIn("画集A.zip", out)
 
+    def test_recursive_scan_includes_subdirs(self):
+        # 递归：子目录里的包也要入队，且任务记各自父目录（产物落旁边）
+        s1 = self._put_zip("云测试", "顶层.zip", {"a.txt": b"x"})
+        s2 = self._put_zip("云测试/第一季", "第1包.zip", {"b.txt": b"y"})
+        s3 = self._put_zip("云测试/第一季/内层", "更深.rar", {"c.txt": b"z"})
+        with mock.patch("tg_userbot.cd2_api.list_remote_dir",
+                        side_effect=self._fake_listing()):
+            out = asyncio.run(ew.command_reply("/115x 云测试"))
+        self.assertIn("发现 3 个压缩包", out)
+        self.assertIn("分布在 3 个目录", out)
+        tasks = runtime_db.list_extract_tasks()
+        by = {(t["remote_dir"], t["archive_name"]): t
+              for t in tasks if t["status"] == "PENDING"}
+        self.assertIn(("/115open/云测试", "顶层.zip"), by)
+        self.assertIn(("/115open/云测试/第一季", "第1包.zip"), by)
+        self.assertIn(("/115open/云测试/第一季/内层", "更深.rar"), by)
+        self.assertEqual(by[("/115open/云测试/第一季/内层", "更深.rar")]
+                         ["archive_size"], s3)
+
+    def test_recursive_scan_depth_cap(self):
+        # 深度上限：超过 EXTRACT_SCAN_MAX_DEPTH 的包不扫
+        # 上限 8 时第 8 层可扫（根=0 层）；深包放第 9 层验证被截断
+        deep = "云测试" + "/层" * (config.EXTRACT_SCAN_MAX_DEPTH + 1)
+        self._put_zip(deep, "太深.zip", {"x": b"1"})
+        self._put_zip("云测试", "浅层.zip", {"x": b"2"})
+        with mock.patch("tg_userbot.cd2_api.list_remote_dir",
+                        side_effect=self._fake_listing()):
+            out = asyncio.run(ew.command_reply("/115x 云测试"))
+        self.assertIn("发现 1 个压缩包", out)   # 只扫到浅层
+        self.assertIn("浅层.zip", out)
+
     def test_unreadable_dir(self):
         with mock.patch("tg_userbot.cd2_api.list_remote_dir",
                         return_value=None):

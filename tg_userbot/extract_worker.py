@@ -438,6 +438,48 @@ def normalize_remote_dir(raw):
     return "/115open/" + "/".join(parts)
 
 
+def scan_remote_archives(root_remote_dir, max_depth=None, max_dirs=None):
+    """递归扫描目录树下所有压缩包（BFS，gRPC 权威视角）。
+
+    返回 (archives, scanned, ghost_dirs)：
+    archives = [(parent_remote_dir, name, size)]——产物落在各自父目录；
+    scanned = 实际列过的目录数；ghost_dirs = 根层 .zip 命名的目录
+    （115 云解压产物，客户端里长得像压缩包）。
+    """
+    from . import cd2_api
+    if max_depth is None:
+        max_depth = int(getattr(config, "EXTRACT_SCAN_MAX_DEPTH", 8))
+    if max_dirs is None:
+        max_dirs = int(getattr(config, "EXTRACT_SCAN_MAX_DIRS", 400))
+    archives, ghost_dirs = [], []
+    scanned = 0
+    root = str(root_remote_dir).rstrip("/")
+    queue = [(root, 0)]
+    seen = set()
+    while queue and scanned < max_dirs:
+        d, depth = queue.pop(0)
+        if d in seen:
+            continue
+        seen.add(d)
+        try:
+            listing = cd2_api.list_remote_dir(d, limit=500)
+        except Exception as e:
+            logger.warning(f"🗜 扫描列目录失败（{d}）：{e}")
+            continue
+        scanned += 1
+        if not listing:
+            continue
+        for n, s, is_dir in listing:
+            if is_dir:
+                if is_archive_name(n) and d == root:
+                    ghost_dirs.append(n)   # 只在根层提示，子层不刷屏
+                if depth < max_depth:
+                    queue.append((f"{d}/{n}", depth + 1))
+            elif is_archive_name(n):
+                archives.append((d, n, int(s or 0)))
+    return archives, scanned, ghost_dirs
+
+
 def status_text():
     """状态总览（命令与菜单共用）。"""
     counts = runtime_db.extract_status_counts()
@@ -539,28 +581,40 @@ async def command_reply(cmd_text):
     if listing is None:
         return (f"❌ 目录不可读：{remote_dir}\n"
                 "（检查 CD2 是否在运行、挂载是否在线、路径是否正确）")
-    archives = [(n, int(s or 0)) for n, s, is_dir in listing
-                if not is_dir and is_archive_name(n)]
-    if not archives:
-        # 常见困惑（2026-10-01 实测）：115 云解压/工具会留下 .zip 命名的
-        # 目录——客户端里长得像压缩包，实际已是解压产物，无包可拉
-        ghost_dirs = [n for n, _s, is_dir in listing
-                      if is_dir and is_archive_name(n)]
+    # 递归扫描（含子目录，gRPC 权威视角）：每个包的任务记其父目录，
+    # 产物回传到 <父目录>/<包名>/，天然防同名冲突
+    found, scanned, ghost_dirs = await asyncio.to_thread(
+        scan_remote_archives, remote_dir)
+    if not found:
         hint = ""
         if ghost_dirs:
             shown = "\n".join(f"  · {n[:50]}" for n in ghost_dirs[:5])
             more = (f"\n  … 共 {len(ghost_dirs)} 个"
                     if len(ghost_dirs) > 5 else "")
-            hint = (f"\n\n⚠️ 注意：该目录下有 {len(ghost_dirs)} 个以压缩包"
+            hint = (f"\n\n⚠️ 注意：根目录下有 {len(ghost_dirs)} 个以压缩包"
                     f"命名的**目录**（已是解压产物，非压缩包文件）：\n"
                     f"{shown}{more}")
         return (f"❌ 没有发现压缩包文件：{remote_dir}\n"
+                f"（已递归扫描 {scanned} 个目录，含子目录，"
+                f"深度上限 {config.EXTRACT_SCAN_MAX_DEPTH}）\n"
                 f"支持：{' / '.join(ARCHIVE_EXTS)}{hint}")
-    ins, skip = runtime_db.enqueue_extract_tasks(remote_dir, archives)
-    names = "\n".join(f"  · {n}" for n, _s in archives[:8])
-    more = f"\n  … 共 {len(archives)} 个" if len(archives) > 8 else ""
-    return (f"🗜 发现 {len(archives)} 个压缩包：新入队 {ins}"
-            f"｜跳过 {skip}（在队/已完成）\n{names}{more}\n\n"
-            "worker 将逐包：拷贝 → 解压 → 回传到 <原目录>/<包名>/ → 对账。"
+    # 按父目录分组入队（唯一键 = 父目录+包名+尺寸，幂等）
+    by_dir = {}
+    for d, n, s_ in found:
+        by_dir.setdefault(d, []).append((n, s_))
+    ins = skip = 0
+    for d, archives in by_dir.items():
+        a, b = runtime_db.enqueue_extract_tasks(d, archives)
+        ins += a
+        skip += b
+    dirs_n = len(by_dir)
+    names = "\n".join(
+        f"  · {d[len(remote_dir):].strip('/') or '(根)'}/{n}"
+        for _d, n, _s in found[:8])
+    more = f"\n  … 共 {len(found)} 个" if len(found) > 8 else ""
+    return (f"🗜 递归扫描 {scanned} 个目录，发现 {len(found)} 个压缩包"
+            f"（分布在 {dirs_n} 个目录）：新入队 {ins}｜跳过 {skip}"
+            f"（在队/已完成）\n{names}{more}\n\n"
+            "worker 将逐包：拷贝 → 解压 → 回传到 <所在目录>/<包名>/ → 对账。"
             "进度：/115x")
     logger.info("🗜 115 解压 worker 已停止（/115x stop）")
