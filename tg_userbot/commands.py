@@ -259,6 +259,7 @@ def _help_text():
         "/cd2tasks —— CD2 上传任务明细\n"
         "/115x <115路径> —— 115 解压回传（拉压缩包→解压→回传+对账）\n"
         "/dyu <抖音作者主页> [子目录] —— 作者全作品批量串行下载\n"
+        "/manual —— 下载链路操作指引（完整机制文档）\n"
         "/115x 状态｜/115x stop 暂停｜/115x start 恢复\n"
         "/botclean on|off —— bot 对话自动清理开关\n"
         "/restart —— 重启 bot（优雅停机，约 30 秒）\n"
@@ -768,6 +769,26 @@ async def handle_command(event, cmd_text):
     if cmd_text == "/help":
         await _reply(event, _help_text())
         logger.info("执行命令：/help")
+        return True
+
+    if cmd_text == "/manual":
+        # 下载链路操作指引（长期维护文档，随版本更新）
+        import os as _os
+        doc = _os.path.join(
+            _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+            "docs", "下载链路操作指引.md")
+        logger.info("执行命令：/manual")
+        if _os.path.isfile(doc):
+            try:
+                await state.client.send_file(
+                    "me", doc,
+                    caption="📘 下载链路操作指引（docs/下载链路操作指引.md，"
+                            "随系统版本长期维护）")
+                await _reply(event, "📘 已把操作指引发到收藏夹。")
+            except Exception as e:
+                await _reply(event, f"❌ 发送文档失败：{e}")
+        else:
+            await _reply(event, "❌ 文档缺失：docs/下载链路操作指引.md")
         return True
 
     if cmd_text == "/help2":

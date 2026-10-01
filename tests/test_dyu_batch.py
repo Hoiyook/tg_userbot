@@ -379,5 +379,20 @@ class SerialGateTest(unittest.IsolatedAsyncioTestCase):
         queue_mod._URL_SERIAL_LOCK = None
 
 
+class ManualCommandTest(unittest.TestCase):
+    """/manual：文档存在且能被命令定位（发送走 state.client，另测替身）。"""
+
+    def test_doc_exists_at_expected_path(self):
+        import tg_userbot.commands as cmds
+        root = os.path.dirname(os.path.dirname(
+            os.path.abspath(cmds.__file__)))
+        doc = os.path.join(root, "docs", "下载链路操作指引.md")
+        self.assertTrue(os.path.isfile(doc), doc)
+        content = open(doc, encoding="utf-8").read()
+        self.assertIn("mermaid", content)          # 数据流图在
+        self.assertIn("/dyu", content)             # 命令表在
+        self.assertIn("更新记录", content)          # 长期维护表在
+
+
 if __name__ == "__main__":
     unittest.main()
