@@ -313,7 +313,15 @@ def _verify_remote_sizes(target_root, rel_files, content_dir):
         dirs.setdefault(parent, []).append(rel)
     for parent, names in dirs.items():
         remote_dir = remote_of(parent)
-        listing = cd2_api.list_remote_dir(remote_dir, limit=500)
+        try:
+            listing = cd2_api.list_remote_dir(remote_dir, limit=500)
+        except Exception as e:
+            # CD2 瞬断（重启/升级/网络抖）：当「本轮对不上」交重试轮兜底，
+            # 绝不让 gRPC 异常逃出对账（冒烟实测：CD2 掉线时 grpc 异常会
+            # 从 list_remote_dir 穿出来）
+            logger.warning(f"🗜 对账列目录失败（{remote_dir}）：{e}")
+            diffs.append(f"远端目录不可读：{remote_dir}")
+            continue
         if listing is None:
             diffs.append(f"远端目录不可读：{remote_dir}")
             continue
