@@ -330,6 +330,20 @@ async def harvest_author_links_via_chrome(sec_user_id, max_items=None,
                        {"url": f"https://www.douyin.com/user/{sec_user_id}"},
                        session_id=sid)
             await asyncio.sleep(init_wait)
+            # 验证码中间页（2026-10-02 生产实测：短时多次访问触发）：页面
+            # 留在屏幕上让 owner 手动滑一次，标签不关（关了就没得滑了）
+            title = str(await eval_js("document.title") or "")
+            if "验证" in title:
+                try:
+                    await notify.notify_user(
+                        "🎵 抖音要求人机验证（访问频率触发）\n\n"
+                        "已在 Chrome Agent 的 Chrome 窗口打开验证页——"
+                        "请到那个窗口完成一次滑块验证，然后重发 /dyu 命令。"
+                        "（验证一次即解除，标签页会自动保留）")
+                except Exception:
+                    pass
+                _KEEP_TAB.add(tgt["targetId"])
+                return None, "被验证码拦截：请在 Chrome 窗口完成验证后重发"
 
             href_expr = ("JSON.stringify("
                          "Array.from(document.querySelectorAll('a[href*="
@@ -368,11 +382,18 @@ async def harvest_author_links_via_chrome(sec_user_id, max_items=None,
                 return None, "页面未渲染出作品（作者不存在或被挑战页拦截）"
             return awemes, None
         finally:
-            try:
-                await call("Target.closeTarget",
-                           {"targetId": tgt["targetId"]})
-            except Exception:
-                pass
+            if tgt["targetId"] not in _KEEP_TAB:
+                try:
+                    await call("Target.closeTarget",
+                               {"targetId": tgt["targetId"]})
+                except Exception:
+                    pass
+            else:
+                logger.info("🎵 验证码页已保留，等待 owner 手动完成验证")
+
+
+# 验证码页保留集（owner 完成验证后页面自然放行，无需程序回收）
+_KEEP_TAB = set()
 
 
 async def _ensure_cdp(port):
