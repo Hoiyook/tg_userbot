@@ -542,8 +542,20 @@ async def command_reply(cmd_text):
     archives = [(n, int(s or 0)) for n, s, is_dir in listing
                 if not is_dir and is_archive_name(n)]
     if not archives:
-        return (f"❌ 没有发现压缩包：{remote_dir}\n"
-                f"支持：{' / '.join(ARCHIVE_EXTS)}")
+        # 常见困惑（2026-10-01 实测）：115 云解压/工具会留下 .zip 命名的
+        # 目录——客户端里长得像压缩包，实际已是解压产物，无包可拉
+        ghost_dirs = [n for n, _s, is_dir in listing
+                      if is_dir and is_archive_name(n)]
+        hint = ""
+        if ghost_dirs:
+            shown = "\n".join(f"  · {n[:50]}" for n in ghost_dirs[:5])
+            more = (f"\n  … 共 {len(ghost_dirs)} 个"
+                    if len(ghost_dirs) > 5 else "")
+            hint = (f"\n\n⚠️ 注意：该目录下有 {len(ghost_dirs)} 个以压缩包"
+                    f"命名的**目录**（已是解压产物，非压缩包文件）：\n"
+                    f"{shown}{more}")
+        return (f"❌ 没有发现压缩包文件：{remote_dir}\n"
+                f"支持：{' / '.join(ARCHIVE_EXTS)}{hint}")
     ins, skip = runtime_db.enqueue_extract_tasks(remote_dir, archives)
     names = "\n".join(f"  · {n}" for n, _s in archives[:8])
     more = f"\n  … 共 {len(archives)} 个" if len(archives) > 8 else ""

@@ -122,6 +122,19 @@ class ScanEnqueueTest(CmdBase):
             out = asyncio.run(ew.command_reply("/115x 空目录"))
         self.assertIn("没有发现压缩包", out)
 
+    def test_zip_named_dirs_hint(self):
+        # 115 云解压会留下 .zip 命名的目录——应提示「无包可拉」而非静默
+        d = os.path.join(self.mount, "云解压目录")
+        os.makedirs(os.path.join(d, "画集A.zip"), exist_ok=True)
+        with open(os.path.join(d, "画集A.zip", "内页.jpg"), "wb") as f:
+            f.write(b"j")
+        with mock.patch("tg_userbot.cd2_api.list_remote_dir",
+                        side_effect=self._fake_listing()):
+            out = asyncio.run(ew.command_reply("/115x 云解压目录"))
+        self.assertIn("没有发现压缩包文件", out)
+        self.assertIn("命名的**目录**", out)
+        self.assertIn("画集A.zip", out)
+
     def test_unreadable_dir(self):
         with mock.patch("tg_userbot.cd2_api.list_remote_dir",
                         return_value=None):
