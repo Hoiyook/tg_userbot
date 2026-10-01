@@ -276,6 +276,10 @@ async def download_url_media(record):
         or compute_url_filename(record.get("title"))
     )
     folder = _douyin_folder()
+    # 子目录（/dyu 作者合集等）：已逐段 sanitize，拼在平台目录下
+    subdir = (record.get("subdir") or "").strip("/")
+    if subdir:
+        folder = os.path.join(folder, subdir)
     os.makedirs(folder, exist_ok=True)
     last_err = None
 
@@ -283,6 +287,12 @@ async def download_url_media(record):
     # 过期直链上。refreshed 标记「本执行已试过刷新」——之后 403 时不再
     # 重复解析（刚试过仍失败，多半是 cookie 失效，几秒后再试也一样）。
     refreshed = False
+    if not record.get("direct_url") and record.get("resolve_first"):
+        # /dyu 批量任务：入队时只有作品页链接（直链签名只活 ~3 小时，
+        # 枚举+排队等不起），执行时才解析。失败回退原链接走普通失败重试
+        refreshed = True
+        logger.info("🎵 批量任务执行期解析直链")
+        url = await _refresh_direct_url(record) or url
     if direct_url_needs_refresh(url):
         refreshed = True
         logger.info("⏰ 直链签名临近过期/已过期，先重新解析刷新再下载")

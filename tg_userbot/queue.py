@@ -746,6 +746,14 @@ async def _run_queued_task(record):
     if kind == "url":
         # 本地解析链的 HTTP 直链下载：没有 Telegram 消息概念，直链/标题/
         # 最终名都在入队时定死在记录里，这里只负责执行 + 失败转 retry。
+        # serial=True 的任务（/dyu 作者合集）走全局串行门：解析+下载一次
+        # 一条——批量打接口怕并发风控，用户明确要求单线程。
+        if record.get("serial"):
+            global _URL_SERIAL_LOCK
+            if _URL_SERIAL_LOCK is None:
+                _URL_SERIAL_LOCK = asyncio.Lock()
+            async with _URL_SERIAL_LOCK:
+                return await download.download_url_media(record)
         return await download.download_url_media(record)
     # 旧版平台链接任务（douyin/instagram）已随统一下载链路退役：落到这里的
     # 是历史 JSON 残留，按未知类型移除 + 记日志，不崩不卡队列。

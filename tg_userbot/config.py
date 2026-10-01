@@ -1531,6 +1531,10 @@ EXTRACT_VERIFY_GAP_SECONDS = 10.0   # 对账轮间隔
 EXTRACT_POLL_SECONDS = 2.0          # worker 无任务时的轮询间隔
 EXTRACT_SCAN_MAX_DEPTH = 8          # /115x 递归扫描深度上限
 EXTRACT_SCAN_MAX_DIRS = 400         # 递归扫描目录数上限（防病态目录树）
+
+# 抖音作者批量（/dyu，2026-10-02）：f2 游标翻页的页数上限（每页 ~20 条，
+# 200 页 ≈ 4000 条作品，防病态循环）；下载串行由任务 serial 标记约束
+DYU_MAX_PAGES = 200
 # 本地工作区：压缩包副本 + 解压产物（DOWNLOAD_DIR 同卷，受磁盘保护线约束）
 EXTRACT_STAGING_ROOT = os.path.join(DOWNLOAD_DIR, "_115解压")
 # CD2 挂载点（挂载根 = 115 根；gRPC 路径 /115open/X ↔ 挂载 /X）。

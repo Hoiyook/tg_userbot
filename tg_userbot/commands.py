@@ -32,6 +32,7 @@ from . import shell
 from . import upload
 from . import pawchive
 from . import extract_worker
+from . import douyin_batch
 from . import sources
 from . import cmd_templates
 from .config import (
@@ -257,6 +258,7 @@ def _help_text():
         "/origin —— 解析失败账本；/cd2ck 日志对账；/cd2check —— API 实对账\n"
         "/cd2tasks —— CD2 上传任务明细\n"
         "/115x <115路径> —— 115 解压回传（拉压缩包→解压→回传+对账）\n"
+        "/dyu <抖音作者主页> [子目录] —— 作者全作品批量串行下载\n"
         "/115x 状态｜/115x stop 暂停｜/115x start 恢复\n"
         "/botclean on|off —— bot 对话自动清理开关\n"
         "/restart —— 重启 bot（优雅停机，约 30 秒）\n"
@@ -644,6 +646,22 @@ async def handle_command(event, cmd_text):
     if cmd_text == "/origin":
         await _reply(event, sources.origin_failures_text())
         logger.info("执行命令：/origin")
+        return True
+
+    if cmd_text.lower().startswith("/dyu"):
+        logger.info(f"执行命令：/dyu {cmd_text[:60]}")
+        url_arg, subdir_arg = douyin_batch.parse_dyu_command(cmd_text)
+        if url_arg is None:
+            await _reply(event,
+                "🎵 /dyu 抖音作者批量下载（owner-only）\n\n"
+                "用法：/dyu <作者主页链接> [子目录]\n"
+                "例：/dyu https://v.douyin.com/xxxx 我的收藏\n"
+                "子目录省略时用作者昵称；已下载作品自动跳过（dyc 判重）。")
+            return True
+        # 先回执（枚举要几分钟），后台跑，进度走通知
+        await _reply(event, f"🎵 开始枚举作者作品：{url_arg}\n"
+                            "（翻页中，完成后通知汇总；作品将逐条串行下载）")
+        asyncio.create_task(douyin_batch.run_dyu(url_arg, subdir_arg))
         return True
 
     if extract_worker.is_extract_command(cmd_text):
