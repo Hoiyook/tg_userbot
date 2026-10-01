@@ -106,6 +106,40 @@ class CookieRefreshTest(unittest.IsolatedAsyncioTestCase):
         loader.assert_not_called()
 
 
+class HarvestHelpersTest(unittest.TestCase):
+    """Chrome DOM 收割的纯函数：href 解析 / 停止判定 / cookie 合并。"""
+
+    def test_parse_video_hrefs(self):
+        hrefs = [
+            "https://www.douyin.com/video/111?a=1",
+            "https://www.douyin.com/video/111",       # 重复 → 去重
+            "https://www.douyin.com/video/222/",
+            "https://www.douyin.com/user/xxx",        # 非视频 → 忽略
+            "", None,
+        ]
+        out = douyin_batch.parse_video_hrefs(hrefs)
+        self.assertEqual([a["aweme_id"] for a in out], ["111", "222"])
+        self.assertEqual(out[0]["desc"], "")
+
+    def test_scroll_should_stop(self):
+        # 连续 stable_rounds 轮无增长才停
+        self.assertFalse(douyin_batch.scroll_should_stop([10, 10]))
+        self.assertTrue(douyin_batch.scroll_should_stop([10, 12, 12, 12]))
+        self.assertFalse(douyin_batch.scroll_should_stop(
+            [10, 12, 12, 14], stable_rounds=2))
+
+    def test_merge_cookie_fragments(self):
+        base = "sessionid=abc; msToken=old; ttwid=old2; foo=1"
+        out = douyin_batch.merge_cookie_fragments(
+            base, {"msToken": "new", "ttwid": "new2"})
+        parts = {p.split("=", 1)[0]: p.split("=", 1)[1]
+                 for p in out.split("; ")}
+        self.assertEqual(parts["sessionid"], "abc")
+        self.assertEqual(parts["msToken"], "new")
+        self.assertEqual(parts["ttwid"], "new2")
+        self.assertEqual(parts["foo"], "1")
+
+
 class _MockTransport:
     """httpx MockTransport 工厂：{url: (status, bytes)}。"""
 

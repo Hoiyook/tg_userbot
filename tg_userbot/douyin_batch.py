@@ -55,6 +55,30 @@ def load_f2():
         return None
 
 
+def merge_cookie_fragments(base_cookie, fragments):
+    """base cookie 串按名字段合并 fragments（同名覆盖，其余保留）。
+
+    典型：登录态（sessionid 等）来自用户 Chrome，时效件（msToken/ttwid）
+    来自无头采集——msToken 是设备级滚动值，不与登录态绑定，可跨源拼接。
+    """
+    if not fragments:
+        return base_cookie or ""
+    parts = [p.strip() for p in (base_cookie or "").split(";") if p.strip()]
+    kept, seen = [], set()
+    for p in parts:
+        name = p.split("=", 1)[0].strip().lower()
+        if name in {k.lower() for k in fragments}:
+            continue          # 待会由 fragments 统一提供
+        kept.append(p)
+        seen.add(name)
+    for k, v in fragments.items():
+        if v:
+            kept.append(f"{k}={v}")
+    return "; ".join(kept)
+
+
+
+
 async def refresh_cookie_from_browser():
     """从本地浏览器取新鲜 douyin cookie（含时效敏感的 msToken）。
 
@@ -76,12 +100,13 @@ async def refresh_cookie_from_browser():
     if err or not cookie_str:
         logger.info(f"🎵 浏览器 cookie 不可用（沿用现值）：{err or '空'}")
         return False
-    # msToken 是 post 接口的硬门槛（false/缺失必 403，2026-10-02 生产
-    # 实测 bot 与 shell 同 cookie 表现分裂的最可疑差异点）：没有就不采用
+    # msToken 是 post 接口的硬门槛（false/缺失必 403）。注意：Chrome 打开
+    # 作者页并不会把它落成 cookie（新版 webmssdk 在内存里用）——枚举的
+    # 免疫路径是 Chrome DOM 收割（harvest_author_links_via_chrome），
+    # 这里只做守卫：没有就不采用，绝不覆盖好值。
     if "mstoken=" not in cookie_str.lower():
         logger.warning(
-            "🎵 浏览器 cookie 里没有 msToken（未采用，沿用现值）——"
-            "Chrome 里打开一次 douyin.com 让页面 JS 生成后再试")
+            "🎵 仍无 msToken（未采用，沿用现值）——请确认 Chrome 可用")
         return False
     save_err = config.save_douyin_cookie(cookie_str)
     if save_err:
@@ -198,6 +223,197 @@ def build_aweme_record(aweme, author, subdir):
         "created_at": created.strftime("%Y-%m-%d %H:%M:%S"),
         "dedup_key": dedup.douyin_key(aweme["aweme_id"]),
     }
+
+
+def parse_video_hrefs(href_list):
+    """DOM href 列表 → 去重保序的 aweme 列表 [{aweme_id, desc, …}]。
+
+    纯函数（可单测）：/video/{id} 提取 id，query/尾斜杠剥掉；非视频
+    href 忽略。desc 由调用方另行从 DOM 文本补（此处只管 id）。
+    """
+    import re as _re
+    seen, out = set(), []
+    pat = _re.compile(r"/video/(\d+)")
+    for href in href_list:
+        m = pat.search(str(href or ""))
+        if not m:
+            continue
+        aid = m.group(1)
+        if aid in seen:
+            continue
+        seen.add(aid)
+        out.append({"aweme_id": aid, "desc": "", "create_time": None})
+    return out
+
+
+def scroll_should_stop(counts, stable_rounds=2):
+    """滚动收割的停止判定（纯函数）：连续 stable_rounds 轮计数无增长。
+
+    counts = 历轮去重链接数序列。到顶（页面加载完）后计数不再涨。
+    """
+    if len(counts) >= stable_rounds + 1 \
+            and counts[-1] == counts[-(stable_rounds + 1)]:
+        return True
+    return False
+
+
+async def harvest_author_links_via_chrome(sec_user_id, max_items=None,
+                                           max_scrolls=60):
+    """Agent 真 Chrome 打开作者页，注入登录态后滚动收割全部作品链接。
+
+    2026-10-02 生产实测链路：游客只有 8 条预览（「登录后免费畅享」墙）；
+    注入用户 Chrome 的 douyin 登录态（sessionid 等）后全量可见；列表滚动
+    容器是内层 [class*=route-scroll-container]（window 滚动无效）。
+    浏览器真指纹 + 页面自己签名 → 对 f2 的 403 风控免疫（同日实测：
+    f2 被拒期间页面照常渲染，102 条稳定收满）。需要 Chrome Agent 在线，
+    不在线时自动拉起一次。返回 (awemes, err)——desc 有、无发布时间
+    （文件名日期退化为入队日）。
+    """
+    import json as _json
+    import urllib.request
+
+    import websockets
+    from . import config as _cfg
+
+    if max_items is None:
+        max_items = int(getattr(_cfg, "DYU_CHROME_MAX_ITEMS", 2000))
+    port = int(getattr(_cfg, "CHROME_CDP_PORT", 9222))
+    if not await _ensure_cdp(port):
+        return None, f"Chrome Agent CDP({port}) 不可达且自动拉起失败"
+    ws_url = _json.loads(urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/json/version",
+        timeout=3).read())["webSocketDebuggerUrl"]
+
+    pause = float(getattr(_cfg, "DYU_CHROME_SCROLL_PAUSE", 2.0))
+    init_wait = float(getattr(_cfg, "DYU_CHROME_INIT_WAIT", 5.0))
+    async with websockets.connect(ws_url, open_timeout=10,
+                                   max_size=16 * 1024 * 1024) as ws:
+        _id = [0]
+
+        async def call(method, params=None, session_id=None):
+            _id[0] += 1
+            msg = {"id": _id[0], "method": method, "params": params or {}}
+            if session_id:
+                msg["sessionId"] = session_id
+            await ws.send(_json.dumps(msg))
+            while True:
+                recv = _json.loads(await asyncio.wait_for(ws.recv(),
+                                                          timeout=60))
+                if recv.get("id") == _id[0]:
+                    if "error" in recv:
+                        raise RuntimeError(
+                            str(recv["error"].get("message", "?")))
+                    return recv.get("result", {})
+
+        tgt = await call("Target.createTarget", {"url": "about:blank"})
+        sid = (await call("Target.attachToTarget",
+                          {"targetId": tgt["targetId"],
+                           "flatten": True}))["sessionId"]
+
+        async def eval_js(expr):
+            r_ = await call("Runtime.evaluate",
+                            {"expression": expr, "returnByValue": True},
+                            session_id=sid)
+            return r_.get("result", {}).get("value")
+
+        try:
+            # 注入用户 Chrome 的 douyin 登录态（免扫码；游客只见 8 条）
+            jar = await asyncio.to_thread(
+                _user_douyin_cookie_jar)
+            if jar:
+                await call("Storage.setCookies", {"cookies": jar},
+                           session_id=sid)
+            else:
+                logger.warning("🎵 未取到用户登录 cookie，游客模式收割"
+                               "（仅前几个作品）")
+            await call("Page.navigate",
+                       {"url": f"https://www.douyin.com/user/{sec_user_id}"},
+                       session_id=sid)
+            await asyncio.sleep(init_wait)
+
+            href_expr = ("JSON.stringify("
+                         "Array.from(document.querySelectorAll('a[href*="
+                         "\"/video/\"]')).map(a=>a.href))")
+            desc_expr = ("JSON.stringify("
+                         "Array.from(document.querySelectorAll("
+                         "'a[href*=\"/video/\"]')).map(a=>"
+                         "(a.getAttribute('aria-label')||a.textContent||'')"
+                         ".trim().slice(0,60)))")
+            # 滚动目标：内层 route-scroll-container（window 滚动无效）；
+            # 兜底 window，再补一发真滚轮事件覆盖其他容器形态
+            scroll_expr = ("(() => {const el = [...document."
+                           "querySelectorAll('[class*=\"route-scroll-"
+                           "container\"]')].find(e => e.scrollHeight > "
+                           "e.clientHeight + 300);"
+                           "(el || document.documentElement).scrollTo(0, "
+                           "999999); return !!el;})()")
+            counts, awemes = [], []
+            for _round in range(max_scrolls):
+                hrefs = _json.loads(await eval_js(href_expr) or "[]")
+                descs = _json.loads(await eval_js(desc_expr) or "[]")
+                awemes = parse_video_hrefs(hrefs)
+                for i, a in enumerate(awemes):
+                    if i < len(descs) and not a["desc"]:
+                        a["desc"] = str(descs[i] or "")
+                counts.append(len(awemes))
+                if len(awemes) >= max_items \
+                        or scroll_should_stop(counts, stable_rounds=4):
+                    break
+                await eval_js(scroll_expr)
+                await call("Input.dispatchMouseEvent",
+                           {"type": "mouseWheel", "x": 500, "y": 500,
+                            "deltaX": 0, "deltaY": 2500}, session_id=sid)
+                await asyncio.sleep(pause)
+            if not awemes:
+                return None, "页面未渲染出作品（作者不存在或被挑战页拦截）"
+            return awemes, None
+        finally:
+            try:
+                await call("Target.closeTarget",
+                           {"targetId": tgt["targetId"]})
+            except Exception:
+                pass
+
+
+async def _ensure_cdp(port):
+    """CDP 可达性探测；不可达时拉起 Chrome Agent 再探一次。"""
+    import urllib.request as _u
+
+    def _alive():
+        try:
+            with _u.urlopen(f"http://127.0.0.1:{port}/json/version",
+                            timeout=2) as r:
+                return bool(r.read())
+        except Exception:
+            return False
+
+    if await asyncio.to_thread(_alive):
+        return True
+    try:
+        from . import chrome_client
+        logger.info("🎵 Chrome Agent 不在线，自动拉起…")
+        await chrome_client.spawn_agent()
+    except Exception as e:
+        logger.warning(f"🎵 Chrome Agent 拉起失败：{e}")
+        return False
+    for _ in range(20):
+        await asyncio.sleep(1.5)
+        if await asyncio.to_thread(_alive):
+            return True
+    return False
+
+
+def _user_douyin_cookie_jar():
+    """用户 Chrome 的 douyin cookie → CDP Storage.setCookies 形态。"""
+    from . import browser_cookies
+    cookie_str, err = browser_cookies.load_browser_cookie_string(
+        str(getattr(config, "DYU_BROWSER_COOKIE", "chrome")))
+    if err or not cookie_str:
+        return []
+    return [{"name": kv.split("=", 1)[0].strip(),
+             "value": kv.split("=", 1)[1],
+             "domain": ".douyin.com", "path": "/"}
+            for kv in cookie_str.split(";") if "=" in kv]
 
 
 async def enumerate_author_posts(sec_user_id, max_pages=None):
@@ -321,28 +537,46 @@ async def _run_dyu_inner(url, subdir_raw):
     logger.info(f"🎵 /dyu 开始枚举：{label}（sec_uid {sec_uid[:18]}…）")
 
     found = queued = skipped = 0
-    async for awemes, has_more in enumerate_author_posts(sec_uid):
-        for a in awemes:
-            found += 1
-            key = dedup.douyin_key(a["aweme_id"])
-            skip, _notice = dedup.should_skip(key) if key else (False, None)
-            if skip:
-                skipped += 1
-                continue
-            record = build_aweme_record(a, nickname, subdir)
-            try:
-                await queue.enqueue_and_start(record)
-                queued += 1
-            except Exception as e:
-                logger.warning(
-                    f"⚠️ 作品入队失败（继续下一条）：{a['aweme_id']} {e}")
-        logger.info(f"🎵 枚举累计 {found} 条（新 {queued} / 已有 {skipped}）"
-                    f"{'…' if has_more else '（完）'}")
+    all_awemes = []
+    enum_via = "Chrome DOM"
+    harvested, chrome_err = await harvest_author_links_via_chrome(sec_uid)
+    if harvested is not None:
+        all_awemes = harvested
+    else:
+        # Chrome 收割失败（Agent 起不来/页面异常）→ f2 兜底（能拿发布时间，
+        # 但受 msToken 时效与风控影响，2026-10-02 生产实测）
+        logger.warning(f"🎵 Chrome 收割失败（{chrome_err}），降级 f2 枚举")
+        enum_via = "f2"
+        try:
+            async for awemes, has_more in enumerate_author_posts(sec_uid):
+                all_awemes.extend(awemes)
+                logger.info(f"🎵 f2 枚举累计 {len(all_awemes)} 条"
+                            f"{'…' if has_more else '（完）'}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Chrome 收割与 f2 枚举都失败：{chrome_err} / "
+                f"{str(e)[:80]}")
+    for a in all_awemes:
+        found += 1
+        key = dedup.douyin_key(a["aweme_id"])
+        skip, _notice = dedup.should_skip(key) if key else (False, None)
+        if skip:
+            skipped += 1
+            continue
+        record = build_aweme_record(a, nickname, subdir)
+        try:
+            await queue.enqueue_and_start(record)
+            queued += 1
+        except Exception as e:
+            logger.warning(
+                f"⚠️ 作品入队失败（继续下一条）：{a['aweme_id']} {e}")
+    logger.info(f"🎵 入队进度：已发现 {found}（新 {queued} / 已有 {skipped}）")
 
     target = f"下载/抖音/{subdir}" if subdir else "下载/抖音"
     text = (f"🎵 抖音作者批量任务已开始\n\n"
             f"作者：{label}\n"
-            f"作品：{found} 个｜新入队 {queued}｜跳过已下载 {skipped}\n"
+            f"作品：{found} 个｜新入队 {queued}｜跳过已下载 {skipped}"
+            f"｜枚举：{enum_via}\n"
             f"目录：{target}\n"
             f"模式：串行逐条（解析→下载），完成后逐条通知")
     try:
