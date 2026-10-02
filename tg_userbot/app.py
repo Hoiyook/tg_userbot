@@ -1437,7 +1437,26 @@ async def main():
 
     # （Runtime DB 初始化已前移到队列装载之前——队列装载依赖 RUNTIME_DB_READY）
 
-    await start_with_retry(state.client)
+    # 登录永不放弃（2026-10-02 生产教训：代理节点劣化时 start_with_retry
+    # 的 10 次耗尽会 raise 出 main()，进程退出且 launchd 不拉起——系统
+    # 整个死透、只能人肉发现）。这里包一层永久重试：30s 起步指数退避、
+    # 封顶 5 分钟，节点恢复后自动上线。
+    _login_delay = 30
+    while True:
+        try:
+            await start_with_retry(state.client)
+            break
+        except asyncio.CancelledError:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            logger.error(
+                f"❌ 登录重试耗尽（{type(e).__name__}: {str(e)[:80]}），"
+                f"{_login_delay}s 后整体重来——节点恢复后系统自动上线"
+            )
+            await asyncio.sleep(_login_delay)
+            _login_delay = min(_login_delay * 2, 300)
 
     me = await state.client.get_me()
     state.MY_ID = me.id
