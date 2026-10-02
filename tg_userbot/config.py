@@ -1538,8 +1538,11 @@ DYU_MAX_PAGES = 200
 # /dyu 开始前从本地浏览器自动保鲜 douyin cookie（msToken 几小时过期，
 # 陈旧值是 403 风控主因，2026-10-02 生产实测）。off/none 关闭。
 DYU_BROWSER_COOKIE = "chrome"
-# 本地工作区：压缩包副本 + 解压产物（DOWNLOAD_DIR 同卷，受磁盘保护线约束）
-EXTRACT_STAGING_ROOT = os.path.join(DOWNLOAD_DIR, "_115解压")
+# 本地工作区：压缩包副本 + 解压产物。必须在 DOWNLOAD_DIR（=CD2 备份监视
+# 树）之外——CD2 备份是「上传后删本地源」的搬移语义，staging 在树内会被
+# 顺手搬走删掉，对账期间文件消失直接炸任务（2026-10-03 生产实测）。放
+# DATA_ROOT 下同卷（磁盘保护线仍适用）但不在监视树内。
+EXTRACT_STAGING_ROOT = os.path.join(DATA_ROOT, "_115解压")
 # CD2 挂载点（挂载根 = 115 根；gRPC 路径 /115open/X ↔ 挂载 /X）。
 # 机器相关值，tg_secrets.json 的 cloud_mount_base 可覆盖。
 CLOUD_MOUNT_BASE = (_SECRET_CONFIG.get("cloud_mount_base")

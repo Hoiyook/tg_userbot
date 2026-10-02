@@ -682,6 +682,9 @@ async def handle_command(event, cmd_text):
     if extract_worker.is_extract_command(cmd_text):
         # 115 解压回传：扫描入队 / 状态 / stop / retry / del
         logger.info(f"执行命令：{cmd_text[:60]}")
+        # 递归扫描大目录树可达 1-2 分钟，先应答再扫（owner 不至于以为没反应）
+        await _reply(event, "🗜 收到，递归扫描中（大目录树约 1-2 分钟，"
+                            "完成后回执入队结果）…")
         await _reply(event, await extract_worker.command_reply(cmd_text))
         return True
 

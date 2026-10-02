@@ -271,20 +271,10 @@ async def _verify_with_retry(tid, target_root, rel_files, content_dir,
     if gap is None:
         gap = float(getattr(config, "EXTRACT_VERIFY_GAP_SECONDS", 10.0))
     for attempt in range(1, tries + 1):
-        # 第二道保险：CD2 自己的上传任务应为 0（正在传说明还没落定）
-        try:
-            reply = await cd2_api.tasks_reply()
-            line = next((ln for ln in reply.splitlines()
-                         if "⬆️上传" in ln), "")
-            in_flight = "".join(ch for ch in line.split("⬆️上传")[-1]
-                                if ch.isdigit()) or "0"
-            if int(in_flight) > 0 and attempt < tries:
-                logger.info(f"🗜 [E{tid}] CD2 仍有 {in_flight} 个上传在途，"
-                            f"{gap}s 后重对账（{attempt}/{tries}）")
-                await asyncio.sleep(gap)
-                continue
-        except Exception as e:
-            logger.warning(f"🗜 [E{tid}] CD2 任务查询失败（仅用尺寸对账）：{e}")
+        # 注：不做「CD2 全局在途==0」的闸门——在途计数覆盖全盘（/dyu 视频等
+        # 其他目录也在备份），永远可能 >0，会把本任务的对账轮次全烧在等待
+        # 上。权威判据只有下面的逐文件尺寸对账，重试轮本身已覆盖「上传未
+        # 落定」的时延。
 
         # 逐父目录 gRPC 尺寸对账（阻塞 gRPC → 放线程）
         diffs = await asyncio.to_thread(
