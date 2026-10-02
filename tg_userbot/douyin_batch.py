@@ -214,20 +214,55 @@ def status_text():
 
 
 def parse_dyu_command(text):
-    """/dyu <主页链接> [子目录] → (url, subdir_raw)；不合法返回 (None, None)。"""
+    """/dyu <主页链接> [since YYYY-MM-DD] [子目录] → (url, subdir, since)。
+
+    since 沿 /paw_plan 的「since 日期」关键词约定；不合法返回 (None, None,
+    None)，since 未给时第三位为 None。
+    """
     import re
+    from datetime import datetime as _dt
     m = re.match(r"^/dyu(?:\s+|$)(.*)$", str(text or "").strip(),
                  re.IGNORECASE)
     if not m:
-        return None, None
+        return None, None, None
     parts = m.group(1).split()
     if not parts:
-        return None, None
+        return None, None, None
     url = parts[0]
     if "douyin.com" not in url:
-        return None, None
-    subdir = " ".join(parts[1:]) if len(parts) > 1 else ""
-    return url, subdir
+        return None, None, None
+    rest = parts[1:]
+    since = None
+    if len(rest) >= 2 and rest[0].lower() == "since":
+        try:
+            since = _dt.strptime(rest[1], "%Y-%m-%d")
+        except ValueError:
+            return None, None, None     # since 关键词后必须跟合法日期
+        rest = rest[2:]
+    subdir = " ".join(rest)
+    return url, subdir, since
+
+
+def filter_awemes_since(awemes, since_dt):
+    """按发布时间过滤（纯函数）。返回 (保留列表, 本页是否已全部早于 since)。
+
+    create_time 缺失的作品**剔除**（无法核实发布日期，宁缺勿错——数据
+    准确性优先）；「本页全早于」供调用方提前停止翻页（页序新→旧）。
+    """
+    import time as _time
+    from datetime import datetime as _dt
+    if since_dt is None:
+        return list(awemes), False
+    floor = _dt.timestamp(since_dt)
+    kept, any_newer = [], False
+    for a in awemes:
+        ct = a.get("create_time")
+        if not ct:
+            continue
+        if int(ct) >= floor:
+            kept.append(a)
+            any_newer = True
+    return kept, not any_newer
 
 
 def build_aweme_record(aweme, author, subdir):
@@ -550,7 +585,7 @@ async def get_sec_user_id(url):
     return sec_uid
 
 
-async def run_dyu(url, subdir_raw):
+async def run_dyu(url, subdir_raw, since=None):
     """后台编排：枚举 → 逐条判重入队 → 汇总通知。返回给命令层的文案由
     command_reply 同步部分给出；本函数只发异步通知。"""
     if _ENUM_LOCK.locked():
@@ -559,7 +594,7 @@ async def run_dyu(url, subdir_raw):
         try:
             # 先保鲜 cookie（msToken 几小时过期，陈旧值是 403 主因）
             await refresh_cookie_from_browser()
-            return await _run_dyu_inner(url, subdir_raw)
+            return await _run_dyu_inner(url, subdir_raw, since)
         except Exception as e:
             logger.exception(f"🎵 /dyu 失败：{e}")
             hint = ""
@@ -577,7 +612,7 @@ async def run_dyu(url, subdir_raw):
             return f"❌ {type(e).__name__}: {e}"
 
 
-async def _run_dyu_inner(url, subdir_raw):
+async def _run_dyu_inner(url, subdir_raw, since=None):
     from . import queue
 
     sec_uid = await get_sec_user_id(url)
@@ -585,28 +620,54 @@ async def _run_dyu_inner(url, subdir_raw):
     subdir = sanitize_filename(subdir_raw) if subdir_raw else \
         (sanitize_filename(nickname) if nickname else "")
     label = nickname or sec_uid[:16]
-    logger.info(f"🎵 /dyu 开始枚举：{label}（sec_uid {sec_uid[:18]}…）")
+    since_note = f"，since {since:%Y-%m-%d}" if since else ""
+    logger.info(f"🎵 /dyu 开始枚举：{label}{since_note}"
+                f"（sec_uid {sec_uid[:18]}…）")
+
+    all_awemes = []
+    if since is not None:
+        # since 模式：f2 专属（作品带发布时间戳；Chrome 页面读不到时间，
+        # 2026-10-03 实测卡片无时间元素、fiber 无 create_time）。页序新→旧，
+        # 某页全部早于 since 即停止翻页（置顶帖只占第 1 页，由整页判定兜住）
+        enum_via = "f2"
+        async for awemes, has_more in enumerate_author_posts(sec_uid):
+            kept, page_all_older = filter_awemes_since(awemes, since)
+            all_awemes.extend(kept)
+            logger.info(f"🎵 f2 枚举累计 {len(all_awemes)} 条"
+                        f"（≥ {since:%Y-%m-%d}）")
+            if page_all_older:
+                logger.info("🎵 本页已全部早于 since，停止翻页")
+                break
+            if not has_more:
+                break
+        if not all_awemes:
+            text = f"🎵 该作者在 {since:%Y-%m-%d} 之后没有新作品"
+            try:
+                await notify.notify_user(text)
+            except Exception:
+                pass
+            return text
+    else:
+        harvested, chrome_err = await harvest_author_links_via_chrome(sec_uid)
+        if harvested is not None:
+            all_awemes = harvested
+            enum_via = "Chrome DOM"
+        else:
+            # Chrome 收割失败（Agent 起不来/页面异常）→ f2 兜底（能拿发布
+            # 时间，但受 msToken 时效与风控影响，2026-10-02 生产实测）
+            logger.warning(f"🎵 Chrome 收割失败（{chrome_err}），降级 f2 枚举")
+            enum_via = "f2"
+            try:
+                async for awemes, has_more in enumerate_author_posts(sec_uid):
+                    all_awemes.extend(awemes)
+                    logger.info(f"🎵 f2 枚举累计 {len(all_awemes)} 条"
+                                f"{'…' if has_more else '（完）'}")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Chrome 收割与 f2 枚举都失败：{chrome_err} / "
+                    f"{str(e)[:80]}")
 
     found = queued = skipped = 0
-    all_awemes = []
-    enum_via = "Chrome DOM"
-    harvested, chrome_err = await harvest_author_links_via_chrome(sec_uid)
-    if harvested is not None:
-        all_awemes = harvested
-    else:
-        # Chrome 收割失败（Agent 起不来/页面异常）→ f2 兜底（能拿发布时间，
-        # 但受 msToken 时效与风控影响，2026-10-02 生产实测）
-        logger.warning(f"🎵 Chrome 收割失败（{chrome_err}），降级 f2 枚举")
-        enum_via = "f2"
-        try:
-            async for awemes, has_more in enumerate_author_posts(sec_uid):
-                all_awemes.extend(awemes)
-                logger.info(f"🎵 f2 枚举累计 {len(all_awemes)} 条"
-                            f"{'…' if has_more else '（完）'}")
-        except Exception as e:
-            raise RuntimeError(
-                f"Chrome 收割与 f2 枚举都失败：{chrome_err} / "
-                f"{str(e)[:80]}")
     for a in all_awemes:
         found += 1
         key = dedup.douyin_key(a["aweme_id"])
@@ -624,8 +685,10 @@ async def _run_dyu_inner(url, subdir_raw):
     logger.info(f"🎵 入队进度：已发现 {found}（新 {queued} / 已有 {skipped}）")
 
     target = f"下载/抖音/{subdir}" if subdir else "下载/抖音"
+    since_line = (f"范围：{since:%Y-%m-%d} 之后\n" if since else "")
     text = (f"🎵 抖音作者批量任务已开始\n\n"
             f"作者：{label}\n"
+            f"{since_line}"
             f"作品：{found} 个｜新入队 {queued}｜跳过已下载 {skipped}"
             f"｜枚举：{enum_via}\n"
             f"目录：{target}\n"

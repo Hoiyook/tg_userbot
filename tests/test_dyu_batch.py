@@ -27,25 +27,80 @@ from tg_userbot import douyin_batch  # noqa: E402
 from tg_userbot import queue as queue_mod  # noqa: E402
 
 
+class SinceTest(unittest.TestCase):
+    """since 日期参数：解析 + 过滤 + 整页早停判定。"""
+
+    def test_parse_since(self):
+        url, sub, since = douyin_batch.parse_dyu_command(
+            "/dyu https://v.douyin.com/abc since 2025-10-01 我的目录")
+        self.assertEqual(url, "https://v.douyin.com/abc")
+        self.assertEqual(sub, "我的目录")
+        self.assertEqual(since.strftime("%Y-%m-%d"), "2025-10-01")
+
+    def test_parse_since_no_subdir(self):
+        url, sub, since = douyin_batch.parse_dyu_command(
+            "/dyu https://v.douyin.com/abc since 2025-10-01")
+        self.assertEqual(sub, "")
+        self.assertIsNotNone(since)
+
+    def test_parse_bad_since_rejected(self):
+        self.assertEqual(
+            douyin_batch.parse_dyu_command(
+                "/dyu https://v.douyin.com/abc since 昨天"),
+            (None, None, None))
+
+    def test_parse_without_since(self):
+        url, sub, since = douyin_batch.parse_dyu_command(
+            "/dyu https://v.douyin.com/abc 目录")
+        self.assertIsNone(since)
+        self.assertEqual(sub, "目录")
+
+    def test_filter_and_page_all_older(self):
+        from datetime import datetime
+        since = datetime(2025, 10, 1)
+        awemes = [
+            {"aweme_id": "1", "create_time": 1759363200},   # 2025-10-02 ✓
+            {"aweme_id": "2", "create_time": 1759276800},   # 2025-10-01 ✓
+            {"aweme_id": "3", "create_time": 1759190400},   # 2025-09-30 ✗
+            {"aweme_id": "4", "create_time": None},         # 无时间 → 剔除
+        ]
+        kept, page_all_older = douyin_batch.filter_awemes_since(awemes, since)
+        self.assertEqual([a["aweme_id"] for a in kept], ["1", "2"])
+        self.assertFalse(page_all_older)   # 页内有新于 since 的
+        # 整页全早于 → 停止翻页信号
+        old_page = [{"aweme_id": "9", "create_time": 1700000000}]
+        kept2, stop = douyin_batch.filter_awemes_since(old_page, since)
+        self.assertEqual(kept2, [])
+        self.assertTrue(stop)
+        # since=None 不过滤
+        kept3, stop3 = douyin_batch.filter_awemes_since(awemes, None)
+        self.assertEqual(len(kept3), 4)
+        self.assertFalse(stop3)
+
+
 class ParseCommandTest(unittest.TestCase):
     def test_parse_ok(self):
-        url, sub = douyin_batch.parse_dyu_command(
+        url, sub, since = douyin_batch.parse_dyu_command(
             "/dyu https://v.douyin.com/abc123/ 我的子目录")
         self.assertEqual(url, "https://v.douyin.com/abc123/")
         self.assertEqual(sub, "我的子目录")
+        self.assertIsNone(since)
 
     def test_parse_no_subdir(self):
-        url, sub = douyin_batch.parse_dyu_command("/dyu https://v.douyin.com/x")
+        url, sub, since = douyin_batch.parse_dyu_command(
+            "/dyu https://v.douyin.com/x")
         self.assertEqual(url, "https://v.douyin.com/x")
         self.assertEqual(sub, "")
+        self.assertIsNone(since)
 
     def test_parse_rejects(self):
-        # 裸命令 / 非抖音域 / 子目录带空格原样保留
-        self.assertEqual(douyin_batch.parse_dyu_command("/dyu"), (None, None))
+        # 裸命令 / 非抖音域 / since 关键词后非日期
+        self.assertEqual(douyin_batch.parse_dyu_command("/dyu"),
+                         (None, None, None))
         self.assertEqual(
             douyin_batch.parse_dyu_command("/dyu https://youtube.com/x"),
-            (None, None))
-        url, sub = douyin_batch.parse_dyu_command(
+            (None, None, None))
+        url, sub, since = douyin_batch.parse_dyu_command(
             "/dyu https://www.douyin.com/user/MS4abc 我 的 目 录")
         self.assertEqual(sub, "我 的 目 录")
 
