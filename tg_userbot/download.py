@@ -311,43 +311,43 @@ async def download_url_media(record):
         #     （bot 若已送过，重复转交的回复会被内容判重拦下，不双下）
         # 绝不拿作品页链接当直链下载（2026-10-02 生产事故：15 条 HTML
         # 假 mp4 被 CD2 搬上 115 又双向删除，历史/判重索引被污染）
-        attempts = int(record.get("attempts") or 0)
-        if attempts <= 1:
-            logger.info("🎵 第 1 顺位：转解析 bot（回复经白名单流下载）")
-            # 节流 20s/条（owner 指令 2026-10-02）：批量转交不打挂第三方
-            # bot；串行门内睡眠，天然限住整批复交速率
-            await asyncio.sleep(20)
-            try:
-                from . import platform
-                await platform.relay_links_to_parse_bot(
-                    "douyin", [record.get("url") or ""])
-                logger.info("🎵 已转解析 bot，任务保留，60s 后重放核对")
-                # 盖在途目录戳：bot 回流的下一个视频直接落 <抖音>/<子目录>/，
-                # 不再进默认的去水印 bot 文件夹（owner 需求 2026-10-02）
-                from . import douyin_batch as _dyb
-                _dyb.stamp_next_bot_video(record.get("subdir"),
-                                          _aweme_id_of(record.get("url")))
-            except Exception as e:
-                logger.warning(f"🎵 转解析 bot 失败：{e}")
+        # 策略（owner 指令 2026-10-02，无次数上限）：每轮都先转解析 bot
+        # ——bot 送回视频的瞬间由目录戳消费方把本任务销账出榜（留在榜上
+        # = bot 还没送到，重发是正确行为）；bot 转交本身失败才试 f2 直连；
+        # 都不成按退避重试。绝不拿作品页链接当直链下载（2026-10-02 生产
+        # 事故：15 条 HTML 假 mp4）。
+        logger.info("🎵 第 1 顺位：转解析 bot（回复经白名单流下载）")
+        # 节流 20s/条（owner 指令）：批量转交不打挂第三方 bot；串行门内
+        # 睡眠天然限住整批复交速率
+        await asyncio.sleep(20)
+        try:
+            from . import platform
+            await platform.relay_links_to_parse_bot(
+                "douyin", [record.get("url") or ""])
+            logger.info("🎵 已转解析 bot，等待回流销账")
+            # 盖在途目录戳：bot 回流的下一个视频直接落 <抖音>/<子目录>/，
+            # 同时把本任务销账出榜（进度可见）
+            from . import douyin_batch as _dyb
+            _dyb.stamp_next_bot_video(record.get("subdir"),
+                                      _aweme_id_of(record.get("url")))
+            # 转交成功：任务留在榜上等销账（bot 回流视频时出榜），
+            # 本轮不下载
             return False
-        if attempts >= 8:
-            logger.warning("🎵 多轮未完成，正式转交解析 bot 并收尾")
-            return await _delegate_url_task_to_bot(record, final_filename)
-        logger.info("🎵 第 2 顺位：f2 执行期解析直链")
-        fresh = await _refresh_direct_url(record)
-        if fresh:
-            url = fresh
-            refreshed = True
-        else:
-            logger.warning("🎵 f2 解析失败，转退避重试")
-            # 顺带保鲜 cookie（有 msToken 守卫，无新值不覆盖）：owner 的
-            # Chrome 一旦刷过 douyin.com（msToken 滚新）即恢复直连
-            try:
-                from . import douyin_batch
-                await douyin_batch.refresh_cookie_from_browser()
-            except Exception as e:
-                logger.debug(f"🎵 重放期 cookie 保鲜失败：{e}")
-            return False
+        except Exception as e:
+            logger.warning(f"🎵 转解析 bot 失败，降级 f2 直连：{e}")
+            logger.info("🎵 第 2 顺位：f2 执行期解析直链")
+            fresh = await _refresh_direct_url(record)
+            if fresh:
+                url = fresh
+                refreshed = True   # 继续走下方直连下载
+            else:
+                logger.warning("🎵 f2 解析失败，转退避重试")
+                try:
+                    from . import douyin_batch
+                    await douyin_batch.refresh_cookie_from_browser()
+                except Exception as e2:
+                    logger.debug(f"🎵 重放期 cookie 保鲜失败：{e2}")
+                return False
     if direct_url_needs_refresh(url):
         refreshed = True
         logger.info("⏰ 直链签名临近过期/已过期，先重新解析刷新再下载")

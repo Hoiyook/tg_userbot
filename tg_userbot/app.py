@@ -782,9 +782,12 @@ async def new_message_handler(event):
                     from . import douyin_batch as _dyb
                     _stamped = _dyb.pop_bot_stamp()
                     if _stamped:
-                        source_override = f"抖音/{_stamped}"
+                        _subdir, _aweme = _stamped
+                        source_override = f"抖音/{_subdir}"
                         logger.info(
                             f"🎵 解析 bot 回流视频已盖目录戳：{source_override}")
+                        if _aweme:
+                            asyncio.create_task(_settle_dyu_task(_aweme))
             except Exception:
                 pass
             # 白名单双通道（2026-09-13）：事件生产者只**记任务**，转发由
@@ -795,6 +798,27 @@ async def new_message_handler(event):
 
     except Exception as e:
         logger.exception(f"❌ 消息处理异常：{e}")
+
+
+async def _settle_dyu_task(aweme_id):
+    """/dyu 销账：解析 bot 已送回该作品的视频（目录戳消费即证据），
+    把对应的 url 重试任务移出队列——留在榜上只会空转（owner 指令：
+    无次数上限、不转交收尾）。视频本体由白名单流下载（已在本消息）。"""
+    try:
+        matched = None
+        for r in list(state.QUEUE.get("retry") or []):
+            if str(aweme_id) in str(r.get("url") or ""):
+                matched = r
+                break
+        if matched is None:
+            return
+        state.QUEUE["retry"].remove(matched)
+        queue._save_after_mutation(matched, "delete")
+        logger.info(
+            f"🎵 /dyu 销账：bot 已送回作品 {aweme_id}，任务出榜"
+            f"（{matched.get('final_name', '')[:40]}）")
+    except Exception as e:
+        logger.warning(f"🎵 /dyu 销账失败（不影响下载）：{e}")
 
 
 def _build_media_record(message, chat_id, source_override, source_link=None,

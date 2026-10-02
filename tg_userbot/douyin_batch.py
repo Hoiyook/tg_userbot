@@ -150,11 +150,16 @@ def stamp_next_bot_video(subdir, aweme_id, ttl=180.0):
 
 
 def pop_bot_stamp():
-    """取走当前戳（一次性）；过期/未盖返回 None。"""
+    """取走当前戳（一次性）；过期/未盖返回 None。
+
+    返回 (subdir, aweme_id)——aweme_id 供销账：bot 回流视频 = 该作品已
+    解决，对应的 url 重试任务应当出榜（进度可见）。
+    """
     if _BOT_STAMP["subdir"] and time.time() <= _BOT_STAMP["expires"]:
         subdir = _BOT_STAMP["subdir"]
+        aweme_id = _BOT_STAMP["aweme_id"]
         _BOT_STAMP.update(subdir=None, aweme_id=None, expires=0.0)
-        return subdir
+        return subdir, aweme_id
     return None
 
 

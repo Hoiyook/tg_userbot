@@ -112,7 +112,7 @@ class BotStampTest(unittest.TestCase):
     def test_stamp_and_pop_once(self):
         douyin_batch._BOT_STAMP.update(subdir=None, aweme_id=None, expires=0)
         douyin_batch.stamp_next_bot_video("作者X", "42")
-        self.assertEqual(douyin_batch.pop_bot_stamp(), "作者X")
+        self.assertEqual(douyin_batch.pop_bot_stamp(), ("作者X", "42"))
         self.assertIsNone(douyin_batch.pop_bot_stamp())   # 一次性
 
     def test_expired_stamp_returns_none(self):
@@ -124,6 +124,47 @@ class BotStampTest(unittest.TestCase):
         douyin_batch._BOT_STAMP.update(subdir=None, aweme_id=None, expires=0)
         douyin_batch.stamp_next_bot_video("", "42")
         self.assertIsNone(douyin_batch.pop_bot_stamp())
+
+
+class SettleTest(unittest.IsolatedAsyncioTestCase):
+    """销账：bot 送回作品 → 对应 url 重试任务出榜（write-through 删库）。"""
+
+    async def test_settle_removes_matching_task(self):
+        import asyncio as _aio
+        from tg_userbot import state, queue as queue_mod
+        old_q = state.QUEUE
+        state.QUEUE = {"tasks": [], "retry": [
+            {"id": "t1", "kind": "url",
+             "url": "https://www.douyin.com/video/42",
+             "final_name": "f.mp4"},
+            {"id": "t2", "kind": "url",
+             "url": "https://www.douyin.com/video/43",
+             "final_name": "g.mp4"},
+        ]}
+        saved = []
+        try:
+            with mock.patch.object(queue_mod, "_save_after_mutation",
+                                   side_effect=lambda r, op:
+                                       saved.append((r["id"], op))):
+                from tg_userbot import app as app_mod
+                await _aio.wait_for(
+                    app_mod._settle_dyu_task("42"), timeout=5)
+            self.assertEqual([r["id"] for r in state.QUEUE["retry"]], ["t2"])
+            self.assertEqual(saved, [("t1", "delete")])
+        finally:
+            state.QUEUE = old_q
+
+    async def test_settle_no_match_is_noop(self):
+        import asyncio as _aio
+        from tg_userbot import state, queue as queue_mod
+        old_q = state.QUEUE
+        state.QUEUE = {"tasks": [], "retry": []}
+        try:
+            from tg_userbot import app as app_mod
+            await _aio.wait_for(app_mod._settle_dyu_task("999"), timeout=5)
+            self.assertEqual(state.QUEUE["retry"], [])
+        finally:
+            state.QUEUE = old_q
 
 
 class HarvestHelpersTest(unittest.TestCase):
@@ -209,6 +250,11 @@ class DownloadSubdirResolveTest(unittest.IsolatedAsyncioTestCase):
         refreshed = mock.AsyncMock(return_value=direct)
         self._patches.append(mock.patch.object(download, "_refresh_direct_url",
                                                refreshed))
+        # bot 转交失败（模拟第三方不可达）→ 落到 f2 直连路径
+        from tg_userbot import platform
+        self._patches.append(mock.patch.object(
+            platform, "relay_links_to_parse_bot",
+            new=mock.AsyncMock(side_effect=RuntimeError("bot 不可达"))))
         for p in self._patches:
             p.start()
         record = {
@@ -301,21 +347,27 @@ class ResolveFailureTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(os.path.exists(
             os.path.join(download._douyin_folder(), "X", "f.mp4")))
 
-    async def test_final_attempt_delegates_and_closes(self):
-        delegated = mock.AsyncMock(return_value="delegated")
+    async def test_no_attempt_cap_always_relays(self):
+        """owner 指令（2026-10-02）：无次数上限——任意 attempts 都转 bot，
+        绝不转交收尾。销账由目录戳消费方负责。"""
+        relayed = mock.AsyncMock()
+        from tg_userbot import platform
         self._patches.append(mock.patch.object(
-            download, "_delegate_url_task_to_bot", delegated))
+            platform, "relay_links_to_parse_bot", relayed))
         self._patches.append(mock.patch.object(asyncio, "sleep",
                                                new=mock.AsyncMock()))
         for p in self._patches:
             p.start()
         try:
-            ok = await download.download_url_media(self._record(attempts=8))
+            for attempts in (8, 20, 99):
+                relayed.reset_mock()
+                ok = await download.download_url_media(
+                    self._record(attempts=attempts))
+                relayed.assert_awaited_once()   # 仍走 bot 优先
+                self.assertFalse(ok)            # 留榜等销账
         finally:
             for p in self._patches:
                 p.stop()
-        delegated.assert_awaited_once()
-        self.assertEqual(ok, "delegated")
 
     async def test_html_response_rejected(self):
         """直链拿到 text/html：判失败绝不落盘（守卫）。"""
