@@ -410,9 +410,21 @@ async def harvest_author_links_via_chrome(sec_user_id, max_items=None,
                 _KEEP_TAB.add(tgt["targetId"])
                 return None, "被验证码拦截：请在 Chrome 窗口完成验证后重发"
 
-            href_expr = ("JSON.stringify("
-                         "Array.from(document.querySelectorAll('a[href*="
-                         "\"/video/\"]')).map(a=>a.href))")
+            # 只收作者作品网格（data-e2e=user-post-list）里的链接——全页
+            # 收割会把页脚「相关推荐/猜你喜欢」的**别人**视频也混进来
+            # （2026-10-03 生产实测：作者 5 个作品全页却收出 13 条）。
+            # user-post-list 缺席时回退 scroll-list（喜欢/收藏页的容器）。
+            scope_expr = (
+                '(() => {'
+                'for (const n of ["user-post-list", "scroll-list"]) {'
+                'const el = document.querySelector(`[data-e2e="${n}"]`);'
+                'if (el) return JSON.stringify('
+                "Array.from(el.querySelectorAll('a[href*=\"/video/\"]'))"
+                '.map(a=>a.href));}'
+                'return "[]";})()'
+            )
+            raw = await eval_js(scope_expr)
+            hrefs = _json.loads(raw or "[]")
             desc_expr = ("JSON.stringify("
                          "Array.from(document.querySelectorAll("
                          "'a[href*=\"/video/\"]')).map(a=>"
@@ -428,7 +440,9 @@ async def harvest_author_links_via_chrome(sec_user_id, max_items=None,
                            "999999); return !!el;})()")
             counts, awemes = [], []
             for _round in range(max_scrolls):
-                hrefs = _json.loads(await eval_js(href_expr) or "[]")
+                if _round > 0:
+                    raw = await eval_js(scope_expr)
+                    hrefs = _json.loads(raw or "[]")
                 descs = _json.loads(await eval_js(desc_expr) or "[]")
                 awemes = parse_video_hrefs(hrefs)
                 for i, a in enumerate(awemes):
