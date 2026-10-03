@@ -140,16 +140,23 @@ def extract_archive(archive_path, dest=None, delete_source=False):
             if os.path.isdir(staging):
                 shutil.rmtree(staging, ignore_errors=True)
             os.makedirs(staging, exist_ok=True)
+            # 超时按包大小放大：600s 底线只够小包；20GB 的 7z CPU 解压
+            # 要 10-20 分钟（2026-10-03 生产实测连续超时），按 10MB/s 保守
+            # 估算并保底 600s
+            size_budget = max(600, int(os.path.getsize(archive_path)
+                                       / (10 * 1024 * 1024)))
             p = subprocess.run(
                 ["bsdtar", "-xf", archive_path, "-C", staging],
-                capture_output=True, timeout=600,
+                capture_output=True, timeout=size_budget,
                 stdin=subprocess.DEVNULL)
             if p.returncode != 0:
                 return "failed", \
                     p.stderr.decode("utf-8", "replace")[:120], []
             os.replace(staging, dest)
         except subprocess.TimeoutExpired:
-            return "failed", "bsdtar 解压超时", []
+            return "failed", (
+                f"bsdtar 解压超时（预算 {size_budget}s，包 "
+                f"{os.path.getsize(archive_path)/1024/1024:.0f}MB）"), []
         except FileNotFoundError:
             return "failed", "bsdtar 不可用", []
 

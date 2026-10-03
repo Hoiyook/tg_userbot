@@ -92,8 +92,13 @@ async def _renew_loop(task_id):
         raise
 
 
-def _copy_file(src, dst, progress=None, chunk=1024 * 1024):
-    """分块拷贝（进度回调每块触发；阻塞，放线程）。返回写入字节数。"""
+def _copy_file(src, dst, progress=None, chunk=1024 * 1024, expected=None):
+    """分块拷贝（进度回调每块触发；阻塞，放线程）。返回写入字节数。
+
+    expected 给定时校验总字节数：挂载源在 CD2 重负载下可能提前吐 EOF
+    （2026-10-03 生产实测：21GB 包只拷出 122 字节还「成功」）——短读
+    一律抛错重拷，绝不把残缺副本送进解压。
+    """
     done = 0
     with open(src, "rb") as fin, open(dst, "wb") as fout:
         while True:
@@ -104,6 +109,10 @@ def _copy_file(src, dst, progress=None, chunk=1024 * 1024):
             done += len(data)
             if progress:
                 progress(done)
+    if expected is not None and done != int(expected):
+        raise IOError(
+            f"拷贝短读：{done} / {expected} 字节（挂载源提前 EOF），"
+            "将重拷")
     return done
 
 
@@ -165,7 +174,8 @@ async def _process_task(task):
                 lambda done: logger.info(
                     f"🗜 [E{tid}] 拷贝进度：{done} / "
                     f"{task['archive_size']} 字节")
-                if done % (64 * 1024 * 1024) == 0 else None)
+                if done % (64 * 1024 * 1024) == 0 else None,
+                expected=task["archive_size"])
             actual = os.path.getsize(local_arch)
             if actual != task["archive_size"]:
                 raise IOError(
