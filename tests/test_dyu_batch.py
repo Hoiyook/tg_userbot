@@ -27,33 +27,67 @@ from tg_userbot import douyin_batch  # noqa: E402
 from tg_userbot import queue as queue_mod  # noqa: E402
 
 
+class OriginalFilterTest(unittest.TestCase):
+    """原创过滤：author.sec_uid 对照，转发剔除、无主剔除、昵称兜底。"""
+
+    def setUp(self):
+        self.sec = "SEC_TARGET"
+        self.awemes = [
+            {"aweme_id": "1", "author_sec_uid": "SEC_TARGET",
+             "author_nickname": "毛姐"},                 # 原创 ✓
+            {"aweme_id": "2", "author_sec_uid": "SEC_OTHER",
+             "author_nickname": "二百者也"},             # 转发 ✗
+            {"aweme_id": "3", "author_sec_uid": None,
+             "author_nickname": "毛姐"},                 # 缺 sec_uid，昵称兜底 ✓
+            {"aweme_id": "4", "author_sec_uid": None,
+             "author_nickname": None},                   # 无主 → 剔除
+        ]
+
+    def test_filter(self):
+        kept, fwd, unk = douyin_batch.filter_awemes_original(
+            self.awemes, self.sec, "毛姐")
+        self.assertEqual([a["aweme_id"] for a in kept], ["1", "3"])
+        self.assertEqual(fwd, 1)
+        self.assertEqual(unk, 1)
+
+    def test_no_nickname_fallback_strict(self):
+        # 没给昵称时缺 sec_uid 一律剔除
+        kept, fwd, unk = douyin_batch.filter_awemes_original(
+            self.awemes, self.sec, None)
+        self.assertEqual([a["aweme_id"] for a in kept], ["1"])
+        self.assertEqual(unk, 2)
+
+
 class SinceTest(unittest.TestCase):
     """since 日期参数：解析 + 过滤 + 整页早停判定。"""
 
     def test_parse_since(self):
-        url, sub, since = douyin_batch.parse_dyu_command(
+        url, sub, since, fwd = douyin_batch.parse_dyu_command(
             "/dyu https://v.douyin.com/abc since 2025-10-01 我的目录")
         self.assertEqual(url, "https://v.douyin.com/abc")
         self.assertEqual(sub, "我的目录")
         self.assertEqual(since.strftime("%Y-%m-%d"), "2025-10-01")
+        self.assertFalse(fwd)
 
     def test_parse_since_no_subdir(self):
-        url, sub, since = douyin_batch.parse_dyu_command(
+        url, sub, since, fwd = douyin_batch.parse_dyu_command(
             "/dyu https://v.douyin.com/abc since 2025-10-01")
         self.assertEqual(sub, "")
         self.assertIsNotNone(since)
+        self.assertFalse(fwd)
 
     def test_parse_bad_since_rejected(self):
         self.assertEqual(
             douyin_batch.parse_dyu_command(
                 "/dyu https://v.douyin.com/abc since 昨天"),
-            (None, None, None))
+            (None, None, None, None))
 
     def test_parse_without_since(self):
-        url, sub, since = douyin_batch.parse_dyu_command(
+        url, sub, since, fwd = douyin_batch.parse_dyu_command(
             "/dyu https://v.douyin.com/abc 目录")
         self.assertIsNone(since)
         self.assertEqual(sub, "目录")
+        self.assertFalse(fwd)
 
     def test_filter_and_page_all_older(self):
         from datetime import datetime
@@ -80,27 +114,29 @@ class SinceTest(unittest.TestCase):
 
 class ParseCommandTest(unittest.TestCase):
     def test_parse_ok(self):
-        url, sub, since = douyin_batch.parse_dyu_command(
+        url, sub, since, fwd = douyin_batch.parse_dyu_command(
             "/dyu https://v.douyin.com/abc123/ 我的子目录")
         self.assertEqual(url, "https://v.douyin.com/abc123/")
         self.assertEqual(sub, "我的子目录")
         self.assertIsNone(since)
+        self.assertFalse(fwd)
 
     def test_parse_no_subdir(self):
-        url, sub, since = douyin_batch.parse_dyu_command(
+        url, sub, since, fwd = douyin_batch.parse_dyu_command(
             "/dyu https://v.douyin.com/x")
         self.assertEqual(url, "https://v.douyin.com/x")
         self.assertEqual(sub, "")
         self.assertIsNone(since)
+        self.assertFalse(fwd)
 
     def test_parse_rejects(self):
         # 裸命令 / 非抖音域 / since 关键词后非日期
         self.assertEqual(douyin_batch.parse_dyu_command("/dyu"),
-                         (None, None, None))
+                         (None, None, None, None))
         self.assertEqual(
             douyin_batch.parse_dyu_command("/dyu https://youtube.com/x"),
-            (None, None, None))
-        url, sub, since = douyin_batch.parse_dyu_command(
+            (None, None, None, None))
+        url, sub, since, fwd = douyin_batch.parse_dyu_command(
             "/dyu https://www.douyin.com/user/MS4abc 我 的 目 录")
         self.assertEqual(sub, "我 的 目 录")
 

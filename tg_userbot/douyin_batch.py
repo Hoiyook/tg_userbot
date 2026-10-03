@@ -214,33 +214,60 @@ def status_text():
 
 
 def parse_dyu_command(text):
-    """/dyu <主页链接> [since YYYY-MM-DD] [子目录] → (url, subdir, since)。
+    """/dyu <主页链接> [since YYYY-MM-DD] [all] [子目录]。
 
-    since 沿 /paw_plan 的「since 日期」关键词约定；不合法返回 (None, None,
-    None)，since 未给时第三位为 None。
+    → (url, subdir, since, include_forward)。since 沿 /paw_plan 的关键词
+    约定；all = 连转发一起收（默认仅原创）。不合法返回全 None。
     """
     import re
     from datetime import datetime as _dt
     m = re.match(r"^/dyu(?:\s+|$)(.*)$", str(text or "").strip(),
                  re.IGNORECASE)
     if not m:
-        return None, None, None
+        return None, None, None, None
     parts = m.group(1).split()
     if not parts:
-        return None, None, None
+        return None, None, None, None
     url = parts[0]
     if "douyin.com" not in url:
-        return None, None, None
+        return None, None, None, None
     rest = parts[1:]
     since = None
     if len(rest) >= 2 and rest[0].lower() == "since":
         try:
             since = _dt.strptime(rest[1], "%Y-%m-%d")
         except ValueError:
-            return None, None, None     # since 关键词后必须跟合法日期
+            return None, None, None, None   # since 后必须跟合法日期
         rest = rest[2:]
+    include_fwd = False
+    if rest and rest[0].lower() == "all":
+        include_fwd = True
+        rest = rest[1:]
     subdir = " ".join(rest)
-    return url, subdir, since
+    return url, subdir, since, include_fwd
+
+
+def filter_awemes_original(awemes, sec_uid, nickname=None):
+    """只保留作者本人的原创作品（纯函数）。
+
+    判据（2026-10-03 单作品接口实测）：转发作品的 author 是**原作者**
+    （sec_uid ≠ 目标作者），原创的 author.sec_uid == 目标作者。author
+    信息缺失的作品剔除（无法核实，宁缺勿错——与 since 的无时间剔除
+    同一原则）。返回 (保留列表, 转发数, 无主数)。
+    """
+    kept, forwards, unknown = [], 0, 0
+    for a in awemes:
+        a_sec = a.get("author_sec_uid")
+        if a_sec:
+            if a_sec == sec_uid:
+                kept.append(a)
+            else:
+                forwards += 1
+        elif nickname and a.get("author_nickname") == nickname:
+            kept.append(a)      # 接口偶尔缺 sec_uid，昵称兜底
+        else:
+            unknown += 1
+    return kept, forwards, unknown
 
 
 def filter_awemes_since(awemes, since_dt):
@@ -563,9 +590,12 @@ async def enumerate_author_posts(sec_user_id, max_pages=None):
         for a in raw.get("aweme_list") or []:
             aid = a.get("aweme_id")
             if aid:
+                author = a.get("author") or {}
                 awemes.append({"aweme_id": aid,
                                "desc": a.get("desc") or "",
-                               "create_time": a.get("create_time")})
+                               "create_time": a.get("create_time"),
+                               "author_sec_uid": author.get("sec_uid"),
+                               "author_nickname": author.get("nickname")})
         yield awemes, bool(raw.get("has_more"))
         if not raw.get("has_more"):
             return
@@ -599,7 +629,7 @@ async def get_sec_user_id(url):
     return sec_uid
 
 
-async def run_dyu(url, subdir_raw, since=None):
+async def run_dyu(url, subdir_raw, since=None, original_only=True):
     """后台编排：枚举 → 逐条判重入队 → 汇总通知。返回给命令层的文案由
     command_reply 同步部分给出；本函数只发异步通知。"""
     if _ENUM_LOCK.locked():
@@ -608,7 +638,8 @@ async def run_dyu(url, subdir_raw, since=None):
         try:
             # 先保鲜 cookie（msToken 几小时过期，陈旧值是 403 主因）
             await refresh_cookie_from_browser()
-            return await _run_dyu_inner(url, subdir_raw, since)
+            return await _run_dyu_inner(url, subdir_raw, since,
+                                        original_only)
         except Exception as e:
             logger.exception(f"🎵 /dyu 失败：{e}")
             hint = ""
@@ -626,7 +657,7 @@ async def run_dyu(url, subdir_raw, since=None):
             return f"❌ {type(e).__name__}: {e}"
 
 
-async def _run_dyu_inner(url, subdir_raw, since=None):
+async def _run_dyu_inner(url, subdir_raw, since=None, original_only=True):
     from . import queue
 
     sec_uid = await get_sec_user_id(url)
@@ -635,27 +666,40 @@ async def _run_dyu_inner(url, subdir_raw, since=None):
         (sanitize_filename(nickname) if nickname else "")
     label = nickname or sec_uid[:16]
     since_note = f"，since {since:%Y-%m-%d}" if since else ""
-    logger.info(f"🎵 /dyu 开始枚举：{label}{since_note}"
+    orig_note = "，只要原创" if original_only else "，含转发"
+    logger.info(f"🎵 /dyu 开始枚举：{label}{since_note}{orig_note}"
                 f"（sec_uid {sec_uid[:18]}…）")
 
     all_awemes = []
-    if since is not None:
-        # since 模式：f2 专属（作品带发布时间戳；Chrome 页面读不到时间，
-        # 2026-10-03 实测卡片无时间元素、fiber 无 create_time）。页序新→旧，
-        # 某页全部早于 since 即停止翻页（置顶帖只占第 1 页，由整页判定兜住）
+    if since is not None or original_only:
+        # f2 专属模式：since 要发布时间戳，original_only 要作者归属字段
+        # ——Chrome 页面两者都读不到（2026-10-03 实测）。页序新→旧。
         enum_via = "f2"
+        pages = 0
+        fwd_total = unk_total = 0
         async for awemes, has_more in enumerate_author_posts(sec_uid):
-            kept, page_all_older = filter_awemes_since(awemes, since)
+            pages += 1
+            kept_by_since, page_all_older = filter_awemes_since(
+                awemes, since)
+            kept, fwd, unk = filter_awemes_original(
+                kept_by_since, sec_uid, nickname)
+            fwd_total += fwd
+            unk_total += unk
             all_awemes.extend(kept)
-            logger.info(f"🎵 f2 枚举累计 {len(all_awemes)} 条"
-                        f"（≥ {since:%Y-%m-%d}）")
-            if page_all_older:
+            logger.info(
+                f"🎵 f2 枚举累计 {len(all_awemes)} 条原创"
+                f"（转发 {fwd_total}｜无主 {unk_total}）")
+            # since 整页早停：需第 2 页起才生效（置顶的旧转发常霸第 1 页，
+            # 整页皆旧不代表后面没有新原创）
+            if page_all_older and pages >= 2:
                 logger.info("🎵 本页已全部早于 since，停止翻页")
                 break
             if not has_more:
                 break
         if not all_awemes:
-            text = f"🎵 该作者在 {since:%Y-%m-%d} 之后没有新作品"
+            text = (f"🎵 该作者没有符合条件的作品"
+                    f"（{'since ' + format(since, '%Y-%m-%d') + ' 之后，' if since else ''}"
+                    f"仅原创；转发 {fwd_total}｜无主 {unk_total}）")
             try:
                 await notify.notify_user(text)
             except Exception:
@@ -700,9 +744,10 @@ async def _run_dyu_inner(url, subdir_raw, since=None):
 
     target = f"下载/抖音/{subdir}" if subdir else "下载/抖音"
     since_line = (f"范围：{since:%Y-%m-%d} 之后\n" if since else "")
+    orig_line = ("内容：仅原创作品\n" if original_only else "")
     text = (f"🎵 抖音作者批量任务已开始\n\n"
             f"作者：{label}\n"
-            f"{since_line}"
+            f"{since_line}{orig_line}"
             f"作品：{found} 个｜新入队 {queued}｜跳过已下载 {skipped}"
             f"｜枚举：{enum_via}\n"
             f"目录：{target}\n"

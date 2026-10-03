@@ -651,8 +651,8 @@ async def handle_command(event, cmd_text):
 
     if cmd_text.lower().startswith("/dyu"):
         logger.info(f"执行命令：/dyu {cmd_text[:60]}")
-        url_arg, subdir_arg, since_arg = douyin_batch.parse_dyu_command(
-            cmd_text)
+        url_arg, subdir_arg, since_arg, include_fwd = (
+            douyin_batch.parse_dyu_command(cmd_text))
         if url_arg is None:
             # 裸 /dyu：有批量任务在跑 → 进度视图；否则用法说明
             try:
@@ -669,18 +669,21 @@ async def handle_command(event, cmd_text):
             else:
                 await _reply(event,
                     "🎵 /dyu 抖音作者批量下载（owner-only）\n\n"
-                    "用法：/dyu <作者主页链接> [since YYYY-MM-DD] [子目录]\n"
+                    "用法：/dyu <作者主页链接> [since YYYY-MM-DD] [all] "
+                    "[子目录]\n"
                     "例：/dyu https://v.douyin.com/xxxx 我的收藏\n"
                     "　　/dyu https://v.douyin.com/xxxx since 2025-10-01\n"
+                    "默认只要原创作品（转发的自动跳过）；加 all 收全部。\n"
                     "子目录省略时用作者昵称；已下载自动跳过。\n"
-                    "since=只要该日期之后的作品（f2 枚举，风控期可能失败）。\n"
+                    "since=只要该日期之后的作品（f2 枚举）。\n"
                     "发 /dyu 可随时看批量进度。")
             return True
         # 先回执（枚举要几分钟），后台跑，进度走通知
         await _reply(event, f"🎵 开始枚举作者作品：{url_arg}\n"
                             "（翻页中，完成后通知汇总；作品将逐条串行下载）")
         asyncio.create_task(
-            douyin_batch.run_dyu(url_arg, subdir_arg, since_arg))
+            douyin_batch.run_dyu(url_arg, subdir_arg, since_arg,
+                                 original_only=not include_fwd))
         return True
 
     if extract_worker.is_extract_command(cmd_text):
