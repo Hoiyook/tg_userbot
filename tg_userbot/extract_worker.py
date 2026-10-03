@@ -118,6 +118,20 @@ async def _process_task(task):
         return
     src = os.path.join(mount_dir, name)
     if not os.path.isfile(src):
+        # 挂载视图在重负载下会抖动（CD2 缓存丢条目），绝不直接判死——
+        # 用 gRPC 权威视角复核，确实不在才终结（2026-10-03 生产实测：
+        # 24 条假终结，包其实都在）
+        from . import cd2_api
+        remote_dir = task["remote_dir"]
+        listing = await asyncio.to_thread(cd2_api.list_remote_dir,
+                                          remote_dir, 300)
+        still_there = listing is not None and any(
+            n == name for n, _s, _d in listing)
+        if still_there:
+            logger.warning(
+                f"🗜 [E{tid}] 挂载视图抖动（gRPC 确认包在），转退避重试")
+            await _fail(tid, "挂载视图抖动：本地 isfile 不可见但 gRPC 确认存在")
+            return
         runtime_db.terminate_extract_task(
             tid, f"远端压缩包已不存在：{task['remote_dir']}/{name}")
         try:
