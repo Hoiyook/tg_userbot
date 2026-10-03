@@ -729,6 +729,24 @@ def _file_entry(att):
             "filename": name}
 
 
+def is_processable_ext_link(link):
+    """常用网盘判定（owner 指令 2026-10-04）：白名单域名的链接才处理。
+
+    host == 域名 或以「.域名」结尾（子域）即命中；其余域名（个人站/
+    社媒/图床等）不处理——帖子仅含这类链接时不入队（连 MANUAL 都不进，
+    避免无意义的人工清单）。
+    """
+    import urllib.parse as _up
+    try:
+        host = _up.urlparse(str((link or {}).get("url") or "")).netloc.lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return any(host == d or host.endswith("." + d)
+               for d in config.PAWCHIVE_EXT_LINK_HOSTS)
+
+
 def is_noise_ext_link(link):
     """YouTube 预览外链判定（作者贴的宣传预览，非可处理网盘资源）。"""
     import urllib.parse as _up
@@ -777,7 +795,11 @@ def build_scan_records(creator, posts, faved_ids=None, scope="notfaved",
                 "path": fmain["path"],
                 "name": fmain.get("name") or os.path.basename(fmain["path"]),
             }))
-        ext_links = extract_links(p)
+        # 外链白名单过滤（owner 指令 2026-10-04）：只有常用网盘链接才记录
+        # 并可能触发 MANUAL；噪声链接（个人站/社媒等）直接丢弃——仅含噪声
+        # 外链的帖子整体不入队
+        all_ext = extract_links(p)
+        ext_links = [l for l in all_ext if is_processable_ext_link(l)]
         if not files and not ext_links:
             continue
         title = p.get("title") or ""

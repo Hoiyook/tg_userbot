@@ -1519,6 +1519,25 @@ PAWCHIVE_AGENT_RETRY_SECONDS = 30
 # 并通知，/paw resume 手动恢复
 PAWCHIVE_MIN_FREE_GB = 2.0
 
+# Pawchive 外链白名单（owner 指令 2026-10-04）：帖子里的站外链接只有命中
+# 这些常用网盘/文件 host 才进人工处理（MANUAL），其余域名（个人站/社媒/
+# 图床等）一律视为噪声、不处理——帖子若仅含噪声外链则整个不入队。
+# 匹配语义：host == 域名 或 host 以「.域名」结尾（子域命中，如
+# pan.quark.cn 命中 quark.cn）。
+PAWCHIVE_EXT_LINK_HOSTS = (
+    # 国际主流
+    "mega.nz", "mega.io", "mediafire.com", "drive.google.com",
+    "1fichier.com", "pixeldrain.com", "gofile.io", "wetransfer.com",
+    "we.tl", "katfile.com", "rapidgator.net", "filefactory.com",
+    "turbobit.net", "hitfile.net", "sendspace.com", "workupload.com",
+    "krakenfiles.com", "hotlink.cc", "bunkr.site", "bunkr.ru",
+    "cyberdrop.me", "cyberdrop.cc", "catbox.moe",
+    # 国内主流
+    "pan.baidu.com", "lanzou.com", "lanpv.com", "aliyundrive.com",
+    "alipan.com", "quark.cn", "123pan.com", "123684.com", "xunlei.com",
+    "189.cn", "139.com", "uc.cn", "caiyun.139.com",
+)
+
 # ------------------------------------------------------------
 # 115 解压回传（2026-09-30，/115x）：拉 115 目录顶层压缩包到本地解压，
 # 逐文件回传 <原目录>/<压缩包名>/，完成后尺寸对账。

@@ -145,6 +145,46 @@ class BuildScanRecordsTest(unittest.TestCase):
                          f"{config.PAWCHIVE_FILE_BASE}/data/aa/a.mp4?f=a.mp4")
         self.assertEqual(records[0]["files"][0]["filename"], "a.mp4")
 
+    def test_processable_ext_link_whitelist(self):
+        """白名单判定：常用网盘命中（含子域），社媒/个人站不命中。"""
+        hit = ["https://mega.nz/folder/x#k",
+               "https://drive.google.com/drive/folders/1",
+               "https://pan.baidu.com/s/1abc",
+               "https://pan.quark.cn/s/x",          # 子域命中 quark.cn
+               "https://www.alipan.com/s/x"]        # 子域命中 alipan.com
+        miss = ["https://twitter.com/someone/status/1",
+                "https://x.com/someone",
+                "https://example.com/download",
+                "https://pawchive.pw/x",
+                "https://notmega.nz/x"]             # 前缀伪装不算
+        for u in hit:
+            self.assertTrue(pawchive.is_processable_ext_link({"url": u}), u)
+        for u in miss:
+            self.assertFalse(pawchive.is_processable_ext_link({"url": u}), u)
+
+    def test_noise_only_post_not_enqueued(self):
+        """帖子只有社媒/个人站链接（无网盘、无直链）→ 整体不入队。"""
+        posts = [self._post(
+            "12", [],
+            content='<a href="https://twitter.com/x/status/1">推</a>'
+                    '<a href="https://example.com/page">站</a>')]
+        records = pawchive.build_scan_records(self._creator(), posts,
+                                              faved_ids=None, scope="notfaved")
+        self.assertEqual(records, [])
+
+    def test_files_with_noise_links_no_manual(self):
+        """有直链 + 噪声链接：附件正常收，但噪声链接不记 ext_links
+        （帖子下载完直链即 COMPLETED，不会掉进人工清单）。"""
+        posts = [self._post(
+            "13", [{"path": "/f/1.mp4", "name": "1.mp4"}],
+            content='<a href="https://twitter.com/x/status/1">推</a>')]
+        records = pawchive.build_scan_records(self._creator(), posts,
+                                              faved_ids=None, scope="notfaved")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(records[0]["files"]), 1)
+        self.assertEqual(records[0]["files"][0]["filename"], "1.mp4")
+        self.assertEqual(records[0]["ext_links"], [])
+
     def test_ext_only_post_kept_for_manual(self):
         """没直链但有外链的帖子要进生命周期（worker 会直接判 MANUAL）。"""
         posts = [self._post("9", [], content='<a href="https://mega.nz/x#k">M</a>')]
