@@ -175,6 +175,9 @@ async def _process_task(task):
         # ── ② EXTRACT（阻塞线程；worker 串行，无需 pawchive 的全局锁） ──
         _CURRENT["stage"] = "解压"
         content_dir = os.path.join(staging, "content")
+        # 重试时清掉上轮残留的 content：os.replace 无法覆盖非空目录
+        # （OSError 66），archive 副本在本地，重解压零成本
+        shutil_rmtree(content_dir)
         status, detail, files = await asyncio.to_thread(
             extract_archive, local_arch, content_dir, False)
         if status == "password":
@@ -318,7 +321,7 @@ def _verify_remote_sizes(target_root, rel_files, content_dir):
     for parent, names in dirs.items():
         remote_dir = remote_of(parent)
         try:
-            listing = cd2_api.list_remote_dir(remote_dir, limit=500)
+            listing = cd2_api.list_remote_dir(remote_dir, limit=2000)
         except Exception as e:
             # CD2 瞬断（重启/升级/网络抖）：当「本轮对不上」交重试轮兜底，
             # 绝不让 gRPC 异常逃出对账（冒烟实测：CD2 掉线时 grpc 异常会
@@ -330,6 +333,11 @@ def _verify_remote_sizes(target_root, rel_files, content_dir):
             diffs.append(f"远端目录不可读：{remote_dir}")
             continue
         sizes = {n: s for n, s, _d in listing}
+        if len(sizes) >= 2000:
+            # 清单撞到分页上限：可能被截断，缺失判定不可信——本轮按
+            # 「对不上」重试（下一轮仍截断则任务会重试耗尽后人工介入）
+            diffs.append(f"远端目录条目≥2000，清单可能截断：{remote_dir}")
+            continue
         for rel in names:
             expect = os.path.getsize(os.path.join(content_dir, rel))
             got = sizes.get(os.path.basename(rel))
