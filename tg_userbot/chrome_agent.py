@@ -564,6 +564,26 @@ async def run_download_attempt(cdp, url, download_dir, timeout,
     是不是取消；这样现存调用点与测试一行都不用改。
     """
     await cdp.setup_download(download_dir)
+    # iwara 视频页（2026-09-28）：全站 CF 防护 + CDN 签名绑定会话——
+    # 先在页面上下文解析最高画质 download 直链，再导航触发下载事件
+    from .iwara import extract_iwara_video_id
+    video_id = extract_iwara_video_id(url)
+    if video_id:
+        await cdp.open_tab(url)
+        import asyncio as _a
+        try:
+            await _a.wait_for(_a.sleep, timeout=6)   # 等页面/登录态就绪
+        except _a.TimeoutError:
+            pass
+        from .iwara import resolve_best_download_url
+        try:
+            dl_url, _title, quality = await resolve_best_download_url(
+                cdp, video_id)
+        except Exception as e:
+            logger.warning(f"🧲 iwara 直链解析失败：{e}")
+            return False, None, None, f"iwara 直链解析失败：{e}"
+        logger.info(f"🌐 iwara 最高画质 {quality}，转下载直链")
+        url = dl_url   # 后续走标准下载事件流（download 域触发浏览器下载）
     target_id = await cdp.open_tab(url)
     loop = asyncio.get_event_loop()
     deadline = loop.time() + float(timeout)

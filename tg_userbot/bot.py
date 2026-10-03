@@ -1124,6 +1124,17 @@ async def bot_message_handler(event):
         if await commands.handle_command(event, text):
             return
 
+    # iwara 视频链接 → 提交 Chrome Agent 下载（CDP 解析签名直链）
+    from .iwara import extract_iwara_video_id
+    iwara_urls = [u for u in manual_links.extract_urls(text)
+                  if extract_iwara_video_id(u)]
+    if iwara_urls:
+        from . import chrome_client
+        out = await chrome_client.handle_chrome_command(
+            event, "/chrome " + iwara_urls[0],
+            owner_id=chrome_client.resolve_owner_id(state.MY_ID))
+        return
+
     # 种子直链（.torrent 结尾）→ 转 115 离线（不走外链台账/普通下载）
     torrent_urls = [u for u in manual_links.extract_urls(text)
                     if torrent_offline.is_torrent_url(u)]
