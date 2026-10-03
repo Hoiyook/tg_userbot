@@ -569,16 +569,16 @@ async def run_download_attempt(cdp, url, download_dir, timeout,
     from .iwara import extract_iwara_video_id
     video_id = extract_iwara_video_id(url)
     if video_id:
-        await cdp.open_tab(url)
+        target_id = await cdp.open_tab(url)
         import asyncio as _a
         try:
-            await _a.wait_for(_a.sleep, timeout=6)   # 等页面/登录态就绪
+            await _a.sleep(6)   # 等页面/登录态就绪
         except _a.TimeoutError:
             pass
         from .iwara import resolve_best_download_url
         try:
             dl_url, _title, quality = await resolve_best_download_url(
-                cdp, video_id)
+                cdp, video_id, target_id)
         except Exception as e:
             logger.warning(f"🧲 iwara 直链解析失败：{e}")
             return False, None, None, f"iwara 直链解析失败：{e}"
@@ -690,13 +690,16 @@ class ChromeCDPClient:
         except Exception:
             return  # 连接断开：事件流自然枯竭，由调用方超时/重连兜底
 
-    async def command(self, method, params=None, timeout=30):
+    async def command(self, method, params=None, timeout=30,
+                      session_id=None):
         self._next_id += 1
         msg_id = self._next_id
         fut = asyncio.get_event_loop().create_future()
         self._pending[msg_id] = fut
-        await self._ws.send(json.dumps(
-            {"id": msg_id, "method": method, "params": params or {}}))
+        payload = {"id": msg_id, "method": method, "params": params or {}}
+        if session_id:
+            payload["sessionId"] = session_id
+        await self._ws.send(json.dumps(payload))
         reply = await asyncio.wait_for(fut, timeout)
         if reply.get("error"):
             raise RuntimeError(f"CDP {method} 失败：{reply['error']}")

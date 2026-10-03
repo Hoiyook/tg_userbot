@@ -44,13 +44,26 @@ _FETCH_VERSIONS_JS = """
 """
 
 
-async def resolve_best_download_url(cdp, video_id):
-    """在 CDP 页面上下文里解析 iwara 视频的最高画质下载直链。
+async def resolve_best_download_url(cdp, video_id, target_id, timeout=40):
+    """在**目标 tab 的会话**里解析 iwara 视频的最高画质下载直链。
 
-    返回 (download_url, title, quality_name)；失败抛 RuntimeError。"""
+    Browser 级 WS 上 Runtime.evaluate 需要 sessionId——先 Target.attachToTarget
+    （flatten），会话内 evaluate 完成后 detach。返回 (download_url, title,
+    quality_name)；失败抛 RuntimeError。"""
     expr = _FETCH_VERSIONS_JS % json.dumps(video_id)
-    result = await cdp.command("Runtime.evaluate", {
-        "expression": expr, "awaitPromise": True, "returnByValue": True})
+    attach = await cdp.command("Target.attachToTarget", {
+        "targetId": target_id, "flatten": True})
+    session_id = attach["sessionId"]
+    try:
+        result = await cdp.command("Runtime.evaluate", {
+            "expression": expr, "awaitPromise": True, "returnByValue": True},
+            session_id=session_id, timeout=timeout)
+    finally:
+        try:
+            await cdp.command("Target.detachFromTarget", {
+                "sessionId": session_id})
+        except Exception:
+            pass
     value = (result.get("result") or {}).get("value")
     if not value:
         raise RuntimeError("iwara 页面脚本无返回（页面未加载完？）")
