@@ -52,14 +52,17 @@ _RESOLVE_JS = """
     const v = document.querySelector('video');
     const src = v ? (v.currentSrc || '') : '';
     if (src) {
-      // 作者/日期/标题从页面 DOM 抓（视频信息区）
-      const link = document.querySelector('a[href*="/profile/"]');
-      const author = link ? (link.textContent || '').trim() : '';
-      const timeEl = document.querySelector('time');
-      const date = timeEl ? (timeEl.getAttribute('datetime') ||
-                              timeEl.title || '').slice(0, 10) : '';
-      const h1 = document.querySelector('h1');
-      const title = h1 ? (h1.textContent || '').trim() : '';
+      // 元数据从 video API 抓（页面上下文 fetch 一直 200；DOM 选择器在
+      // SPA 重渲染后不稳定——抓到过侧栏 Playlists/Chapters）
+      let author = '', date = '', title = '';
+      try {
+        const meta = await fetch(
+          'https://api.iwara.tv/video/' + location.pathname.split('/')[2]);
+        const mj = await meta.json();
+        author = (mj.user && mj.user.name) || '';
+        date = (mj.createdAt || '').slice(0, 10);
+        title = (mj.title || '').slice(0, 80);
+      } catch (e) {}
       return JSON.stringify({quality: q,
         url: src.replace('/view?', '/download?'),
         author: author, date: date, title: title});
