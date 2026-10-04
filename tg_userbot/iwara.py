@@ -1,13 +1,17 @@
-"""Iwara 视频下载支持（2026-09-28）：iwara.tv 全站 Cloudflare 防护，
-服务端裸 HTTP 一律 403；但 CDN 签名直链**绑定浏览器会话**。因此获取
-直链必须在 Agent 的 Chrome（CDP）里完成，下载也交给 Chrome（Agent
-现有下载事件监听接住），复用全部现有架构。
+"""Iwara 视频下载支持（2026-09-28 调研定稿）。
 
-流程（process_iwara_url）：
-  CDP 打开视频页 → 页面内 fetch api.iwara.tv/video/<id> → fileUrl →
-  版本清单 → 选最高画质（排除 preview）→ Page.navigate 到 download
-  直链 → Agent 的 downloadWillBegin/downloadProgress 现有监听接住 →
-  成品落 TG Chrome Download 目录。
+机制（全部实测验证）：
+- iwara 全站 Cloudflare：服务端裸 HTTP 一律 403，必须经 Agent 的 Chrome
+- 视频 API 的 fileUrl 清单（fetch 复刻）只回 360/preview——**与 SPA 首屏
+  拿到的完整清单（含 540/Source）不一致**，差异在服务端按请求特征分发，
+  外部无法观测也无法复刻
+- 但 SPA 播放器的画质菜单（齿轮 → Source）真实可点，切换后
+  video.currentSrc 即**原画直链**（lumi/kafka.iwara.tv 的 view URL），
+  view→download 同 hash 转换即为下载直链（206 + video/mp4 已验证）
+
+因此 resolve 走「真实 UI 复刻」：开视频页 → 点齿轮 → 点 Source →
+读 video.currentSrc → view 转 download。这不是脆弱的 hack——它复刻的
+就是用户手动下载的精确路径。
 """
 import json
 import re
@@ -24,33 +28,47 @@ def extract_iwara_video_id(url):
     return m.group(1) if m else None
 
 
-_FETCH_VERSIONS_JS = """
-(async (videoId) => {
-  const r = await fetch('https://api.iwara.tv/video/' + videoId);
-  if (!r.ok) return JSON.stringify({error: 'video ' + r.status});
-  const j = await r.json();
-  const r1 = await fetch(j.fileUrl);
-  if (!r1.ok) return JSON.stringify({error: 'fileUrl ' + r1.status});
-  const versions = await r1.json();
-  const cand = versions.filter(v => v.name !== 'preview');
-  const best = cand.length ? cand[cand.length - 1] : versions[0];
-  return JSON.stringify({
-    best: best.name,
-    url: 'https:' + best.src.download,
-    title: (j.title || '').slice(0, 80),
-    author: j.user ? j.user.name : '',
+# 齿轮按钮（播放器设置）的 svg path 指纹与画质项匹配规则
+_GEAR_PATH_PREFIX = "M487.4 315.7"
+_QUALITY_ORDER = ("Source", "1080", "720", "540", "360")
+
+# 页面内脚本：点齿轮开菜单 → 依序尝试画质（Source 优先）→ 读播放源
+_RESOLVE_JS = """
+(async (qualities) => {
+  const findBtn = (prefix) => [...document.querySelectorAll('button')].find(b => {
+    const p = b.querySelector('svg path');
+    return p && (p.getAttribute('d') || '').startsWith(prefix);
   });
-})(%s)
+  const gear = findBtn('%(gear)s');
+  if (!gear) return JSON.stringify({error: 'no-gear'});
+  gear.click();
+  await new Promise(r => setTimeout(r, 600));
+  for (const q of qualities) {
+    const item = [...document.querySelectorAll('li, [role=menuitem], button')]
+      .find(e => (e.textContent || '').trim().toLowerCase() === q.toLowerCase());
+    if (!item) continue;
+    item.click();
+    await new Promise(r => setTimeout(r, 1500));
+    const v = document.querySelector('video');
+    const src = v ? (v.currentSrc || '') : '';
+    if (src) {
+      return JSON.stringify({quality: q,
+        url: src.replace('/view?', '/download?')});
+    }
+  }
+  return JSON.stringify({error: 'no-quality-item'});
+})(%(qualities)s)
 """
 
 
 async def resolve_best_download_url(cdp, video_id, target_id, timeout=40):
-    """在**目标 tab 的会话**里解析 iwara 视频的最高画质下载直链。
+    """在目标 tab 会话里复刻 UI：齿轮 → 最高画质 → 播放源转下载直链。
 
-    Browser 级 WS 上 Runtime.evaluate 需要 sessionId——先 Target.attachToTarget
-    （flatten），会话内 evaluate 完成后 detach。返回 (download_url, title,
-    quality_name)；失败抛 RuntimeError。"""
-    expr = _FETCH_VERSIONS_JS % json.dumps(video_id)
+    返回 (download_url, title, quality_name)；失败抛 RuntimeError。"""
+    expr = _RESOLVE_JS % {
+        "gear": _GEAR_PATH_PREFIX,
+        "qualities": json.dumps(list(_QUALITY_ORDER)),
+    }
     attach = await cdp.command("Target.attachToTarget", {
         "targetId": target_id, "flatten": True})
     session_id = attach["sessionId"]
@@ -69,7 +87,5 @@ async def resolve_best_download_url(cdp, video_id, target_id, timeout=40):
         raise RuntimeError("iwara 页面脚本无返回（页面未加载完？）")
     info = json.loads(value)
     if "error" in info:
-        raise RuntimeError(f"iwara API：{info['error']}")
-    if not info.get("url"):
-        raise RuntimeError("iwara 版本清单无下载直链")
-    return info["url"], info.get("title") or "", info.get("best") or ""
+        raise RuntimeError(f"iwara UI 复刻失败：{info['error']}")
+    return info["url"], info.get("title") or "", info.get("quality") or ""
