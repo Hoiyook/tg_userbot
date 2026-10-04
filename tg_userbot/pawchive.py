@@ -914,7 +914,18 @@ async def _scan_and_notify(creator, scope, since=None):
         await notify_user(summary)
     except Exception as e:
         logger.exception(f"🐾 Pawchive 扫描失败：{label}")
-        await notify_user(f"❌ Pawchive 扫描失败（{label}）：{e}")
+        # 站点抖动（超时/403/DDoS-Guard 拦截）给出「等会重试即可」的定性，
+        # 并提示 cookie 无辜——2026-10-05 生产实测：站点挂 6 分钟，owner
+        # 连按 cookie 按钮以为配置坏了
+        msg = str(e)
+        if "timed out" in msg or "403" in msg or "timeout" in msg.lower():
+            await notify_user(
+                f"❌ Pawchive 扫描失败（{label}）：站点临时不可达\n\n"
+                f"原因：{msg[:120]}\n"
+                "已自动重试 4 次仍超时——pawchive.pw 的防护层抖动，"
+                "**稍等几分钟重发 /paw plan 即可**（cookie 无需改动）。")
+        else:
+            await notify_user(f"❌ Pawchive 扫描失败（{label}）：{e}")
     finally:
         state.PAW_SCAN_RUNNING = None
         state.PAW_SCAN_PROGRESS = {}
