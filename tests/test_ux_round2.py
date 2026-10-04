@@ -12,6 +12,7 @@
 不联网：HTTP 全部 monkeypatch；DB 落进程级临时目录。
 """
 import asyncio
+import inspect
 import sqlite3
 import atexit
 import json
@@ -3487,3 +3488,57 @@ class TorrentInfohashUrlTest(unittest.TestCase):
         text, sub = asyncio.run(main2())
         req = sub.call_args[0][0]
         self.assertIn("btih:abc", req, "解析出的磁力应原样提交")
+
+
+class MemoCommandTest(unittest.TestCase):
+    """/memo dispatch（2026-10-04 修复：8d390e4 声称接线但从未落地——
+    钉死「注册了面板条目的命令必须有 handler」）。"""
+
+    def setUp(self):
+        self.path = os.path.join(_TMP, f"memo_{id(self)}.json")
+        self._p = mock.patch.object(
+            __import__("tg_userbot.memo", fromlist=["x"]),
+            "MEMO_FILE", self.path)
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        import tg_userbot.memo as memo_mod
+        memo_mod._MEMOS = memo_mod._load()
+
+    def _run(self, cmd):
+        ev = mock.MagicMock()
+        ev.reply = mock.AsyncMock()
+        import asyncio
+        from tg_userbot import commands as c
+        ok = asyncio.new_event_loop().run_until_complete(
+            c.handle_command(ev, cmd))
+        return ok, ev.reply.await_args.args[0]
+
+    def test_add_list_del_clear(self):
+        ok, t = self._run("/memo 测试一条")
+        self.assertTrue(ok)
+        self.assertIn("已记录 #", t)
+        ok, t = self._run("/memo")
+        self.assertIn("测试一条", t)
+        ok, t = self._run("/memo del 1")
+        self.assertIn("已删除 #1", t)
+        ok, t = self._run("/memo clear")
+        self.assertIn("已清空", t)
+
+    def test_registered_matches_panel(self):
+        """BOT_COMMANDS 里注册的每个命令名都必须有 dispatch——防止再出现
+        「面板有条目、实际无 handler」的假命令。"""
+        import re
+        self.assertIn("memo", config.REGISTERED_COMMAND_NAMES)
+        from tg_userbot import bot as b, commands as c
+        src = inspect.getsource(c.handle_command)
+        handled = set(re.findall(
+            r'cmd_text(?:\.startswith\(| == )"/(\w+)', src))
+        panel = {name for name, _ in b.BOT_COMMANDS}
+        # 子命令家族（/paw_xxx、/listen_xxx 等）在各自模块 parse 分发；
+        # 家族基名有 dispatch 即算覆盖
+        handled |= {"caption_filter", "wl", "retry", "listen", "sqlt",
+                   "cmdt", "chrome", "cd2"}
+        missing = panel - handled - {"help", "start", "paw"}
+        # paw 家族在 pawchive.command_reply 分发、help/start 有专门分支
+        self.assertEqual(missing, set(),
+                         f"面板命令无 dispatch: {sorted(missing)}")
