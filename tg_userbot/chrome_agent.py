@@ -590,15 +590,14 @@ async def run_download_attempt(cdp, url, download_dir, timeout,
         # （异常调用形态）仅记日志不命名。
         try:
             from .naming import sanitize_filename_bounded
-            if task is not None:
-                if author:
-                    sub = safe_subdir(
-                        "iwara/" + sanitize_filename_bounded(author))
-                    if sub:
-                        task["download_subdir"] = sub
-                prefix = " ".join(x for x in (date, title) if x)
-                if prefix:
-                    task["label"] = sanitize_filename_bounded(prefix)
+            if task is not None and author:
+                sub = safe_subdir(
+                    "iwara/" + sanitize_filename_bounded(author))
+                if sub:
+                    task["download_subdir"] = sub
+            # 文件名由 iwara.py 通过 download= URL 参数预设（日期+标题），
+            # 不再用 label 后缀重命名——CD2 对成品「3 秒备份删源」会赢过
+            # apply_label_rename 的改名（2026-10-04 E2E 实测竞态）
         except Exception as e:
             logger.warning(f"🌐 iwara 命名信息应用失败（保留默认）：{e}")
         # subdir 刚设置——重算本任务下载目录并让 Chrome 下载落新目录。

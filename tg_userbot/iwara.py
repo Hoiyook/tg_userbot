@@ -63,8 +63,16 @@ _RESOLVE_JS = """
         date = (mj.createdAt || '').slice(0, 10);
         title = (mj.title || '').slice(0, 80);
       } catch (e) {}
-      return JSON.stringify({quality: q,
-        url: src.replace('/view?', '/download?'),
+      // download= 参数让 Chrome 直接以该名落盘（SPA 同款机制）——
+      // 绕开「下载完成 → CD2 秒删 → rename 追不上」的竞态
+      const stem = [date, title].filter(x => x).join(' ');
+      const orig = (src.match(/filename=([^&]+)/) || ['', 'video.mp4'])[1];
+      const ext = (orig.match(/\.[a-z0-9]+$/i) || ['.mp4'])[0];
+      const safe = (stem || orig.replace(ext, '')).replace(
+        /[\\/:*?"<>|]/g, '_').slice(0, 120);
+      const dl = src.replace('/view?', '/download?') +
+        '&download=' + encodeURIComponent(safe + ext);
+      return JSON.stringify({quality: q, url: dl,
         author: author, date: date, title: title});
     }
   }
