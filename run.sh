@@ -253,7 +253,10 @@ do_start() {
         echo "ℹ️  Chrome Agent 已在运行（PID $(agent_pids | pids_text)），跳过"
         warn_duplicate_agents
     else
-        nohup "$PY" -m "$AGENT_MODULE" >>"$RUNTIME_DIR/chrome_agent.out" 2>&1 &
+        # TG_CHROME_HEADLESS=0：Agent 的专用 Chrome 以有头模式运行（owner
+        # 指令 2026-10-04——验证码页/收割页面直接可见可操作）
+        nohup env TG_CHROME_HEADLESS=0 "$PY" -m "$AGENT_MODULE" \
+            >>"$RUNTIME_DIR/chrome_agent.out" 2>&1 &
         disown 2>/dev/null || true
         sleep 2
         if [ -n "$(agent_pids)" ]; then
