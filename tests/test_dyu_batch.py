@@ -27,6 +27,36 @@ from tg_userbot import douyin_batch  # noqa: E402
 from tg_userbot import queue as queue_mod  # noqa: E402
 
 
+class MergeCapturedTest(unittest.TestCase):
+    """页面捕获批次合并：去重保序、四字段提取、字段缺失剔除。"""
+
+    def _batch(self, aids_with_author):
+        return {"aweme_list": [
+            {"aweme_id": aid, "desc": f"d{aid}", "create_time": 1700000000,
+             "author": {"sec_uid": sec, "nickname": f"n{sec[:4]}"}}
+            for aid, sec in aids_with_author]}
+
+    def test_merge_and_dedup(self):
+        b1 = self._batch([("1", "A"), ("2", "B")])
+        b2 = self._batch([("2", "B"), ("3", "A")])   # 2 跨页重复
+        out = douyin_batch.merge_captured_batches([b1, b2])
+        self.assertEqual([a["aweme_id"] for a in out], ["1", "2", "3"])
+        self.assertEqual(out[0]["desc"], "d1")
+        self.assertEqual(out[0]["author_sec_uid"], "A")
+        self.assertTrue(out[0]["create_time"])
+
+    def test_missing_fields_dropped(self):
+        batches = [{"aweme_list": [
+            {"aweme_id": "x", "desc": "无 author", "create_time": 1},
+            {"aweme_id": "y", "desc": "无时间",
+             "author": {"sec_uid": "A"}},
+        ]}]
+        self.assertEqual(douyin_batch.merge_captured_batches(batches), [])
+
+    def test_none_safe(self):
+        self.assertEqual(douyin_batch.merge_captured_batches(None), [])
+
+
 class OriginalFilterTest(unittest.TestCase):
     """原创过滤：author.sec_uid 对照，转发剔除、无主剔除、昵称兜底。"""
 

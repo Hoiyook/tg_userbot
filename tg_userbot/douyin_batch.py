@@ -349,6 +349,184 @@ def scroll_should_stop(counts, stable_rounds=2):
     return False
 
 
+# 页面内捕获钩子：包装 fetch 与 XMLHttpRequest，把 /aweme/post/ 的响应
+# JSON 原地存进 window.__captured。**绝不能用 CDP Network 域**——Argus
+# 会探测它并令页面自身的请求签名失效（2026-10-04 生产实测：开
+# Network.enable → 全部 XHR 403 Sign Invalid；不开 → 翻页正常）。
+_PAGE_HOOK_JS = """
+(() => {
+  if (window.__captured) return 'already';
+  window.__captured = [];
+  const keep = (u, getBody) => {
+    if (!String(u).includes('/aweme/post/')) return;
+    try {
+      const t = getBody();
+      if (t) { try { window.__captured.push(JSON.parse(t)); } catch (e) {} }
+    } catch (e) {}
+  };
+  const of_ = window.fetch;
+  window.fetch = function(...args) {
+    const p = of_.apply(this, args);
+    const u = String((args[0] && args[0].url) || args[0] || '');
+    if (u.includes('/aweme/post/')) {
+      p.then(r => r.clone().text().then(t => keep(u, () => t)))
+       .catch(() => {});
+    }
+    return p;
+  };
+  const oo = XMLHttpRequest.prototype.open;
+  const os_ = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function(m, u, ...rest) {
+    this.__u = u; return oo.call(this, m, u, ...rest);
+  };
+  XMLHttpRequest.prototype.send = function(...rest) {
+    this.addEventListener('load', () => keep(this.__u,
+      () => this.responseText));
+    return os_.apply(this, ...rest);
+  };
+  return 'hooked';
+})()
+"""
+
+
+def merge_captured_batches(batches):
+    """页面捕获的响应批次 → 去重保序的 aweme 列表（纯函数，可单测）。
+
+    每条提取枚举/过滤所需四字段：aweme_id / desc / create_time /
+    author_sec_uid / author_nickname。字段缺失的作品剔除（宁缺勿错，
+    与既有 since/original 过滤同一原则）。
+    """
+    seen, out = set(), []
+    for d in batches or []:
+        for a in (d or {}).get("aweme_list") or []:
+            aid = a.get("aweme_id")
+            if not aid or aid in seen:
+                continue
+            seen.add(aid)
+            author = a.get("author") or {}
+            if not (a.get("create_time") and author.get("sec_uid")):
+                continue     # 过滤所需字段不全 → 剔除
+            out.append({"aweme_id": str(aid),
+                        "desc": a.get("desc") or "",
+                        "create_time": a.get("create_time"),
+                        "author_sec_uid": author.get("sec_uid"),
+                        "author_nickname": author.get("nickname")})
+    return out
+
+
+async def harvest_author_awemes_via_chrome(sec_user_id, max_scrolls=60):
+    """Agent Chrome 页面内钩子收割（字段全量版，2026-10-04）。
+
+    与 DOM href 收割的差异：从页面自己的 /aweme/post/ XHR 响应里拿完整
+    aweme 数据（含 create_time 与 author.sec_uid）→ 原创/since 过滤可用；
+    DOM 收割只有链接无字段。两者都**不开 CDP Network 域**（Argus 探测它
+    就拒签）。需要 Agent Chrome 在线且已登录抖音（登录态与浏览器环境
+    同源才过 Argus）。返回 (awemes, err)。
+    """
+    import json as _json
+    import urllib.request
+
+    import websockets
+    from . import config as _cfg
+
+    port = int(getattr(_cfg, "CHROME_CDP_PORT", 9222))
+    if not await _ensure_cdp(port):
+        return None, f"Chrome Agent CDP({port}) 不可达且自动拉起失败"
+    ws_url = _json.loads(urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/json/version",
+        timeout=3).read())["webSocketDebuggerUrl"]
+
+    pause = float(getattr(_cfg, "DYU_CHROME_SCROLL_PAUSE", 2.2))
+    init_wait = float(getattr(_cfg, "DYU_CHROME_INIT_WAIT", 7.0))
+    async with websockets.connect(ws_url, open_timeout=10,
+                                   max_size=32 * 1024 * 1024) as ws:
+        _id = [0]
+
+        async def call(method, params=None, session_id=None):
+            _id[0] += 1
+            msg = {"id": _id[0], "method": method, "params": params or {}}
+            if session_id:
+                msg["sessionId"] = session_id
+            await ws.send(_json.dumps(msg))
+            import time as _t
+            deadline = _t.monotonic() + 60
+            while _t.monotonic() < deadline:
+                try:
+                    recv = _json.loads(await asyncio.wait_for(
+                        ws.recv(), timeout=deadline - _t.monotonic()))
+                except asyncio.TimeoutError:
+                    break
+                if recv.get("id") == _id[0]:
+                    if "error" in recv:
+                        raise RuntimeError(
+                            str(recv["error"].get("message", "?"))[:80])
+                    return recv.get("result", {})
+            raise RuntimeError(f"CDP 应答超时：{method}")
+
+        tgt = await call("Target.createTarget", {"url": "about:blank"})
+        sid = (await call("Target.attachToTarget",
+                          {"targetId": tgt["targetId"],
+                           "flatten": True}))["sessionId"]
+
+        async def eval_js(expr):
+            r_ = await call("Runtime.evaluate",
+                            {"expression": expr, "returnByValue": True},
+                            session_id=sid)
+            return r_.get("result", {}).get("value")
+
+        try:
+            # 导航前注入钩子（新文档自动执行，首屏 XHR 也能捕获）；
+            # 加载后再补一次兜底（前两批 XHR 由滚动触发，来得及）
+            await call("Page.addScriptToEvaluateOnNewDocument",
+                       {"source": _PAGE_HOOK_JS}, session_id=sid)
+            await call("Page.navigate",
+                       {"url": f"https://www.douyin.com/user/{sec_user_id}"},
+                       session_id=sid)
+            await asyncio.sleep(init_wait)
+            title = str(await eval_js("document.title") or "")
+            if "验证" in title:
+                try:
+                    await notify.notify_user(
+                        "🎵 抖音要求人机验证\n\n已在 Agent Chrome 窗口打开"
+                        "验证页——请到那个窗口完成一次滑块验证后重发命令。")
+                except Exception:
+                    pass
+                return None, "被验证码拦截：请在 Chrome 窗口完成验证后重发"
+            await eval_js(_PAGE_HOOK_JS)
+
+            scroll_expr = ("(() => {const el = [...document."
+                           "querySelectorAll('[class*=\"route-scroll-"
+                           "container\"]')].find(e => e.scrollHeight > "
+                           "e.clientHeight + 300);"
+                           "(el || document.documentElement).scrollTo(0, "
+                           "999999); return !!el;})()")
+            counts, batches = [], []
+            for _round in range(max_scrolls):
+                raw = await eval_js(
+                    "JSON.stringify(window.__captured || [])")
+                batches = _json.loads(raw or "[]")
+                counts.append(len(merge_captured_batches(batches)))
+                if len(counts) >= 5 and counts[-1] == counts[-5]:
+                    break          # 连续多轮无新增（DOM 与捕获都稳定）
+                await eval_js(scroll_expr)
+                await asyncio.sleep(pause)
+            awemes = merge_captured_batches(batches)
+            if not awemes:
+                # 兜底信号：DOM 也没渲染 → 会话被临时风控/挑战页
+                dom_n = await eval_js(
+                    "document.querySelectorAll("
+                    "'a[href*=\"/video/\"]').length")
+                return None, (f"页面未渲染（DOM={dom_n}，捕获 0 批）——"
+                              "会话可能被临时风控，稍等几分钟再试")
+            return awemes, None
+        finally:
+            try:
+                await call("Target.closeTarget",
+                           {"targetId": tgt["targetId"]})
+            except Exception:
+                pass
+
+
 async def harvest_author_links_via_chrome(sec_user_id, max_items=None,
                                            max_scrolls=60):
     """Agent 真 Chrome 打开作者页，注入登录态后滚动收割全部作品链接。
@@ -677,34 +855,58 @@ async def _run_dyu_inner(url, subdir_raw, since=None, original_only=True):
 
     all_awemes = []
     if since is not None or original_only:
-        # f2 专属模式：since 要发布时间戳，original_only 要作者归属字段
-        # ——Chrome 页面两者都读不到（2026-10-03 实测）。页序新→旧。
-        enum_via = "f2"
-        pages = 0
-        fwd_total = unk_total = 0
-        async for awemes, has_more in enumerate_author_posts(sec_uid):
-            pages += 1
-            kept_by_since, page_all_older = filter_awemes_since(
-                awemes, since)
-            kept, fwd, unk = filter_awemes_original(
+        # 需要字段的模式（since 要时间戳、原创要作者归属）。
+        # 第 1 顺位：Agent Chrome 页面内钩子收割（字段全量，免 403——
+        #   页面自己签名；2026-10-04 Argus 收紧后 f2 直连已被拒）。
+        # 第 2 顺位：f2 直连（Argus 收紧前可用，保留作回落）。
+        # 第 3 顺位：DOM href 收割无字段——本模式不可用，如实报错。
+        enum_via = "Chrome 钩子"
+        harvested, chrome_err = await harvest_author_awemes_via_chrome(
+            sec_uid)
+        if harvested is None:
+            logger.warning(
+                f"🎵 钩子收割失败（{chrome_err}），降级 f2 枚举")
+            enum_via = "f2"
+            fwd_total = unk_total = 0
+            pages = 0
+            async for awemes, has_more in enumerate_author_posts(sec_uid):
+                pages += 1
+                kept_by_since, page_all_older = filter_awemes_since(
+                    awemes, since)
+                kept, fwd, unk = filter_awemes_original(
+                    kept_by_since, sec_uid, nickname)
+                fwd_total += fwd
+                unk_total += unk
+                all_awemes.extend(kept)
+                logger.info(
+                    f"🎵 f2 枚举累计 {len(all_awemes)} 条原创"
+                    f"（转发 {fwd_total}｜无主 {unk_total}）")
+                if page_all_older and pages >= 2:
+                    logger.info("🎵 本页已全部早于 since，停止翻页")
+                    break
+                if not has_more:
+                    break
+            if not all_awemes and fwd_total == 0 and unk_total == 0 \
+                    and pages == 0:
+                text = (f"❌ 两条枚举路都失败\n\nChrome 钩子："
+                        f"{chrome_err}\nf2：403 风控\n"
+                        "（Argus 收紧期，稍后再试）")
+                try:
+                    await notify.notify_user(text)
+                except Exception:
+                    pass
+                return text
+        else:
+            kept_by_since, _ = filter_awemes_since(harvested, since)
+            all_awemes, fwd_total, unk_total = filter_awemes_original(
                 kept_by_since, sec_uid, nickname)
-            fwd_total += fwd
-            unk_total += unk
-            all_awemes.extend(kept)
-            logger.info(
-                f"🎵 f2 枚举累计 {len(all_awemes)} 条原创"
-                f"（转发 {fwd_total}｜无主 {unk_total}）")
-            # since 整页早停：需第 2 页起才生效（置顶的旧转发常霸第 1 页，
-            # 整页皆旧不代表后面没有新原创）
-            if page_all_older and pages >= 2:
-                logger.info("🎵 本页已全部早于 since，停止翻页")
-                break
-            if not has_more:
-                break
+            logger.info(f"🎵 钩子收割 {len(harvested)} 条"
+                        f"（原创 {len(all_awemes)}｜转发 {fwd_total}"
+                        f"｜无主 {unk_total}）")
         if not all_awemes:
             text = (f"🎵 该作者没有符合条件的作品"
                     f"（{'since ' + format(since, '%Y-%m-%d') + ' 之后，' if since else ''}"
-                    f"仅原创；转发 {fwd_total}｜无主 {unk_total}）")
+                    f"仅原创；转发 {fwd_total}｜无主 {unk_total}｜枚举：{enum_via}）")
             try:
                 await notify.notify_user(text)
             except Exception:
