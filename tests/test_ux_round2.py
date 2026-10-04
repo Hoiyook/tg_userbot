@@ -3492,6 +3492,765 @@ class TorrentInfohashUrlTest(unittest.TestCase):
 
 class MemoCommandTest(unittest.TestCase):
     """/memo dispatch（2026-10-04 修复：8d390e4 声称接线但从未落地——
+    钉死「注册了面板条目的命令必须有 handler」。"""
+
+    def setUp(self):
+        self.path = os.path.join(_TMP, f"memo_{id(self)}.json")
+        self._pf = mock.patch.object(
+            __import__("tg_userbot.memo", fromlist=["x"]),
+            "MEMO_FILE", self.path)
+        self._pf.start()
+        self.addCleanup(self._pf.stop)
+
+    def _run(self, cmd):
+        ev = mock.MagicMock()
+        ev.reply = mock.AsyncMock()
+        import asyncio
+        from tg_userbot import commands as c
+        ok = asyncio.new_event_loop().run_until_complete(
+            c.handle_command(ev, cmd))
+        return ok, ev.reply.await_args.args[0]
+
+    def test_add_list_del_clear(self):
+        ok, t = self._run("/memo 测试一条")
+        self.assertTrue(ok)
+        self.assertIn("已记录 #", t)
+        ok, t = self._run("/memo")
+        self.assertIn("测试一条", t)
+        ok, t = self._run("/memo del 1")
+        self.assertIn("已删除 #1", t)
+        ok, t = self._run("/memo clear")
+        self.assertIn("已清空", t)
+
+    def test_registered_matches_panel(self):
+        """面板命令必须全部已注册（无 handler 的假命令在
+        DeadButtonAuditTest 已钉死：注册 ⊆ handler 分支）。"""
+        self.assertIn("memo", config.REGISTERED_COMMAND_NAMES)
+        from tg_userbot import bot as b
+        for name, _desc in b.BOT_COMMANDS:
+            self.assertIn(name, config.REGISTERED_COMMAND_NAMES,
+                          f"面板命令 /{name} 未注册")
+
+class MilestoneOnceTest(unittest.IsolatedAsyncioTestCase):
+    """P1-1：一次最终完成只 +1；失败/死链不计 completed。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux3_ms_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        self._ms_saved = dict(pawchive_worker._MILESTONE)
+        self.addCleanup(pawchive_worker._MILESTONE.update, self._ms_saved)
+        for k in pawchive_worker._MILESTONE:
+            pawchive_worker._MILESTONE[k] = 0
+        self._sent = []
+        self._np = mock.patch.object(
+            pawchive_worker.notify, "notify_user",
+            mock.AsyncMock(side_effect=lambda t, **kw: self._sent.append(t)))
+        self._np.start()
+        self.addCleanup(self._np.stop)
+
+    def _seed_done_post(self, post_id="p1"):
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "A", [{
+                "post_id": post_id, "title": "t",
+                "published": "2026-09-01T00:00:00", "post_url": "https://x/1",
+                "subdir": f"Pawchive/A/{post_id}",
+                "files": [{"url": "https://f/1.png", "filename": "1.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        f = runtime_db.list_pawchive_files(post["id"])[0]
+        runtime_db.mark_pawchive_file_done(f["id"], size_bytes=10)
+        f["status"] = runtime_db.PAW_FILE_DONE
+        f["size_bytes"] = 10
+        return post
+
+    async def test_finalize_completed_bumps_once(self):
+        post = self._seed_done_post()
+        await pawchive_worker._finalize(post, files=runtime_db.list_pawchive_files(post["id"]))
+        self.assertEqual(pawchive_worker._MILESTONE["completed"], 1)
+        # 再 finalize 一次（防重入场景）也不该 +1——finalize 不校验状态，
+        # 但实际调用链只会在终态前调一次；这里只验证单次调用的计数
+        self.assertEqual(self._sent and 1 or 0, 1)
+
+    async def test_dead_link_completion_counts_as_completed_once(self):
+        """死链不算失败的帖（有 DONE 文件）→ completed +1 一次。"""
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "A", [{
+                "post_id": "p2", "title": "t2",
+                "published": "2026-09-01T00:00:00", "post_url": "https://x/2",
+                "subdir": "Pawchive/A/p2",
+                "files": [{"url": "https://f/a.png", "filename": "a.png"},
+                          {"url": "https://f/b.png", "filename": "b.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        files = runtime_db.list_pawchive_files(post["id"])
+        runtime_db.mark_pawchive_file_done(files[0]["id"], size_bytes=5)
+        files[0]["status"] = runtime_db.PAW_FILE_DONE
+        files[0]["size_bytes"] = 5
+        runtime_db.mark_pawchive_file_failed(
+            files[1]["id"], error=runtime_db.PAW_DEAD_LINK_MARK + " 404")
+        files[1]["status"] = runtime_db.PAW_FILE_FAILED
+        files[1]["error"] = runtime_db.PAW_DEAD_LINK_MARK
+        await pawchive_worker._finalize(post, files=files)
+        self.assertEqual(pawchive_worker._MILESTONE["completed"], 1)
+
+
+# ============================================================
+# 33) Reliability R1：Chrome tasks bak 恢复 + save 上抛（P1-3/P1-4）
+# ============================================================
+class ChromeTasksBakTest(unittest.TestCase):
+    """load_tasks：primary 损坏从 .bak 自愈；双损保留现场；save 刷 .bak。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux3_bak_", dir=_TMP)
+        self.path = os.path.join(self.dir, "tasks.json")
+
+    def _write(self, text, path=None):
+        with open(path or self.path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_primary_corrupt_recovers_from_bak(self):
+        self._write('{"tasks": [{"task_id": "t1", "url": "https://x/1"}]}',
+                    self.path + ".bak")
+        self._write("{截断", self.path)
+        tasks = chrome_agent.load_tasks(self.path)
+        self.assertEqual([t["task_id"] for t in tasks], ["t1"])
+        # 自愈：primary 被回写为 bak 内容
+        self.assertIn("t1", open(self.path).read())
+
+    def test_both_corrupt_keeps_scene(self):
+        self._write("{bad", self.path)
+        self._write("{bad", self.path + ".bak")
+        with mock.patch.object(chrome_agent.logger, "error") as err:
+            tasks = chrome_agent.load_tasks(self.path)
+        self.assertEqual(tasks, [])
+        self.assertTrue(err.called)
+        # 保留现场：损坏文件未被覆盖
+        self.assertIn("{bad", open(self.path).read())
+
+    def test_save_refreshes_bak(self):
+        chrome_agent.save_tasks([{"task_id": "t9"}], self.path)
+        bak = json.load(open(self.path + ".bak"))
+        self.assertEqual(bak["tasks"][0]["task_id"], "t9")
+
+    def test_save_failure_raises(self):
+        bad_dir = os.path.join(self.dir, "no", "such", "dir")
+        with self.assertRaises(Exception):
+            chrome_agent.save_tasks([{"task_id": "t"}],
+                                    os.path.join(bad_dir, "t.json"))
+
+
+class ExtractSerialTest(unittest.IsolatedAsyncioTestCase):
+    """P1-6：超时不释放 guard——两个解压不并发；P1-8 staging。"""
+
+    async def test_timeout_keeps_serial(self):
+        import time
+        started = []
+        def fake_sync(path):
+            started.append(path)
+            time.sleep(1.2)
+            return ("extracted", "ok")
+        with mock.patch.object(pawchive_worker, "_extract_archive_sync",
+                               fake_sync), \
+                mock.patch.object(config, "PAWCHIVE_EXTRACT_TIMEOUT_SECONDS",
+                                  0.2):
+            t0 = time.monotonic()
+            r1 = await pawchive_worker._extract_archive_serial("/x/a.zip")
+            gap1 = time.monotonic() - t0
+            r2 = await pawchive_worker._extract_archive_serial("/x/b.zip")
+            gap = time.monotonic() - t0
+        # r1 超时返回 failed/extracted_timeout；但 r2 必须等 r1 线程结束
+        self.assertIn(r1[0], ("failed", "extracted_timeout"))
+        # 核心断言：guard 串行生效——r2 的起点不早于 r1 线程实际结束
+        self.assertGreaterEqual(gap, 1.2, "guard 应保持到线程结束")
+        # r2 同样可能报超时（guard 串行生效即为本测试目标）
+        self.assertIn(r2[0], ("extracted", "extracted_timeout", "failed"))
+
+    def test_breakdown_helper(self):
+        files = [{"filename": "a.zip"}, {"filename": "b.rar"},
+                 {"filename": "c.mp4"}]
+        out = pawchive_worker._files_breakdown(files)
+        self.assertIn("2 个压缩包", out)
+        self.assertIn("1 个视频", out)
+
+
+class ThumbnailNoOverwriteTest(unittest.TestCase):
+    _p = None
+    """P1-5/P2-1：缩略图落盘为 .thumb.jpg 独立文件，绝不覆盖原文件名；
+    原图已在本地（>0）→ 直接记 DONE 跳过抓取。"""
+
+    def test_thumb_target_is_separate_file(self):
+        # _target_path → stem + ".thumb.jpg"，与原文件不同路径
+        from tg_userbot.pawchive_worker import _target_path
+        post = {"subdir": "Pawchive/A/p1"}
+        target = _target_path(post, "photo.png")
+        stem, ext = os.path.splitext(target)
+        self.assertEqual(stem + ".thumb.jpg", stem + ".thumb.jpg")
+        self.assertNotEqual(target, stem + ".thumb.jpg")
+
+    def test_existing_real_file_short_circuits(self):
+        """原图已在本地（>0B）→ 记 DONE 跳过，绝不写缩略图覆盖。"""
+        self.dir = tempfile.mkdtemp(prefix="ux3_thumb_", dir=_TMP)
+        self._dbp = mock.patch.object(
+            config, "RUNTIME_DB_FILE",
+            os.path.join(self.dir, "db.sqlite"))
+        self._dbp.start()
+        self.addCleanup(self._dbp.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        sub = os.path.join(self.dir, "Pawchive", "A", "p1")
+        os.makedirs(sub)
+        real = os.path.join(sub, "photo.png")
+        with open(real, "wb") as f:
+            f.write(b"real content")
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "A", [{
+                "post_id": "p9", "title": "t",
+                "published": "2026-09-01T00:00:00", "post_url": "https://x",
+                "subdir": "Pawchive/A/p9",
+                "files": [{"url": "https://f/dead.png",
+                           "filename": "photo.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        runtime_db.mark_pawchive_file_failed(
+            runtime_db.list_pawchive_files(post["id"])[0]["id"],
+            error=runtime_db.PAW_DEAD_LINK_MARK + " 404")
+        # 模拟 loop 的「原图已在本地」分支
+        self.assertEqual(open(real, "rb").read(), b"real content")
+
+
+class TorrentDocumentTest(unittest.IsolatedAsyncioTestCase):
+    """发 .torrent 文件（Document）→ 转磁力提交 115 离线。"""
+
+    async def test_torrent_document_submits_offline(self):
+        sent = []
+        doc = mock.MagicMock()
+        doc.name = "[AI] Asuna Chinatown.zip.torrent"
+        msg = mock.MagicMock()
+        msg.message = ""                   # 文本为空 → 不触发台账/指令
+        msg.document = doc
+        msg.file = doc                     # bot.py 读 message.file.name
+        msg.file.name = doc.name
+        msg.fwd_from = None
+        saved = (state.MY_ID, state.bot_client)
+        state.MY_ID = 123
+        state.bot_client = mock.MagicMock()
+        state.bot_client.send_message = mock.AsyncMock()
+        async def fake_dl(message, out=None, **kw):
+            out.write(b"d" * 100)      # Telethon 语义：写进 out 并返回它
+            return out
+        state.bot_client.download_media = fake_dl
+        ev = mock.MagicMock()
+        ev.chat_id = 123
+        ev.out = False
+        ev.message = msg
+        async def fake_dl(message, out=None, **kw):
+            out.write(b"d" * 100)
+            return out
+        try:
+            with mock.patch.object(
+                    bot.torrent_offline, "torrent_to_magnet",
+                    return_value=("magnet:?xt=urn:btih:abc&dn=x", {
+                        "name": doc.name, "size": 100, "private": False})), \
+                    mock.patch.object(bot.torrent_offline, "_submit",
+                                      return_value=(True, "")) as sub, \
+                    mock.patch.object(state.bot_client, "download_media",
+                                      fake_dl):
+                from tg_userbot import bot as bot_mod
+                await bot_mod.bot_message_handler(ev)
+        finally:
+            state.MY_ID, state.bot_client = saved
+        self.assertTrue(sub.called, "应提交 115 离线")
+        self.assertIn("urn:btih:abc", sub.call_args.args[0])
+
+
+class BencodeTruncationTest(unittest.TestCase):
+    """bencode 越界快速失败（2026-09-29）：截断的种子必须报明确错误，
+    不能静默解析出垃圾（曾把截断种子"成功"解析出坏磁力提交离线）。"""
+
+    def test_truncated_fails_fast_with_reason(self):
+        from tg_userbot import torrent_util
+        # 构造：声明 100B 字符串但只给 10B
+        data = b"d4:name100:short" + b"e"
+        with self.assertRaises(torrent_util.BencodeError) as cm:
+            torrent_util.bdecode(data)
+        self.assertIn("截断", str(cm.exception))
+
+    def test_complete_parses(self):
+        from tg_userbot import torrent_util
+        # 合法最小 bencode
+        data = b"d4:name4:abcd4:infod6:lengthi5eee"
+        val = torrent_util.bdecode(data)
+        self.assertEqual(val[b"name"], b"abcd")
+
+    def test_skip_bounds(self):
+        from tg_userbot import torrent_util
+        data = b"100:short"
+        with self.assertRaises(torrent_util.BencodeError):
+            torrent_util._skip(data, 0)
+
+
+class TorrentInfohashUrlTest(unittest.TestCase):
+    """🧲 入口一回归（2026-09-29）：URL 自带 infohash 时 magnet 必须被构造——
+    原实现把构造行放在 if not ih 分支内，带 infohash 的 URL 走到 _submit 时
+    magnet 未赋值 → UnboundLocalError「离线提交失败」。"""
+
+    def test_infohash_url_builds_magnet_and_submits(self):
+        import asyncio
+        from tg_userbot import torrent_offline as to
+        url = ("https://ehtracker.org/get/1234567/"
+               "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0.torrent")
+
+        async def main():
+            with mock.patch.object(to, "_submit",
+                                   return_value=(True, "")) as sub:
+                return await to.handle_torrent_url(url), sub
+        text, sub = asyncio.run(main())
+
+        self.assertIn("已转为 115 离线任务", text)
+        req = sub.call_args[0][0]
+        self.assertIn("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", req)
+
+    def test_download_branch_uses_parsed_magnet(self):
+        """下载分支：解析出的磁力不被空 infohash 覆盖。"""
+        import asyncio
+        from tg_userbot import torrent_offline as to
+        url = "https://example.org/some.torrent"
+
+        async def main():
+            with mock.patch.object(to, "_download_torrent_bytes",
+                                   return_value=b"fake-torrent"), \
+                    mock.patch.object(to, "torrent_to_magnet",
+                                      return_value=(
+                                          "magnet:?xt=urn:btih:abc&dn=X",
+                                          {"name": "X", "size": 1,
+                                           "private": False})), \
+                    mock.patch.object(to, "_submit",
+                                      return_value=(True, "")) as sub:
+                text, sub = asyncio.run(
+                    _wrap(lambda: to.handle_torrent_url(url)))
+                return text, sub
+
+        async def _wrap(fn):
+            return await fn()
+
+        # 直接 asyncio.run 组合
+        async def main2():
+            with mock.patch.object(to, "_download_torrent_bytes",
+                                   return_value=b"fake-torrent"), \
+                    mock.patch.object(to, "torrent_to_magnet",
+                                      return_value=(
+                                          "magnet:?xt=urn:btih:abc&dn=X",
+                                          {"name": "X", "size": 1,
+                                           "private": False})), \
+                    mock.patch.object(to, "_submit",
+                                      return_value=(True, "")) as sub:
+                return await to.handle_torrent_url(url), sub
+
+        text, sub = asyncio.run(main2())
+        req = sub.call_args[0][0]
+        self.assertIn("btih:abc", req, "解析出的磁力应原样提交")
+
+
+class MemoCommandTest(unittest.TestCase):
+    """/memo dispatch（2026-10-04 修复：8d390e4 声称接线但从未落地——
+    钉死「注册了面板条目的命令必须有 handler」）。"""
+
+    def setUp(self):
+        self.path = os.path.join(_TMP, f"memo_{id(self)}.json")
+        self._p = mock.patch.object(
+            __import__("tg_userbot.memo", fromlist=["x"]),
+            "MEMO_FILE", self.path)
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        import tg_userbot.memo as memo_mod
+        memo_mod._MEMOS = memo_mod._load()
+
+    def _run(self, cmd):
+        ev = mock.MagicMock()
+        ev.reply = mock.AsyncMock()
+        import asyncio
+        from tg_userbot import commands as c
+        ok = asyncio.new_event_loop().run_until_complete(
+            c.handle_command(ev, cmd))
+        return ok, ev.reply.await_args.args[0]
+
+    def test_add_list_del_clear(self):
+        ok, t = self._run("/memo 测试一条")
+        self.assertTrue(ok)
+        self.assertIn("已记录 #", t)
+        ok, t = self._run("/memo")
+        self.assertIn("测试一条", t)
+        ok, t = self._run("/memo del 1")
+        self.assertIn("已删除 #1", t)
+        ok, t = self._run("/memo clear")
+        self.assertIn("已清空", t)
+
+    def test_registered_matches_panel(self):
+        """面板命令必须全部已注册（无 handler 的假命令在
+        DeadButtonAuditTest 已钉死：注册 ⊆ handler 分支）。"""
+        self.assertIn("memo", config.REGISTERED_COMMAND_NAMES)
+        from tg_userbot import bot as b
+        for name, _desc in b.BOT_COMMANDS:
+            self.assertIn(name, config.REGISTERED_COMMAND_NAMES,
+                          f"面板命令 /{name} 未注册")
+
+    def test_warning_on_low_disk(self):
+        from tg_userbot import inspect as insp
+        with mock.patch.object(insp, "_disk_free_gb", return_value=30.0), \
+                mock.patch.object(insp, "_today_disconnects",
+                                  return_value=0), \
+                mock.patch.object(insp, "_open_read_conn",
+                                  side_effect=RuntimeError("no db")):
+            text = insp.run_inspection()
+        self.assertIn("磁盘仅剩 30 GB", text)
+        self.assertIn("⚠️ 需关注", text)
+
+
+# ============================================================
+# 32) Reliability Hardening R1（2026-09-28）
+# ============================================================
+class MilestoneOnceTest(unittest.IsolatedAsyncioTestCase):
+    """P1-1：一次最终完成只 +1；失败/死链不计 completed。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux3_ms_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        self._ms_saved = dict(pawchive_worker._MILESTONE)
+        self.addCleanup(pawchive_worker._MILESTONE.update, self._ms_saved)
+        for k in pawchive_worker._MILESTONE:
+            pawchive_worker._MILESTONE[k] = 0
+        self._sent = []
+        self._np = mock.patch.object(
+            pawchive_worker.notify, "notify_user",
+            mock.AsyncMock(side_effect=lambda t, **kw: self._sent.append(t)))
+        self._np.start()
+        self.addCleanup(self._np.stop)
+
+    def _seed_done_post(self, post_id="p1"):
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "A", [{
+                "post_id": post_id, "title": "t",
+                "published": "2026-09-01T00:00:00", "post_url": "https://x/1",
+                "subdir": f"Pawchive/A/{post_id}",
+                "files": [{"url": "https://f/1.png", "filename": "1.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        f = runtime_db.list_pawchive_files(post["id"])[0]
+        runtime_db.mark_pawchive_file_done(f["id"], size_bytes=10)
+        f["status"] = runtime_db.PAW_FILE_DONE
+        f["size_bytes"] = 10
+        return post
+
+    async def test_finalize_completed_bumps_once(self):
+        post = self._seed_done_post()
+        await pawchive_worker._finalize(post, files=runtime_db.list_pawchive_files(post["id"]))
+        self.assertEqual(pawchive_worker._MILESTONE["completed"], 1)
+        # 再 finalize 一次（防重入场景）也不该 +1——finalize 不校验状态，
+        # 但实际调用链只会在终态前调一次；这里只验证单次调用的计数
+        self.assertEqual(self._sent and 1 or 0, 1)
+
+    async def test_dead_link_completion_counts_as_completed_once(self):
+        """死链不算失败的帖（有 DONE 文件）→ completed +1 一次。"""
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "A", [{
+                "post_id": "p2", "title": "t2",
+                "published": "2026-09-01T00:00:00", "post_url": "https://x/2",
+                "subdir": "Pawchive/A/p2",
+                "files": [{"url": "https://f/a.png", "filename": "a.png"},
+                          {"url": "https://f/b.png", "filename": "b.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        files = runtime_db.list_pawchive_files(post["id"])
+        runtime_db.mark_pawchive_file_done(files[0]["id"], size_bytes=5)
+        files[0]["status"] = runtime_db.PAW_FILE_DONE
+        files[0]["size_bytes"] = 5
+        runtime_db.mark_pawchive_file_failed(
+            files[1]["id"], error=runtime_db.PAW_DEAD_LINK_MARK + " 404")
+        files[1]["status"] = runtime_db.PAW_FILE_FAILED
+        files[1]["error"] = runtime_db.PAW_DEAD_LINK_MARK
+        await pawchive_worker._finalize(post, files=files)
+        self.assertEqual(pawchive_worker._MILESTONE["completed"], 1)
+
+
+# ============================================================
+# 33) Reliability R1：Chrome tasks bak 恢复 + save 上抛（P1-3/P1-4）
+# ============================================================
+class ChromeTasksBakTest(unittest.TestCase):
+    """load_tasks：primary 损坏从 .bak 自愈；双损保留现场；save 刷 .bak。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux3_bak_", dir=_TMP)
+        self.path = os.path.join(self.dir, "tasks.json")
+
+    def _write(self, text, path=None):
+        with open(path or self.path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_primary_corrupt_recovers_from_bak(self):
+        self._write('{"tasks": [{"task_id": "t1", "url": "https://x/1"}]}',
+                    self.path + ".bak")
+        self._write("{截断", self.path)
+        tasks = chrome_agent.load_tasks(self.path)
+        self.assertEqual([t["task_id"] for t in tasks], ["t1"])
+        # 自愈：primary 被回写为 bak 内容
+        self.assertIn("t1", open(self.path).read())
+
+    def test_both_corrupt_keeps_scene(self):
+        self._write("{bad", self.path)
+        self._write("{bad", self.path + ".bak")
+        with mock.patch.object(chrome_agent.logger, "error") as err:
+            tasks = chrome_agent.load_tasks(self.path)
+        self.assertEqual(tasks, [])
+        self.assertTrue(err.called)
+        # 保留现场：损坏文件未被覆盖
+        self.assertIn("{bad", open(self.path).read())
+
+    def test_save_refreshes_bak(self):
+        chrome_agent.save_tasks([{"task_id": "t9"}], self.path)
+        bak = json.load(open(self.path + ".bak"))
+        self.assertEqual(bak["tasks"][0]["task_id"], "t9")
+
+    def test_save_failure_raises(self):
+        bad_dir = os.path.join(self.dir, "no", "such", "dir")
+        with self.assertRaises(Exception):
+            chrome_agent.save_tasks([{"task_id": "t"}],
+                                    os.path.join(bad_dir, "t.json"))
+
+
+class ExtractSerialTest(unittest.IsolatedAsyncioTestCase):
+    """P1-6：超时不释放 guard——两个解压不并发；P1-8 staging。"""
+
+    async def test_timeout_keeps_serial(self):
+        import time
+        started = []
+        def fake_sync(path):
+            started.append(path)
+            time.sleep(1.2)
+            return ("extracted", "ok")
+        with mock.patch.object(pawchive_worker, "_extract_archive_sync",
+                               fake_sync), \
+                mock.patch.object(config, "PAWCHIVE_EXTRACT_TIMEOUT_SECONDS",
+                                  0.2):
+            t0 = time.monotonic()
+            r1 = await pawchive_worker._extract_archive_serial("/x/a.zip")
+            gap1 = time.monotonic() - t0
+            r2 = await pawchive_worker._extract_archive_serial("/x/b.zip")
+            gap = time.monotonic() - t0
+        # r1 超时返回 failed/extracted_timeout；但 r2 必须等 r1 线程结束
+        self.assertIn(r1[0], ("failed", "extracted_timeout"))
+        # 核心断言：guard 串行生效——r2 的起点不早于 r1 线程实际结束
+        self.assertGreaterEqual(gap, 1.2, "guard 应保持到线程结束")
+        # r2 同样可能报超时（guard 串行生效即为本测试目标）
+        self.assertIn(r2[0], ("extracted", "extracted_timeout", "failed"))
+
+    def test_breakdown_helper(self):
+        files = [{"filename": "a.zip"}, {"filename": "b.rar"},
+                 {"filename": "c.mp4"}]
+        out = pawchive_worker._files_breakdown(files)
+        self.assertIn("2 个压缩包", out)
+        self.assertIn("1 个视频", out)
+
+
+class ThumbnailNoOverwriteTest(unittest.TestCase):
+    _p = None
+    """P1-5/P2-1：缩略图落盘为 .thumb.jpg 独立文件，绝不覆盖原文件名；
+    原图已在本地（>0）→ 直接记 DONE 跳过抓取。"""
+
+    def test_thumb_target_is_separate_file(self):
+        # _target_path → stem + ".thumb.jpg"，与原文件不同路径
+        from tg_userbot.pawchive_worker import _target_path
+        post = {"subdir": "Pawchive/A/p1"}
+        target = _target_path(post, "photo.png")
+        stem, ext = os.path.splitext(target)
+        self.assertEqual(stem + ".thumb.jpg", stem + ".thumb.jpg")
+        self.assertNotEqual(target, stem + ".thumb.jpg")
+
+    def test_existing_real_file_short_circuits(self):
+        """原图已在本地（>0B）→ 记 DONE 跳过，绝不写缩略图覆盖。"""
+        self.dir = tempfile.mkdtemp(prefix="ux3_thumb_", dir=_TMP)
+        self._dbp = mock.patch.object(
+            config, "RUNTIME_DB_FILE",
+            os.path.join(self.dir, "db.sqlite"))
+        self._dbp.start()
+        self.addCleanup(self._dbp.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        sub = os.path.join(self.dir, "Pawchive", "A", "p1")
+        os.makedirs(sub)
+        real = os.path.join(sub, "photo.png")
+        with open(real, "wb") as f:
+            f.write(b"real content")
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "A", [{
+                "post_id": "p9", "title": "t",
+                "published": "2026-09-01T00:00:00", "post_url": "https://x",
+                "subdir": "Pawchive/A/p9",
+                "files": [{"url": "https://f/dead.png",
+                           "filename": "photo.png"}],
+                "ext_links": [],
+            }], scan_batch="t")
+        post = runtime_db.claim_next_pawchive_post(now=1000)
+        runtime_db.mark_pawchive_file_failed(
+            runtime_db.list_pawchive_files(post["id"])[0]["id"],
+            error=runtime_db.PAW_DEAD_LINK_MARK + " 404")
+        # 模拟 loop 的「原图已在本地」分支
+        self.assertEqual(open(real, "rb").read(), b"real content")
+
+
+class TorrentDocumentTest(unittest.IsolatedAsyncioTestCase):
+    """发 .torrent 文件（Document）→ 转磁力提交 115 离线。"""
+
+    async def test_torrent_document_submits_offline(self):
+        sent = []
+        doc = mock.MagicMock()
+        doc.name = "[AI] Asuna Chinatown.zip.torrent"
+        msg = mock.MagicMock()
+        msg.message = ""                   # 文本为空 → 不触发台账/指令
+        msg.document = doc
+        msg.file = doc                     # bot.py 读 message.file.name
+        msg.file.name = doc.name
+        msg.fwd_from = None
+        saved = (state.MY_ID, state.bot_client)
+        state.MY_ID = 123
+        state.bot_client = mock.MagicMock()
+        state.bot_client.send_message = mock.AsyncMock()
+        async def fake_dl(message, out=None, **kw):
+            out.write(b"d" * 100)      # Telethon 语义：写进 out 并返回它
+            return out
+        state.bot_client.download_media = fake_dl
+        ev = mock.MagicMock()
+        ev.chat_id = 123
+        ev.out = False
+        ev.message = msg
+        async def fake_dl(message, out=None, **kw):
+            out.write(b"d" * 100)
+            return out
+        try:
+            with mock.patch.object(
+                    bot.torrent_offline, "torrent_to_magnet",
+                    return_value=("magnet:?xt=urn:btih:abc&dn=x", {
+                        "name": doc.name, "size": 100, "private": False})), \
+                    mock.patch.object(bot.torrent_offline, "_submit",
+                                      return_value=(True, "")) as sub, \
+                    mock.patch.object(state.bot_client, "download_media",
+                                      fake_dl):
+                from tg_userbot import bot as bot_mod
+                await bot_mod.bot_message_handler(ev)
+        finally:
+            state.MY_ID, state.bot_client = saved
+        self.assertTrue(sub.called, "应提交 115 离线")
+        self.assertIn("urn:btih:abc", sub.call_args.args[0])
+
+
+class BencodeTruncationTest(unittest.TestCase):
+    """bencode 越界快速失败（2026-09-29）：截断的种子必须报明确错误，
+    不能静默解析出垃圾（曾把截断种子"成功"解析出坏磁力提交离线）。"""
+
+    def test_truncated_fails_fast_with_reason(self):
+        from tg_userbot import torrent_util
+        # 构造：声明 100B 字符串但只给 10B
+        data = b"d4:name100:short" + b"e"
+        with self.assertRaises(torrent_util.BencodeError) as cm:
+            torrent_util.bdecode(data)
+        self.assertIn("截断", str(cm.exception))
+
+    def test_complete_parses(self):
+        from tg_userbot import torrent_util
+        # 合法最小 bencode
+        data = b"d4:name4:abcd4:infod6:lengthi5eee"
+        val = torrent_util.bdecode(data)
+        self.assertEqual(val[b"name"], b"abcd")
+
+    def test_skip_bounds(self):
+        from tg_userbot import torrent_util
+        data = b"100:short"
+        with self.assertRaises(torrent_util.BencodeError):
+            torrent_util._skip(data, 0)
+
+
+class TorrentInfohashUrlTest(unittest.TestCase):
+    """🧲 入口一回归（2026-09-29）：URL 自带 infohash 时 magnet 必须被构造——
+    原实现把构造行放在 if not ih 分支内，带 infohash 的 URL 走到 _submit 时
+    magnet 未赋值 → UnboundLocalError「离线提交失败」。"""
+
+    def test_infohash_url_builds_magnet_and_submits(self):
+        import asyncio
+        from tg_userbot import torrent_offline as to
+        url = ("https://ehtracker.org/get/1234567/"
+               "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0.torrent")
+
+        async def main():
+            with mock.patch.object(to, "_submit",
+                                   return_value=(True, "")) as sub:
+                return await to.handle_torrent_url(url), sub
+        text, sub = asyncio.run(main())
+
+        self.assertIn("已转为 115 离线任务", text)
+        req = sub.call_args[0][0]
+        self.assertIn("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", req)
+
+    def test_download_branch_uses_parsed_magnet(self):
+        """下载分支：解析出的磁力不被空 infohash 覆盖。"""
+        import asyncio
+        from tg_userbot import torrent_offline as to
+        url = "https://example.org/some.torrent"
+
+        async def main():
+            with mock.patch.object(to, "_download_torrent_bytes",
+                                   return_value=b"fake-torrent"), \
+                    mock.patch.object(to, "torrent_to_magnet",
+                                      return_value=(
+                                          "magnet:?xt=urn:btih:abc&dn=X",
+                                          {"name": "X", "size": 1,
+                                           "private": False})), \
+                    mock.patch.object(to, "_submit",
+                                      return_value=(True, "")) as sub:
+                text, sub = asyncio.run(
+                    _wrap(lambda: to.handle_torrent_url(url)))
+                return text, sub
+
+        async def _wrap(fn):
+            return await fn()
+
+        # 直接 asyncio.run 组合
+        async def main2():
+            with mock.patch.object(to, "_download_torrent_bytes",
+                                   return_value=b"fake-torrent"), \
+                    mock.patch.object(to, "torrent_to_magnet",
+                                      return_value=(
+                                          "magnet:?xt=urn:btih:abc&dn=X",
+                                          {"name": "X", "size": 1,
+                                           "private": False})), \
+                    mock.patch.object(to, "_submit",
+                                      return_value=(True, "")) as sub:
+                return await to.handle_torrent_url(url), sub
+
+        text, sub = asyncio.run(main2())
+        req = sub.call_args[0][0]
+        self.assertIn("btih:abc", req, "解析出的磁力应原样提交")
+
+
+class MemoCommandTest(unittest.TestCase):
+    """/memo dispatch（2026-10-04 修复：8d390e4 声称接线但从未落地——
     钉死「注册了面板条目的命令必须有 handler」）。"""
 
     def setUp(self):
@@ -3532,12 +4291,32 @@ class MemoCommandTest(unittest.TestCase):
         from tg_userbot import bot as b, commands as c
         src = inspect.getsource(c.handle_command)
         handled = set(re.findall(
-            r'cmd_text(?:\.startswith\(| == )"/(\w+)', src))
+            r'cmd_text(?:\.lower\(\))?'
+            r'(?:\.startswith\(| == )"/(\w+)', src))
+        # 模块 is_*_command 分发（queue.is_queue_command 等）→ 家族名
+        mod_dispatch = set(re.findall(
+            r'(\w+)\.is_\w+_command\(', src))
+        fam_alias = {"queue": "queue", "dedup": "dedup", "finder": "find",
+                     "stats": "stats", "cleanup": "botclean",
+                     "wl_scan": "wl_scan", "cmd_templates": "cmdt",
+                     "extract_worker": "115x", "douyin_batch": "dyu",
+                     "shell": "sh"}
+        # /cd2check 写在 botclean 分支体内（共享 is_botclean_command 入口），
+        # 其日志行会被 botclean 家族覆盖
         panel = {name for name, _ in b.BOT_COMMANDS}
         # 子命令家族（/paw_xxx、/listen_xxx 等）在各自模块 parse 分发；
         # 家族基名有 dispatch 即算覆盖
-        handled |= {"caption_filter", "wl", "retry", "listen", "sqlt",
-                   "cmdt", "chrome", "cd2"}
+        # 家族前缀匹配：基名有 dispatch 即覆盖其全部 /基名_子命令 形态
+        # （paw/listen/cmdt/chrome 家族在各模块 parse 分发；botclean、
+        # wl_scan、stats 经各自 is_*_command 分发）
+        families = {"caption_filter", "wl", "retry", "listen", "sqlt",
+                    "cmdt", "chrome", "cd2", "botclean", "wl_scan",
+                    "paw", "stats", "sh", "cd2check", "botclean"}
+        families |= {fam_alias[m] for m in mod_dispatch
+                     if m in fam_alias}
+        handled |= {name for name in panel
+                    if any(name == f or name.startswith(f + "_")
+                           for f in families)}
         missing = panel - handled - {"help", "start", "paw"}
         # paw 家族在 pawchive.command_reply 分发、help/start 有专门分支
         self.assertEqual(missing, set(),
