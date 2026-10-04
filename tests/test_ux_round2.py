@@ -4311,7 +4311,8 @@ class MemoCommandTest(unittest.TestCase):
         # wl_scan、stats 经各自 is_*_command 分发）
         families = {"caption_filter", "wl", "retry", "listen", "sqlt",
                     "cmdt", "chrome", "cd2", "botclean", "wl_scan",
-                    "paw", "stats", "sh", "cd2check", "botclean"}
+                    "paw", "stats", "shell", "extract_worker",
+                    "douyin_batch", "memo", "cd2check"}
         families |= {fam_alias[m] for m in mod_dispatch
                      if m in fam_alias}
         handled |= {name for name in panel

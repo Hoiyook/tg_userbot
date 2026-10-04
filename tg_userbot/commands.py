@@ -890,6 +890,29 @@ async def handle_command(event, cmd_text):
 
         return True
 
+    if cmd_text == "/memo" or cmd_text.startswith("/memo "):
+        # 备忘录（2026-10-04 修复：8d390e4 声称接线但 dispatch 从未落地，
+        # /memo 一直落到「未识别→主菜单」；本次补上并加注册审计钉死）
+        from . import memo
+        arg = cmd_text[len("/memo"):].strip()
+        if not arg:
+            await _reply(event, memo.list_text())
+            logger.info("执行命令：/memo（列表）")
+            return True
+        if arg.lower() == "clear":
+            ok, msg = memo.clear()
+        elif arg.split()[0] == "del":
+            parts = arg.split()
+            if len(parts) != 2 or not parts[1].isdigit():
+                await _reply(event, "用法：/memo del <序号>")
+                return True
+            ok, msg = memo.delete(int(parts[1]))
+        else:
+            ok, msg = memo.add(arg)
+        await _reply(event, msg)
+        logger.info("执行命令：/memo")
+        return True
+
     if cmd_text == "/inspect":
         await _reply(event, "🔍 巡检中……")
         from . import inspect as inspect_mod

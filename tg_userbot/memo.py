@@ -32,6 +32,7 @@ def _load():
         logger.warning(f"📝 读取备忘录失败，从空开始：{e}")
         _MEMOS = []
         _NEXT_ID = 1
+    return _MEMOS
 
 
 def _save():
