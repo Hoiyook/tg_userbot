@@ -492,6 +492,25 @@ async def harvest_author_awemes_via_chrome(sec_user_id, max_scrolls=60):
                 except Exception:
                     pass
                 return None, "被验证码拦截：请在 Chrome 窗口完成验证后重发"
+            # 「服务异常」占位页（owner 2026-10-04 实测：手动 F5 一次即恢复）
+            # ——检测到就自动 reload，最多两轮；钩子经 addScript 重载后仍生效
+            for _reload in range(2):
+                state = await eval_js(
+                    "JSON.stringify({err: document.body.innerText.includes("
+                    "'服务异常'), dom: document.querySelectorAll("
+                    "'a[href*=\"/video/\"]').length, cap: "
+                    "(window.__captured||[]).length})")
+                import json as _j2
+                st = _j2.loads(state or "{}")
+                if not st.get("err") and (st.get("dom") or st.get("cap")):
+                    break
+                logger.info(f"🎵 页面未就绪（{st}），自动刷新重载"
+                            f"（{_reload + 1}/2）")
+                await call("Page.reload", {}, session_id=sid)
+                await asyncio.sleep(init_wait)
+                title = str(await eval_js("document.title") or "")
+                if "验证" in title:
+                    return None, "刷新后遇到验证码：请手动完成后重发"
             await eval_js(_PAGE_HOOK_JS)
 
             scroll_expr = ("(() => {const el = [...document."
