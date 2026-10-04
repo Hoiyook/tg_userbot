@@ -550,7 +550,7 @@ async def _finish_cancelled(cdp, guid, filename):
 
 
 async def run_download_attempt(cdp, url, download_dir, timeout,
-                               cancel_event=None):
+                               cancel_event=None, task=None):
     """执行一次下载尝试（规格 22：完全由 CDP 事件判定，不 sleep 猜测）。
 
     返回 (ok, filename, size_bytes, error)。事件流：
@@ -576,13 +576,40 @@ async def run_download_attempt(cdp, url, download_dir, timeout,
         except _a.TimeoutError:
             pass
         from .iwara import resolve_best_download_url
+        old_sub = (task or {}).get("download_subdir") or ""
         try:
-            dl_url, _title, quality = await resolve_best_download_url(
-                cdp, video_id, target_id)
+            dl_url, title, quality, author, date = (
+                await resolve_best_download_url(cdp, video_id, target_id))
         except Exception as e:
             logger.warning(f"🧲 iwara 直链解析失败：{e}")
             return False, None, None, f"iwara 直链解析失败：{e}"
         logger.info(f"🌐 iwara 最高画质 {quality}，转下载直链")
+        # 命名规约（2026-10-04 用户要求）：作者名做子目录，日期+标题做
+        # 文件名前缀。task 在手即直接改记录（subdir 决定落盘目录，label
+        # 由 apply_label_rename 收尾拼「label 原文件名」）；task 不在
+        # （异常调用形态）仅记日志不命名。
+        try:
+            from .naming import sanitize_filename_bounded
+            if task is not None:
+                if author:
+                    sub = safe_subdir(
+                        "iwara/" + sanitize_filename_bounded(author))
+                    if sub:
+                        task["download_subdir"] = sub
+                prefix = " ".join(x for x in (date, title) if x)
+                if prefix:
+                    task["label"] = sanitize_filename_bounded(prefix)
+        except Exception as e:
+            logger.warning(f"🌐 iwara 命名信息应用失败（保留默认）：{e}")
+        # subdir 刚设置——重算本任务下载目录并让 Chrome 下载落新目录。
+        # 调用方传入的 download_dir 是按**旧 subdir** 算的任务目录；根目录
+        # = 剥掉旧 subdir 前缀（download_subdir 记录的是相对根的路径）。
+        if task is not None and task.get("download_subdir"):
+            root = (download_dir[:len(download_dir) - len(old_sub) - 1]
+                    if old_sub and download_dir.endswith(old_sub)
+                    else download_dir)
+            download_dir = get_task_download_dir(root, task)
+            await cdp.setup_download(download_dir)
         url = dl_url   # 后续走标准下载事件流（download 域触发浏览器下载）
     target_id = await cdp.open_tab(url)
     loop = asyncio.get_event_loop()
@@ -1012,7 +1039,7 @@ async def process_pending_tasks(cdp, tasks, tasks_path, download_dir,
             try:
                 ok, filename, size, error = await run_download_attempt(
                     cdp, task["url"], task_dir, timeout,
-                    cancel_event=cancel_event)
+                    cancel_event=cancel_event, task=task)
             finally:
                 watcher.cancel()
                 try:

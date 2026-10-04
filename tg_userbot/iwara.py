@@ -52,8 +52,17 @@ _RESOLVE_JS = """
     const v = document.querySelector('video');
     const src = v ? (v.currentSrc || '') : '';
     if (src) {
+      // 作者/日期/标题从页面 DOM 抓（视频信息区）
+      const link = document.querySelector('a[href*="/profile/"]');
+      const author = link ? (link.textContent || '').trim() : '';
+      const timeEl = document.querySelector('time');
+      const date = timeEl ? (timeEl.getAttribute('datetime') ||
+                              timeEl.title || '').slice(0, 10) : '';
+      const h1 = document.querySelector('h1');
+      const title = h1 ? (h1.textContent || '').trim() : '';
       return JSON.stringify({quality: q,
-        url: src.replace('/view?', '/download?')});
+        url: src.replace('/view?', '/download?'),
+        author: author, date: date, title: title});
     }
   }
   return JSON.stringify({error: 'no-quality-item'});
@@ -64,7 +73,7 @@ _RESOLVE_JS = """
 async def resolve_best_download_url(cdp, video_id, target_id, timeout=40):
     """在目标 tab 会话里复刻 UI：齿轮 → 最高画质 → 播放源转下载直链。
 
-    返回 (download_url, title, quality_name)；失败抛 RuntimeError。"""
+    返回 (download_url, title, quality, author, date)；失败抛 RuntimeError。"""
     expr = _RESOLVE_JS % {
         "gear": _GEAR_PATH_PREFIX,
         "qualities": json.dumps(list(_QUALITY_ORDER)),
@@ -88,4 +97,5 @@ async def resolve_best_download_url(cdp, video_id, target_id, timeout=40):
     info = json.loads(value)
     if "error" in info:
         raise RuntimeError(f"iwara UI 复刻失败：{info['error']}")
-    return info["url"], info.get("title") or "", info.get("quality") or ""
+    return (info["url"], info.get("title") or "", info.get("quality") or "",
+            info.get("author") or "", info.get("date") or "")
