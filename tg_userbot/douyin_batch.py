@@ -583,7 +583,12 @@ async def enumerate_author_posts(sec_user_id, max_pages=None):
                 # douyin.com，cookie 里已是新一代
                 await refresh_cookie_from_browser()
         if page is None:
-            return
+            # 三轮全 403 耗尽：必须 raise 让上层发失败通知——静默 return
+            # 会把风控故障伪装成「作者没有作品」（2026-10-04 生产误报：
+            # 「没有符合条件的作品」实为 403 全拒）
+            raise RuntimeError(
+                "f2 枚举连续被 403 拒绝（msToken 失效/风控）——Chrome 打开"
+                "一次 douyin.com 刷新 msToken 后重发命令")
         pages += 1
         raw = page._to_raw() if hasattr(page, "_to_raw") else {}
         awemes = []
