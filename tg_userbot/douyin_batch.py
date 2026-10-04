@@ -492,22 +492,35 @@ async def harvest_author_awemes_via_chrome(sec_user_id, max_scrolls=60):
                 except Exception:
                     pass
                 return None, "被验证码拦截：请在 Chrome 窗口完成验证后重发"
-            # 「服务异常」占位页（owner 2026-10-04 实测：手动 F5 一次即恢复）
-            # ——检测到就自动 reload，最多两轮；钩子经 addScript 重载后仍生效
+            # 「服务异常」占位页（owner 2026-10-04 实测：手动 F5 一次即恢复）。
+            # 刷新必须用 Input.dispatchKeyEvent 模拟**真实 F5 按键**——
+            # Page.reload 会被 Argus 识别（实测重载后 addScript 注入的钩子
+            # 不执行、页面仍吐降级页），真实按键事件则与手动操作同效
             for _reload in range(2):
                 state = await eval_js(
                     "JSON.stringify({err: document.body.innerText.includes("
                     "'服务异常'), dom: document.querySelectorAll("
                     "'a[href*=\"/video/\"]').length, cap: "
-                    "(window.__captured||[]).length})")
+                    "(window.__captured||[]).length, hook: "
+                    "typeof window.__captured})")
                 import json as _j2
                 st = _j2.loads(state or "{}")
-                if not st.get("err") and (st.get("dom") or st.get("cap")):
+                if (not st.get("err") and (st.get("cap")
+                        or (st.get("dom") and st.get("hook") != "undefined"))):
                     break
-                logger.info(f"🎵 页面未就绪（{st}），自动刷新重载"
-                            f"（{_reload + 1}/2）")
-                await call("Page.reload", {}, session_id=sid)
-                await asyncio.sleep(init_wait)
+                logger.info(f"🎵 页面未就绪（{st}），F5 重载（{_reload + 1}/2）")
+                await call("Input.dispatchKeyEvent", {
+                    "type": "keyDown", "key": "F5", "code": "F5",
+                    "windowsVirtualKeyCode": 116,
+                    "nativeVirtualKeyCode": 116}, session_id=sid)
+                await call("Input.dispatchKeyEvent", {
+                    "type": "keyUp", "key": "F5", "code": "F5",
+                    "windowsVirtualKeyCode": 116,
+                    "nativeVirtualKeyCode": 116}, session_id=sid)
+                await asyncio.sleep(max(init_wait, 9.0))
+                # 重载后钩子可能未随新文档执行（Argus 干扰 addScript）——
+                # 无条件补注入，宁可重复注入（钩子自身幂等）
+                await eval_js(_PAGE_HOOK_JS)
                 title = str(await eval_js("document.title") or "")
                 if "验证" in title:
                     return None, "刷新后遇到验证码：请手动完成后重发"
