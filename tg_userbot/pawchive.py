@@ -1194,8 +1194,11 @@ async def _refresh_existing_post(row, service, creator_id, post_id):
         logger.warning(f"🐾 刷新帖子详情失败（回落状态回复）：{e}")
         return _post_status_reply(row)
     d = detail[0] if isinstance(detail, list) else detail
+    # deferred 附件（仅 temp_url）与 path 附件同等收集——2026-10-05 生产
+    # 实测：帖 161805432 的 4 个 MP4 全是 temp_url 形态，旧判定把它们
+    # 静默漏掉（/paw_post 刷新「没有新附件」假象）
     files = [_file_entry(a) for a in (d.get("attachments") or [])
-             if a and a.get("path")]
+             if a and (a.get("path") or a.get("temp_url"))]
     fmain = d.get("file") or {}
     if fmain.get("path") and not any(
             a.get("path") == fmain["path"]
