@@ -886,6 +886,7 @@ async def _run_dyu_inner(url, subdir_raw, since=None, original_only=True):
                 f"（sec_uid {sec_uid[:18]}…）")
 
     all_awemes = []
+    dom_rescued = False
     if since is not None or original_only:
         # 需要字段的模式（since 要时间戳、原创要作者归属）。
         # 第 1 顺位：Agent Chrome 页面内钩子收割（字段全量，免 403——
@@ -916,28 +917,67 @@ async def _run_dyu_inner(url, subdir_raw, since=None, original_only=True):
             enum_via = "f2"
             fwd_total = unk_total = 0
             pages = 0
-            async for awemes, has_more in enumerate_author_posts(sec_uid):
-                pages += 1
-                kept_by_since, page_all_older = filter_awemes_since(
-                    awemes, since)
-                kept, fwd, unk = filter_awemes_original(
-                    kept_by_since, sec_uid, nickname)
-                fwd_total += fwd
-                unk_total += unk
-                all_awemes.extend(kept)
-                logger.info(
-                    f"🎵 f2 枚举累计 {len(all_awemes)} 条原创"
-                    f"（转发 {fwd_total}｜无主 {unk_total}）")
-                if page_all_older and pages >= 2:
-                    logger.info("🎵 本页已全部早于 since，停止翻页")
-                    break
-                if not has_more:
-                    break
-            if not all_awemes and fwd_total == 0 and unk_total == 0 \
-                    and pages == 0:
-                text = (f"❌ 两条枚举路都失败\n\nChrome 钩子："
-                        f"{chrome_err}\nf2：403 风控\n"
-                        "（Argus 收紧期，稍后再试）")
+            f2_err = None
+            try:
+                async for awemes, has_more in enumerate_author_posts(sec_uid):
+                    pages += 1
+                    kept_by_since, page_all_older = filter_awemes_since(
+                        awemes, since)
+                    kept, fwd, unk = filter_awemes_original(
+                        kept_by_since, sec_uid, nickname)
+                    fwd_total += fwd
+                    unk_total += unk
+                    all_awemes.extend(kept)
+                    logger.info(
+                        f"🎵 f2 枚举累计 {len(all_awemes)} 条原创"
+                        f"（转发 {fwd_total}｜无主 {unk_total}）")
+                    if page_all_older and pages >= 2:
+                        logger.info("🎵 本页已全部早于 since，停止翻页")
+                        break
+                    if not has_more:
+                        break
+            except Exception as _fe:
+                # 403 耗尽等不再整条炸掉：记录后仍可走 DOM 兜底
+                f2_err = str(_fe)[:120]
+                logger.warning(f"🎵 f2 枚举失败：{f2_err}")
+            # 第三兜底（2026-10-05 实测）：列表接口被风控「服务异常」时，
+            # 作者页 SSR 直出的作品网格仍可收割。仅限无 since 模式——DOM
+            # 链接无发布时间，since 过滤会全剔；作品网格里的链接全是作者
+            # 本人作品（user-post-list 容器），直接标注 sec_uid 过原创关；
+            # 无 create_time → 文件名日期退化为入队日，判重保证重发可补齐
+            dom_err = None
+            if since is None and (f2_err or (not all_awemes and pages == 0)):
+                dom_items = None
+                for _attempt in (1, 2):
+                    try:
+                        dom_items, dom_err = await \
+                            harvest_author_links_via_chrome(sec_uid)
+                    except Exception as _de:
+                        dom_items, dom_err = None, str(_de)[:120]
+                    if dom_items or "验证码" in (dom_err or ""):
+                        break
+                    if _attempt == 1:
+                        logger.warning(
+                            f"🎵 DOM 兜底第 1 次失败（{dom_err}），"
+                            "20s 后换新 tab 重试一次")
+                        await asyncio.sleep(20)
+                if dom_items:
+                    for _a in dom_items:
+                        _a["author_sec_uid"] = sec_uid
+                    all_awemes.extend(dom_items)
+                    enum_via = "Chrome DOM 兜底"
+                    dom_rescued = True
+                    logger.warning(
+                        f"🎵 列表接口不可用，DOM 兜底收割 {len(dom_items)} 条"
+                        "（页面直出，可能不全；判重保证稍后重发可补齐）")
+            if not all_awemes:
+                parts = [f"Chrome 钩子：{chrome_err or '—'}",
+                         f"f2 直连：{f2_err or '空结果'}"]
+                if since is None:
+                    parts.append(f"DOM 兜底：{dom_err or '空结果'}")
+                text = ("❌ 枚举全部失败\n\n" + "\n".join(parts) +
+                        "\n\n（列表接口被风控通常稍后自行恢复；也可到 "
+                        "Agent Chrome 窗口手动打开一次该作者页再重发）")
                 try:
                     await notify.notify_user(text)
                 except Exception:
@@ -1014,9 +1054,12 @@ async def _run_dyu_inner(url, subdir_raw, since=None, original_only=True):
     target = f"下载/抖音/{subdir}" if subdir else "下载/抖音"
     since_line = (f"范围：{since:%Y-%m-%d} 之后\n" if since else "")
     orig_line = ("内容：仅原创作品\n" if original_only else "")
+    rescue_line = ("⚠️ 列表接口被风控，本次走页面直出兜底：可能不全，"
+                   "稍后重发可补齐（判重）\n" if dom_rescued else "")
     text = (f"🎵 抖音作者批量任务已开始\n\n"
             f"作者：{label}\n"
             f"{since_line}{orig_line}"
+            f"{rescue_line}"
             f"作品：{found} 个｜新入队 {queued}｜跳过已下载 {skipped}"
             f"｜枚举：{enum_via}\n"
             f"目录：{target}\n"

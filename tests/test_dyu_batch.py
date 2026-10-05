@@ -567,5 +567,125 @@ class ManualCommandTest(unittest.TestCase):
         self.assertIn("更新记录", content)          # 长期维护表在
 
 
+class DomRescueTest(unittest.IsolatedAsyncioTestCase):
+    """第三兜底（2026-10-05）：钩子+f2 全挂时，无 since 模式落 DOM 收割。
+
+    列表接口被风控「服务异常」时作者页 SSR 直出的作品网格仍可用；
+    网格链接全是作者本人作品 → 标注 sec_uid 过原创关；有 since 时不可
+    用（DOM 无发布时间，过滤会全剔）——必须如实报失败而不是假成功。
+    """
+
+    SEC = "MS4wLjABAAAAtest"
+
+    def _patched(self, hook, f2, dom):
+        import contextlib
+
+        async def _sec(url):
+            return self.SEC
+
+        async def _nick(uid):
+            return "x优"
+
+        async def _noop_notify(text):
+            self._notified = text
+
+        async def _enqueue(record):
+            self._enqueued.append(record)
+
+        @contextlib.contextmanager
+        def _ctx():
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    douyin_batch, "get_sec_user_id", _sec))
+                stack.enter_context(mock.patch.object(
+                    douyin_batch, "fetch_author_nickname", _nick))
+                stack.enter_context(mock.patch.object(
+                    douyin_batch, "notify",
+                    mock.Mock(notify_user=_noop_notify)))
+                stack.enter_context(mock.patch.object(
+                    queue_mod, "enqueue_and_start", _enqueue))
+                if hook is not None:
+                    stack.enter_context(mock.patch.object(
+                        douyin_batch, "harvest_author_awemes_via_chrome",
+                        hook))
+                if f2 is not None:
+                    stack.enter_context(mock.patch.object(
+                        douyin_batch, "enumerate_author_posts", f2))
+                if dom is not None:
+                    stack.enter_context(mock.patch.object(
+                        douyin_batch, "harvest_author_links_via_chrome",
+                        dom))
+                yield
+
+        return _ctx()
+
+    async def test_rescues_via_dom_and_flags_summary(self):
+        async def _hook(uid):
+            return None, "页面未渲染（DOM=8，捕获 0 批）"
+
+        async def _f2(uid):
+            raise RuntimeError("f2 枚举连续被 403 拒绝")
+            yield  # noqa: 器语法要求
+
+        async def _dom(uid):
+            return [{"aweme_id": "111", "desc": "视频一"},
+                    {"aweme_id": "222", "desc": ""}], None
+
+        self._enqueued, self._notified = [], None
+        with self._patched(_hook, _f2, _dom):
+            text = await douyin_batch._run_dyu_inner(
+                "https://v.douyin.com/x/", None, since=None,
+                original_only=True)
+        self.assertEqual(len(self._enqueued), 2)
+        for r in self._enqueued:
+            self.assertTrue(r["dedup_key"].startswith("dyc:"))
+            self.assertTrue(r["url"].startswith("https://www.douyin.com"))
+        self.assertIn("Chrome DOM 兜底", text)
+        self.assertIn("可能不全", text)
+        self.assertEqual(self._notified, text)
+
+    async def test_since_mode_skips_dom_rescue(self):
+        async def _hook(uid):
+            return None, "页面未渲染"
+
+        async def _f2(uid):
+            raise RuntimeError("403")
+            yield  # noqa: 器语法要求
+
+        async def _dom(uid):
+            raise AssertionError("since 模式不得走 DOM 兜底")
+
+        from datetime import datetime as _dt
+        self._enqueued, self._notified = [], None
+        with self._patched(_hook, _f2, _dom):
+            text = await douyin_batch._run_dyu_inner(
+                "https://v.douyin.com/x/", None, since=_dt(2026, 9, 1),
+                original_only=True)
+        self.assertEqual(self._enqueued, [])
+        self.assertIn("枚举全部失败", text)
+        self.assertNotIn("DOM 兜底：", text)   # DOM 兜底压根没尝试
+
+    async def test_dom_rescue_empty_reports_all_three(self):
+        async def _hook(uid):
+            return None, "Target crashed"
+
+        async def _f2(uid):
+            raise RuntimeError("403")
+            yield  # noqa: 器语法要求
+
+        async def _dom(uid):
+            return None, "页面未渲染出作品"
+
+        self._enqueued, self._notified = [], None
+        with self._patched(_hook, _f2, _dom):
+            text = await douyin_batch._run_dyu_inner(
+                "https://v.douyin.com/x/", None, since=None,
+                original_only=True)
+        self.assertEqual(self._enqueued, [])
+        for part in ("Chrome 钩子：Target crashed", "f2 直连：403",
+                     "DOM 兜底：页面未渲染出作品"):
+            self.assertIn(part, text)
+
+
 if __name__ == "__main__":
     unittest.main()
