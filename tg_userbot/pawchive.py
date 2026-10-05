@@ -452,13 +452,16 @@ async def ack_stale_creators(reply):
 # 帖子 / 收藏 / 外链
 # ============================================================
 def fetch_creator_posts(service, creator_id, cookie=None, progress=None,
-                        known_ids=None):
-    """分页拉取创作者帖子；**整页均已入库时提前停止**（增量扫描）。
+                        known_ids=None, until_date=None):
+    """分页拉取创作者帖子；两种提前停止：增量早停 + until_date 边界。
 
-    帖子按发布时间倒序返回；**连续两整页均已入库**才提前停止——单页假象
-    （站点排序抖动/补传插页）不会导致漏数据，任何未见过的帖子都会让扫描
-    继续。正确性锚点仍是入库时的 INSERT OR IGNORE 唯一索引；提前停止只是
-    省请求，绝不影响完整性。known_ids=None 时全量分页（首扫）。
+    帖子按发布时间倒序返回：
+    - 增量早停：**连续两整页均已入库**才提前停止——单页假象（站点排序
+      抖动/补传插页）不会导致漏数据。known_ids=None 时全量分页（首扫）。
+    - since 模式（until_date=YYYY-MM-DD）：页内任一帖 published 早于
+      该日期即停止翻页——API 按发布时间倒序，越翻越旧，边界之后全是
+      更老的帖子，无需继续。省掉 600 条级别的无效翻页（2026-09-28
+      Ecchy18 实测：since 边界在 12 页之外，白翻 590 条老帖）。
     """
     posts, offset = [], 0
     all_known_pages = 0
@@ -469,6 +472,14 @@ def fetch_creator_posts(service, creator_id, cookie=None, progress=None,
         posts.extend(page)
         if progress:
             progress(f"已拉取 {len(posts)} 条")
+        # since 边界：本页出现早于 until_date 的帖子（API 倒序 → 之后全是
+        # 更老的）即停，但**本页中晚于边界的数据已收下**，不丢
+        if until_date and page and any(
+                (p.get("published") or "")[:10] < until_date for p in page):
+            logger.info(
+                f"🐾 since 边界触及（{until_date}，offset {offset}），"
+                f"停止翻页，共拉取 {len(posts)} 条")
+            return posts
         if known_ids is not None and page and all(
                 str(p["id"]) in known_ids for p in page):
             all_known_pages += 1
@@ -870,7 +881,8 @@ async def _scan_and_notify(creator, scope, since=None):
         _scan_stage("拉取帖子")()
         posts = await asyncio.to_thread(
             fetch_creator_posts, creator["service"], creator["id"], cookie,
-            progress=_scan_stage("拉取帖子"), known_ids=known_ids)
+            progress=_scan_stage("拉取帖子"), known_ids=known_ids,
+            until_date=since)
         if cookie:
             _scan_stage("收藏对比")(
                 f"共 {len(posts)} 帖，拉取收藏清单（较慢）")

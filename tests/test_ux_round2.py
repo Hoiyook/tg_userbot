@@ -495,7 +495,7 @@ class ScanProgressTest(unittest.IsolatedAsyncioTestCase):
         creator = {"id": "46802018", "name": "MofuMochii", "service": "patreon"}
 
         def fake_fetch(service, cid, cookie=None, progress=None,
-                       known_ids=None):
+                       known_ids=None, until_date=None):
             if progress:
                 progress("已拉取 120 条")
             return [{"id": 1, "title": "t"}]
@@ -4322,3 +4322,42 @@ class MemoCommandTest(unittest.TestCase):
         # paw 家族在 pawchive.command_reply 分发、help/start 有专门分支
         self.assertEqual(missing, set(),
                          f"面板命令无 dispatch: {sorted(missing)}")
+
+
+class UntilDateEarlyStopTest(unittest.TestCase):
+    """since 模式翻页边界：触到早于 until_date 的帖子即停止翻页。"""
+
+    def _fake_pages(self, pages):
+        """构造分页假 HTTP：pages 是 [[{published}...], ...] 逐页返回。"""
+        calls = {"offset": []}
+
+        def fake_http(url, cookie=None, timeout=90):
+            offset = int(url.split("o=")[1])
+            calls["offset"].append(offset)
+            return pages[offset // 50] if offset // 50 < len(pages) else []
+        return fake_http, calls
+
+    def test_stops_at_since_boundary(self):
+        import itertools
+        # 首页必须满页（_PAGE=50）才会翻第 2 页
+        p1 = [{"published": f"2026-10-0{1 + i // 25}T00:00:00", "id": str(i)}
+              for i in range(50)]
+        p2 = [{"published": "2026-09-20T00:00:00", "id": "3"},
+              {"published": "2026-09-25T00:00:00", "id": "4"}]  # 越界页
+        fake_http, calls = self._fake_pages([p1, p2])
+        with mock.patch.object(pawchive, "_http_get_json", fake_http):
+            posts = pawchive.fetch_creator_posts(
+                "patreon", "1", until_date="2026-09-29")
+        # 第 2 页出现越界帖即停（共 2 次请求，第 3 页永不请求）
+        self.assertEqual(len(calls["offset"]), 2)
+        # raw 分页整页返回（含越界页），新帖筛选交给 build_scan_records
+        self.assertEqual(len(posts), 52)
+
+    def test_no_until_date_full_pagination(self):
+        """未指定 until_date：保持原全量分页行为（不提前停）。"""
+        fake_http, calls = self._fake_pages(
+            [[{"published": "2020-01-01T00:00:00", "id": str(i)}
+              for i in range(50)]])
+        with mock.patch.object(pawchive, "_http_get_json", fake_http):
+            pawchive.fetch_creator_posts("patreon", "1")
+        self.assertGreaterEqual(len(calls["offset"]), 2)
