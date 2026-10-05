@@ -893,8 +893,23 @@ async def _run_dyu_inner(url, subdir_raw, since=None, original_only=True):
         # 第 2 顺位：f2 直连（Argus 收紧前可用，保留作回落）。
         # 第 3 顺位：DOM href 收割无字段——本模式不可用，如实报错。
         enum_via = "Chrome 钩子"
-        harvested, chrome_err = await harvest_author_awemes_via_chrome(
-            sec_uid)
+        harvested, chrome_err = None, None
+        for _attempt in (1, 2):
+            try:
+                harvested, chrome_err = await \
+                    harvest_author_awemes_via_chrome(sec_uid)
+            except Exception as _he:
+                # 2026-10-05 实测：Target crashed / CDP 应答超时是 tab 级
+                # 瞬态故障，但异常会整条 /dyu 直接死掉（连 f2 回落都不
+                # 走）——收编为软失败，换新 tab 重试一次
+                harvested, chrome_err = None, str(_he)[:120]
+            if harvested is not None or "验证码" in (chrome_err or ""):
+                break
+            if _attempt == 1:
+                logger.warning(
+                    f"🎵 钩子收割第 1 次失败（{chrome_err}），"
+                    "20s 后换新 tab 重试一次")
+                await asyncio.sleep(20)
         if harvested is None:
             logger.warning(
                 f"🎵 钩子收割失败（{chrome_err}），降级 f2 枚举")
@@ -945,7 +960,22 @@ async def _run_dyu_inner(url, subdir_raw, since=None, original_only=True):
                 pass
             return text
     else:
-        harvested, chrome_err = await harvest_author_links_via_chrome(sec_uid)
+        # 与钩子收割同理：Target crashed / CDP 超时不许整条 /dyu 硬死，
+        # 收编为软失败并换新 tab 重试一次，仍败才落 f2 兜底
+        harvested, chrome_err = None, None
+        for _attempt in (1, 2):
+            try:
+                harvested, chrome_err = await \
+                    harvest_author_links_via_chrome(sec_uid)
+            except Exception as _he:
+                harvested, chrome_err = None, str(_he)[:120]
+            if harvested is not None:
+                break
+            if _attempt == 1:
+                logger.warning(
+                    f"🎵 DOM 收割第 1 次失败（{chrome_err}），"
+                    "20s 后换新 tab 重试一次")
+                await asyncio.sleep(20)
         if harvested is not None:
             all_awemes = harvested
             enum_via = "Chrome DOM"

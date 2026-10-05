@@ -480,6 +480,38 @@ def sweep_orphan_partials(download_dir, tasks,
     return removed
 
 
+async def sweep_orphan_iwara_tabs(cdp, host, port):
+    """Agent 启动时关掉上个进程遗留的 iwara 视频标签页。
+
+    iwara 下载 tab 在 run_download_attempt 的 finally 里必关；Agent 进程
+    中途被杀时 finally 不执行 → tab 泄漏成孤儿。视频页内存重，孤儿累积
+    拖累整浏览器的渲染进程稳定（2026-10-05 实测：两个孤儿 tab 遗留一天
+    多，同日 /dyu 连续 Target crashed）。启动时本进程还没有任何任务在
+    跑、恢复判定的任务也尚未开 tab，凡 iwara.tv 的 page 必是孤儿，全关；
+    douyin tab（msToken 保鲜）与用户手开的 tab 不动。
+    """
+    try:
+        targets = await asyncio.to_thread(
+            _http_get_json, f"http://{host}:{port}/json/list") or []
+    except Exception as e:
+        logger.warning(f"🧹 孤儿 iwara tab 清扫失败（不阻塞启动）：{e}")
+        return
+    closed = 0
+    for t in targets:
+        if t.get("type") != "page":
+            continue
+        url = t.get("url") or ""
+        if "iwara.tv" not in url:
+            continue
+        try:
+            await cdp.close_tab(t["id"])
+            closed += 1
+        except Exception:
+            pass
+    if closed:
+        logger.info(f"🧹 关闭遗留 iwara 标签页 {closed} 个")
+
+
 async def _next_event_or_cancel(cdp, timeout, cancel_task):
     """等下一个 CDP 事件；取消请求到达则返回 `_CANCEL_SENTINEL`（§13）。
 
@@ -1120,6 +1152,7 @@ async def agent_main():
     save_tasks(tasks, CHROME_TASKS_FILE)
     # 恢复判定之后再扫：非终态任务（含刚被恢复成 PENDING 的）的半成品要留着
     sweep_orphan_partials(CHROME_DOWNLOAD_DIR, tasks)
+    await sweep_orphan_iwara_tabs(client, CHROME_CDP_HOST, CHROME_CDP_PORT)
     try:
         while not stop.is_set():
             if not client.is_alive():
