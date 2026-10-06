@@ -725,5 +725,47 @@ class GatewayHeadersTest(unittest.TestCase):
         self.assertEqual(kw["headers"], {})
 
 
+class BatchLifecycleTest(unittest.TestCase):
+    """裸 /dyu 进度视图的生命周期记录（2026-10-06）。
+
+    队列只在任务执行中有货：枚举阶段、逐条销账出榜间隙、全部完成后队列
+    都是空的——裸 /dyu 若只看队列，进度视图会错落成用法说明。
+    """
+
+    def setUp(self):
+        douyin_batch._BATCH.update(
+            label=None, started_at=None, ended_at=None, note=None,
+            found=None, queued=None, skipped=None, enum_via=None,
+            rescued=False)
+
+    def test_fresh_process_shows_no_history(self):
+        self.assertFalse(douyin_batch.has_batch_history())
+
+    def test_start_makes_history_and_running_view(self):
+        douyin_batch.note_batch_start("x优")
+        self.assertTrue(douyin_batch.has_batch_history())
+        text = douyin_batch.status_text()
+        self.assertIn("批量进行中：x优", text)
+        self.assertIn("开始枚举", text)
+
+    def test_end_with_counts_shows_summary(self):
+        douyin_batch.note_batch_start("x优")
+        douyin_batch._BATCH.update(found=17, queued=17, skipped=0,
+                                   enum_via="f2", rescued=True)
+        douyin_batch.note_batch_end("入队 17/17，逐条下载中")
+        text = douyin_batch.status_text()
+        self.assertIn("上次批量：x优", text)
+        self.assertIn("枚举 17 ｜ 入队 17", text)
+        self.assertIn("页面直出兜底", text)
+        self.assertIn("入队 17/17", text)
+
+    def test_queue_rows_count_as_history(self):
+        with mock.patch.object(
+                douyin_batch.state, "QUEUE",
+                {"tasks": [{"serial": True, "source": "抖音作者合集",
+                            "id": "x"}], "retry": []}):
+            self.assertTrue(douyin_batch.has_batch_history())
+
+
 if __name__ == "__main__":
     unittest.main()

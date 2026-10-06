@@ -654,17 +654,10 @@ async def handle_command(event, cmd_text):
         url_arg, subdir_arg, since_arg, include_fwd = (
             douyin_batch.parse_dyu_command(cmd_text))
         if url_arg is None:
-            # 裸 /dyu：有批量任务在跑 → 进度视图；否则用法说明
-            try:
-                from tg_userbot import state as _st
-                rows = list(_st.QUEUE.get("tasks") or []) + \
-                    list(_st.QUEUE.get("retry") or [])
-                has_batch = any(r.get("serial")
-                                and r.get("source") == "抖音作者合集"
-                                for r in rows)
-            except Exception:
-                has_batch = False
-            if has_batch:
+            # 裸 /dyu：跑过批量（本进程记忆或队列有批量活）→ 进度视图；
+            # 从没用过 → 用法说明。进度视图内含批量生命周期行，队列空
+            # （枚举中/逐条销账间隙/全部完成）也能如实交代状态
+            if douyin_batch.has_batch_history():
                 await _reply(event, douyin_batch.status_text())
             else:
                 await _reply(event,

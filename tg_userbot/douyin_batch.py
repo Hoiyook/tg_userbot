@@ -158,6 +158,33 @@ def _work_url(aweme_id):
 # bot 回文本/超时不消费，TTL 过期自然作废，下一轮转交重盖）
 _BOT_STAMP = {"subdir": None, "aweme_id": None, "expires": 0.0}
 
+# 最近/当前批量任务的生命周期（进程内记忆）。裸 /dyu 的进度视图靠它：
+# 队列只在「任务执行中」有货——枚举阶段、每条销账出榜后的间隙、全部
+# 完成后队列都是空的，只看队列会把进度视图错落成用法说明（2026-10-06）。
+_BATCH = {"label": None, "started_at": None, "ended_at": None, "note": None,
+          "found": None, "queued": None, "skipped": None,
+          "enum_via": None, "rescued": False}
+
+
+def note_batch_start(label):
+    _BATCH.update(label=label, started_at=time.time(), ended_at=None,
+                  note=None, found=None, queued=None, skipped=None,
+                  enum_via=None, rescued=False)
+
+
+def note_batch_end(note=None):
+    _BATCH.update(ended_at=time.time(), note=note)
+
+
+def has_batch_history():
+    """裸 /dyu 是否应显示进度视图：本进程跑过批量，或队列里还有批量活。"""
+    if _BATCH.get("label"):
+        return True
+    rows = list(state.QUEUE.get("tasks") or []) + \
+        list(state.QUEUE.get("retry") or [])
+    return any(r.get("serial") and r.get("source") == "抖音作者合集"
+               for r in rows)
+
 
 def stamp_next_bot_video(subdir, aweme_id, ttl=180.0):
     """登记：解析 bot 即将回流的下一个视频落 <抖音>/<subdir>/。"""
@@ -193,6 +220,24 @@ def status_text():
     executing = [r for r in mine if r.get("id") in state.EXECUTING]
     retry = [r for r in mine if r in (state.QUEUE.get("retry") or [])]
     lines = ["🎵 抖音作者批量进度", ""]
+    # 批量生命周期：进行中 / 上次结果——队列空（枚举中、逐条销账间隙、
+    # 全部完成）时这是唯一能说明「批量到底怎么样了」的信息
+    b = _BATCH
+    if b.get("label"):
+        if b.get("ended_at") is None:
+            lines.append(f"📌 批量进行中：{b['label']}"
+                         f"（{time.strftime('%H:%M:%S', time.localtime(b['started_at']))}"
+                         " 开始枚举；枚举阶段队列还看不到任务）")
+        else:
+            note = f"，{b['note']}" if b.get("note") else ""
+            lines.append(f"📌 上次批量：{b['label']}"
+                         f"（{time.strftime('%H:%M:%S', time.localtime(b['ended_at']))}"
+                         f" 枚举完成{note}）")
+        if b.get("found") is not None:
+            lines.append(f"枚举 {b['found']} ｜ 入队 {b['queued']}"
+                         f" ｜ 跳过已下载 {b['skipped']} ｜ 枚举路：{b['enum_via']}"
+                         + ("（页面直出兜底，可能不全）" if b.get("rescued") else ""))
+        lines.append("")
     lines.append(f"待下载 {len(pending)} · 下载中 {len(executing)}"
                  f" · 待重试 {len(retry)}")
     for r in executing[:2]:
@@ -876,6 +921,7 @@ async def run_dyu(url, subdir_raw, since=None, original_only=True):
                                         original_only)
         except Exception as e:
             logger.exception(f"🎵 /dyu 失败：{e}")
+            note_batch_end(f"失败：{type(e).__name__} {str(e)[:60]}")
             hint = ""
             if "403" in str(e):
                 hint = ("\n\n💡 403 风控：cookie/msToken 已失效。用 Chrome "
@@ -899,6 +945,7 @@ async def _run_dyu_inner(url, subdir_raw, since=None, original_only=True):
     subdir = sanitize_filename(subdir_raw) if subdir_raw else \
         (sanitize_filename(nickname) if nickname else "")
     label = nickname or sec_uid[:16]
+    note_batch_start(label)
     since_note = f"，since {since:%Y-%m-%d}" if since else ""
     orig_note = "，只要原创" if original_only else "，含转发"
     logger.info(f"🎵 /dyu 开始枚举：{label}{since_note}{orig_note}"
@@ -997,6 +1044,7 @@ async def _run_dyu_inner(url, subdir_raw, since=None, original_only=True):
                 text = ("❌ 枚举全部失败\n\n" + "\n".join(parts) +
                         "\n\n（列表接口被风控通常稍后自行恢复；也可到 "
                         "Agent Chrome 窗口手动打开一次该作者页再重发）")
+                note_batch_end("枚举全部失败")
                 try:
                     await notify.notify_user(text)
                 except Exception:
@@ -1013,6 +1061,7 @@ async def _run_dyu_inner(url, subdir_raw, since=None, original_only=True):
             text = (f"🎵 该作者没有符合条件的作品"
                     f"（{'since ' + format(since, '%Y-%m-%d') + ' 之后，' if since else ''}"
                     f"仅原创；转发 {fwd_total}｜无主 {unk_total}｜枚举：{enum_via}）")
+            note_batch_end("没有符合条件的作品")
             try:
                 await notify.notify_user(text)
             except Exception:
@@ -1069,12 +1118,15 @@ async def _run_dyu_inner(url, subdir_raw, since=None, original_only=True):
             logger.warning(
                 f"⚠️ 作品入队失败（继续下一条）：{a['aweme_id']} {e}")
     logger.info(f"🎵 入队进度：已发现 {found}（新 {queued} / 已有 {skipped}）")
+    _BATCH.update(found=found, queued=queued, skipped=skipped,
+                  enum_via=enum_via, rescued=dom_rescued)
 
     target = f"下载/抖音/{subdir}" if subdir else "下载/抖音"
     since_line = (f"范围：{since:%Y-%m-%d} 之后\n" if since else "")
     orig_line = ("内容：仅原创作品\n" if original_only else "")
     rescue_line = ("⚠️ 列表接口被风控，本次走页面直出兜底：可能不全，"
                    "稍后重发可补齐（判重）\n" if dom_rescued else "")
+    note_batch_end(f"入队 {queued}/{found}，逐条下载中")
     text = (f"🎵 抖音作者批量任务已开始\n\n"
             f"作者：{label}\n"
             f"{since_line}{orig_line}"
