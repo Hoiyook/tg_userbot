@@ -139,14 +139,15 @@ def configure(log_file: str, retention_days: int = 7) -> None:
     console_handler.setFormatter(_make_formatter())
     logger.addHandler(console_handler)
 
-    # telethon 底层日志（WARNING）接进同一文件：下载连败时 Telethon 只在
-    # 最外层抛 ValueError('Request was unsuccessful N time(s)')，真正的
-    # 错误类（ServerError/Interdc/TimedOut…）只在它自己的 WARNING 里——
-    # 不接线就永远只能看到被吞掉根因的空壳错误（2026-10-06 Opalu 案排查
-    # 时被迫去 userbot.out 里考古）。文件 handler 独立挂，不随 configure
-    # 清理逻辑反复摘挂； propagate 关掉避免落回 stderr 无时间戳散行。
+    # telethon 底层日志（INFO）接进同一文件：下载连败时 Telethon 只在最外层
+    # 抛 ValueError('Request was unsuccessful N time(s)')，真正的错误类只在
+    # 它自己的日志里——且 FLOOD_WAIT 分支日志是 INFO 级（WARNING 看不见，
+    # 2026-10-06 Opalu 案：6 连败全是 flood 静默睡眠，42s 耗尽无一行警告）。
+    # telethon INFO 量少且句句有用（flood 等待/授权导出/超时重试）。文件
+    # handler 独立挂，不随 configure 清理逻辑反复摘挂；propagate 关掉避免
+    # 落回 stderr 无时间戳散行。
     tl = logging.getLogger("telethon")
-    tl.setLevel(logging.WARNING)
+    tl.setLevel(logging.INFO)
     tl.propagate = False
     for old in list(tl.handlers):
         tl.removeHandler(old)
