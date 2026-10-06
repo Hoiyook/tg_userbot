@@ -687,5 +687,43 @@ class DomRescueTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn(part, text)
 
 
+class GatewayHeadersTest(unittest.TestCase):
+    """f2 直连网关头（2026-10-06）：UIFID 从 cookie 派生为 uifid 请求头。
+
+    抖音列表接口网关要求 uifid + x-tt-argus 请求头，缺了一律 403（f2 上游
+    PR #446 方案，未合入装的 0.0.1.6，由我们派生注入）。
+    """
+
+    def test_derives_from_uifid_cookie(self):
+        h = douyin_batch._gateway_headers(
+            "sessionid=abc; UIFID=gateway-id; ttwid=browser")
+        self.assertEqual(h, {"uifid": "gateway-id", "x-tt-argus": "1"})
+
+    def test_case_insensitive_and_no_uifid(self):
+        self.assertEqual(
+            douyin_batch._gateway_headers("uifid=lower"), 
+            {"uifid": "lower", "x-tt-argus": "1"})
+        self.assertEqual(douyin_batch._gateway_headers("sessionid=s"), {})
+        self.assertEqual(douyin_batch._gateway_headers(""), {})
+        self.assertEqual(douyin_batch._gateway_headers(None), {})
+
+    def test_handler_kwargs_wires_and_config_wins(self):
+        with mock.patch.object(config, "DOUYIN_COOKIE",
+                               "sessionid=s; UIFID=cookie-id"), \
+             mock.patch.object(config, "DOUYIN_HEADERS",
+                               {"uifid": "explicit", "User-Agent": "UA"}):
+            kw = douyin_batch._handler_kwargs()
+        self.assertEqual(kw["cookie"], "sessionid=s; UIFID=cookie-id")
+        # 显式配置压过派生值，未覆盖的 x-tt-argus 保留
+        self.assertEqual(kw["headers"], {
+            "uifid": "explicit", "x-tt-argus": "1", "User-Agent": "UA"})
+
+    def test_handler_kwargs_without_uifid(self):
+        with mock.patch.object(config, "DOUYIN_COOKIE", "sessionid=s"), \
+             mock.patch.object(config, "DOUYIN_HEADERS", {}):
+            kw = douyin_batch._handler_kwargs()
+        self.assertEqual(kw["headers"], {})
+
+
 if __name__ == "__main__":
     unittest.main()

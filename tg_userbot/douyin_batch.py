@@ -117,11 +117,30 @@ async def refresh_cookie_from_browser():
     return True
 
 
+def _gateway_headers(cookie):
+    """抖音列表接口网关头（f2 上游 PR #446 的方案，未合入装的 0.0.1.6）。
+
+    2026-10-06 实测：列表接口一律 403，原因是网关要求把 cookie 里的 UIFID
+    同时作为 uifid 请求头发送，外加 x-tt-argus: 1（列表端点只验存在不验
+    签名，字面量即可）。cookie 没有 UIFID（游客/旧 cookie）时不加。
+    """
+    for part in (cookie or "").split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.strip().split("=", 1)
+        if name.strip().casefold() == "uifid" and value.strip():
+            return {"uifid": value.strip(), "x-tt-argus": "1"}
+    return {}
+
+
 def _handler_kwargs():
     """f2 DouyinHandler 配置：cookie 调用时读（/cookie 与浏览器保鲜立即生效）。"""
+    cookie = getattr(config, "DOUYIN_COOKIE", "") or ""
+    headers = _gateway_headers(cookie)
+    headers.update(dict(getattr(config, "DOUYIN_HEADERS", {})))  # 显式配置优先
     return {
-        "cookie": getattr(config, "DOUYIN_COOKIE", "") or "",
-        "headers": dict(getattr(config, "DOUYIN_HEADERS", {})),
+        "cookie": cookie,
+        "headers": headers,
         "proxies": {"http://": None, "https://": None},   # 境内服务直连
         "timeout": 15,
         "max_retries": 2,
