@@ -402,6 +402,46 @@ class TestDropExportedSender(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(download._media_dc_id(None))
 
 
+class TestForceReconnect(unittest.IsolatedAsyncioTestCase):
+    """零推进强制重建连接（2026-10-06）：is_connected() 对黑洞 TCP 恒真，
+    普通「断了才连」分支永远不触发——force 时必须无条件断开重连。"""
+
+    def _transfer(self, calls, connected=True):
+        state = {"up": connected}
+
+        class _T:
+            def is_connected(self):
+                return state["up"]
+
+            async def disconnect(self):
+                calls.append("disconnect")
+                state["up"] = False
+
+            async def connect(self):
+                calls.append("connect")
+                state["up"] = True
+        return _T()
+
+    async def test_force_reconnects_even_when_connected(self):
+        calls = []
+        t = self._transfer(calls, connected=True)
+        with mock.patch.object(download.asyncio, "sleep",
+                               mock.AsyncMock()), \
+             mock.patch.object(download.state, "client", t, create=True):
+            await download._sleep_and_reconnect(None, force=True)
+        self.assertEqual(calls, ["disconnect", "connect"])
+
+    async def test_non_force_keeps_live_connection(self):
+        calls = []
+        t = self._transfer(calls, connected=True)
+        with mock.patch.object(download.asyncio, "sleep",
+                               mock.AsyncMock()), \
+             mock.patch.object(download.state, "client", t, create=True):
+            await download._sleep_and_reconnect(None, force=False)
+        self.assertEqual(calls, [])
+
+
 if __name__ == "__main__":
+
 
     unittest.main()

@@ -586,15 +586,25 @@ async def download_url_media(record):
             _RESERVED_FINAL_PATHS.discard(final_path)
 
 
-async def _sleep_and_reconnect(worker):
-    """重试前的固定 3 秒等待；传字节的连接（worker 或主客户端）断开则重连。"""
+async def _sleep_and_reconnect(worker, force=False):
+    """重试前的固定 3 秒等待；force（零推进）或已断开时重建传字节连接。
+
+    force 的理由（2026-10-06 Opalu 案）：worker 的 TCP 被代理掐流后表面
+    存活实际黑洞——is_connected() 照样 True，普通重连分支永远不触发，
+    重试全撞同一条死路（0 字节连败 18 次，同分钟其他 worker 照常成功）。
+    零推进 = 这条 socket 上一个字节都拿不到，唯有换新 socket 才可能换
+    到活路由。文件多半在 home DC（不走跨 DC 导出），主连接就是传输路。
+    """
     logger.info("🔄 3 秒后重试下载...")
     await asyncio.sleep(3)
     transfer = worker or state.client
     try:
+        if force and transfer.is_connected():
+            logger.info("🔌 零推进，强制重建传输连接（换新路由）...")
+            await transfer.disconnect()
         if not transfer.is_connected():
             logger.info("🔌 Telegram 连接已断开，正在重新连接...")
-            await transfer.connect()
+            await asyncio.wait_for(transfer.connect(), timeout=30)
             logger.info("✅ Telegram 重新连接成功")
             workers.mark_healthy(worker)
     except Exception as e:
@@ -1200,11 +1210,12 @@ async def download_file(message, source_override=None, caption_override=None,
                         # 否则同一失效引用会把剩余重试次数原样烧完
                         message = await _refresh_message(message)
                     if gained <= 0:
-                        # 零推进 = 这次尝试一个字节都没拿到：毒多半在跨 DC
-                        # 缓存 sender（原样复用死路由），丢掉换新（2026-10-06）
+                        # 零推进 = 这次尝试一个字节都没拿到：毒多半在缓存
+                        # 连接上（跨 DC 导出 sender 或 worker 主连接黑洞），
+                        # 丢缓存 sender + 强制重建连接，双管齐下换新路由
                         await _drop_exported_sender(
                             worker or state.client, _media_dc_id(message))
-                    await _sleep_and_reconnect(worker)
+                    await _sleep_and_reconnect(worker, force=(gained <= 0))
 
                 except Exception as e:
                     last_err = f"{type(e).__name__}: {e}"
@@ -1221,7 +1232,7 @@ async def download_file(message, source_override=None, caption_override=None,
                     if gained <= 0:
                         await _drop_exported_sender(
                             worker or state.client, _media_dc_id(message))
-                    await _sleep_and_reconnect(worker)
+                    await _sleep_and_reconnect(worker, force=(gained <= 0))
 
             logger.error("❌ 已达到最大重试次数，下载失败")
 
