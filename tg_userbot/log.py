@@ -138,3 +138,20 @@ def configure(log_file: str, retention_days: int = 7) -> None:
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(_make_formatter())
     logger.addHandler(console_handler)
+
+    # telethon 底层日志（WARNING）接进同一文件：下载连败时 Telethon 只在
+    # 最外层抛 ValueError('Request was unsuccessful N time(s)')，真正的
+    # 错误类（ServerError/Interdc/TimedOut…）只在它自己的 WARNING 里——
+    # 不接线就永远只能看到被吞掉根因的空壳错误（2026-10-06 Opalu 案排查
+    # 时被迫去 userbot.out 里考古）。文件 handler 独立挂，不随 configure
+    # 清理逻辑反复摘挂； propagate 关掉避免落回 stderr 无时间戳散行。
+    tl = logging.getLogger("telethon")
+    tl.setLevel(logging.WARNING)
+    tl.propagate = False
+    for old in list(tl.handlers):
+        tl.removeHandler(old)
+        try:
+            old.close()
+        except Exception:
+            pass
+    tl.addHandler(file_handler)

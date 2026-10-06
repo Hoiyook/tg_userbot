@@ -349,5 +349,59 @@ class TestTerminalQueueRemoval(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(state.QUEUE["retry"]), 1)
 
 
+class TestDropExportedSender(unittest.IsolatedAsyncioTestCase):
+    """零推进时丢弃跨 DC 导出 sender（2026-10-06 Opalu 案）。
+
+    telethon 对「还连着」的缓存 sender 原样复用（need_connect 只看标志，
+    不验活）：代理掐流后 TCP 表面存活实际黑洞，重试永远撞同一条死路。
+    丢弃后下次下载重新导出授权、新建 TCP 路由。
+    """
+
+    class _FakeBorrowState:
+        def __init__(self, n=0):
+            self._n = n
+
+    class _FakeSender:
+        def __init__(self):
+            self.disconnected = False
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    class _FakeClient:
+        def __init__(self, senders):
+            self._borrowed_senders = senders
+
+    async def test_evicts_idle_sender_and_disconnects(self):
+        sender = self._FakeSender()
+        client = self._FakeClient(
+            {2: (self._FakeBorrowState(n=0), sender)})
+        await download._drop_exported_sender(client, 2)
+        self.assertTrue(sender.disconnected)
+        self.assertNotIn(2, client._borrowed_senders)
+
+    async def test_skips_when_borrow_still_out(self):
+        # 有并发借用时不丢弃：telethon 归还时会 KeyError
+        sender = self._FakeSender()
+        client = self._FakeClient(
+            {2: (self._FakeBorrowState(n=1), sender)})
+        await download._drop_exported_sender(client, 2)
+        self.assertFalse(sender.disconnected)
+        self.assertIn(2, client._borrowed_senders)
+
+    async def test_noop_cases(self):
+        await download._drop_exported_sender(None, 2)          # 无客户端
+        await download._drop_exported_sender(self._FakeClient({}), 2)  # 无缓存
+        await download._drop_exported_sender(
+            self._FakeClient({2: (self._FakeBorrowState(), self._FakeSender())}),
+            None)                                               # 本 DC 文件
+
+    def test_media_dc_id_without_media(self):
+        self.assertIsNone(download._media_dc_id(mock.Mock(document=None,
+                                                          photo=None)))
+        self.assertIsNone(download._media_dc_id(None))
+
+
 if __name__ == "__main__":
+
     unittest.main()

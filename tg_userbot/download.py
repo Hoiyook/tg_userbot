@@ -603,6 +603,52 @@ async def _sleep_and_reconnect(worker):
         logger.exception(f"重新连接 Telegram 失败：{e}")
 
 
+def _media_dc_id(message):
+    """消息媒体的所在 DC（跨 DC 文件才有意义；拿不到返回 None）。"""
+    try:
+        from telethon.utils import get_input_location
+        media = (getattr(message, "document", None)
+                 or getattr(message, "photo", None))
+        if media is None:
+            return None
+        dc_id, _loc = get_input_location(media)
+        return dc_id
+    except Exception:
+        return None
+
+
+async def _drop_exported_sender(client, dc_id):
+    """丢弃缓存的跨 DC 导出 sender，下次下载重新导出授权（新 TCP 新路由）。
+
+    2026-10-06 Opalu 案实测：跨 DC 文件零字节连败 6 轮 ×3 次尝试，同分钟
+    其他 DC 的下载照常成功、owner 手动下载正常——毒在 telethon 对该 DC
+    的缓存 sender 上。_borrow_exported_sender 对「还连着」的缓存 sender
+    原样复用（need_connect 只看 _connected 标志），代理掐流后 TCP 表面
+    存活实际黑洞，重试永远撞同一条死路。零推进时强制丢弃才可能换到活
+    路由；本 DC 文件（dc_id 为 None/与 home 相同）不走导出，无需处理。
+    """
+    if client is None or not dc_id:
+        return
+    borrowed = getattr(client, "_borrowed_senders", None)
+    if not borrowed:
+        return
+    entry = borrowed.get(dc_id)
+    if entry is None:
+        return
+    borrow_state, sender = entry
+    if getattr(borrow_state, "_n", 0) != 0:
+        # 同客户端还有并发借用（本 DC 其他下载在途）：丢弃会让它归还时
+        # KeyError，跳过本轮换路（该任务自己的重试会再触发）
+        return
+    borrowed.pop(dc_id, None)
+    try:
+        await sender.disconnect()
+    except Exception:
+        pass
+    logger.info(f"🔌 已丢弃 DC{dc_id} 的跨 DC 传输连接"
+                "（下轮重试重新导出授权、新建路由）")
+
+
 async def _refresh_message(message):
     """重取消息拿新鲜的 file_reference（引用失效类错误后的重试前置）。
 
@@ -1153,6 +1199,11 @@ async def download_file(message, source_override=None, caption_override=None,
                         # 引用已作废：先重取消息换新 file_reference 再重试，
                         # 否则同一失效引用会把剩余重试次数原样烧完
                         message = await _refresh_message(message)
+                    if gained <= 0:
+                        # 零推进 = 这次尝试一个字节都没拿到：毒多半在跨 DC
+                        # 缓存 sender（原样复用死路由），丢掉换新（2026-10-06）
+                        await _drop_exported_sender(
+                            worker or state.client, _media_dc_id(message))
                     await _sleep_and_reconnect(worker)
 
                 except Exception as e:
@@ -1167,8 +1218,10 @@ async def download_file(message, source_override=None, caption_override=None,
                     )
                     if attempt >= cap:
                         break
-                    logger.info("🔄 3 秒后重试下载...")
-                    await asyncio.sleep(3)
+                    if gained <= 0:
+                        await _drop_exported_sender(
+                            worker or state.client, _media_dc_id(message))
+                    await _sleep_and_reconnect(worker)
 
             logger.error("❌ 已达到最大重试次数，下载失败")
 
