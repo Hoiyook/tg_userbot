@@ -287,6 +287,20 @@ def _chrome_body_sep():
     return "\n\n──────\n\n" + chrome_client.load_cancelable_view()[0]
 
 
+# 待重试面板当前页码（点击条目 ▶️/❌ 后原地重渲染用——否则拿不到页码，
+# 只好弹回主页；_paged_lines/retry_menu_buttons 自带钳制，越界安全）
+_RETRY_PAGE = [1]
+
+
+def _retry_view(headline):
+    """待重试条目操作后的回执：确认行 + 当前页刷新视图（原地停留）。"""
+    page = _RETRY_PAGE[0]
+    return (
+        f"{headline}\n\n──────\n\n{queue.format_retry_text(state.QUEUE, page)}",
+        menu.retry_menu_buttons(page),
+    )
+
+
 async def handle_menu_action(action, arg, event):
     """按按钮动作执行并返回 (新文本, 新按钮)；返回 (None, None) 表示不改动消息。"""
     if action == "home":
@@ -796,9 +810,13 @@ async def handle_menu_action(action, arg, event):
         # 与 /queue del 同路：执行中的任务先真正取消在途下载再移除记录
         ok, removed, cancelled = await queue.queue_del_task(record_id=arg)
         if not ok:
-            return "❌ 任务已不存在", menu.back_home_buttons()
+            return "❌ 任务已不存在", menu.queue_menu_buttons()
         verb = "🛑 已取消下载并移除" if cancelled else "✅ 已从队列移除"
-        return f"{verb}：{removed.get('label', '')}", menu.back_home_buttons()
+        return (
+            f"{verb}：{removed.get('label', '')}\n\n──────\n\n"
+            + queue.format_queue_text(state.QUEUE),
+            menu.queue_menu_buttons(),
+        )
     if action == "capf":
         return caption_filter.rules_text(), menu.caption_filter_menu_buttons()
     if action in ("capf_add", "capf_del", "capf_test"):
@@ -893,6 +911,7 @@ async def handle_menu_action(action, arg, event):
             page = int(arg) if arg else 1
         except ValueError:
             page = 1
+        _RETRY_PAGE[0] = page
         return (
             queue.format_retry_text(state.QUEUE, page),
             menu.retry_menu_buttons(page),
@@ -903,24 +922,18 @@ async def handle_menu_action(action, arg, event):
                else "🔁 待重试列表为空（或都在执行中）")
         if over:
             msg += f"；另有 {over} 条超上限已跳过"
-        return (
-            msg,
-            menu.retry_menu_buttons(1),
-        )
+        return _retry_view(msg)
     if action == "retry_run":
         async with state.QUEUE_LOCK:
             record = next(
                 (r for r in state.QUEUE["retry"] if r.get("id") == arg), None
             )
         if record is None:
-            return "❌ 任务已不存在", menu.back_home_buttons()
+            return _retry_view("❌ 任务已不存在")
         if record["id"] in state.EXECUTING:
-            return "⏳ 该任务正在执行中", menu.back_home_buttons()
+            return _retry_view("⏳ 该任务正在执行中")
         queue.spawn_execute(record)
-        return (
-            f"▶️ 已重新执行：{record.get('label', '')}",
-            menu.back_home_buttons(),
-        )
+        return _retry_view(f"▶️ 已重新执行：{record.get('label', '')}")
     if action == "retry_del":
         async with state.QUEUE_LOCK:
             before = len(state.QUEUE["retry"])
@@ -932,10 +945,10 @@ async def handle_menu_action(action, arg, event):
             removed_any = len(state.QUEUE["retry"]) != before
             if removed_any:
                 queue._save_after_mutation(removed, "delete")
-        return (
-            ("✅ 已从待重试列表移除" if removed_any else "❌ 任务已不存在"),
-            menu.back_home_buttons(),
-        )
+        if removed_any:
+            return _retry_view(
+                f"✅ 已从待重试列表移除：{removed.get('label', '')}")
+        return _retry_view("❌ 任务已不存在")
     if action == "back":
         _clear_input_states()
         listener.draft_cancel()

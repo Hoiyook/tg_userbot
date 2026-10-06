@@ -1406,3 +1406,75 @@ class InputWindowCancelCoverageTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(listener.draft_active())
         await bot.handle_menu_action("input_cancel", None, mock.MagicMock())
         self.assertFalse(listener.draft_active())
+
+
+class RetryPanelInPlaceRefreshTest(unittest.IsolatedAsyncioTestCase):
+    """待重试/队列条目操作后原地刷新列表（2026-10-06）。
+
+    ▶️ 重跑 / ❌ 移除原先返回 back_home_buttons——点一下就弹回主页，
+    多页列表操作一次按一次返回（用户实测反馈）。现在确认行 + 当前页
+    刷新视图，页码由 bot._RETRY_PAGE 记忆（翻到第几页操作后仍在第几页）。
+    """
+
+    def _make_record(self, i):
+        return {"id": f"rid{i}", "label": f"任务{i}", "attempts": 1,
+                "serial": True, "source": "测试"}
+
+    def setUp(self):
+        from tg_userbot import state as st
+        self._saved = (st.QUEUE, st.EXECUTING, st.QUEUE_LOCK)
+        self.records = [self._make_record(i) for i in range(12)]
+        st.QUEUE = {"tasks": [], "retry": list(self.records)}
+        st.EXECUTING = set()
+        st.QUEUE_LOCK = asyncio.Lock()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        from tg_userbot import state as st
+        st.QUEUE, st.EXECUTING, st.QUEUE_LOCK = self._saved
+        bot._RETRY_PAGE[0] = 1
+
+    async def test_retry_del_stays_on_list_page2(self):
+        target = self.records[10]["id"]          # 第 2 页的第 1 条
+        bot._RETRY_PAGE[0] = 2
+        text, buttons = await bot.handle_menu_action(
+            "retry_del", target, mock.MagicMock())
+        self.assertIn("已从待重试列表移除：任务10", text)
+        self.assertIn("待重试列表", text)
+        self.assertIn("第 2/2 页", text)          # 删后 11 条仍是 2 页，页码保持
+        self.assertIn("任务11", text)             # 第 2 页剩下的那条原地可见
+        self.assertIn("共 11 条", text)
+        flat = [b for row in buttons for b in row]
+        self.assertTrue(any("♻️ 全部重放" in b.text for b in flat),
+                        "应停留在待重试面板而不是回主页")
+
+    async def test_retry_run_stays_on_list(self):
+        target = self.records[0]["id"]
+        with mock.patch.object(bot.queue, "spawn_execute") as sp:
+            text, buttons = await bot.handle_menu_action(
+                "retry_run", target, mock.MagicMock())
+        sp.assert_called_once()
+        self.assertIn("已重新执行：任务0", text)
+        self.assertIn("待重试列表", text)
+        flat = [b for row in buttons for b in row]
+        self.assertTrue(any("♻️ 全部重放" in b.text for b in flat))
+
+    async def test_retry_del_missing_record_stays_on_list(self):
+        text, buttons = await bot.handle_menu_action(
+            "retry_del", "no-such-id", mock.MagicMock())
+        self.assertIn("任务已不存在", text)
+        self.assertIn("待重试列表", text)
+
+    async def test_queue_del_stays_on_queue(self):
+        from tg_userbot import state as st
+        st.QUEUE = {"tasks": [self._make_record(0)], "retry": []}
+        async def _fake_del(record_id=None, **kw):
+            return True, st.QUEUE["tasks"][0], False
+        with mock.patch.object(bot.queue, "queue_del_task", _fake_del):
+            text, buttons = await bot.handle_menu_action(
+                "queue_del", "rid0", mock.MagicMock())
+        self.assertIn("已从队列移除", text)
+        self.assertIn("下载队列", text)
+        flat = [b for row in buttons for b in row]
+        self.assertTrue(any("🔄 刷新" in b.text for b in flat),
+                        "应停留在队列面板而不是回主页")
