@@ -743,19 +743,15 @@ async def _pump_iter(client, media, path, total, start, progress):
             if not (total and offset < total):
                 break
             if not got_more:
-                # 服务器确认已到末尾（再请求立即 EOF）——这就是全部数据。
-                # 差距 ≤2% 按实际收尾；超限按失败重试（防截断假成功）
+                # 服务器确认已到末尾（再请求立即 EOF）——实际字节数就是
+                # Telegram 存储的完整文件，**声明元数据才是虚高的一方**
+                #（2026-10-07/08 两例：0.88% 与 6.8%，相对阈值证明不可行，
+                # 已废弃）——按实际大小收尾，完成通知会显示实际尺寸供核对
                 gap_pct = (total - offset) / total * 100
-                if gap_pct <= 2.0:
-                    logger.warning(
-                        f"ⓘ 服务器实际提供 {offset} 字节，与声明 {total} "
-                        f"差 {gap_pct:.2f}%（元数据虚高）——按实际大小收尾"
-                    )
-                else:
-                    raise ConnectionError(
-                        f"下载数据提前结束且服务器确认无更多"
-                        f"（{offset}/{total} 字节，差 {gap_pct:.1f}%），"
-                        "转续传重试")
+                logger.warning(
+                    f"ⓘ 服务器实际提供 {offset} 字节，与声明 {total} "
+                    f"差 {gap_pct:.2f}%（声明元数据虚高）——按实际大小收尾"
+                )
                 break
     return path
 

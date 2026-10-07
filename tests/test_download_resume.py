@@ -144,18 +144,32 @@ class TestPumpIter(unittest.IsolatedAsyncioTestCase):
         progress.assert_any_call(4, 6)
         progress.assert_any_call(6, 6)
 
-    async def test_short_read_over_gap_still_raises(self):
-        # 声明 10 只给 2（差 80%），探测轮也无更多数据 → 仍按失败重试
+    async def test_short_read_server_eof_accepts_actual(self):
+        # 声明 10 只给 2（差 80%），探测轮确认 EOF → 按实际收尾
+        # （服务器确认无更多 = 实际字节即完整文件，声明元数据是虚高方）
         part = os.path.join(_TMP, "pump_b.download")
         client = _FakeStreamClient([(b"AB", None),    # 首轮：2/10
                                     (None, None)])    # 探测：EOF 确认
         with mock.patch("telethon.utils.get_input_location",
-                        return_value=(2, None)), \
-             self.assertRaises(ConnectionError):
-            await download._pump_iter(client, object(), part, 10, 0,
-                                      mock.Mock())
-        # 短读的字节也要留在盘上（锚点），下次续传
+                        return_value=(2, None)):
+            out = await download._pump_iter(client, object(), part, 10, 0,
+                                            mock.Mock())
+        self.assertEqual(out, part)
         self.assertEqual(os.path.getsize(part), 2)
+
+    async def test_probe_with_data_continues_transfer(self):
+        # 传输截断（非元数据虚高）：探测轮出数据 → 续传追平到声明大小
+        part = os.path.join(_TMP, "pump_probe.download")
+        client = _FakeStreamClient([
+            ((b"A" * 40, None)),           # 首轮：40/100 断
+            ((b"B" * 60, None)),           # 探测轮：出剩余 60
+        ])
+        with mock.patch("telethon.utils.get_input_location",
+                        return_value=(2, None)):
+            out = await download._pump_iter(client, object(), part, 100, 0,
+                                            mock.Mock())
+        self.assertEqual(out, part)
+        self.assertEqual(os.path.getsize(part), 100)
 
     async def test_metadata_bloat_within_2pct_accepted(self):
         # 2026-10-07 生产案例：43KB JPG 声明 43690 实给 43305（差 0.88%）
