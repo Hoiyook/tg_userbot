@@ -144,9 +144,11 @@ class TestPumpIter(unittest.IsolatedAsyncioTestCase):
         progress.assert_any_call(4, 6)
         progress.assert_any_call(6, 6)
 
-    async def test_short_read_raises_connection_error(self):
+    async def test_short_read_over_gap_still_raises(self):
+        # 声明 10 只给 2（差 80%），探测轮也无更多数据 → 仍按失败重试
         part = os.path.join(_TMP, "pump_b.download")
-        client = _FakeStreamClient([(b"AB", None)])   # 声明 10 只给了 2
+        client = _FakeStreamClient([(b"AB", None),    # 首轮：2/10
+                                    (None, None)])    # 探测：EOF 确认
         with mock.patch("telethon.utils.get_input_location",
                         return_value=(2, None)), \
              self.assertRaises(ConnectionError):
@@ -154,6 +156,22 @@ class TestPumpIter(unittest.IsolatedAsyncioTestCase):
                                       mock.Mock())
         # 短读的字节也要留在盘上（锚点），下次续传
         self.assertEqual(os.path.getsize(part), 2)
+
+    async def test_metadata_bloat_within_2pct_accepted(self):
+        # 2026-10-07 生产案例：43KB JPG 声明 43690 实给 43305（差 0.88%）
+        # → 按实际大小收尾，不再死循环
+        part = os.path.join(_TMP, "pump_meta.download")
+        client = _FakeStreamClient([
+            ((b"A" * 43305, None)),        # 首轮：到 43305 提前结束
+            ((None, None)),                # 探测：EOF 确认
+        ])
+        # get_input_location 会被 mock 掉（基座）——本用例直调需自备
+        with mock.patch("telethon.utils.get_input_location",
+                        return_value=(2, None)):
+            out = await download._pump_iter(client, object(), part, 43690,
+                                            0, mock.Mock())
+        self.assertEqual(out, part)
+        self.assertEqual(os.path.getsize(part), 43305)
 
     async def test_fresh_start_uses_wb(self):
         part = os.path.join(_TMP, "pump_c.download")

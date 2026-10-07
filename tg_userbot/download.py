@@ -716,8 +716,14 @@ async def _pump_iter(client, media, path, total, start, progress):
     从 0 开始，掐一次白一次）。dc_id 取自 media 位置；跨 DC 时 telethon
     内部做授权导出，AuthBytesInvalidError 竞态由上层重试兜住。
 
-    服务器提前收流（loop 正常结束但字节数不够）转成 ConnectionError 走
-    重试分支续传——静默短读会造出不完整文件，违背数据准确性优先原则。
+    服务器提前收流（loop 正常结束但字节数不够）分两种，处理截然不同
+    （2026-10-07 生产实测：43KB JPG 声明 43690 实给 43305，重试从 43305
+    续传立即 EOF，死循环到上限）：
+      ① 传输截断——重新请求同 offset 能继续出数据 → 循环续传追平；
+      ② 声明大小虚高——再请求立即 EOF（服务器确认没有更多）→ 这就是
+         服务器上的完整数据。差距 ≤2% 时按实际大小收尾（与既有的
+         「实际<98% 声明」告警同一容忍线）；差距过大仍按失败重试
+         （防 21GB 包被截成 30MB 假成功）。
     成功返回 path（与 download_media 的成功返回值对齐）。
     """
     from telethon.utils import get_input_location
@@ -725,15 +731,32 @@ async def _pump_iter(client, media, path, total, start, progress):
     offset = start
     progress(offset, total)      # 续传基线立即上报（UI + 看门狗心跳）
     with open(path, "ab" if start else "wb") as f:
-        async for chunk in client.iter_download(
-            media, offset=offset, file_size=total, dc_id=dc_id,
-        ):
-            f.write(chunk)
-            offset += len(chunk)
-            progress(offset, total)
-    if total and offset < total:
-        raise ConnectionError(
-            f"下载数据提前结束（{offset}/{total} 字节），转续传重试")
+        while True:
+            got_more = False
+            async for chunk in client.iter_download(
+                media, offset=offset, file_size=total, dc_id=dc_id,
+            ):
+                f.write(chunk)
+                offset += len(chunk)
+                got_more = True
+                progress(offset, total)
+            if not (total and offset < total):
+                break
+            if not got_more:
+                # 服务器确认已到末尾（再请求立即 EOF）——这就是全部数据。
+                # 差距 ≤2% 按实际收尾；超限按失败重试（防截断假成功）
+                gap_pct = (total - offset) / total * 100
+                if gap_pct <= 2.0:
+                    logger.warning(
+                        f"ⓘ 服务器实际提供 {offset} 字节，与声明 {total} "
+                        f"差 {gap_pct:.2f}%（元数据虚高）——按实际大小收尾"
+                    )
+                else:
+                    raise ConnectionError(
+                        f"下载数据提前结束且服务器确认无更多"
+                        f"（{offset}/{total} 字节，差 {gap_pct:.1f}%），"
+                        "转续传重试")
+                break
     return path
 
 
