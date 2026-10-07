@@ -1246,6 +1246,19 @@ async def download_file(message, source_override=None, caption_override=None,
                     gained_total += max(gained, 0)
                     cap = DOWNLOAD_RETRIES + (
                         RESUME_EXTRA_RETRIES if gained_total > 0 else 0)
+                    # 底层 MTProto 请求 6 连败（telethon 内部已重试 6 次）：
+                    # 这条连接/DC 路由劣化——换一条 worker 连接再试
+                    # （2026-10-07 BlobCG 193M 案例每轮 0 字节推进连败）
+                    if "Request was unsuccessful" in last_err \
+                            and worker is not None:
+                        try:
+                            await workers.release(worker)
+                            worker = await workers.borrow()
+                            attach_download_worker(did, worker)
+                            logger.info("🔄 请求 6 连败（连接劣化），"
+                                        "已换一条下载连接重试")
+                        except Exception as rot_err:
+                            logger.warning(f"🔄 换下载连接失败：{rot_err}")
                     logger.exception(
                         f"❌ 下载出现未预期错误，尝试第 {attempt} 次"
                         f"（上限 {cap}，累计推进 {format_size(gained_total)}）：{e}"

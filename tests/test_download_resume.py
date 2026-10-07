@@ -225,6 +225,38 @@ class TestResumeWiring(_Base):
         self.assertEqual(len(client.calls), 1)   # 零进展不放宽：1 次即止
 
 
+class WorkerRotationTest(_Base):
+    """请求 6 连败 → 换一条 worker 连接重试（BlobCG 193M 案例）。"""
+
+    async def test_unsuccessful_request_rotates_worker(self):
+        msg = _FakeMessage(size=4096)
+        w1 = _FakeStreamClient([
+            ((None, ValueError("Request was unsuccessful 6 time(s)"))),
+            ((None, ValueError("Request was unsuccessful 6 time(s)")))])
+        w2 = _FakeStreamClient([
+            ((None, ValueError("Request was unsuccessful 6 time(s)"))),
+            ((None, ValueError("Request was unsuccessful 6 time(s)")))])
+        released = []
+        async def fake_release(w):
+            released.append(w)
+        # borrow 序列确定性：首借 w1，换线借 w2
+        b_mock = mock.Mock(side_effect=[w1, w2])
+        patches = [
+            mock.patch.object(download.workers, "borrow", new=b_mock),
+            mock.patch.object(download.workers, "release",
+                              side_effect=fake_release),
+            mock.patch.object(download, "DOWNLOAD_RETRIES", 2),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        result, _ = await self._run_download(w1, msg)
+        self.assertFalse(result)
+        # 换线时先释放劣化连接（收尾 finally 会再释放换上的 w2）
+        self.assertIs(released[0], w1)
+        self.assertEqual(len(w1.calls) + len(w2.calls), 2)
+
+
 class TestTerminalDeadMedia(_Base):
     """刷新引用后零字节 + 引用失效 → 终结性登记与明确通知。"""
 
