@@ -306,10 +306,14 @@ async def _verify_with_retry(tid, target_root, rel_files, content_dir,
     """
     from . import cd2_api
     if tries is None:
-        tries = int(getattr(config, "EXTRACT_VERIFY_TRIES", 6))
+        tries = int(getattr(config, "EXTRACT_VERIFY_TRIES", 9))
     if gap is None:
-        gap = float(getattr(config, "EXTRACT_VERIFY_GAP_SECONDS", 10.0))
+        gap = float(getattr(config, "EXTRACT_VERIFY_GAP_SECONDS", 15.0))
     for attempt in range(1, tries + 1):
+        if attempt > 1:
+            # 逐轮加倍：CD2 异步上传大树可能要几分钟到十几分钟，
+            # 固定短间隔的窗口不够（2026-10-09 E444：深层目录 60s 未落定）
+            gap = min(gap * 2, 120.0)
         # 注：不做「CD2 全局在途==0」的闸门——在途计数覆盖全盘（/dyu 视频等
         # 其他目录也在备份），永远可能 >0，会把本任务的对账轮次全烧在等待
         # 上。权威判据只有下面的逐文件尺寸对账，重试轮本身已覆盖「上传未
