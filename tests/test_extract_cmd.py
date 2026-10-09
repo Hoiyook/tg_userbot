@@ -177,6 +177,47 @@ class ScanEnqueueTest(CmdBase):
         self.assertIn("路径无效", out)
 
 
+class WatchTest(CmdBase):
+    """watch 登记目录：持久化 + 每小时自动扫描入队。"""
+
+    def test_watch_add_list_unwatch(self):
+        self._put_zip("云测试", "w1.zip", {"a": b"x"})
+        out = asyncio.run(ew.command_reply("/115x watch 云测试"))
+        self.assertIn("已登记 watch", out)
+        out = asyncio.run(ew.command_reply("/115x watch"))
+        self.assertIn("/115open/云测试", out)
+        # 重复登记 → 提示已存在
+        out = asyncio.run(ew.command_reply("/115x watch 云测试"))
+        self.assertIn("已在 watch", out)
+        # unwatch
+        out = asyncio.run(ew.command_reply("/115x unwatch 云测试"))
+        self.assertIn("已取消", out)
+        self.assertEqual(ew._WATCH_DIRS["dirs"], [])
+
+    def test_watch_scan_enqueues_new_archives(self):
+        size = self._put_zip("云测试", "auto.zip", {"a": b"x"})
+        ew._WATCH_DIRS["dirs"] = ["/115open/云测试"]
+        self.addCleanup(ew._WATCH_DIRS.update, {"dirs": []})
+        with mock.patch("tg_userbot.cd2_api.list_remote_dir",
+                        side_effect=self._fake_listing()):
+            ins, lines = asyncio.run(ew.watch_scan_once())
+        self.assertEqual(ins, 1)
+        tasks = runtime_db.list_extract_tasks()
+        self.assertEqual([t["archive_name"] for t in tasks], ["auto.zip"])
+        # 再扫一轮：唯一键挡下，0 新增
+        ins2, _ = asyncio.run(ew.watch_scan_once())
+        self.assertEqual(ins2, 0)
+
+    def test_watch_persisted_across_load(self):
+        import json
+        ew._WATCH_FILE = os.path.join(self.db_dir, "watch_dirs.json")
+        self.assertTrue(ew.watch_add("/115open/云测试"))
+        # 模拟重启：重新 load
+        ew._WATCH_DIRS["dirs"] = []
+        ew.load_watch_dirs()
+        self.assertIn("/115open/云测试", ew._WATCH_DIRS["dirs"])
+
+
 class ControlTest(CmdBase):
     def test_stop_start(self):
         out = asyncio.run(ew.command_reply("/115x_stop"))

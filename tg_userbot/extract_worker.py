@@ -79,6 +79,7 @@ def request_stop():
 
 # 当前在途任务（/115x stop 回执与状态视图用）
 _CURRENT = {"task_id": None, "label": None, "stage": None}
+_WATCH_TASKS = set()
 
 
 async def _renew_loop(task_id):
@@ -401,6 +402,13 @@ async def extract_worker_loop():
     logger.info(
         "🗜 115 解压 worker 已启动（串行一次一包，退避重试上限 "
         f"{config.EXTRACT_MAX_ATTEMPTS}，staging {config.EXTRACT_STAGING_ROOT}）")
+    load_watch_dirs()
+    if _WATCH_DIRS["dirs"]:
+        logger.info(f"🗜 watch 已登记 {len(_WATCH_DIRS['dirs'])} 个目录，"
+                    "每小时自动扫描")
+    watch_task = asyncio.ensure_future(_watch_loop())
+    _WATCH_TASKS.add(watch_task)
+    watch_task.add_done_callback(_WATCH_TASKS.discard)
     # 崩溃自愈：上次进程遗留的过期 PROCESSING → PENDING
     try:
         runtime_db.recover_expired_extract_tasks()
@@ -502,6 +510,117 @@ def scan_remote_archives(root_remote_dir, max_depth=None, max_dirs=None):
     return archives, scanned, ghost_dirs
 
 
+# watch 登记（/115x watch <路径>）：每小时自动扫描这些目录，新压缩包
+# 自动入队（唯一键判重，只收新的）。持久化在 config.PAWCHIVE_COOKIE 同级
+# 的 JSON——重启后恢复。
+_WATCH_FILE = None
+_WATCH_DIRS = {"dirs": [], "last_scan": 0.0}
+
+
+def load_watch_dirs():
+    """启动时从 runtime/watch_dirs.json 恢复登记。"""
+    import json as _json
+    from . import runtime_db as _rtdb
+    path = os.path.join(os.path.dirname(config.RUNTIME_DB_FILE),
+                        "watch_dirs.json")
+    global _WATCH_FILE
+    _WATCH_FILE = path
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = _json.load(f)
+        _WATCH_DIRS["dirs"] = [str(x) for x in d.get("dirs") or []]
+        _WATCH_DIRS["last_scan"] = float(d.get("last_scan") or 0)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"🗜 watch 登记读取失败：{e}")
+
+
+def save_watch_dirs():
+    import json as _json
+    try:
+        path = _WATCH_FILE or os.path.join(
+            os.path.dirname(config.RUNTIME_DB_FILE), "watch_dirs.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump({"dirs": _WATCH_DIRS["dirs"],
+                        "last_scan": _WATCH_DIRS["last_scan"]}, f,
+                       ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"🗜 watch 登记保存失败：{e}")
+
+
+def watch_add(remote_dir):
+    """登记目录（归一化去重）。已在列表返回 False。"""
+    remote_dir = normalize_remote_dir(remote_dir)
+    if remote_dir is None:
+        return False
+    if remote_dir in _WATCH_DIRS["dirs"]:
+        return False
+    _WATCH_DIRS["dirs"].append(remote_dir)
+    save_watch_dirs()
+    return True
+
+
+def watch_remove(remote_dir):
+    """取消登记。返回是否移除了。"""
+    remote_dir = normalize_remote_dir(remote_dir)
+    if remote_dir in _WATCH_DIRS["dirs"]:
+        _WATCH_DIRS["dirs"].remove(remote_dir)
+        save_watch_dirs()
+        return True
+    return False
+
+
+async def watch_scan_once():
+    """扫一轮全部登记目录：新压缩包自动入队。返回 (新入队总数, 摘要行列表)。"""
+    from . import cd2_api
+    total_ins = 0
+    lines = []
+    for d in list(_WATCH_DIRS["dirs"]):
+        try:
+            listing = await asyncio.to_thread(cd2_api.list_remote_dir, d, 500)
+        except Exception as e:
+            lines.append(f"⚠️ {d}：列目录失败 {type(e).__name__}")
+            continue
+        if listing is None:
+            lines.append(f"⚠️ {d}：目录不可读（CD2 掉线？）")
+            continue
+        archives = [(n, int(s_ or 0)) for n, s_, is_dir in listing
+                    if not is_dir and is_archive_name(n)]
+        ins, skip = runtime_db.enqueue_extract_tasks(d, archives)
+        total_ins += ins
+        if ins or skip:
+            lines.append(f"· {d}：新 {ins}｜已有 {skip}")
+    _WATCH_DIRS["last_scan"] = time.time()
+    save_watch_dirs()
+    return total_ins, lines
+
+
+async def _watch_loop():
+    """常驻 watch 扫描循环：每小时一轮（有登记才扫）。"""
+    interval = float(getattr(config, "EXTRACT_WATCH_INTERVAL_SECONDS",
+                             3600))
+    while not _STOP["requested"]:
+        try:
+            if _WATCH_DIRS["dirs"] and not _PAUSED.get("paused") \
+                    and state.RUNTIME_DB_READY:
+                ins, _lines = await watch_scan_once()
+                if ins:
+                    logger.info(f"🗜 watch 自动入队 {ins} 个新压缩包")
+                    try:
+                        await notify.notify_user(
+                            f"🗜 115 watch：发现 {ins} 个新压缩包，"
+                            "已自动入队解压回传")
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception(f"🗜 watch 扫描异常：{e}")
+        await asyncio.sleep(interval)
+
+
 def status_text():
     """状态总览（命令与菜单共用）。"""
     counts = runtime_db.extract_status_counts()
@@ -539,6 +658,8 @@ def status_text():
                 line += f"\n   {t['error'][:70]}"
             lines.append(line)
     lines.append("")
+    if _WATCH_DIRS["dirs"]:
+        lines.append("watch：" + "、".join(_WATCH_DIRS["dirs"]))
     lines.append("用法：/115x <115路径>（如 /115x 云下载）；"
                  "/115x stop 暂停领取｜/115x start 恢复｜"
                  "/115x retry id｜/115x del id")
@@ -566,6 +687,30 @@ async def command_reply(cmd_text):
     head, _, rest = body.partition(" ")
     low = head.lower()
 
+    if low == "watch":
+        if not rest:
+            if not _WATCH_DIRS["dirs"]:
+                return "📭 未登记 watch 目录。用法：/115x watch <115路径>"
+            lines = ["📡 watch 已登记目录："]
+            for d in _WATCH_DIRS["dirs"]:
+                lines.append(f"  · {d}")
+            lines.append("每小时自动扫描，新压缩包自动入队。"
+                         "取消：/115x unwatch <路径>")
+            return "\n".join(lines)
+        rd = normalize_remote_dir(rest)
+        if rd is None:
+            return "❌ 路径无效"
+        if watch_add(rd):
+            return f"📡 已登记 watch：{rd}\n每小时自动扫描，" \
+                   "新压缩包自动入队解压回传（判重只收新的）。"
+        return f"ℹ️ {rd} 已在 watch 列表里"
+    if low == "unwatch":
+        rd = normalize_remote_dir(rest)
+        if rd is None:
+            return "❌ 路径无效"
+        if watch_remove(rd):
+            return f"🔕 已取消 watch：{rd}"
+        return f"❌ {rd} 不在 watch 列表里"
     if low == "stop":
         _PAUSED["paused"] = True
         logger.info("🗜 115 解压 worker 暂停领取（/115x stop）")

@@ -1551,6 +1551,7 @@ EXTRACT_BACKOFF_MAX_SECONDS = 7200  # 封顶 2 小时
 EXTRACT_VERIFY_TRIES = 6            # 对账重试轮数（等 CD2 后台上传清空）
 EXTRACT_VERIFY_GAP_SECONDS = 10.0   # 对账轮间隔
 EXTRACT_POLL_SECONDS = 2.0          # worker 无任务时的轮询间隔
+EXTRACT_WATCH_INTERVAL_SECONDS = 3600   # watch 登记目录的自动扫描周期
 EXTRACT_SCAN_MAX_DEPTH = 8          # /115x 递归扫描深度上限
 EXTRACT_SCAN_MAX_DIRS = 400         # 递归扫描目录数上限（防病态目录树）
 
