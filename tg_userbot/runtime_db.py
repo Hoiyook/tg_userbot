@@ -108,6 +108,9 @@ EXTRACT_PROCESSING = "PROCESSING"
 EXTRACT_COMPLETED = "COMPLETED"
 EXTRACT_FAILED = "FAILED"
 EXTRACT_TERMINAL = "TERMINAL"
+# 需密码已跳过（/115x 用目录名密码试过一次仍失败）：不算终结——每次
+# 扫描（watch/手动）会把该目录的 PASSWORD 任务重置回 PENDING 再试
+EXTRACT_PASSWORD = "PASSWORD"
 
 
 class DbUnavailable(RuntimeError):
@@ -2500,8 +2503,46 @@ def complete_extract_task(task_id, now=None):
     return ok
 
 
+def mark_extract_password(task_id, error, now=None):
+    """PROCESSING → PASSWORD（需密码已跳过；不算终结，扫描会重置再试）。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE extract_tasks SET status=?, completed_at=?, "
+            "lease_until=NULL, error=?, updated_at=? "
+            "WHERE id=? AND status=?",
+            (EXTRACT_PASSWORD, now, str(error)[:500], now,
+             int(task_id), EXTRACT_PROCESSING),
+        )
+        return bool(cur.rowcount)
+
+    ok = _write(do, "115 解压任务转 PASSWORD")
+    if ok:
+        logger.warning(f"🗄 115 解压任务 #{task_id} → PASSWORD：{error}")
+    return ok
+
+
+def reset_extract_password_tasks(remote_dir, now=None):
+    """PASSWORD → PENDING（扫描重置：下次解压再试目录名密码）。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE extract_tasks SET status=?, next_retry_at=NULL, "
+            "updated_at=? WHERE remote_dir=? AND status=?",
+            (EXTRACT_PENDING, now, str(remote_dir), EXTRACT_PASSWORD),
+        )
+        return cur.rowcount
+
+    return _write(do, "重置 115 解压 PASSWORD 任务")
+
+
 def retry_extract_task(task_id, now=None):
-    """TERMINAL/FAILED → PENDING（手动重投；staging/error 保留可溯源）。"""
+    """TERMINAL/FAILED/PASSWORD → PENDING（手动重投；staging/error 保留
+    可溯源）。"""
     now = _now(now)
 
     def do(conn):
@@ -2509,9 +2550,9 @@ def retry_extract_task(task_id, now=None):
             conn,
             "UPDATE extract_tasks SET status=?, next_retry_at=NULL, "
             "lease_until=NULL, updated_at=? WHERE id=? AND "
-            "status IN (?, ?)",
+            "status IN (?, ?, ?)",
             (EXTRACT_PENDING, now, int(task_id),
-             EXTRACT_FAILED, EXTRACT_TERMINAL),
+             EXTRACT_FAILED, EXTRACT_TERMINAL, EXTRACT_PASSWORD),
         )
         return bool(cur.rowcount)
 

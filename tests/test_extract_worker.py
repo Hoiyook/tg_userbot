@@ -181,7 +181,9 @@ class HappyPathTest(_Env):
 
 
 class FailurePathTest(_Env):
-    async def test_password_rar_terminates(self):
+    async def test_password_rar_goes_password_status(self):
+        """坏 rar → 目录名密码尝试失败 → PASSWORD 状态（不算终结，
+        下次扫描重置再试——owner 指令 2026-10-09）。"""
         d = os.path.join(self.mount, "云下载")
         os.makedirs(d, exist_ok=True)
         bad = os.path.join(d, "加密包.rar")
@@ -190,10 +192,15 @@ class FailurePathTest(_Env):
         task = self._enqueue_one("云下载", "加密包.rar", os.path.getsize(bad))
         await self._run_one_tick()
         after = runtime_db.get_extract_task(task["id"])
-        self.assertEqual(after["status"], runtime_db.EXTRACT_TERMINAL)
+        self.assertEqual(after["status"], runtime_db.EXTRACT_PASSWORD)
         self.assertIn("需密码", after["error"])
         text = self._notify_calls()[-1].args[0]
         self.assertIn("需密码", text)
+        self.assertIn("自动再试", text)
+        # 重置：watch 扫描一轮（同目录）→ PASSWORD 回 PENDING 再试
+        runtime_db.reset_extract_password_tasks("/115open/云下载")
+        after = runtime_db.get_extract_task(task["id"])
+        self.assertEqual(after["status"], runtime_db.EXTRACT_PENDING)
 
     def _break_verify(self, marker):
         """让对账对包含 marker 的远端目录报尺寸漂移（其余照常）。"""

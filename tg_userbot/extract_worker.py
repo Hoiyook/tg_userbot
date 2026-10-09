@@ -192,15 +192,26 @@ async def _process_task(task):
         status, detail, files = await asyncio.to_thread(
             extract_archive, local_arch, content_dir, False)
         if status == "password":
-            runtime_db.terminate_extract_task(tid, f"需密码：{detail}")
-            shutil_rmtree(staging)   # 无密码处理不了，副本也不留
-            try:
-                await notify.notify_user(
-                    f"🗜 115 解压任务终止（需密码）\n\n{name}\n"
-                    f"原因：{detail}\n已跳过，不会重试。")
-            except Exception:
-                pass
-            return
+            # 目录名密码尝试（owner 指令 2026-10-09）：压缩包所在最后一层
+            # 目录名做密码，只试一次（如 /云下载/Telegram@XXX 下的包用
+            # Telegram@XXX 做密码）
+            dir_pwd = os.path.basename(mount_dir.rstrip("/"))
+            logger.info(f"🗜 [E{tid}] 需密码，尝试目录名密码（{dir_pwd}）")
+            status, detail, files = await asyncio.to_thread(
+                extract_archive, local_arch, content_dir, False, dir_pwd)
+            if status != "extracted":
+                runtime_db.mark_extract_password(
+                    tid, f"需密码（目录名 {dir_pwd} 尝试失败）：{detail}")
+                shutil_rmtree(staging)
+                try:
+                    await notify.notify_user(
+                        f"🗜 115 解压跳过（需密码）\n\n{name}\n"
+                        f"已尝试目录名「{dir_pwd}」做密码仍失败。\n"
+                        "已跳过；下次扫描该目录时会自动再试。")
+                except Exception:
+                    pass
+                return
+            status, detail, files = "extracted", detail, files
         if status == "no-space":
             await _fail(tid, f"磁盘不足：{detail}")
             return
@@ -589,6 +600,8 @@ async def watch_scan_once():
         archives = [(n, int(s_ or 0)) for n, s_, is_dir in listing
                     if not is_dir and is_archive_name(n)]
         ins, skip = runtime_db.enqueue_extract_tasks(d, archives)
+        # 该目录的 PASSWORD 任务重置回 PENDING（下次再试目录名密码）
+        runtime_db.reset_extract_password_tasks(d)
         total_ins += ins
         if ins or skip:
             lines.append(f"· {d}：新 {ins}｜已有 {skip}")
