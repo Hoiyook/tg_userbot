@@ -588,27 +588,29 @@ def watch_remove(remote_dir):
 
 
 async def watch_scan_once():
-    """扫一轮全部登记目录：新压缩包自动入队。返回 (新入队总数, 摘要行列表)。"""
-    from . import cd2_api
+    """扫一轮全部登记目录：递归（含子目录）发现新压缩包自动入队。
+
+    返回 (新入队总数, 摘要行列表)。用户的包常按「一包一夹」存放，
+    顶层扫描会一无所获（2026-10-10 生产实测）——与命令扫描共用同一
+    递归实现（scan_remote_archives，深度/目录数上限内置）。"""
     total_ins = 0
     lines = []
     for d in list(_WATCH_DIRS["dirs"]):
-        try:
-            listing = await asyncio.to_thread(cd2_api.list_remote_dir, d, 500)
-        except Exception as e:
-            lines.append(f"⚠️ {d}：列目录失败 {type(e).__name__}")
-            continue
-        if listing is None:
-            lines.append(f"⚠️ {d}：目录不可读（CD2 掉线？）")
-            continue
-        archives = [(n, int(s_ or 0)) for n, s_, is_dir in listing
-                    if not is_dir and is_archive_name(n)]
-        ins, skip = runtime_db.enqueue_extract_tasks(d, archives)
-        # 该目录的 PASSWORD 任务重置回 PENDING（下次再试目录名密码）
-        runtime_db.reset_extract_password_tasks(d)
+        found, scanned, _ghosts = await asyncio.to_thread(
+            scan_remote_archives, d)
+        by_dir = {}
+        for pd, name, sz in found:
+            by_dir.setdefault(pd, []).append((name, sz))
+        ins = skip = 0
+        for pd, archives in by_dir.items():
+            a, b = runtime_db.enqueue_extract_tasks(pd, archives)
+            # 该目录的 PASSWORD 任务重置回 PENDING（下次再试目录名密码）
+            runtime_db.reset_extract_password_tasks(pd)
+            ins += a
+            skip += b
         total_ins += ins
         if ins or skip:
-            lines.append(f"· {d}：新 {ins}｜已有 {skip}")
+            lines.append(f"· {d}：新 {ins}｜已有 {skip}（扫 {scanned} 目录）")
     _WATCH_DIRS["last_scan"] = time.time()
     save_watch_dirs()
     return total_ins, lines

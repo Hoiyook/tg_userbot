@@ -194,18 +194,23 @@ class WatchTest(CmdBase):
         self.assertIn("已取消", out)
         self.assertEqual(ew._WATCH_DIRS["dirs"], [])
 
-    def test_watch_scan_enqueues_new_archives(self):
-        size = self._put_zip("云测试", "auto.zip", {"a": b"x"})
+    def test_watch_scan_enqueues_new_archives_recursive(self):
+        """递归：子目录里的新包也要入队；再扫一轮唯一键挡下 0 新增。"""
+        size = self._put_zip("云测试/第一季", "auto.zip", {"a": b"x"})
         ew._WATCH_DIRS["dirs"] = ["/115open/云测试"]
         self.addCleanup(ew._WATCH_DIRS.update, {"dirs": []})
         with mock.patch("tg_userbot.cd2_api.list_remote_dir",
                         side_effect=self._fake_listing()):
-            ins, lines = asyncio.run(ew.watch_scan_once())
+            ins, _lines = asyncio.run(ew.watch_scan_once())
         self.assertEqual(ins, 1)
         tasks = runtime_db.list_extract_tasks()
-        self.assertEqual([t["archive_name"] for t in tasks], ["auto.zip"])
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["remote_dir"],
+                         "/115open/云测试/第一季")   # 记录所在子目录
         # 再扫一轮：唯一键挡下，0 新增
-        ins2, _ = asyncio.run(ew.watch_scan_once())
+        with mock.patch("tg_userbot.cd2_api.list_remote_dir",
+                        side_effect=self._fake_listing()):
+            ins2, _ = asyncio.run(ew.watch_scan_once())
         self.assertEqual(ins2, 0)
 
     def test_watch_persisted_across_load(self):
