@@ -301,21 +301,13 @@ async def download_url_media(record):
     # 重复解析（刚试过仍失败，多半是 cookie 失效，几秒后再试也一样）。
     refreshed = False
     if not record.get("direct_url") and record.get("resolve_first"):
-        # /dyu 批量任务的逐条解析策略（owner 指令 2026-10-02）：
-        #   第 1 顺位 解析 bot —— 链接发给第三方 bot（自己服务端解析，
-        #     不吃本地风控），回复的视频走白名单流自动下载；任务**不删**
-        #     （转交 ≠ 送达），退避 60s 后重放核对
-        #   第 2 顺位 f2 本地直连 —— bot 没送到时（重放仍见本任务）解析
-        #     直链直接下；cookie 自动保鲜（msToken 滚新即恢复）
-        #   收尾 兜底转交 —— 8 次仍没完成则正式转交并按完成移除
-        #     （bot 若已送过，重复转交的回复会被内容判重拦下，不双下）
+        # /dyu 批量任务的逐条策略（owner 指令 2026-10-02/04 定稿）：
+        # 每轮重放都先转解析 bot（第三方自己解析，不吃本地风控）；bot 送回
+        # 视频的瞬间由目录戳消费方把本任务销账出榜——留在榜上 = bot 还没
+        # 送到，重发是正确行为，无次数上限。bot 转交失败才降级 f2 直连
+        # （cookie 自动保鲜，msToken 滚新即恢复）。都失败按退避重试。
         # 绝不拿作品页链接当直链下载（2026-10-02 生产事故：15 条 HTML
-        # 假 mp4 被 CD2 搬上 115 又双向删除，历史/判重索引被污染）
-        # 策略（owner 指令 2026-10-02，无次数上限）：每轮都先转解析 bot
-        # ——bot 送回视频的瞬间由目录戳消费方把本任务销账出榜（留在榜上
-        # = bot 还没送到，重发是正确行为）；bot 转交本身失败才试 f2 直连；
-        # 都不成按退避重试。绝不拿作品页链接当直链下载（2026-10-02 生产
-        # 事故：15 条 HTML 假 mp4）。
+        # 假 mp4 被 CD2 搬上 115 又双向删除，历史/判重索引被污染）。
         logger.info("🎵 第 1 顺位：转解析 bot（回复经白名单流下载）")
         # 节流 20s/条（owner 指令）：批量转交不打挂第三方 bot；串行门内
         # 睡眠天然限住整批复交速率
@@ -325,6 +317,7 @@ async def download_url_media(record):
             await platform.relay_links_to_parse_bot(
                 "douyin", [record.get("url") or ""])
             logger.info("🎵 已转解析 bot，等待回流销账")
+            record["delegated_to_bot"] = True   # 告知队列：委托等待中，不受死文件熔断
             # 盖在途目录戳：bot 回流的下一个视频直接落 <抖音>/<子目录>/，
             # 同时把本任务销账出榜（进度可见）
             from . import douyin_batch as _dyb
@@ -398,8 +391,9 @@ async def download_url_media(record):
                     #（与 download_file 同一套纪律）。逐块喂 sha256——内容级
                     # 判重的零额外 I/O 路径（媒体路径是事后读回临时文件）。
                     hasher = hashlib.sha256()
+                    _http_client = _make_http_client(DOWNLOAD_IDLE_TIMEOUT)
                     dl_task = asyncio.ensure_future(_stream_url_to_file(
-                        _make_http_client(DOWNLOAD_IDLE_TIMEOUT),
+                        _http_client,
                         url, temp_path, progress, hasher=hasher,
                     ))
                     try:
@@ -428,11 +422,19 @@ async def download_url_media(record):
                                 "直链下载被底层取消"
                             ) from exc
                     finally:
+                        # 兜底：dl_task 未结束（超时/异常路径）先取消它
                         if not dl_task.done():
                             dl_task.cancel()
                             try:
                                 await dl_task
                             except asyncio.CancelledError:
+                                pass
+                        # 连接池本体显式关闭（此前每次尝试泄漏一个
+                        # AsyncClient，socket/FD 等 GC 才回收）
+                        if _http_client is not None:
+                            try:
+                                await _http_client.aclose()
+                            except Exception:
                                 pass
 
                     if not os.path.exists(temp_path):

@@ -7,6 +7,7 @@ import asyncio
 import atexit
 import json
 import os
+import sys
 import shutil
 import tempfile
 import time
@@ -19,6 +20,8 @@ _TMP = tempfile.mkdtemp(prefix="tg_userbot_queue_test_")
 atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import conftest as _btn_shim  # noqa: F401,E402  按钮属性垫片
 from tg_userbot import state, config, queue  # noqa: E402
 from tg_userbot import stats as stats_mod  # noqa: E402
 

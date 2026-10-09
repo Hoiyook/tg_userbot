@@ -1997,12 +1997,7 @@ async def command_reply(event, cmd_text):
     if action == "pr":
         await event.reply(post_report_text(arg), link_preview=False)
         return
-    if action == "paw_done":
-        reply = mark_manual_done(arg)
-        view_text, buttons = manual_view()
-        await event.reply(f"{reply}\n\n{view_text}", buttons=buttons,
-                          link_preview=False)
-        return
+
     if action == "search":
         await _reply_search(event, arg)
         return

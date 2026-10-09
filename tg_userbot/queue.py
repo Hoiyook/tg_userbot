@@ -39,10 +39,10 @@ from .config import (
     QUEUE_KIND_LABELS,
 )
 from .log import clear_trace, logger, set_trace
+from .sources import message_link
 
 # serial url 任务（/dyu）的全局串行门：懒建，首个使用方在事件循环里创建
 _URL_SERIAL_LOCK = None
-from .sources import message_link
 
 # 对 create_task 产出的执行任务持有强引用：事件循环只对 Task 持有弱引用，任务在
 # 完成前可能被 GC（asyncio 官方建议显式持引用；3.9 下 pending 任务实测虽不会被
@@ -294,6 +294,7 @@ def _save_after_mutation(record, op):
             logger.warning(
                 f"🗄 下载队列持久化异常（内存为准）：{type(e).__name__}: {e}")
             return
+        return      # sqlite 写入成功：到此为止，不穿透明明已废弃的 JSON 全量落盘
     save_queue(state.QUEUE)
 
 
@@ -810,6 +811,7 @@ async def execute_queued_task(record):
                         if r.get("id") != record["id"]
                     ]
                 _save_after_mutation(record, "delete")
+                state.DOWNLOAD_PROGRESS_SEEN.pop(record["id"], None)
             else:
                 # 终结性失败（2026-09-30，Evanescia 案例）：download_file 判定
                 # 「媒体在服务器端已失效（刷新引用后零字节）」。队列重试已确认
@@ -858,9 +860,16 @@ async def execute_queued_task(record):
                     stats.emit_event("FAILED", task_id=record["id"],
                                      label=record.get("label"))
                     # 死文件熔断标记：本次尝试零进度（起步即败）→ 记快速失败
-                    # 时刻（AUTO_REPLAY 据此跳过）；有进度 → 清标记（链路类可重试）
+                    # 时刻（AUTO_REPLAY 据此跳过）；有进度 → 清标记（链路类可重试）。
+                    # /dyu 委托等待中视为有进展（owner 策略：无上限、每轮都转
+                    # bot，bot 回流即销账）——熔断会把重放节奏钳到 6h 一发
+                    _dyu_waiting = bool(
+                        record.get("resolve_first")
+                        and record.get("delegated_to_bot"))
                     _record_fail_fast(
-                        record, state.DOWNLOAD_PROGRESS_SEEN.get(record["id"], False))
+                        record,
+                        _dyu_waiting or state.DOWNLOAD_PROGRESS_SEEN.get(
+                            record["id"], False))
                     state.DOWNLOAD_PROGRESS_SEEN.pop(record["id"], None)
     finally:
         state.EXECUTING.discard(record["id"])

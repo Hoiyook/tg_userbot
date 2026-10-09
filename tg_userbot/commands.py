@@ -548,9 +548,6 @@ async def handle_command(event, cmd_text):
                 idx = int(parts[1])
             except (IndexError, ValueError):
                 idx = None
-            except (IndexError, ValueError):
-                await _reply(event, "❌ /queue del 用法：/queue del <序号>")
-                return True
             # 执行中的任务先真正取消在途下载（task.cancel → 清半成品、归还
             # worker），再把记录移除；排队中的直接移除。
             ok, removed, cancelled = await queue.queue_del_task(index=idx)
@@ -960,7 +957,7 @@ async def handle_command(event, cmd_text):
         await _reply(event, await cd2_api.tasks_reply())
         return True
 
-    if cleanup.is_botclean_command(cmd_text):
+    if cmd_text == "/cd2check":
         from . import cd2_api
         logger.info("执行命令：/cd2check")
         await _reply(event, await cd2_api.reconcile_reply())

@@ -814,6 +814,9 @@ async def _settle_dyu_task(aweme_id):
             return
         state.QUEUE["retry"].remove(matched)
         queue._save_after_mutation(matched, "delete")
+        stats.emit_event("REMOVED", task_id=matched["id"],
+                         label=matched.get("final_name"),
+                         why="dyu_settled")
         logger.info(
             f"🎵 /dyu 销账：bot 已送回作品 {aweme_id}，任务出榜"
             f"（{matched.get('final_name', '')[:40]}）")

@@ -3522,6 +3522,52 @@ class MemoCommandTest(unittest.TestCase):
         ok, t = self._run("/memo clear")
         self.assertIn("已清空", t)
 
+    def test_every_panel_command_actually_dispatches(self):
+        """终极钉子（P0 复发防护）：BOT_COMMANDS 每个命令都必须有 dispatch
+        ——/memo、/botclean、/cd2check 三次「注册了但派发缺失/被劫持」
+        事故的同根总钉。
+
+        安全命令（无副作用）：真实发给 handle_command 断言返回 True；
+        有副作用的（重启/清理/启停/开关类）：只做静态锚点检查。"""
+        import asyncio as _aio
+        import inspect as _inspect
+        from tg_userbot import commands as c
+        src = _inspect.getsource(c.handle_command)
+
+        async def fake_reply(text, **kw):
+            return None
+        ev = mock.MagicMock()
+        ev.reply = mock.AsyncMock(side_effect=fake_reply)
+
+        static_only = {"restart", "clean", "clearmsg", "setcleartime",
+                       "botclean", "cd2", "cd2_stop", "cd2check",
+                       "cd2tasks", "chrome_stop", "chrome_cancel",
+                       "paw_pause", "paw_resume", "paw_cookie",
+                       "paw_since", "paw_notify", "paw_done",
+                       "extract_stop", "extract_start", "retry_del",
+                       "retry_all", "queue_del", "listen_off",
+                       "listen_on", "listen_scan", "listen_add",
+                       "listen_edit", "listen_del", "listen_interval",
+                       "wl_add", "wl_del", "wl_scan", "memo", "cmdt",
+                       "sqlt", "sql", "sh", "up", "chrome", "dyu",
+                       "115x", "find", "stats"}
+        failures = []
+        for cmd_name, _desc in b.BOT_COMMANDS:
+            if cmd_name in static_only:
+                anchors = (f'"/{cmd_name}"', f"is_{cmd_name}_command",
+                           f'"{cmd_name}_command"')
+                if not any(a in src for a in anchors):
+                    failures.append(f"/{cmd_name}（源码无派发痕迹）")
+                continue
+            ev2 = mock.MagicMock()
+            ev2.reply = mock.AsyncMock()
+            handled = asyncio.new_event_loop().run_until_complete(
+                c.handle_command(ev2, f"/{cmd_name}"))
+            if not handled:
+                failures.append(f"/{cmd_name}（真实调用未处理）")
+        self.assertEqual(failures, [],
+                         "面板命令派发缺失/被劫持：" + "、".join(failures))
+
     def test_registered_matches_panel(self):
         """面板命令必须全部已注册（无 handler 的假命令在
         DeadButtonAuditTest 已钉死：注册 ⊆ handler 分支）。"""

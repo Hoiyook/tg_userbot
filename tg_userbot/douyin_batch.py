@@ -561,14 +561,14 @@ async def harvest_author_awemes_via_chrome(sec_user_id, max_scrolls=60):
             # Page.reload 会被 Argus 识别（实测重载后 addScript 注入的钩子
             # 不执行、页面仍吐降级页），真实按键事件则与手动操作同效
             for _reload in range(2):
-                state = await eval_js(
+                page_state = await eval_js(
                     "JSON.stringify({err: document.body.innerText.includes("
                     "'服务异常'), dom: document.querySelectorAll("
                     "'a[href*=\"/video/\"]').length, cap: "
                     "(window.__captured||[]).length, hook: "
                     "typeof window.__captured})")
                 import json as _j2
-                st = _j2.loads(state or "{}")
+                st = _j2.loads(page_state or "{}")
                 if (not st.get("err") and (st.get("cap")
                         or (st.get("dom") and st.get("hook") != "undefined"))):
                     break
