@@ -913,8 +913,11 @@ def _origin_date(origin):
         return None
 
 
-async def _enqueue_me(message):
+async def _enqueue_me(message, no_label_wait=False):
     """Saved Messages 原消息入队：相册无自身文字的成员先继承同组说明再入队。
+
+    no_label_wait：启动对账补入队时为 True——跳过尾随评论的宽限等待
+    （停机窗口的评论若真存在，等不到；不为对账拖慢启动）。
 
     手工转发评论（窗口内的待关联标注）一并继承为命名标注——Telegram 把它发成
     「评论 + 紧跟媒体」；一条评论后连续转发的 N 条媒体都拿到同一条标注。
@@ -923,7 +926,8 @@ async def _enqueue_me(message):
     尾随评论一个落地机会；已有标注时不等待、立即继承。
     """
     user_label = _take_me_label()
-    if user_label is None and ME_LABEL_GRACE_SECONDS > 0:
+    if user_label is None and ME_LABEL_GRACE_SECONDS > 0 \
+            and not no_label_wait:
         await asyncio.sleep(ME_LABEL_GRACE_SECONDS)
         user_label = _take_me_label()
     if user_label:
@@ -1099,6 +1103,59 @@ async def _fetch_group_caption(message) -> str:
     except Exception as e:
         logger.warning(f"读取相册说明失败（msg_id={msg_id}）：{e}")
         return ""
+
+
+async def _reconcile_saved_media():
+    """启动对账兜底：直接拉收藏夹最近 100 条，补入队停机期间漏掉的媒体。
+
+    catch_up（getDifference）对长停机的大缺口不保证完整（2026-10-10
+    owner 实测：离线 5 天的转发未到达）——这条以「消息 ID 水位线」为准：
+    水位线之上且是媒体的，逐条走 _enqueue_me（判重挡已下载，不会重复）。
+    水位线存 runtime_db schema_meta；首跑只建水位线、不回灌历史。
+    文本/命令不在对账范围（仍靠 catch_up）。"""
+    from . import runtime_db as _rtdb
+
+    wm_raw = _rtdb.get_schema_meta("paw_me_watermark")
+    watermark = int(wm_raw) if wm_raw else None
+    fetch = asyncio.ensure_future(
+        state.client.get_messages(state.MY_ID, limit=100))
+    try:
+        msgs = await asyncio.wait_for(fetch, timeout=90)
+    except asyncio.TimeoutError:
+        fetch.cancel()
+        logger.warning("📬 收藏夹对账拉取超时（跳过本轮）")
+        return
+    msgs = [m for m in (msgs or []) if m]
+    if not msgs:
+        return
+    top_id = max(m.id for m in msgs)
+    if watermark is None:
+        _rtdb.set_schema_meta("paw_me_watermark", str(top_id))
+        logger.info(f"📬 收藏夹对账：首跑建立水位线 {top_id}（不回灌历史）")
+        return
+    missed = [m for m in msgs
+              if m.id > watermark and is_downloadable(m)]
+    if not missed:
+        if top_id > watermark:
+            _rtdb.set_schema_meta("paw_me_watermark", str(top_id))
+        logger.info("📬 收藏夹对账：无漏网媒体")
+        return
+    missed.sort(key=lambda m: m.id)
+    logger.warning(
+        f"📬 启动对账：发现 {len(missed)} 条停机期间未入队的收藏夹媒体，"
+        "补入队（判重挡已下载）")
+    for m in missed:
+        try:
+            await _enqueue_me(m, no_label_wait=True)
+        except Exception as e:
+            logger.warning(f"📬 补入队消息 {m.id} 失败（继续下一条）：{e}")
+    _rtdb.set_schema_meta("paw_me_watermark", str(top_id))
+    try:
+        await notify.notify_user(
+            f"📬 启动对账：补入队 {len(missed)} 条停机期间漏掉的收藏夹媒体"
+            f"（消息 id 至 {max(m.id for m in missed)}）")
+    except Exception:
+        pass
 
 
 async def _maybe_album_caption(message):
@@ -1478,6 +1535,13 @@ async def main():
         logger.info("📬 启动补拉完成（停机窗口内的消息已追上）")
     except Exception as e:
         logger.warning(f"启动 catch_up 失败（停机窗口的消息可能有缺口）：{e}")
+
+    # 启动对账兜底：catch_up 对长停机的大缺口不保证完整——直接拉收藏夹
+    # 最近 100 条按 msg_id 水位线核对，漏掉的媒体补入队
+    try:
+        await _reconcile_saved_media()
+    except Exception as e:
+        logger.warning(f"📬 收藏夹启动对账失败（不影响启动）：{e}")
 
     # 建立多 worker 下载池：DOWNLOAD_CONCURRENCY 条独立连接并发拉文件，
     # 破掉主客户端单 socket 的聚合瓶颈。失败自动降级回单连接（功能不丢）。

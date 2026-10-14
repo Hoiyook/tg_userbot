@@ -3160,6 +3160,59 @@ class InspectTest(unittest.TestCase):
 # ============================================================
 # 32) Reliability Hardening R1（2026-09-28）
 # ============================================================
+class SavedMediaReconcileTest(unittest.IsolatedAsyncioTestCase):
+    """启动对账：水位线之上且是媒体的补入队；首跑只建水位线。"""
+
+    def _msg(self, mid, downloadable=True):
+        m = mock.MagicMock()
+        m.id = mid
+        m.downloadable = downloadable   # is_downloadable 的 side_effect 读它
+        return m
+
+    async def _run(self, msgs, watermark):
+        import asyncio as _aio
+        from tg_userbot import app as app_mod
+        from tg_userbot import runtime_db as _rtdb
+        calls = []
+        async def fake_enqueue(m, no_label_wait=False):
+            calls.append((m.id, no_label_wait))
+        with mock.patch.object(app_mod, "state") as st, \
+             mock.patch.object(_rtdb, "get_schema_meta",
+                               return_value=watermark), \
+             mock.patch.object(_rtdb, "set_schema_meta") as setmeta, \
+             mock.patch.object(app_mod.state.client, "get_messages",
+                               new=mock.AsyncMock(return_value=msgs)), \
+             mock.patch.object(app_mod, "is_downloadable",
+                               side_effect=lambda m: m.downloadable), \
+             mock.patch.object(app_mod, "_enqueue_me",
+                               side_effect=fake_enqueue), \
+             mock.patch.object(app_mod.notify, "notify_user",
+                               new=mock.AsyncMock()):
+            await _aio.wait_for(
+                app_mod._reconcile_saved_media(), timeout=10)
+            return calls, setmeta
+
+    async def test_first_run_sets_watermark_without_enqueue(self):
+        msgs = [self._msg(200, True), self._msg(150, True)]
+        calls, setmeta = await self._run(msgs, None)
+        self.assertEqual(calls, [])
+        setmeta.assert_called_once_with("paw_me_watermark", "200")
+
+    async def test_missed_media_enqueued(self):
+        msgs = [self._msg(300, True),   # 漏网媒体
+                self._msg(250, False),  # 非媒体：只推水位线
+                self._msg(100, True)]   # 低于水位线：不动
+        calls, setmeta = await self._run(msgs, "200")
+        self.assertEqual(calls, [(300, True)])
+        setmeta.assert_called_once_with("paw_me_watermark", "300")
+
+    async def test_no_missed_only_advances_watermark(self):
+        msgs = [self._msg(210, False), self._msg(205, False)]
+        calls, setmeta = await self._run(msgs, "200")
+        self.assertEqual(calls, [])
+        setmeta.assert_called_once_with("paw_me_watermark", "210")
+
+
 class MilestoneOnceTest(unittest.IsolatedAsyncioTestCase):
     """P1-1：一次最终完成只 +1；失败/死链不计 completed。"""
 
