@@ -17,6 +17,7 @@ PROCESSING_DOUYIN_IDS / WHITELIST_CHATS）。命名/历史等纯函数模块允�
 """
 import re
 import uuid
+import asyncio
 from datetime import datetime
 
 from telethon.utils import get_peer_id
@@ -249,7 +250,12 @@ async def _relay_kind_links(kind: str, urls):
 
     for url in urls:
         try:
-            await state.client.send_message(bot_username, url)
+            # 超时硬顶（2026-10-16 生产事故）：断连窗口里 send_message 可能
+            # 永久挂起——/dyu 串行门内的调用会因此**手持串行锁卡死整个批量
+            # 队列 1.5 小时**（3002c3a9 案例）。60s 发不出去按失败处理，
+            # 上层降级/重试；绝不无限等。
+            await asyncio.wait_for(
+                state.client.send_message(bot_username, url), timeout=60)
             logger.info(
                 f"📤 已把{label}链接发给解析 bot（{bot_username}），"
                 "回复视频将自动转发进收藏夹下载"
