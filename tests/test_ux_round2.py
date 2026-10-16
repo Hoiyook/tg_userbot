@@ -3160,6 +3160,38 @@ class InspectTest(unittest.TestCase):
 # ============================================================
 # 32) Reliability Hardening R1（2026-09-28）
 # ============================================================
+class AssociateLabelsTest(unittest.TestCase):
+    """目录标注重建：/评论关联后续媒体，普通文本清空。"""
+
+    def _m(self, mid, text=None, media=False):
+        m = mock.MagicMock()
+        m.id = mid
+        m.message = text
+        m.media = "x" if media else None
+        return m
+
+    def test_comment_labels_following_media(self):
+        from tg_userbot import app as app_mod
+        msgs = [self._m(1, text="/77T"), self._m(2, media=True),
+                self._m(3, media=True)]
+        out = app_mod._associate_labels_chrono(msgs)
+        self.assertEqual(out, {2: "77T", 3: "77T"})
+
+    def test_plain_text_clears_pending(self):
+        from tg_userbot import app as app_mod
+        msgs = [self._m(1, text="/77T"), self._m(2, text="哈哈"),
+                self._m(3, media=True)]
+        out = app_mod._associate_labels_chrono(msgs)
+        self.assertEqual(out, {})
+
+    def test_new_comment_switches(self):
+        from tg_userbot import app as app_mod
+        msgs = [self._m(1, text="/77T"), self._m(2, media=True),
+                self._m(3, text="/BlobCG"), self._m(4, media=True)]
+        out = app_mod._associate_labels_chrono(msgs)
+        self.assertEqual(out, {2: "77T", 4: "BlobCG"})
+
+
 class SavedMediaReconcileTest(unittest.IsolatedAsyncioTestCase):
     """启动对账：水位线之上且是媒体的补入队；首跑只建水位线。"""
 

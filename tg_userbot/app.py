@@ -934,8 +934,11 @@ async def _enqueue_me(message, no_label_wait=False):
         logger.info(f"🏷 媒体 {message.id} 继承转发评论标注：\"{user_label}\"")
     album_caption = await _maybe_album_caption(message)
     origin = await resolve_origin_snapshot(message)
-    # 目录模式标注：/A#标注 → 标注拼 # 进文件名 + 落 原目录/A/（2026-09-16）
     user_label, source_subdir = split_label_subdir(user_label or "")
+    # 启动对账补入队：消息对象上带有重建的目录标注（_reconcile_saved_media）
+    # ——放在 split 之后，避免被空标注覆盖
+    if not source_subdir and getattr(message, "_reconcile_subdir", None):
+        source_subdir = str(getattr(message, "_reconcile_subdir"))
     # 溯源快照：频道原帖的 peer/msg（2026-09-18）——/retry 视图生成
     # t.me 跳转链接，死文件可回原帖重新转发救回
     origin_chat = origin.get("peer_id") if origin else None
@@ -1105,6 +1108,40 @@ async def _fetch_group_caption(message) -> str:
         return ""
 
 
+def _associate_labels_chrono(msgs):
+    """按时间序给媒体消息关联前置的「/目录」评论标注（纯函数，可单测）。
+
+    返回 {msg_id: 子目录}。规则与实况路径一致（split_label_subdir）：
+    评论以「/」开头且能解析出子目录才算标注；一条标注作用于其后的媒体，
+    直到下一条标注或普通文本出现。
+    """
+    def _label_of(text):
+        raw = str(text or "").strip()
+        if not raw.startswith("/") or len(raw) < 2:
+            return None
+        body = raw[1:]
+        if "#" in body:
+            body = body.partition("#")[0]
+        parts = [p for p in (sanitize_dirname(x) for x in body.split("/"))
+                 if p]
+        return "/".join(parts) or None
+
+    pending = None
+    out = {}
+    for m in sorted(msgs, key=lambda x: x.id):
+        text = (getattr(m, "message", "") or "").strip()
+        lab = _label_of(text)
+        if lab is not None:
+            pending = lab          # 标注评论：生效于后续媒体
+            continue
+        if text and not getattr(m, "media", None):
+            pending = None         # 普通文字：清空挂起标注
+            continue
+        if getattr(m, "media", None) and pending:
+            out[m.id] = pending
+    return out
+
+
 async def _reconcile_saved_media():
     """启动对账兜底：直接拉收藏夹最近 100 条，补入队停机期间漏掉的媒体。
 
@@ -1133,6 +1170,10 @@ async def _reconcile_saved_media():
         _rtdb.set_schema_meta("paw_me_watermark", str(top_id))
         logger.info(f"📬 收藏夹对账：首跑建立水位线 {top_id}（不回灌历史）")
         return
+    # 目录标注重建（owner 工作流：转发时发「/子目录」评论排序）——
+    # 停机窗口里评论与媒体都躺在收藏夹，按时间序把最近的「/评论」
+    # 关联给后续媒体，补入队时子目录不丢（2026-10-16 owner 实测缺失）
+    labels = _associate_labels_chrono(msgs)
     missed = [m for m in msgs
               if m.id > watermark and is_downloadable(m)]
     if not missed:
@@ -1146,6 +1187,9 @@ async def _reconcile_saved_media():
         "补入队（判重挡已下载）")
     for m in missed:
         try:
+            sub = labels.get(m.id)
+            if sub:
+                m._reconcile_subdir = sub
             await _enqueue_me(m, no_label_wait=True)
         except Exception as e:
             logger.warning(f"📬 补入队消息 {m.id} 失败（继续下一条）：{e}")
