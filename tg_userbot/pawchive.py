@@ -87,18 +87,30 @@ def _cache_path():
 
 
 def load_creators(refresh=False):
-    """全量创作者列表（约 20MB / 九万条），TTL 内读缓存。阻塞，放线程跑。"""
+    """全量创作者列表（约 20MB / 九万条），TTL 内读缓存。阻塞，放线程跑。
+
+    刷新失败（站点慢/超时，2026-10-17 实测 20MB 拉取 4 连败）→ 退回
+    过期缓存（stale-if-error）：名字→id 映射极少变动，旧缓存远比失败强。
+    无任何缓存才抛错。"""
     path = _cache_path()
-    if not refresh:
-        try:
-            age = time.time() - os.path.getmtime(path)
-            if age < config.PAWCHIVE_CREATORS_CACHE_TTL:
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except (FileNotFoundError, OSError, ValueError):
-            pass
-    data = _http_get_json(f"{config.PAWCHIVE_API_BASE}/api/v1/creators",
-                          timeout=120)
+    stale = None
+    try:
+        age = time.time() - os.path.getmtime(path)
+        with open(path, "r", encoding="utf-8") as f:
+            stale = json.load(f)
+        if not refresh and age < config.PAWCHIVE_CREATORS_CACHE_TTL:
+            return stale
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    try:
+        data = _http_get_json(f"{config.PAWCHIVE_API_BASE}/api/v1/creators",
+                              timeout=120)
+    except Exception as e:
+        if stale is not None:
+            logger.warning(
+                f"🐾 creators 刷新失败，退回过期缓存（{len(stale)} 条）：{e}")
+            return stale
+        raise
     os.makedirs(config.PAWCHIVE_DATA_DIR, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
