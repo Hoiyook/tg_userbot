@@ -86,19 +86,22 @@ def _cache_path():
     return os.path.join(config.PAWCHIVE_DATA_DIR, "creators.json")
 
 
-def load_creators(refresh=False):
+def load_creators(refresh=False, max_age=None):
     """全量创作者列表（约 20MB / 九万条），TTL 内读缓存。阻塞，放线程跑。
 
     刷新失败（站点慢/超时，2026-10-17 实测 20MB 拉取 4 连败）→ 退回
     过期缓存（stale-if-error）：名字→id 映射极少变动，旧缓存远比失败强。
-    无任何缓存才抛错。"""
+    无任何缓存才抛错。max_age：缓存最大可接受年龄（秒），None=TTL；
+    解析作者名场景给长 max_age——映射极少变动，不值得为它冒 20MB
+    网络拉取的险。"""
     path = _cache_path()
+    ttl = config.PAWCHIVE_CREATORS_CACHE_TTL if max_age is None else max_age
     stale = None
     try:
         age = time.time() - os.path.getmtime(path)
         with open(path, "r", encoding="utf-8") as f:
             stale = json.load(f)
-        if not refresh and age < config.PAWCHIVE_CREATORS_CACHE_TTL:
+        if not refresh and age < ttl:
             return stale
     except (FileNotFoundError, OSError, ValueError):
         pass
@@ -133,12 +136,16 @@ def search_creators(term, limit=5):
     return fuzzy[:limit]
 
 
-def resolve_creator(name):
-    """名字 → 创作者 dict（精确优先，否则取最热子串匹配）；找不到返回 None。"""
+def resolve_creator(name, allow_refresh=True):
+    """名字 → 创作者 dict（精确优先，否则取最热子串匹配）；找不到返回 None。
+
+    allow_refresh：解析作者名只需「名字→id」映射（极少变动）——缓存无论
+    多旧都可用（2026-10-18 owner 实测：20MB 全量刷新在站点慢时 4 连败
+    挂起命令 20 分钟）；全量刷新只应由 /paw 主动维护时触发。"""
     term = str(name or "").strip().lower()
     if not term:
         return None
-    creators = load_creators()
+    creators = load_creators(refresh=allow_refresh)
     for c in creators:
         if c.get("name", "").lower() == term:
             return c
@@ -147,8 +154,11 @@ def resolve_creator(name):
 
 
 async def resolve_creator_async(name):
-    """resolve_creator 的异步包装（阻塞 HTTP 下放线程；bot 菜单窗口用）。"""
-    return await asyncio.to_thread(resolve_creator, name)
+    """resolve_creator 的异步包装（阻塞 HTTP 下放线程；bot 菜单窗口用）。
+
+    解析作者名不触发 20MB 全量刷新——缓存无论多旧都可直接用于「名字→id」，
+    刷新失败还会挂起命令 20 分钟（2026-10-18 owner 实测）。"""
+    return await asyncio.to_thread(resolve_creator, name, allow_refresh=False)
 
 
 # ============================================================
