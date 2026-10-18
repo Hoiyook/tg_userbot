@@ -91,18 +91,25 @@ def load_creators(refresh=False, max_age=None):
 
     刷新失败（站点慢/超时，2026-10-17 实测 20MB 拉取 4 连败）→ 退回
     过期缓存（stale-if-error）：名字→id 映射极少变动，旧缓存远比失败强。
-    无任何缓存才抛错。max_age：缓存最大可接受年龄（秒），None=TTL；
-    解析作者名场景给长 max_age——映射极少变动，不值得为它冒 20MB
-    网络拉取的险。"""
+    无任何缓存才抛错。
+
+    语义定稿（2026-10-18 owner 实测二连败后）：refresh=False 时**绝不碰
+    网络**——缓存无论多旧都直接返回（名字→id 映射极少变动，旧缓存远比
+    20 分钟的挂起强）；refresh=True 才走网络刷新。"""
     path = _cache_path()
-    ttl = config.PAWCHIVE_CREATORS_CACHE_TTL if max_age is None else max_age
+    if not refresh:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, OSError, ValueError):
+            if refresh is False:
+                raise RuntimeError(
+                    "creators 缓存不存在且禁止联网刷新——先手动重建缓存")
+            raise
     stale = None
     try:
-        age = time.time() - os.path.getmtime(path)
         with open(path, "r", encoding="utf-8") as f:
             stale = json.load(f)
-        if not refresh and age < ttl:
-            return stale
     except (FileNotFoundError, OSError, ValueError):
         pass
     try:
