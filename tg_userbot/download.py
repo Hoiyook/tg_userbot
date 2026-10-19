@@ -312,10 +312,27 @@ async def download_url_media(record):
         # 节流 20s/条（owner 指令）：批量转交不打挂第三方 bot；串行门内
         # 睡眠天然限住整批复交速率
         await asyncio.sleep(20)
-        try:
-            from . import platform
-            await platform.relay_links_to_parse_bot(
-                "douyin", [record.get("url") or ""])
+        # 转交重试 3 次 × 20s：断连窗口（Cannot send requests while
+        # disconnected）常在数十秒内自愈（主客户端自动重连），坐等即可；
+        # 3 次全败才降级 f2 直连（owner 指令 2026-10-19：bot 优先）
+        relay_ok = False
+        for _relay_try in range(1, 4):
+            try:
+                from . import platform
+                await asyncio.wait_for(
+                    platform.relay_links_to_parse_bot(
+                        "douyin", [record.get("url") or ""],
+                        raise_on_error=True),
+                    timeout=90)
+                relay_ok = True
+                break
+            except Exception as relay_err:
+                logger.warning(
+                    f"🎵 转交尝试 {_relay_try}/3 失败："
+                    f"{type(relay_err).__name__}: {str(relay_err)[:80]}")
+                if _relay_try < 3:
+                    await asyncio.sleep(20)
+        if relay_ok:
             logger.info("🎵 已转解析 bot，等待回流销账")
             record["delegated_to_bot"] = True   # 告知队列：委托等待中，不受死文件熔断
             # 盖在途目录戳：bot 回流的下一个视频直接落 <抖音>/<子目录>/，
@@ -326,21 +343,20 @@ async def download_url_media(record):
             # 转交成功：任务留在榜上等销账（bot 回流视频时出榜），
             # 本轮不下载
             return False
-        except Exception as e:
-            logger.warning(f"🎵 转解析 bot 失败，降级 f2 直连：{e}")
-            logger.info("🎵 第 2 顺位：f2 执行期解析直链")
-            fresh = await _refresh_direct_url(record)
-            if fresh:
-                url = fresh
-                refreshed = True   # 继续走下方直连下载
-            else:
-                logger.warning("🎵 f2 解析失败，转退避重试")
-                try:
-                    from . import douyin_batch
-                    await douyin_batch.refresh_cookie_from_browser()
-                except Exception as e2:
-                    logger.debug(f"🎵 重放期 cookie 保鲜失败：{e2}")
-                return False
+        # 转交 3 次全败 → f2 直连兜底
+        logger.info("🎵 第 2 顺位：f2 执行期解析直链")
+        fresh = await _refresh_direct_url(record)
+        if fresh:
+            url = fresh
+            refreshed = True   # 继续走下方直连下载
+        else:
+            logger.warning("🎵 f2 解析失败，转退避重试")
+            try:
+                from . import douyin_batch
+                await douyin_batch.refresh_cookie_from_browser()
+            except Exception as e2:
+                logger.debug(f"🎵 重放期 cookie 保鲜失败：{e2}")
+            return False
     if direct_url_needs_refresh(url):
         refreshed = True
         logger.info("⏰ 直链签名临近过期/已过期，先重新解析刷新再下载")

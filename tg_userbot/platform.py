@@ -215,17 +215,21 @@ async def _handle_douyin_urls(message, douyin_urls):
         await _relay_kind_links("douyin", remaining)
 
 
-async def relay_links_to_parse_bot(kind: str, urls):
+async def relay_links_to_parse_bot(kind: str, urls, raise_on_error=False):
     """把链接原文发给解析 bot 的公开入口（与 _relay_kind_links 同路径）。
 
     download 的直链失效降级（_delegate_url_task_to_bot）用它把原始分享
     链接兜底转给解析 bot——bot 在自己服务端解析、不依赖本地 cookie。
-    """
-    await _relay_kind_links(kind, urls)
+    raise_on_error=True（/dyu 串行批用）：发送失败向上抛异常交调用方
+    处置（重试/降级），不发 ❌ 通知（避免断连窗口刷屏）。"""
+    await _relay_kind_links(kind, urls, raise_on_error=raise_on_error)
 
 
-async def _relay_kind_links(kind: str, urls):
-    """把一个 kind（douyin/instagram）下的若干链接原文发给其解析 bot。"""
+async def _relay_kind_links(kind: str, urls, raise_on_error=False):
+    """把一个 kind（douyin/instagram）下的若干链接原文发给其解析 bot。
+
+    raise_on_error=True：发送失败上抛（/dyu 串行批自带重试与最终通知），
+    不再逐条发 ❌ 通知刷屏。"""
     if not urls:
         return
     cfg = PLATFORM_LINKS.get(kind)
@@ -262,6 +266,8 @@ async def _relay_kind_links(kind: str, urls):
             )
         except Exception as e:
             logger.exception(f"❌ {label}链接处理失败：{url} | {e}")
+            if raise_on_error:
+                raise
             try:
                 await notify.notify_user(
                     f"❌ {label}链接处理失败\n\n"
