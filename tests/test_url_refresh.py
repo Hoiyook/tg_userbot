@@ -181,7 +181,7 @@ class DownloadUrlMediaTest(unittest.IsolatedAsyncioTestCase):
     def _patch_relay(self, exc=None):
         self.relayed = []
 
-        async def fake_relay(kind, urls):
+        async def fake_relay(kind, urls, **kwargs):
             self.relayed.append((kind, list(urls)))
             if exc is not None:
                 raise exc
