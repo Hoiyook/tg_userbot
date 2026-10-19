@@ -6,9 +6,7 @@ COPY 幂等 / 解压 / UPLOAD 逐文件 / VERIFY 通过与失败 / 密码终结�
 
     .venv/bin/python -m unittest tests.test_extract_worker -v
 """
-import asyncio
 import atexit
-import io
 import os
 import shutil
 import sys
@@ -26,7 +24,6 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import config  # noqa: E402
 from tg_userbot import extract_worker as ew  # noqa: E402
-from tg_userbot import notify  # noqa: E402
 from tg_userbot import runtime_db  # noqa: E402
 from tg_userbot import state  # noqa: E402
 
@@ -257,6 +254,67 @@ class PreconditionTest(_Env):
         with mock.patch.object(config, "CLOUD_MOUNT_BASE",
                                "/nonexistent_mount"):
             self.assertFalse(ew._preconditions_ok())
+
+
+class CopyWatchdogTest(_Env):
+    """拷贝看门狗：FUSE 冻结（无进度）→ 超时转退避重投；有增长 → 不误伤。"""
+
+    def _fast_watchdog(self):
+        return [mock.patch.object(config, "EXTRACT_COPY_CHECK_SECONDS", 0.05),
+                mock.patch.object(config, "EXTRACT_COPY_STALL_SECONDS", 0.15)]
+
+    async def test_frozen_copy_times_out_and_requeues(self):
+        import time as _time
+
+        def frozen_copy(src, dst, progress=None, chunk=0, expected=None):
+            # 模拟挂载冻结：写入一小段后字节永停（线程自限时，避免拖垮
+            # 执行器关停；看门狗在 0.15s 内就应先抛）
+            with open(dst, "wb") as f:
+                f.write(b"\0" * 64)
+            deadline = _time.monotonic() + 1.5
+            while _time.monotonic() < deadline:
+                _time.sleep(0.01)
+            return True
+
+        size = self._put_remote_zip("云下载", "冻结包.zip", {"a.txt": b"x"})
+        task = self._enqueue_one("云下载", "冻结包.zip", size)
+        patches = self._fast_watchdog() + [
+            mock.patch.object(ew, "_copy_file", frozen_copy)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        await self._run_one_tick()
+        after = runtime_db.get_extract_task(task["id"])
+        self.assertEqual(after["status"], runtime_db.EXTRACT_PENDING)
+        self.assertIn("挂载冻结", after["error"])
+        self.assertGreaterEqual(after["attempts"], 1)
+
+    async def test_growing_copy_not_interrupted(self):
+        import time as _time
+
+        def slow_copy(src, dst, progress=None, chunk=0, expected=None):
+            # 慢但持续增长（读真内容，解压步骤还要用）：每个检查窗口
+            # 都有新字节 → 不应触发看门狗
+            with open(src, "rb") as fi, open(dst, "wb") as fo:
+                while True:
+                    b = fi.read(8)
+                    if not b:
+                        break
+                    fo.write(b)
+                    fo.flush()
+                    _time.sleep(0.02)
+            return True
+
+        size = self._put_remote_zip("云下载", "慢包.zip", {"a.txt": b"x"})
+        task = self._enqueue_one("云下载", "慢包.zip", size)
+        patches = self._fast_watchdog() + [
+            mock.patch.object(ew, "_copy_file", slow_copy)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        await self._run_one_tick()
+        after = runtime_db.get_extract_task(task["id"])
+        self.assertEqual(after["status"], runtime_db.EXTRACT_COMPLETED)
 
 
 if __name__ == "__main__":

@@ -164,19 +164,51 @@ async def _process_task(task):
 
     local_arch = os.path.join(staging, "archive" +
                               os.path.splitext(name)[1].lower())
+
+    async def _copy_with_watchdog(src_path, dst_path, expected):
+        """带无进度看门狗的拷贝：FUSE 挂载冻结时 read 会永久阻塞（无异常
+        不超时），实测两个 1GB 任务卡同一字节 12 小时。每 CHECK 周期查
+        一次目标增长，COPY_STALL 内无增长 → 抛错走重试（底层线程可能仍
+        阻塞在 read 上，但 worker 不再被拖死）。"""
+        check = float(getattr(
+            config, "EXTRACT_COPY_CHECK_SECONDS", 60))
+        copied = asyncio.ensure_future(asyncio.to_thread(
+            _copy_file, src_path, dst_path,
+            expected=expected))
+        stall = 0.0
+        last = -1
+        while True:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(copied), timeout=check)
+            except asyncio.TimeoutError:
+                cur = os.path.getsize(dst_path) \
+                    if os.path.exists(dst_path) else 0
+                if cur != last:
+                    if cur - last >= 256 * 1024 * 1024:
+                        logger.info(
+                            f"🗜 拷贝进度：{cur} / {expected} 字节")
+                    last = cur
+                    stall = 0.0
+                else:
+                    stall += check
+                if stall >= float(getattr(
+                        config, "EXTRACT_COPY_STALL_SECONDS", 900)):
+                    copied.cancel()
+                    raise TimeoutError(
+                        f"拷贝无进度超过 {int(stall)}s（挂载冻结），转重试")
+            except asyncio.CancelledError:
+                copied.cancel()
+                raise
+
     try:
         # ── ① COPY（幂等：副本已存在且尺寸一致 → 跳过） ──
         if os.path.isfile(local_arch) \
                 and os.path.getsize(local_arch) == task["archive_size"]:
             logger.info(f"🗜 [E{tid}] 副本已存在（断点续用），跳过拷贝")
         else:
-            await asyncio.to_thread(
-                _copy_file, src, local_arch,
-                lambda done: logger.info(
-                    f"🗜 [E{tid}] 拷贝进度：{done} / "
-                    f"{task['archive_size']} 字节")
-                if done % (64 * 1024 * 1024) == 0 else None,
-                expected=task["archive_size"])
+            await _copy_with_watchdog(
+                src, local_arch, task["archive_size"])
             actual = os.path.getsize(local_arch)
             if actual != task["archive_size"]:
                 raise IOError(
@@ -238,7 +270,7 @@ async def _process_task(task):
                     and os.path.getsize(target) == size:
                 skipped += 1      # 115 秒传/重试幂等：远端已有同尺寸
             else:
-                await asyncio.to_thread(_copy_file, local, target)
+                await _copy_with_watchdog(local, target, size)
                 uploaded += 1
                 total_bytes += size
             runtime_db.set_extract_progress(
@@ -304,7 +336,6 @@ async def _verify_with_retry(tid, target_root, rel_files, content_dir,
 
     返回差异清单（空 = 通过）。每轮之间睡 gap 秒（CD2 异步上传在途）。
     """
-    from . import cd2_api
     if tries is None:
         tries = int(getattr(config, "EXTRACT_VERIFY_TRIES", 9))
     if gap is None:
@@ -535,7 +566,6 @@ _WATCH_DIRS = {"dirs": [], "last_scan": 0.0}
 def load_watch_dirs():
     """启动时从 runtime/watch_dirs.json 恢复登记。"""
     import json as _json
-    from . import runtime_db as _rtdb
     path = os.path.join(os.path.dirname(config.RUNTIME_DB_FILE),
                         "watch_dirs.json")
     global _WATCH_FILE
