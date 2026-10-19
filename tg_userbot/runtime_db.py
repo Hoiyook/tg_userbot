@@ -772,6 +772,25 @@ def migrate() -> int:
     if version < 12:
         # v11 → v12：新增 extract_tasks（115 解压回传）。纯建表。
         logger.info("🗄 Runtime DB 迁移：v12（+ extract_tasks 115 解压回传）")
+    if version < 13:
+        # v12 → v13：瞬时故障（挂载抖动/冻结、远端暂不可读）曾是 TERMINAL
+        # 终结台账；_fail 改为「瞬时故障不占上限、无限退避重试」后，把存量
+        # 这类终结批量回投 PENDING（重置 attempts 重新计数）。「远端压缩包
+        # 已不存在」是永久事实，保持 TERMINAL 不动。一次性数据迁移，幂等。
+        def _v13(conn):
+            marks = ("挂载视图抖动", "远端目录不可读", "挂载冻结")
+            where = " OR ".join("error LIKE ?" for _ in marks)
+            cur = _execute(
+                conn,
+                f"UPDATE extract_tasks SET status=?, attempts=0, "
+                f"next_retry_at=NULL, lease_until=NULL, updated_at=? "
+                f"WHERE status=? AND ({where})",
+                (EXTRACT_PENDING, _now(), EXTRACT_TERMINAL,
+                 *(f"%{m}%" for m in marks)))
+            if cur.rowcount:
+                logger.info(f"🗄 v13：瞬时故障终结任务回投 {cur.rowcount} 条")
+        _write(_v13, "迁移 v13（瞬时 TERMINAL 回投）")
+        logger.info("🗄 Runtime DB 迁移：v13（瞬时故障 TERMINAL 存量回投）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")

@@ -785,3 +785,50 @@ class ExecuteUserSqlTest(_DbTestCase):
         runtime_db.close_db()
         with self.assertRaises(runtime_db.DbUnavailable):
             runtime_db.execute_user_sql("SELECT 1")
+
+
+class V13TransientRequeueTest(_DbTestCase):
+    """v13 数据迁移：瞬时故障（挂载抖动/冻结、远端不可读）的存量 TERMINAL
+    批量回投 PENDING；「远端压缩包已不存在」这类永久事实保持终结。"""
+
+    def _seed_terminal(self, remote_dir, name, error):
+        runtime_db.enqueue_extract_tasks(remote_dir, [(name, 123)])
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "UPDATE extract_tasks SET status='TERMINAL', attempts=5, "
+            "error=? WHERE remote_dir=? AND archive_name=?",
+            (error, remote_dir, name))
+        conn.commit()
+        conn.close()
+
+    def test_transient_terminal_requeued_permanent_kept(self):
+        from tg_userbot import runtime_db as rdb
+        self._seed_terminal("/115open/云下载", "抖.zip",
+                            "挂载视图抖动：本地 isfile 不可见但 gRPC 确认存在")
+        self._seed_terminal("/115open/云下载", "读.zip",
+                            "对账不一致：远端目录不可读：/115open/云下载/x")
+        self._seed_terminal("/115open/云下载", "没.zip",
+                            "远端压缩包已不存在：/115open/云下载/没.zip")
+        # 模拟旧版本库：版本号退回 12，重跑 init_db 触发 v13 迁移
+        runtime_db.set_schema_meta("schema_version", 12)
+        runtime_db.close_db()
+        self.assertTrue(runtime_db.init_db())
+        self.assertEqual(runtime_db.get_schema_version(),
+                         config.RUNTIME_DB_SCHEMA_VERSION)
+
+        rows = {r["archive_name"]: r
+                for r in runtime_db.list_extract_tasks(limit=100)}
+        self.assertEqual(rows["抖.zip"]["status"], rdb.EXTRACT_PENDING)
+        self.assertEqual(rows["抖.zip"]["attempts"], 0)
+        self.assertIsNone(rows["抖.zip"]["next_retry_at"])
+        self.assertEqual(rows["读.zip"]["status"], rdb.EXTRACT_PENDING)
+        self.assertEqual(rows["没.zip"]["status"], rdb.EXTRACT_TERMINAL,
+                         "永久事实不回投")
+        # 幂等：再跑一次不重复动作、不报错
+        runtime_db.set_schema_meta("schema_version", 12)
+        runtime_db.close_db()
+        self.assertTrue(runtime_db.init_db())
+        rows = {r["archive_name"]: r["status"]
+                for r in runtime_db.list_extract_tasks(limit=100)}
+        self.assertEqual(rows["抖.zip"], rdb.EXTRACT_PENDING)
+        self.assertEqual(rows["没.zip"], rdb.EXTRACT_TERMINAL)

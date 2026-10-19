@@ -311,10 +311,25 @@ def shutil_rmtree(path):
     shutil.rmtree(path, ignore_errors=True)
 
 
+_TRANSIENT_MARKS = ("挂载视图抖动", "远端目录不可读", "挂载冻结")
+"""基础设施类瞬时故障标记（我们自己生成的错误文案）：这类失败不烧
+尝试次数上限——环境恢复前按退避节奏（封顶 2h）无限重试，直到成功
+或源消失转「已不存在」终结。owner 指令 2026-10-19：瞬时故障自动重投，
+不积累成需要人工的终结台账。"""
+
+
 async def _fail(tid, error):
-    """失败分流：重试未到上限 → 退避重投；到上限 → 终结 + 通知。"""
+    """失败分流：瞬时故障 → 无限退避重试；其余未到上限 → 退避重投；
+    到上限 → 终结 + 通知。"""
     task = runtime_db.get_extract_task(tid)
     attempts = int(task["attempts"]) if task else 1
+    if any(m in error for m in _TRANSIENT_MARKS):
+        delay = _backoff_delay(attempts)
+        runtime_db.postpone_extract_task(tid, time.time() + delay, error)
+        logger.warning(
+            f"🗜 [E{tid}] {error}；瞬时故障不占上限，"
+            f"{delay}s 后重试（第 {attempts} 次）")
+        return
     if attempts >= int(config.EXTRACT_MAX_ATTEMPTS):
         runtime_db.terminate_extract_task(tid, error)
         try:

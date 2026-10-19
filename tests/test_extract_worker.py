@@ -248,6 +248,26 @@ class FailurePathTest(_Env):
         self.assertEqual(after["status"], runtime_db.EXTRACT_TERMINAL)
         self.assertIn("已不存在", after["error"])
 
+    async def test_transient_failure_never_terminates(self):
+        """瞬时故障（挂载冻结/抖动、远端不可读）不占尝试上限：哪怕已达
+        MAX_ATTEMPTS 也只退避重投，不转终结（owner 指令 2026-10-19）。"""
+        size = self._put_remote_zip("云下载", "瞬时.zip", {"a.txt": b"x"})
+        task = self._enqueue_one("云下载", "瞬时.zip", size)
+        with mock.patch.object(config, "EXTRACT_MAX_ATTEMPTS", 1), \
+                mock.patch.object(config, "EXTRACT_BACKOFF_BASE_SECONDS", 0):
+            for msg in ("TimeoutError: 拷贝无进度超过 900s（挂载冻结），转重试",
+                        "挂载视图抖动：本地 isfile 不可见但 gRPC 确认存在",
+                        "对账不一致：远端目录不可读：/115open/云下载/x"):
+                # postpone 只作用于 PROCESSING 行——生产里 _fail 总在领取后
+                # 调用，测试同样先领取再失败（退避基数 0 → 立即可再领取）
+                self.assertIsNotNone(
+                    runtime_db.claim_next_extract_task())
+                await ew._fail(task["id"], msg)
+                after = runtime_db.get_extract_task(task["id"])
+                self.assertEqual(after["status"], runtime_db.EXTRACT_PENDING,
+                                 f"「{msg[:12]}…」不得终结")
+                self.assertIsNotNone(after["next_retry_at"])
+
 
 class PreconditionTest(_Env):
     def test_mount_missing_blocks(self):
