@@ -127,10 +127,34 @@ def extract_archive(archive_path, dest=None, delete_source=False,
         except RuntimeError as e:
             # stdlib 读到加密成员时的典型异常
             return "password", str(e)[:120], []
+        except zipfile.BadZipFile as e:
+            # stdlib 连容器都解析不了（分卷标记/损坏）。用 bsdtar 探测
+            # 区分「引擎宽容度」与「源文件真坏」：能列 → 回落 bsdtar 解；
+            # 也不能 → 源文件损坏/非标准格式，判 failed 终结——绝不误标
+            # 「需密码」（会进每轮扫描无限重试的假循环）。
+            import subprocess
+            try:
+                probe = subprocess.run(
+                    ["bsdtar", "-tvf", archive_path], capture_output=True,
+                    timeout=120, stdin=subprocess.DEVNULL)
+            except subprocess.TimeoutExpired:
+                probe = None
+            if probe is not None and probe.returncode == 0:
+                logger.info(
+                    f"🗜 stdlib 拒解析（{str(e)[:60]}），回落 bsdtar："
+                    f"{os.path.basename(archive_path)}")
+                use_bsdtar = True
+            else:
+                reason = ("list 超时" if probe is None else
+                          probe.stderr.decode("utf-8", "replace").strip())
+                return ("failed",
+                        f"zip 容器不可解析（{str(e)[:60]}）；bsdtar 亦拒："
+                        f"{reason[:60] or '无输出'}。源文件疑损坏或非标准格式",
+                        [])
         except Exception as e:
             return "failed", f"{type(e).__name__}: {e}", []
-    else:
-        # ── bsdtar 路：rar/7z/tar 系 + 一切带密码的包 ──
+    if use_bsdtar:
+        # ── bsdtar 路：rar/7z/tar 系 + 一切带密码的包 + stdlib 拒解析的 zip ──
         import subprocess
         probe_cmd = ["bsdtar", "-tvf", archive_path]   # -v：带尺寸可做守卫
         if password:
@@ -201,7 +225,9 @@ def extract_archive(archive_path, dest=None, delete_source=False,
         for n in names:
             files.append(os.path.join(root, n))
     if not files:
-        return "failed", "解压后目录为空", []
+        return ("failed",
+                "解压后目录为空（引擎零产物：源文件疑损坏、噪声目录，"
+                "或加密卷未解）", [])
     if delete_source:
         try:
             os.remove(archive_path)

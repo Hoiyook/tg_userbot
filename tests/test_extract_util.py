@@ -5,7 +5,6 @@ dest；非 zip（bsdtar 分支）成功与"需密码"探测；pawchive 委托层
 
     .venv/bin/python -m unittest tests.test_extract_util -v
 """
-import io
 import os
 import shutil
 import sys
@@ -307,3 +306,49 @@ class PawchiveDelegateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CorruptZipTest(unittest.TestCase):
+    """stdlib 拒解析的 zip：bsdtar 探测分流——能列则回落抢救可恢复成员，
+    也不能则诚实判 failed（疑源文件损坏），绝不误标「需密码」进假循环。"""
+
+    CD_SIG = b"PK\x01\x02"    # 中央目录
+    EOCD_SIG = b"PK\x05\x06"  # 结束记录
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="tg_extract_corrupt_")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def test_truncated_zip_salvages_listable_members(self):
+        """尾部（含 EOCD）被截断：stdlib 拒开，libarchive 能沿本地头抢救
+        出前半段成员 → 回落 bsdtar，解出可恢复部分。"""
+        arch = os.path.join(self.dir, "截断.zip")
+        _make_zip(arch, {"a.txt": b"hello", "sub/b.txt": b"world"})
+        with open(arch, "rb") as f:
+            raw = f.read()
+        with open(arch, "wb") as f:
+            f.write(raw[:len(raw) // 2])
+        status, detail, files = extract_util.extract_archive(arch)
+        self.assertEqual(status, "extracted", detail)
+        dest = os.path.join(self.dir, "截断")
+        self.assertTrue(os.path.isfile(os.path.join(dest, "a.txt")),
+                        "前半段的可恢复成员应被抢救")
+
+    def test_corrupt_body_fails_honestly_not_password(self):
+        """中央目录区被噪声覆盖（115 上真实坏源的模样，如 E24371）：
+        stdlib 与 bsdtar 都拒 → failed「疑损坏」终结，不误标需密码。"""
+        arch = os.path.join(self.dir, "坏.zip")
+        _make_zip(arch, {"a.txt": b"hello"})
+        with open(arch, "rb") as f:
+            raw = bytearray(f.read())
+        cd = raw.find(self.CD_SIG)
+        eocd = raw.rfind(self.EOCD_SIG)
+        self.assertGreater(cd, 0, "测试造数：应能找到中央目录签名")
+        for i in range(cd, eocd):
+            raw[i] = (raw[i] * 7 + 13) & 0xFF   # 确定性噪声
+        with open(arch, "wb") as f:
+            f.write(bytes(raw))
+        status, detail, files = extract_util.extract_archive(arch)
+        self.assertEqual(status, "failed", detail)
+        self.assertIn("疑损坏", detail)
+        self.assertEqual(files, [])
