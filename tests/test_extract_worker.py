@@ -276,6 +276,28 @@ class PreconditionTest(_Env):
             self.assertFalse(ew._preconditions_ok())
 
 
+class RecoverLoopTest(_Env):
+    async def test_recover_loop_runs_periodically(self):
+        """运行期租约回收循环按周期调用 DB 回收（启动自愈盖不住的
+        「停机窗口领取后被 SIGKILL」幽灵靠它兜底，实测 E24388）。"""
+        import asyncio
+        calls = []
+        with mock.patch.object(config, "EXTRACT_RECOVER_SECONDS", 0.05), \
+                mock.patch.object(
+                    runtime_db, "recover_expired_extract_tasks",
+                    side_effect=lambda: calls.append(1)):
+            task = asyncio.ensure_future(ew._recover_loop())
+            try:
+                await asyncio.sleep(0.18)
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self.assertGreaterEqual(len(calls), 2, "回收扫描应周期执行")
+
+
 class CopyWatchdogTest(_Env):
     """拷贝看门狗：FUSE 冻结（无进度）→ 超时转退避重投；有增长 → 不误伤。"""
 

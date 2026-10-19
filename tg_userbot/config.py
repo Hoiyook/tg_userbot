@@ -1544,7 +1544,9 @@ PAWCHIVE_EXT_LINK_HOSTS = (
 # ------------------------------------------------------------
 # 115 解压回传（2026-09-30，/115x）：拉 115 目录顶层压缩包到本地解压，
 # 逐文件回传 <原目录>/<压缩包名>/，完成后尺寸对账。
-EXTRACT_LEASE_SECONDS = 3600        # 单包处理租约（GB 级包拷贝+解压可达小时级）
+EXTRACT_LEASE_SECONDS = 900         # 单包处理租约（续租每 60s 推一次，
+                                    # 时长只关乎「断联后多久判死」，与包多大无关）
+EXTRACT_RECOVER_SECONDS = 600       # 运行期过期租约回收扫描周期
 EXTRACT_MAX_ATTEMPTS = 5            # 退避重试上限；超过转 TERMINAL（人工重投）
 EXTRACT_BACKOFF_BASE_SECONDS = 300  # 首败退避 5 分钟
 EXTRACT_BACKOFF_MAX_SECONDS = 7200  # 封顶 2 小时

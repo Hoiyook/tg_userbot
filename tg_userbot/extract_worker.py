@@ -93,6 +93,25 @@ async def _renew_loop(task_id):
         raise
 
 
+async def _recover_loop():
+    """运行期租约回收循环：定时把过期 PROCESSING 放回 PENDING。
+
+    启动时的一次性自愈盖不住「优雅停机窗口里领了任务、随即被 SIGKILL」
+    的幽灵（租约未过期，启动自愈跳过；此后无人回收 → 永久卡死，实测
+    E24388）。在途任务的租约由 _renew_loop 持续推延，不会被误回收。
+    """
+    interval = int(getattr(config, "EXTRACT_RECOVER_SECONDS", 600))
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                runtime_db.recover_expired_extract_tasks()
+            except Exception as e:
+                logger.warning(f"🗜 解压任务租约回收扫描失败：{e}")
+    except asyncio.CancelledError:
+        raise
+
+
 def _copy_file(src, dst, progress=None, chunk=1024 * 1024, expected=None):
     """分块拷贝（进度回调每块触发；阻塞，放线程）。返回写入字节数。
 
@@ -177,6 +196,7 @@ async def _process_task(task):
             expected=expected))
         stall = 0.0
         last = -1
+        logged = 0
         while True:
             try:
                 return await asyncio.wait_for(
@@ -185,9 +205,12 @@ async def _process_task(task):
                 cur = os.path.getsize(dst_path) \
                     if os.path.exists(dst_path) else 0
                 if cur != last:
-                    if cur - last >= 256 * 1024 * 1024:
+                    # 对比「上次已记录」水位：60s 内增量常不足 256MB，
+                    # 对比上次轮询会永远够不到阈值（进度全程静默）
+                    if cur - logged >= 256 * 1024 * 1024:
                         logger.info(
-                            f"🗜 拷贝进度：{cur} / {expected} 字节")
+                            f"🗜 [E{tid}] 拷贝进度：{cur} / {expected} 字节")
+                        logged = cur
                     last = cur
                     stall = 0.0
                 else:
@@ -470,6 +493,9 @@ async def extract_worker_loop():
     watch_task = asyncio.ensure_future(_watch_loop())
     _WATCH_TASKS.add(watch_task)
     watch_task.add_done_callback(_WATCH_TASKS.discard)
+    recover_task = asyncio.ensure_future(_recover_loop())
+    _WATCH_TASKS.add(recover_task)
+    recover_task.add_done_callback(_WATCH_TASKS.discard)
     # 崩溃自愈：上次进程遗留的过期 PROCESSING → PENDING
     try:
         runtime_db.recover_expired_extract_tasks()
