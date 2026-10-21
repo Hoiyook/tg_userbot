@@ -579,3 +579,44 @@ class PostSubcommandParseTest(unittest.TestCase):
             action, _ = pawchive.parse_paw_command(f"/paw {sub} test")
             self.assertEqual(action, sub,
                              f"子命令 /paw {sub} 未注册进 parse_paw_command")
+
+
+class ManualViewCreatorFilterTest(_DbTestCase):
+    """/paw_manual <作者>：MANUAL 视图按作者过滤（大小写不敏感包含匹配）。"""
+
+    def _seed_manual(self):
+        for cid, name, pid, url in (("42", "Alpha", "1", "u1"),
+                                    ("99", "SillyTeshii", "2", "u2")):
+            runtime_db.enqueue_pawchive_posts("patreon", cid, name, [{
+                "post_id": pid, "title": f"T{pid}",
+                "published": "2026-10-0" + pid, "post_url": url,
+                "subdir": f"s{pid}", "files": [],
+                "ext_links": [{"kind": "link", "domain": "mega.nz",
+                               "url": f"https://mega.nz/{pid}",
+                               "text": "M"}]}])
+        import sqlite3 as _sq
+        conn = _sq.connect(config.RUNTIME_DB_FILE)
+        conn.execute("UPDATE pawchive_posts SET status='MANUAL'")
+        conn.commit()
+        conn.close()
+
+    def test_creator_filter_substring_case_insensitive(self):
+        self._seed_manual()
+        text, rows = pawchive.manual_view(creator="silly")
+        self.assertIn("SillyTeshii", text)
+        self.assertNotIn("Alpha", text)
+        self.assertIn("作者含「silly」", text)
+        self.assertEqual(len(rows), 1)
+
+    def test_creator_filter_no_match(self):
+        self._seed_manual()
+        text, rows = pawchive.manual_view(creator="不存在的作者")
+        self.assertIn("没有作者名含", text)
+        self.assertEqual(rows, [])
+
+    def test_no_arg_keeps_full_view(self):
+        self._seed_manual()
+        text, rows = pawchive.manual_view()
+        self.assertIn("Alpha", text)
+        self.assertIn("SillyTeshii", text)
+        self.assertEqual(len(rows), 2)

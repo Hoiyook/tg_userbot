@@ -1584,7 +1584,7 @@ def status_text():
                      f"{config.PAWCHIVE_MIN_FREE_GB:.0f} GB）")
     lines += [
         "",
-        "命令：/paw plan <作者>｜/paw search <词>｜/paw manual",
+        "命令：/paw plan <作者>｜/paw search <词>｜/paw manual [作者]",
         "/paw retry <ID|all>｜/paw pause｜/paw resume｜/paw csv <作者>",
     ]
     return "\n".join(lines)
@@ -1655,21 +1655,33 @@ async def retry_all_reply():
     return f"{TEXT_PREFIX}\n{msg}"
 
 
-def manual_view(limit=10):
+def manual_view(limit=10, creator=None):
     """MANUAL（人工处理）视图：文本（作者/日期/帖子/外链清单）+ 按钮行。
 
     每帖一行按钮：✅ 完成（paw_done 回调，人工处理完外链后点它标记
-    COMPLETED）+ 🔗 原帖（URL 按钮，直接打开帖子）。"""
+    COMPLETED）+ 🔗 原帖（URL 按钮，直接打开帖子）。
+    creator 给定时只看该作者——大小写不敏感的**包含**匹配（如
+    /paw_manual silly 命中 SillyTeshii）；过滤在拉取后进行（拉取池放大到
+    2000，不受默认 limit=10 截断影响漏帖）。"""
     from .menu import encode_menu_data   # 函数内导入避免 menu↔本模块成环
+    low = (creator or "").strip().lower() or None
     try:
         posts = runtime_db.list_pawchive_posts(
-            status=runtime_db.PAW_POST_MANUAL, limit=limit)
+            status=runtime_db.PAW_POST_MANUAL,
+            limit=2000 if low else limit)
     except runtime_db.DbUnavailable as e:
         return (f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}", [])
+    if low:
+        posts = [p for p in posts
+                 if low in (p.get("creator_name") or "").lower()]
+        if not posts:
+            return (f"{TEXT_PREFIX}\n👤 没有作者名含「{creator.strip()}」的"
+                    "待人工帖子（/paw_manual 不带参数看全部）", [])
     if not posts:
         return (f"{TEXT_PREFIX}\n👤 没有待人工处理的帖子"
                 "（外链帖会在直链下完后出现在这里）", [])
-    lines = [f"{TEXT_PREFIX}：👤 待人工处理 {len(posts)} 帖"
+    head = f"（作者含「{creator.strip()}」）" if low else ""
+    lines = [f"{TEXT_PREFIX}：👤 待人工处理{head} {len(posts)} 帖"
              "（处理完外链点 ✅ 标记完成）", ""]
     rows = []
     for p in posts:
@@ -1984,7 +1996,8 @@ async def command_reply(event, cmd_text):
         if (arg or "").strip().lower() == "export":
             await event.reply(manual_export_text(), link_preview=False)
             return
-        view_text, buttons = manual_view()
+        # 带参数 = 按作者过滤（大小写不敏感包含匹配），如 /paw_manual silly
+        view_text, buttons = manual_view(creator=arg)
         await event.reply(view_text, buttons=buttons, link_preview=False)
         return
     if action == "done":
@@ -2067,7 +2080,7 @@ def _help_text():
         "  /paw post <帖子URL|ID> —— 单独获取指定帖子的附件\n"
         "  /paw find <关键词> —— 按名称查扫描记录与当前目录文件\n"
         "  /paw offline <链接> —— 磁力/直链丢给 CD2 离线到 115\n"
-        "  /paw manual —— 待人工处理的帖子（含外链清单与 ✅ 按钮）\n"
+        "  /paw manual [作者] —— 待人工处理的帖子（可按作者过滤，含外链清单与 ✅ 按钮）\n"
         "  /paw manual export —— 全部待处理外链导出为工作清单\n"
         "  /paw att <URL|帖子ID|行id> —— 查帖子的附件与外链状态\n"
         "  /paw pr <URL|帖子ID|行id> —— 帖子执行详情报告（附件/外链统计、"
