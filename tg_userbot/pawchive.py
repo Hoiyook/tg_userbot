@@ -242,6 +242,19 @@ def set_default_since(value):
 # ------------------------------------------------------------
 BACKFILL_THROTTLE_SECONDS = 2.5
 BACKFILL_GONE_MARK = "站点已无此帖"
+# backfill 专用线程池：asyncio 默认 to_thread 池（8 核 = 12 线程）与下载器
+# 共享——8 帖并发下载把池占满时，backfill 的逐帖 fetch 在队列里排不上队，
+# 604 帖实测 3 小时零进展（2026-10-21）。独立 2 线程，与下载互不抢。
+_BACKFILL_POOL = None
+
+
+def _backfill_pool():
+    global _BACKFILL_POOL
+    if _BACKFILL_POOL is None:
+        import concurrent.futures
+        _BACKFILL_POOL = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="paw-backfill")
+    return _BACKFILL_POOL
 
 
 async def backfill_author(name):
@@ -269,19 +282,34 @@ async def backfill_author(name):
         await notify.notify_user(text)
 
     async def _run():
-        added_total = posts_touched = gone = 0
+        added_total = posts_touched = gone = fetch_failed = 0
         done = 0
         try:
             for r in rows:
                 done += 1
                 _scan_stage("回填详情")(
                     f"{done}/{len(rows)}｜新增 {added_total}")
+                if done % 25 == 0:
+                    logger.info(
+                        f"🐾 回填进度 {done}/{len(rows)}："
+                        f"新增 {added_total}，站点已无 {gone}，"
+                        f"拉取失败 {fetch_failed}")
                 try:
-                    detail = await asyncio.to_thread(
-                        fetch_post_detail, r["service"], r["creator_id"],
-                        r["post_id"], config.PAWCHIVE_COOKIE or None)
-                except Exception:
-                    gone += 1          # 详情 404/网络失败：站点侧已无此帖
+                    detail = await asyncio.get_event_loop(
+                    ).run_in_executor(
+                        _backfill_pool(), fetch_post_detail,
+                        r["service"], r["creator_id"], r["post_id"],
+                        config.PAWCHIVE_COOKIE or None)
+                except Exception as e:
+                    # 404 = 站点侧已无此帖；其余（429/超时/断网）只是本轮
+                    # 没拉到——混在一起会把限流误报成「站点已无」
+                    if "404" in str(e):
+                        gone += 1
+                    else:
+                        fetch_failed += 1
+                        logger.warning(
+                            f"🐾 回填拉取失败 {r['post_id']}："
+                            f"{str(e)[:80]}")
                     await asyncio.sleep(BACKFILL_THROTTLE_SECONDS)
                     continue
                 d = detail[0] if isinstance(detail, list) else detail
@@ -311,8 +339,9 @@ async def backfill_author(name):
                 await asyncio.sleep(BACKFILL_THROTTLE_SECONDS)
             summary = (
                 f"🐾 回填完成：{rows[0]['creator_name']}\n"
-                f"检查 {len(rows)} 帖｜站点已无 {gone} 帖\n"
-                f"补录新附件 {added_total} 个（涉及 {posts_touched} 帖，"
+                f"检查 {len(rows)} 帖｜站点已无 {gone} 帖"
+                + (f"｜拉取失败 {fetch_failed} 帖" if fetch_failed else "")
+                + f"\n补录新附件 {added_total} 个（涉及 {posts_touched} 帖，"
                 "已重开入队只下新增）")
             if added_total:
                 summary += "\nworker 将自动补下，完成进度看 /paw progress"
@@ -324,7 +353,11 @@ async def backfill_author(name):
         finally:
             state.PAW_SCAN_RUNNING = None
             state.PAW_SCAN_PROGRESS = {}
-        await _notify(summary)
+        try:
+            await _notify(summary)
+        except Exception as e:
+            # 回执也走 TG，撞限频/断连不能让任务带异常死掉（无人知晓）
+            logger.warning(f"🐾 回填完成通知发送失败：{e}")
 
     task = asyncio.create_task(_run())
     _SPAWNED_SCANS.add(task)

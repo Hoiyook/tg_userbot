@@ -4492,3 +4492,58 @@ class UntilDateEarlyStopTest(unittest.TestCase):
         with mock.patch.object(pawchive, "_http_get_json", fake_http):
             pawchive.fetch_creator_posts("patreon", "1")
         self.assertGreaterEqual(len(calls["offset"]), 2)
+
+
+class BackfillFailureSplitTest(unittest.IsolatedAsyncioTestCase):
+    """回填拉取失败的计数分离：404 = 站点已无；其余 = 拉取失败（限流/
+    断网不能误报成「站点已无」，owner 数据准确性原则）。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ux2_bfs_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        runtime_db.enqueue_pawchive_posts(
+            "patreon", "1", "Who", [{
+                "post_id": "p1", "title": "t", "published": "2026-09-01",
+                "post_url": "https://x/p1", "subdir": "s1",
+                "files": [], "ext_links": [],
+            }, {
+                "post_id": "p2", "title": "t", "published": "2026-09-01",
+                "post_url": "https://x/p2", "subdir": "s2",
+                "files": [], "ext_links": [],
+            }], scan_batch="t")
+
+    def tearDown(self):
+        state.PAW_SCAN_RUNNING = None
+        state.PAW_SCAN_PROGRESS = {}
+
+    async def test_404_vs_network_counted_separately(self):
+        from tg_userbot import pawchive as paw
+
+        def fake_fetch(service, cid, pid, cookie=None):
+            if pid == "p1":
+                raise RuntimeError("HTTP 404")
+            raise RuntimeError("重试 4 次仍失败：429")
+        notifies = []
+
+        async def fake_notify(text, buttons=None):
+            notifies.append(text)
+        with mock.patch.object(paw, "fetch_post_detail", fake_fetch), \
+                mock.patch.object(paw.asyncio, "sleep",
+                                  mock.AsyncMock()), \
+                mock.patch("tg_userbot.notify.notify_user",
+                           new=fake_notify):
+            async def run():
+                await paw.backfill_author("Who")
+                for t in list(paw._SPAWNED_SCANS):
+                    await t
+            await run()
+        self.assertTrue(notifies)
+        text = notifies[-1]
+        self.assertIn("站点已无 1 帖", text)
+        self.assertIn("拉取失败 1 帖", text)

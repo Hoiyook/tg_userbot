@@ -895,7 +895,10 @@ class Reporter:
             self._last_status_at = now
 
     async def run(self):
-        """后台主循环（规格 §31/§32）：独立 Task，异常永不外逸、取消原样上抛。"""
+        """后台主循环（规格 §31/§32）：独立 Task，异常永不外逸、取消原样上抛。
+
+        FloodWait 尊重判罚：睡满要求的秒数——否则提速到 5s 后每轮硬撞，
+        罚时越滚越长（2026-10-21 实测与 pawchive 面板互相拉高罚时）。"""
         if not REPORT_ENABLED:
             return
         while True:
@@ -905,6 +908,12 @@ class Reporter:
                 await self.tick()
             except asyncio.CancelledError:
                 raise
+            except FloodWaitError as e:
+                wait = int(e.seconds) + 1
+                logger.warning(
+                    f"🤖 汇报被限频，罚等 {wait}s（期间暂停刷新）")
+                await asyncio.sleep(wait)
+                continue
             except Exception as e:
                 logger.exception(f"🤖 汇报周期异常（不影响核心系统）：{e}")
             await asyncio.sleep(REPORT_EVENT_POLL_SECONDS)

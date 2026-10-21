@@ -921,9 +921,13 @@ async def _refresh_panel():
 
 
 async def _panel_loop():
-    """进度面板循环：有活动内容变化就原地编辑（间隔 PAWCHIVE_PANEL_INTERVAL）。"""
+    """进度面板循环：有活动内容变化就原地编辑（间隔 PAWCHIVE_PANEL_INTERVAL）。
+
+    FloodWait 尊重服务端判罚：睡满要求的秒数再回来——否则 5s 一撞，罚时
+    越滚越长（2026-10-21 实测 174s 罚时 + 30 条静默告警）。"""
     interval = float(config.PAWCHIVE_PANEL_INTERVAL_SECONDS)
     logger.info(f"🐾 Pawchive 进度面板已启动（每 {interval:.0f}s 刷新）")
+    from telethon.errors import FloodWaitError
     try:
         while True:
             await asyncio.sleep(interval)
@@ -931,6 +935,11 @@ async def _panel_loop():
                 await _refresh_panel()
             except asyncio.CancelledError:
                 raise
+            except FloodWaitError as e:
+                wait = int(e.seconds) + 1
+                logger.warning(
+                    f"🐾 进度面板被限频，罚等 {wait}s（期间暂停刷新）")
+                await asyncio.sleep(wait)
             except Exception as e:
                 logger.warning(f"🐾 进度面板刷新失败（下轮再试）：{e}")
     except asyncio.CancelledError:
