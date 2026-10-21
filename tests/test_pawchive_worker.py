@@ -11,6 +11,7 @@ import atexit
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -821,3 +822,67 @@ class InflightLeakTest(_WorkerDbTestCase):
                                mock.AsyncMock()):
             await worker._spawn_post(claimed)
         self.assertNotIn(claimed["id"], worker._INFLIGHT)
+
+
+def _signed(url_path, e_offset, s="abc"):
+    """带签名的 temp_url 形态直链（t1.pawchive.pw/f/<token>?e=&s=）。"""
+    return (f"https://t1.pawchive.pw/{url_path}"
+            f"?e={int(time.time()) + e_offset}&s={s}")
+
+
+async def _noop_download(post, files):
+    return None
+
+
+class SignedRefreshTest(_WorkerDbTestCase):
+    """签名直链刷新：temp_url 约 6h 过期，排队超窗即 403（帖 161805432
+    实测）。领取后对临期/过期的 PENDING 文件重拉单帖 API 换新签。"""
+
+    async def test_expired_signed_urls_refreshed_by_token(self):
+        from tg_userbot import pawchive as paw_mod
+        old = _signed("f/tokA/a.mp4", -100)      # 已过期
+        old2 = _signed("f/tokB/b.mp4", 1800)     # 临期（<2h 余量）
+        post, _ = self._seed_and_claim(_post(
+            "61", files=[
+                {"url": old, "filename": "a.mp4"},
+                {"url": old2, "filename": "b.mp4"},
+                {"url": "https://file.pawchive.pw/data/c.gif",
+                 "filename": "c.gif"},                    # 无签名：不动
+            ]))
+        fresh_a = _signed("f/tokA/a.mp4", 20000, s="new-a")
+        fresh_b = _signed("f/tokB/b.mp4", 20000, s="new-b")
+        with mock.patch.object(
+                paw_mod, "fetch_post_detail",
+                return_value={"attachments": [
+                    {"temp_url": fresh_a, "name": "a.mp4"},
+                    {"temp_url": fresh_b, "name": "b.mp4"},
+                    {"path": "63/0c/x.gif", "name": "c.gif"},
+                ]}), \
+                self._patch_downloader(("done", 5, None)):
+            ok = await worker.process_post(post)
+        self.assertTrue(ok)
+        rows = {r["filename"]: r
+                for r in runtime_db.list_pawchive_files(post["id"])}
+        self.assertEqual(rows["a.mp4"]["url"], fresh_a)
+        self.assertEqual(rows["b.mp4"]["url"], fresh_b)
+        self.assertEqual(rows["c.gif"]["url"],
+                         "https://file.pawchive.pw/data/c.gif")
+        # 换新后下载成功 → 帖子 COMPLETED
+        self.assertEqual(
+            runtime_db.get_pawchive_post(post["id"])["status"],
+            runtime_db.PAW_POST_COMPLETED)
+
+    async def test_api_failure_keeps_old_urls(self):
+        from tg_userbot import pawchive as paw_mod
+        old = _signed("f/tokA/a.mp4", -100)
+        post, _ = self._seed_and_claim(_post(
+            "62", files=[{"url": old, "filename": "a.mp4"}]))
+        with mock.patch.object(
+                paw_mod, "fetch_post_detail",
+                side_effect=RuntimeError("api down")), \
+                mock.patch.object(worker, "_download_post_files",
+                                  new=_noop_download):
+            ok = await worker.process_post(post)
+        self.assertTrue(ok)
+        rows = runtime_db.list_pawchive_files(post["id"])
+        self.assertEqual(rows[0]["url"], old, "API 挂了按旧链走，不炸流程")

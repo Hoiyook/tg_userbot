@@ -27,6 +27,7 @@
 import asyncio
 import collections
 import os
+import re
 import shutil
 import time
 import urllib.error
@@ -704,6 +705,68 @@ async def _finalize(post, files):
     await _milestone_notify_if_due()
 
 
+def _signed_expiry(url):
+    """temp_url 的过期时间戳（?e=…）；无签名直链（file.pawchive.pw）返回 None。"""
+    m = re.search(r"[?&]e=(\d+)", url or "")
+    return int(m.group(1)) if m else None
+
+
+def _signed_token(url):
+    """直链 /f/<token>/ 的稳定段（e/s 轮换但 token 不变，2026-10-21 实测
+    帖 161805432 过期链与重刮链 token 相同）。无 /f/ 段返回 None。"""
+    i = (url or "").find("/f/")
+    if i < 0:
+        return None
+    return url[i + 3:].split("/", 1)[0].split("?", 1)[0] or None
+
+
+async def _refresh_stale_signed_urls(post, files):
+    """签名直链刷新：temp_url 有效期约 6h，「扫描入库 → 排队轮到下载」
+    一旦超窗全数 403（帖 161805432 四个 mp4 实测）。领取后对临期/过期的
+    PENDING 文件重拉单帖公开 API 换新签（token 匹配，文件名兜底），DB 与
+    内存同步回写。刷新失败不阻塞——按旧链下载进既有失败轨道，下轮再刷。
+    """
+    margin = int(getattr(config, "PAWCHIVE_SIGNED_MARGIN_SECONDS", 7200))
+    stale = [f for f in files
+             if f["status"] == runtime_db.PAW_FILE_PENDING
+             and (exp := _signed_expiry(f["url"])) is not None
+             and exp < time.time() + margin]
+    if not stale:
+        return
+    from . import pawchive   # 环 avoidance：函数内导入，同 process_post
+    logger.info(f"🐾 {len(stale)} 个签名直链临期/过期，重拉单帖 API 换新签："
+                f"{post['creator_name']} #{post['id']}")
+    try:
+        detail = await asyncio.to_thread(
+            pawchive.fetch_post_detail, post["service"], post["creator_id"],
+            post["post_id"], (config.PAWCHIVE_COOKIE or "").strip() or None)
+    except Exception as e:
+        logger.warning(f"🐾 签名刷新失败（按旧链下载）：{e}")
+        return
+    fresh, fresh_by_name = {}, {}
+    for a in (detail or {}).get("attachments") or []:
+        u = a.get("temp_url") if isinstance(a, dict) else None
+        if not u:
+            continue
+        tok = _signed_token(u)
+        if tok:
+            fresh[tok] = u
+        name = (a.get("name") or "").strip().lower()
+        if name:
+            fresh_by_name[name] = u
+    refreshed = 0
+    for f in stale:
+        new = fresh.get(_signed_token(f["url"]))
+        if not new:
+            new = fresh_by_name.get((f.get("filename") or "").strip().lower())
+        if new and new != f["url"]:
+            runtime_db.update_pawchive_file_url(f["id"], new)
+            f["url"] = new
+            refreshed += 1
+    if refreshed:
+        logger.info(f"🐾 签名直链换新 {refreshed}/{len(stale)} 个")
+
+
 def _requeue_legacy_submitted(files):
     """旧 Chrome 时代的 SUBMITTED 文件全部放回 PENDING（执行体切换迁移）。
 
@@ -1162,6 +1225,9 @@ async def process_post(post):
 
     # 2) 旧 Chrome 时代的 SUBMITTED 放回 PENDING（执行体切换迁移）
     _requeue_legacy_submitted(files)
+
+    # 2.5) 签名直链刷新（temp_url 约 6h 过期，排队超窗即 403）
+    await _refresh_stale_signed_urls(post, files)
 
     # 3) 死链预检（HTTP 在线程池跑，DB 写留在本线程）
     if config.PAWCHIVE_PRECHECK_HEAD:

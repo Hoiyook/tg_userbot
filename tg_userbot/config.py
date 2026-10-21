@@ -1582,6 +1582,10 @@ PAWCHIVE_CSV_MAX_ROWS = 20000
 # 不进 Chrome——否则死链没有下载事件，每条要烧满 CHROME_DOWNLOAD_TIMEOUT
 # （1800s）×3 次重试才判死（2026-09-14 实测某创作者 88% 附件是 404 死链）。
 PAWCHIVE_PRECHECK_HEAD = True
+# temp_url 签名直链（t1.pawchive.pw/f/…?e=&s=）有效期仅约 6h（2026-10-21
+# 实测，帖 161805432 排队超窗后 4 个 mp4 全 403）。剩余有效期低于此余量
+# 的 PENDING 文件，worker 领取后先重拉单帖 API 换新签再下载。
+PAWCHIVE_SIGNED_MARGIN_SECONDS = 7200
 # 扫描数据（创作者全量缓存 JSON，约 20MB）放 RUNTIME_DIR/pawchive/
 PAWCHIVE_DATA_DIR = os.path.join(RUNTIME_DIR, "pawchive")
 
