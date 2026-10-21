@@ -392,8 +392,10 @@ ORIGIN_RETRY_ATTEMPTS = 3             # 整条上溯链的最大尝试次数
 ORIGIN_RETRY_DELAY_SECONDS = 30       # 相邻两次尝试的退避（秒）
 ORIGIN_FAILURES_FILE = os.path.join(RUNTIME_DIR, "origin_failures.jsonl")
 # 执行进度主动汇报（2026-09-15 用户要求）：专用进度面板（主账号发 bot 对话、
-# 原地编辑，同 Reporter 模式）每 N 秒刷新一次；每完成 M 帖发一次里程碑汇总
-PAWCHIVE_PANEL_INTERVAL_SECONDS = 60
+# 原地编辑，同 Reporter 模式）每 N 秒刷新一次；每完成 M 帖发一次里程碑汇总。
+# 60 → 5（2026-10-21 用户要求提速；内容没变不编辑，同消息 0.2 次/秒远在
+# Telegram 编辑限频安全线内，面板循环自带失败重试）
+PAWCHIVE_PANEL_INTERVAL_SECONDS = 5
 # 多帖并发：worker 同时处理的帖子数上限（帖内文件并发仍由 /thread 信号量总控）
 PAWCHIVE_MAX_INFLIGHT_POSTS = 8  # 4→8（2026-09-18：CDN 每 53s 掐断流，更多并发流摊平吞吐）
 # 429 限流感知（2026-09-28 巡检：Falling Sakee 海量图集触发站点限流）
@@ -1026,11 +1028,13 @@ PERSISTENT_NOTIFICATION_PREFIXES = (
 # 它自己的任何异常都被兜住，绝不拖垮下载/队列/worker。
 REPORT_ENABLED = True
 
-# Status Panel 常规刷新间隔（秒）。下载进行中另有更快的进度节奏。
-REPORT_INTERVAL_SECONDS = 60   # 与 Pawchive 进度面板统一（2026-09-17）
+# Status Panel 常规刷新间隔（秒）。60 → 5（2026-10-21 用户要求提速，与
+# Pawchive 进度面板统一；内容没变不编辑，限频安全）。原「下载中加密到 15s」
+# 双档随之拉平。
+REPORT_INTERVAL_SECONDS = 5
 # 有下载在跑时，面板按此间隔刷新（只在这些时候加密，空闲时回到常规间隔）
 REPORT_PROGRESS_ENABLED = True
-REPORT_PROGRESS_INTERVAL_SECONDS = 15
+REPORT_PROGRESS_INTERVAL_SECONDS = 5
 
 # 事件流轮询间隔（秒）：增量读 task_events.jsonl 的新行 → 派发事件通知。
 # 这是「立即通知」的代价上限——事件最迟这么久被汇报出去。

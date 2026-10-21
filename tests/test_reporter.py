@@ -1005,7 +1005,7 @@ class PanelCodeBlockTest(unittest.TestCase):
 
 
 class UnifiedPanelIntervalTest(unittest.TestCase):
-    """两面板刷新周期统一（默认 60s）。"""
+    """两面板刷新周期统一（默认 5s，2026-10-21 用户要求提速）。"""
 
     def test_intervals_match(self):
         from tg_userbot import config
