@@ -1887,36 +1887,44 @@ def archived_posts_overview(limit=15):
     return _read(do, "统计归档帖明细")
 
 
-def author_progress(creator_name):
+def author_progress(creator_name, creator_id=None):
     """按作者聚合 Pawchive 处理进度（/paw progress，只读）。
 
     返回 (posts, files, recent)：posts = {status: n}；files = {status:
     [n, total_bytes]}；recent = 最近 8 个非 COMPLETED 帖 [{id, status,
-    title, published, attempts, last_error}]。名字大小写不敏感精确匹配。"""
+    title, published, attempts, last_error}]。名字大小写不敏感精确匹配；
+    creator_id 给定时按 id 精确（同名创作者防混，2026-10-21）。"""
 
     def do(conn):
         name = str(creator_name or "").strip()
+        extra = [str(creator_id)] if creator_id is not None else []
+
+        def _cond(prefix=""):
+            c = [f"{prefix}creator_name = ? COLLATE NOCASE"]
+            if creator_id is not None:
+                c.append(f"{prefix}creator_id = ?")
+            return " AND ".join(c)
+
+        where = _cond()
         canonical = _execute(
             conn, "SELECT creator_name FROM pawchive_posts "
-            "WHERE creator_name = ? COLLATE NOCASE LIMIT 1",
-            (name,)).fetchone()
+            f"WHERE {where} LIMIT 1", [name] + extra).fetchone()
         posts = dict(_execute(
             conn, "SELECT status, COUNT(*) FROM pawchive_posts "
-            "WHERE creator_name = ? COLLATE NOCASE GROUP BY status",
-            (name,)).fetchall())
+            f"WHERE {where} GROUP BY status", [name] + extra).fetchall())
         files = {}
         for st, n, sz in _execute(
                 conn, "SELECT f.status, COUNT(*), COALESCE(SUM(f.size_bytes),0) "
                 "FROM pawchive_files f JOIN pawchive_posts p ON f.post_row=p.id "
-                "WHERE p.creator_name = ? COLLATE NOCASE GROUP BY f.status",
-                (name,)).fetchall():
+                f"WHERE {_cond('p.')} GROUP BY f.status",
+                [name] + extra).fetchall():
             files[st] = [int(n), int(sz or 0)]
         # 「最近未完成」只列**可行动**状态（归档=站点侧已不存在，不是待办）
         recent = _execute(
             conn, "SELECT id, status, title, published, attempts, last_error "
-            "FROM pawchive_posts WHERE creator_name = ? COLLATE NOCASE "
+            f"FROM pawchive_posts WHERE {where} "
             "AND status NOT IN (?, ?) ORDER BY id DESC LIMIT 8",
-            (name, PAW_POST_COMPLETED, PAW_POST_ARCHIVED)).fetchall()
+            [name] + extra + [PAW_POST_COMPLETED, PAW_POST_ARCHIVED]).fetchall()
         return (canonical[0] if canonical else name, posts, files,
                 [{"id": r[0], "status": r[1], "title": r[2],
                   "published": r[3], "attempts": r[4], "last_error": r[5]}
@@ -1925,15 +1933,39 @@ def author_progress(creator_name):
     return _read(do, "统计作者 Pawchive 进度")
 
 
-def posts_for_backfill(creator_name):
-    """某作者全部存量帖（回填用）：任何状态都要重拉详情对比。"""
+def creator_ids_by_name(creator_name):
+    """该名字在库里对应的去重 creator_id 列表（同名防混检测用）。"""
 
     def do(conn):
         rows = _execute(
-            conn, "SELECT id, post_id, creator_id, service, status, "
-            "creator_name FROM pawchive_posts "
-            "WHERE creator_name = ? COLLATE NOCASE "
-            "ORDER BY id DESC", (str(creator_name or "").strip(),)).fetchall()
+            conn, "SELECT DISTINCT creator_id FROM pawchive_posts "
+            "WHERE creator_name = ? COLLATE NOCASE",
+            (str(creator_name or "").strip(),)).fetchall()
+        return [r[0] for r in rows]
+
+    return _read(do, "查名字对应的创作者 id")
+
+
+def posts_for_backfill(creator_name=None, creator_id=None):
+    """某作者全部存量帖（回填用）：任何状态都要重拉详情对比。
+
+    creator_id 给定时按 id 精确（同名创作者防混，2026-10-21）；两者都空
+    返回空列表。"""
+
+    def do(conn):
+        if creator_id is not None:
+            rows = _execute(
+                conn, "SELECT id, post_id, creator_id, service, status, "
+                "creator_name FROM pawchive_posts "
+                "WHERE creator_id = ? ORDER BY id DESC",
+                (str(creator_id),)).fetchall()
+        else:
+            rows = _execute(
+                conn, "SELECT id, post_id, creator_id, service, status, "
+                "creator_name FROM pawchive_posts "
+                "WHERE creator_name = ? COLLATE NOCASE "
+                "ORDER BY id DESC",
+                (str(creator_name or "").strip(),)).fetchall()
         return [{"id": r[0], "post_id": r[1], "creator_id": r[2],
                  "service": r[3], "status": r[4], "creator_name": r[5]}
                 for r in rows]
@@ -1941,15 +1973,22 @@ def posts_for_backfill(creator_name):
     return _read(do, "列出回填目标帖")
 
 
-def author_failed_split(creator_name):
-    """某作者失败文件两分：(死链数, 非死链数)。/paw progress 用。"""
+def author_failed_split(creator_name, creator_id=None):
+    """某作者失败文件两分：(死链数, 非死链数)。/paw progress 用。
+
+    creator_id 给定时按 id 精确（同名创作者防混）。"""
 
     def do(conn):
+        conds = ["f.status=?", "p.creator_name=? COLLATE NOCASE"]
+        params = [PAW_FILE_FAILED, str(creator_name or "").strip()]
+        if creator_id is not None:
+            conds.append("p.creator_id=?")
+            params.append(str(creator_id))
         rows = _execute(
             conn, "SELECT f.error, COUNT(*) FROM pawchive_files f "
             "JOIN pawchive_posts p ON f.post_row=p.id "
-            "WHERE f.status=? AND p.creator_name=? COLLATE NOCASE "
-            "GROUP BY f.error", (PAW_FILE_FAILED, creator_name)).fetchall()
+            f"WHERE {' AND '.join(conds)} "
+            "GROUP BY f.error", params).fetchall()
         dead = sum(n for err, n in rows
                    if (err or "").startswith(PAW_DEAD_LINK_MARK))
         total = sum(n for _e, n in rows)

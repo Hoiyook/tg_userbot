@@ -143,21 +143,88 @@ def search_creators(term, limit=5):
     return fuzzy[:limit]
 
 
-def resolve_creator(name, allow_refresh=True):
-    """名字 → 创作者 dict（精确优先，否则取最热子串匹配）；找不到返回 None。
+def parse_creator_ref(name):
+    """「名字#id」/「纯数字 id」→ (名字部分, id部分)；无 id 时 id=None。
 
-    allow_refresh：解析作者名只需「名字→id」映射（极少变动）——缓存无论
-    多旧都可用（2026-10-18 owner 实测：20MB 全量刷新在站点慢时 4 连败
-    挂起命令 20 分钟）；全量刷新只应由 /paw 主动维护时触发。"""
-    term = str(name or "").strip().lower()
-    if not term:
-        return None
+    /paw_plan 68838545      → ("", "68838545")
+    /paw_plan 愚者s#3704548 → ("愚者s", "3704548")
+    /paw_plan 愚者s          → ("愚者s", None)
+    """
+    q = str(name or "").strip()
+    if not q:
+        return "", None
+    if q.isdigit():
+        return "", q
+    if "#" in q:
+        head, _, tail = q.rpartition("#")
+        if tail.isdigit():
+            return head.strip(), tail
+    return q, None
+
+
+def resolve_creators(name, allow_refresh=True):
+    """名字 → 全部候选（重名消歧，2026-10-21：全量缓存 9.6 万创作者里
+    实测 2,684 个重名组，旧逻辑静默取第一个可能扫错人）。
+
+    返回 dict：
+      kind: "none" | "id" | "exact" | "fuzzy"
+      hits: 候选列表（exact = 同名全部，按收藏降序；fuzzy = 包含命中，
+            按收藏降序；id = 单元素）
+    传「名字#id」或纯数字 id 时按 id 精确解析（kind="id"）。"""
+    name_part, id_part = parse_creator_ref(name)
     creators = load_creators(refresh=allow_refresh)
-    for c in creators:
-        if c.get("name", "").lower() == term:
-            return c
-    hits = [c for c in creators if term in c.get("name", "").lower()]
-    return max(hits, key=lambda c: c.get("favorited", 0)) if hits else None
+    if id_part:
+        hit = next((c for c in creators if str(c.get("id")) == id_part), None)
+        return {"kind": "id" if hit else "none", "hits": [hit] if hit else []}
+    term = name_part.strip().lower()
+    if not term:
+        return {"kind": "none", "hits": []}
+    exact = [c for c in creators if (c.get("name") or "").lower() == term]
+    if exact:
+        exact.sort(key=lambda c: -(c.get("favorited") or 0))
+        return {"kind": "exact", "hits": exact}
+    fuzzy = [c for c in creators if term in (c.get("name") or "").lower()]
+    if not fuzzy:
+        return {"kind": "none", "hits": []}
+    fuzzy.sort(key=lambda c: -(c.get("favorited") or 0))
+    return {"kind": "fuzzy", "hits": fuzzy}
+
+
+def pick_favorited_creator(hits):
+    """同名多候选的自动选定：恰有一个收藏过 → 选它（附说明）；否则
+    (None, "")，调用方转消歧提示。收藏数是「用户自己关注过」的强信号，
+    未收藏的同名号大概率不是你要的那个。"""
+    if len(hits) <= 1:
+        return (hits[0] if hits else None), ""
+    faved = [c for c in hits if (c.get("favorited") or 0) > 0]
+    if len(faved) == 1:
+        c = faved[0]
+        note = (f"同名 {len(hits)} 个创作者，按你的收藏自动选定 "
+                f"{c.get('name')}#{c.get('id')}"
+                f"（其余 {len(hits) - 1} 个未收藏；要指定用 名字#id）")
+        return c, note
+    return None, ""
+
+
+def format_creator_candidates(hits, limit=10):
+    """候选清单文案：名字#id（收藏 N）…，供 /paw plan/csv/backfill 消歧。"""
+    lines = []
+    for c in hits[:limit]:
+        lines.append(f"  · {c.get('name')}#{c.get('id')}"
+                     f"（收藏 {c.get('favorited') or 0}）")
+    if len(hits) > limit:
+        lines.append(f"  … 等 {len(hits)} 个，用 名字#id 指定")
+    return "\n".join(lines)
+
+
+def resolve_creator(name, allow_refresh=True):
+    """名字 → 创作者 dict（兼容旧签名：id/唯一精确命中 → 该创作者；
+    同名多个 → 收藏数最高者；子串 → 收藏数最高者）。找不到返回 None。
+    需要消歧语义的入口（plan/csv/backfill）请改用 resolve_creators。"""
+    res = resolve_creators(name, allow_refresh=allow_refresh)
+    if res["kind"] == "none":
+        return None
+    return max(res["hits"], key=lambda c: c.get("favorited") or 0)
 
 
 async def resolve_creator_async(name):
@@ -258,21 +325,36 @@ def _backfill_pool():
 
 
 async def backfill_author(name):
-    """回填一个作者的全部存量帖。返回回执文案（完成后 notify）。"""
+    """回填一个作者的全部存量帖。返回回执文案（完成后 notify）。
+
+    同名防混（2026-10-21）：按名字命中多个 creator_id 时拒绝并列出各自
+    帖量，要求 名字#id 或纯数字 id 定向；不再默默把两个号混着回填。"""
     label = str(name or "").strip()
     if not label:
-        return f"{TEXT_PREFIX}\n用法：/paw backfill <作者名>"
+        return f"{TEXT_PREFIX}\n用法：/paw backfill <作者名|名字#id|数字id>"
     if state.PAW_SCAN_RUNNING is not None:
         return (f"{TEXT_PREFIX}\n⏳ 已有扫描/回填在进行"
                 f"（{state.PAW_SCAN_RUNNING}），稍后再试")
+    name_part, id_part = parse_creator_ref(label)
     try:
-        rows = runtime_db.posts_for_backfill(label)
+        rows = runtime_db.posts_for_backfill(
+            creator_name=name_part or None, creator_id=id_part)
     except runtime_db.DbUnavailable as e:
         return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
     if not rows:
         return (f"{TEXT_PREFIX}\n❌ 没有叫「{label}」的扫描记录\n"
                 "注意：backfill 是**按作者名**回填历史帖（如 /paw backfill SillyTeshii）；"
                 "多词作者名直接跟在后面。先 /paw search <词> 确认名字")
+    by_id = {}
+    for r in rows:
+        by_id.setdefault(r["creator_id"], []).append(r)
+    if len(by_id) > 1:
+        breakdown = "\n".join(
+            f"  · {rs[0]['creator_name']}#{cid}（{len(rs)} 帖）"
+            for cid, rs in by_id.items())
+        return (f"{TEXT_PREFIX}\n⚠️ 「{name_part}」名下有 {len(by_id)} 个"
+                f"创作者（共 {len(rows)} 帖），请定向回填：\n{breakdown}\n"
+                "用法：/paw_backfill 名字#id 或 /paw_backfill 数字id")
     state.PAW_SCAN_RUNNING = f"回填 {rows[0]['creator_name']}"
     state.PAW_SCAN_PROGRESS = {
         "started": time.monotonic(), "stage": "回填详情", "detail": "0/0"}
@@ -368,26 +450,59 @@ async def backfill_author(name):
 
 
 def author_progress_text(name):
-    """/paw progress <作者名>：按作者的处理进度总览（只读）。
+    """/paw progress <作者名|名字#id|数字id>：按作者的处理进度总览（只读）。
 
     帖子状态计数 + 文件级产出（含死链占比）+ 最近未完成明细（行 id 可接
     /paw pr / /paw retry）。归档帖如实单列——它们是「站点侧已不存在」，
-    不是待办。"""
+    不是待办。同名创作者（一个名字对应多个 id）按 id 逐个分节报告，
+    不再混在一起。"""
     q = str(name or "").strip()
     if not q:
         return (f"{TEXT_PREFIX}\n用法：/paw progress <作者名>\n"
                 "例：/paw progress MofuMochii")
+    name_part, id_part = parse_creator_ref(q)
+    lookup = name_part or q
     try:
-        display, posts, files, recent = runtime_db.author_progress(q)
+        ids = runtime_db.creator_ids_by_name(lookup)
+    except runtime_db.DbUnavailable as e:
+        return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if id_part:
+        sections = [id_part]
+    elif not ids:
+        return (f"{TEXT_PREFIX}\n❌ 没有叫「{q}」的扫描记录\n"
+                "（先 /paw plan <作者名> 扫描；不确定用 /paw search <词>）")
+    else:
+        sections = ids
+    parts = []
+    annotate = len(sections) > 1 or id_part
+    for cid in sections[:5]:
+        block = _progress_one_section(lookup, cid, annotate=annotate)
+        if block:
+            parts.append(block)
+    if len(sections) > 5:
+        parts.append(f"… 另有 {len(sections) - 5} 个同名创作者，"
+                     "用 名字#id 逐个查看")
+    if len(sections) > 1:
+        parts.insert(0, f"⚠️ 「{lookup}」名下有 {len(sections)} 个创作者，"
+                     "分节报告（名字#id 只看一个）：")
+    return "\n\n".join(parts)[:3900]
+
+
+def _progress_one_section(lookup, creator_id, annotate=False):
+    """单个 creator_id 的进度分节（author_progress_text 的主体）。
+    annotate=False（名字只对应一个 id 的常见情形）保持旧显示格式。"""
+    try:
+        display, posts, files, recent = runtime_db.author_progress(
+            lookup, creator_id=creator_id)
     except runtime_db.DbUnavailable as e:
         return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
     if not posts:
-        return (f"{TEXT_PREFIX}\n❌ 没有叫「{q}」的扫描记录\n"
-                "（先 /paw plan <作者名> 扫描；不确定用 /paw search <词>）")
+        return None
+    header = f"{display}#{creator_id}" if annotate else display
 
     done_n = posts.get(runtime_db.PAW_POST_COMPLETED, 0)
     total = sum(posts.values())
-    lines = [f"{TEXT_PREFIX}：{display} 处理进度", "",
+    lines = [f"{TEXT_PREFIX}：{header} 处理进度", "",
              f"帖子 {total} 个：✅ 完成 {done_n}"]
     for st, n in sorted(posts.items()):
         if st == runtime_db.PAW_POST_COMPLETED:
@@ -402,7 +517,7 @@ def author_progress_text(name):
     # 失败文件里死链/非死链两分（口径与 /paw fail 一致）
     dead = non_dead = 0
     try:
-        split = runtime_db.author_failed_split(display)
+        split = runtime_db.author_failed_split(display, creator_id=creator_id)
         dead, non_dead = split
     except runtime_db.DbUnavailable:
         pass
@@ -424,7 +539,7 @@ def author_progress_text(name):
             lines.append(f"  #{r['id']} {_STATUS_LABELS.get(r['status'], r['status'])}"
                          f"｜{str(r['title'])[:26]}{err}")
         lines.append("单帖详情 /paw pr <行id>｜重投 /paw retry <行id>")
-    return "\n".join(lines)[:3900]
+    return "\n".join(lines)
 
 
 def fail_text(limit=20):
@@ -844,6 +959,17 @@ def build_scan_records(creator, posts, faved_ids=None, scope="notfaved",
     from .naming import sanitize_filename
 
     creator_name = creator.get("name") or f"{creator['service']}/{creator['id']}"
+    # 同名防混（2026-10-21）：名字在创作者缓存里撞车时，目录追加 #id——
+    # 否则两个「愚者s」的文件混居同一目录。仅重名触发，单名作者布局不变。
+    dir_base = sanitize_filename(creator_name) or "creator"
+    try:
+        same_name = [c for c in load_creators(refresh=False)
+                     if (c.get("name") or "").lower()
+                     == (creator_name or "").lower()]
+        if len(same_name) > 1:
+            dir_base = f"{dir_base}#{creator.get('id')}"
+    except Exception as e:
+        logger.warning(f"🐾 同名检测失败（目录不加 #id）：{e}")
     records = []
     for p in posts:
         pid = str(p["id"])
@@ -878,7 +1004,7 @@ def build_scan_records(creator, posts, faved_ids=None, scope="notfaved",
         title = p.get("title") or ""
         date = (p.get("published") or "")[:10] or "unknown"
         subdir = "Pawchive/{}/{}_{}_{}".format(
-            sanitize_filename(creator_name) or "creator",
+            dir_base,
             date, pid, sanitize_filename(title)[:60] or "untitled")
         records.append({
             "post_id": pid,
@@ -1617,7 +1743,7 @@ def status_text():
                      f"{config.PAWCHIVE_MIN_FREE_GB:.0f} GB）")
     lines += [
         "",
-        "命令：/paw plan <作者>｜/paw search <词>｜/paw manual [作者]",
+        "命令：/paw plan <作者|名字#id>｜/paw search <词>｜/paw manual [作者|名字#id]",
         "/paw retry <ID|all>｜/paw pause｜/paw resume｜/paw csv <作者>",
     ]
     return "\n".join(lines)
@@ -1697,25 +1823,43 @@ def manual_view(limit=10, creator=None):
     /paw_manual silly 命中 SillyTeshii）；过滤在拉取后进行（拉取池放大到
     2000，不受默认 limit=10 截断影响漏帖）。"""
     from .menu import encode_menu_data   # 函数内导入避免 menu↔本模块成环
-    low = (creator or "").strip().lower() or None
+    name_part, id_part = parse_creator_ref(creator)
+    low = (name_part or "").strip().lower() or None
     try:
         posts = runtime_db.list_pawchive_posts(
             status=runtime_db.PAW_POST_MANUAL,
-            limit=2000 if low else limit)
+            limit=2000 if (low or id_part) else limit)
     except runtime_db.DbUnavailable as e:
         return (f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}", [])
-    if low:
+    if id_part:
+        posts = [p for p in posts if str(p.get("creator_id")) == id_part]
+        if not posts:
+            return (f"{TEXT_PREFIX}\n👤 没有 id「{id_part}」的待人工帖子",
+                    [])
+    elif low:
         posts = [p for p in posts
                  if low in (p.get("creator_name") or "").lower()]
         if not posts:
-            return (f"{TEXT_PREFIX}\n👤 没有作者名含「{creator.strip()}」的"
+            return (f"{TEXT_PREFIX}\n👤 没有作者名含「{name_part.strip()}」的"
                     "待人工帖子（/paw_manual 不带参数看全部）", [])
     if not posts:
         return (f"{TEXT_PREFIX}\n👤 没有待人工处理的帖子"
                 "（外链帖会在直链下完后出现在这里）", [])
-    head = f"（作者含「{creator.strip()}」）" if low else ""
+    # 同名防混提示：按名字过滤命中多个 creator_id 时明示（数据不合并，
+    # 只是提醒用 名字#id 可只看其中一个）
+    dup_note = ""
+    if low and not id_part:
+        ids = {str(p.get("creator_id")) for p in posts}
+        if len(ids) > 1:
+            dup_note = (f"⚠️ 该名下有 {len(ids)} 个同名创作者混列，"
+                        "用 /paw_manual 名字#id 只看一个\n")
+    head = ""
+    if id_part:
+        head = f"（作者#{id_part}）"
+    elif low:
+        head = f"（作者含「{name_part.strip()}」）"
     lines = [f"{TEXT_PREFIX}：👤 待人工处理{head} {len(posts)} 帖"
-             "（处理完外链点 ✅ 标记完成）", ""]
+             "（处理完外链点 ✅ 标记完成）", dup_note]
     rows = []
     budget = 3500   # Telegram 单消息 4096 上限留余量：帖多时截断并给出口
     used = sum(len(x) for x in lines)
@@ -2124,7 +2268,7 @@ def _help_text():
         "  /paw post <帖子URL|ID> —— 单独获取指定帖子的附件\n"
         "  /paw find <关键词> —— 按名称查扫描记录与当前目录文件\n"
         "  /paw offline <链接> —— 磁力/直链丢给 CD2 离线到 115\n"
-        "  /paw manual [作者] —— 待人工处理的帖子（可按作者过滤，含外链清单与 ✅ 按钮）\n"
+        "  /paw manual [作者|名字#id] —— 待人工帖子（可按作者过滤；重名用 #id 区分）\n"
         "  /paw manual export —— 全部待处理外链导出为工作清单\n"
         "  /paw att <URL|帖子ID|行id> —— 查帖子的附件与外链状态\n"
         "  /paw pr <URL|帖子ID|行id> —— 帖子执行详情报告（附件/外链统计、"
@@ -2210,24 +2354,43 @@ async def _reply_plan(event, arg):
     name = " ".join(parts).strip()
     if not name:
         await event.reply(
-            f"{TEXT_PREFIX}\n用法：/paw plan <作者名> [all]"
-            "\n　　/paw plan <作者名> since <YYYY-MM-DD> [all]",
+            f"{TEXT_PREFIX}\n用法：/paw plan <作者名|名字#id|数字id> [all]"
+            "\n　　/paw plan <…> since <YYYY-MM-DD> [all]"
+            "\n重名作者用 名字#id 或纯数字 id 指定（候选见提示）",
             link_preview=False)
         return
     try:
-        creator = await resolve_creator_async(name)
+        # 名字→id 映射极少变动：禁联网走旧缓存（2026-10-18 实测联网刷新
+        # 在站点慢时挂起 20 分钟）
+        res = await asyncio.to_thread(resolve_creators, name,
+                                      False)
     except Exception as e:
         await event.reply(f"{TEXT_PREFIX}\n❌ 解析作者失败：{e}",
                           link_preview=False)
         return
-    if creator is None:
+    note = ""
+    if res["kind"] == "none":
         await event.reply(
             f"{TEXT_PREFIX}\n没有叫「{name}」的创作者，先 /paw search <词>",
             link_preview=False)
         return
+    if res["kind"] == "exact":
+        creator, note = pick_favorited_creator(res["hits"])
+        if creator is None:
+            await event.reply(
+                f"{TEXT_PREFIX}\n⚠️ 「{parse_creator_ref(name)[0]}」有 "
+                f"{len(res['hits'])} 个同名创作者，请指定：\n"
+                + format_creator_candidates(res["hits"])
+                + "\n用法：/paw plan 名字#id [all]",
+                link_preview=False)
+            return
+    else:   # id 直投或唯一子串命中
+        creator = res["hits"][0]
     if not config.PAWCHIVE_COOKIE and scope == "notfaved":
         scope = "all"   # 无 Cookie 无从对比，直接按全部处理（摘要里会提示）
     msg = await start_scan(creator, scope, since=since)
+    if note:
+        msg += f"\nℹ️ {note}"
     await event.reply(f"{TEXT_PREFIX}\n{msg}", link_preview=False)
 
 
@@ -2285,21 +2448,44 @@ async def _reply_cookie(event, arg):
                       link_preview=False)
 
 
+async def _resolve_creator_for_ops(name):
+    """csv/backfill 共用的作者解析：id 直投、唯一/单一收藏自动选定、
+    同名多候选 → (None, 消歧文案)。禁联网（名字→id 走旧缓存）。"""
+    try:
+        res = await asyncio.to_thread(resolve_creators, name, False)
+    except Exception as e:
+        return None, f"❌ 解析作者失败：{e}"
+    if res["kind"] == "none":
+        return None, None
+    if res["kind"] == "exact":
+        creator, note = pick_favorited_creator(res["hits"])
+        if creator is None:
+            return None, (
+                f"⚠️ 「{parse_creator_ref(name)[0]}」有 {len(res['hits'])} "
+                f"个同名创作者，请指定：\n"
+                + format_creator_candidates(res["hits"])
+                + "\n用法：名字#id 或纯数字 id")
+        return creator, (f"ℹ️ {note}" if note else None)
+    return res["hits"][0], None
+
+
 async def _reply_csv(event, arg):
     name = (arg or "").strip()
-    try:
-        creator = await asyncio.to_thread(resolve_creator, name) if name else None
-    except Exception as e:
-        await event.reply(f"{TEXT_PREFIX}\n❌ 解析作者失败：{e}",
-                          link_preview=False)
-        return
-    if creator is None and state.PAW_LAST_SCAN:
+    creator, err = (None, None)
+    if name:
+        creator, err = await _resolve_creator_for_ops(name)
+    elif state.PAW_LAST_SCAN:
         # 缺省用最近一次扫描的作者
         last = state.PAW_LAST_SCAN.get("creator")
-        creator = await asyncio.to_thread(resolve_creator, last) if last else None
+        if last:
+            creator, err = await _resolve_creator_for_ops(last)
+    if err:
+        await event.reply(f"{TEXT_PREFIX}\n{err}", link_preview=False)
+        return
     if creator is None:
         await event.reply(
-            f"{TEXT_PREFIX}\n用法：/paw csv <作者名>（先 /paw plan 扫描过）",
+            f"{TEXT_PREFIX}\n用法：/paw csv <作者名|名字#id|数字id>"
+            "（先 /paw plan 扫描过）",
             link_preview=False)
         return
     await event.reply(f"{TEXT_PREFIX}\n{await csv_reply(creator)}",

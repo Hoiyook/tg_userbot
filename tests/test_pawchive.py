@@ -646,3 +646,191 @@ class ManualViewBudgetTest(_DbTestCase):
         self.assertIn("/paw manual export", text)
         self.assertLess(len(rows), 60)
         self.assertGreater(len(rows), 0)
+
+
+class ParseCreatorRefTest(unittest.TestCase):
+    """名字#id / 纯数字 id 的引用解析。"""
+
+    def test_forms(self):
+        self.assertEqual(pawchive.parse_creator_ref("68838545"),
+                         ("", "68838545"))
+        self.assertEqual(pawchive.parse_creator_ref("愚者s#3704548"),
+                         ("愚者s", "3704548"))
+        self.assertEqual(pawchive.parse_creator_ref("愚者s"),
+                         ("愚者s", None))
+        self.assertEqual(pawchive.parse_creator_ref("a#b#c"),
+                         ("a#b#c", None))   # 尾段非数字：整体按名字
+        self.assertEqual(pawchive.parse_creator_ref("名字#非数字"),
+                         ("名字#非数字", None))
+        self.assertEqual(pawchive.parse_creator_ref(""), ("", None))
+
+
+class ResolveCreatorsTest(unittest.TestCase):
+    """重名消歧核心：id 直投 / 唯一精确 / 多候选 / 单一收藏自动选定。"""
+
+    def _creators(self):
+        return [
+            {"id": "1", "name": "kuma", "favorited": 245},
+            {"id": "2", "name": "Kuma", "favorited": 0},
+            {"id": "3", "name": "kuma-pixel", "favorited": 9},
+            {"id": "4", "name": "solo", "favorited": 5},
+        ]
+
+    def setUp(self):
+        self._p = mock.patch.object(pawchive, "load_creators",
+                                    return_value=self._creators())
+        self._p.start()
+        self.addCleanup(self._p.stop)
+
+    def test_numeric_id_direct(self):
+        res = pawchive.resolve_creators("2", allow_refresh=False)
+        self.assertEqual(res["kind"], "id")
+        self.assertEqual(res["hits"][0]["name"], "Kuma")
+
+    def test_hash_id_direct(self):
+        res = pawchive.resolve_creators("kuma#2", allow_refresh=False)
+        self.assertEqual(res["kind"], "id")
+        self.assertEqual(res["hits"][0]["favorited"], 0)
+
+    def test_exact_multiple_sorted_by_favorited(self):
+        res = pawchive.resolve_creators("KUMA", allow_refresh=False)
+        self.assertEqual(res["kind"], "exact")
+        self.assertEqual([h["id"] for h in res["hits"]], ["1", "2"])
+
+    def test_exact_single(self):
+        res = pawchive.resolve_creators("solo", allow_refresh=False)
+        self.assertEqual(res["kind"], "exact")
+        self.assertEqual(res["hits"][0]["id"], "4")
+
+    def test_fuzzy_sorted(self):
+        res = pawchive.resolve_creators("kum", allow_refresh=False)
+        self.assertEqual(res["kind"], "fuzzy")
+        self.assertEqual([h["id"] for h in res["hits"]], ["1", "3", "2"])
+
+    def test_none(self):
+        res = pawchive.resolve_creators("不存在", allow_refresh=False)
+        self.assertEqual(res["kind"], "none")
+
+    def test_pick_favorited_autoselect(self):
+        hits = pawchive.resolve_creators("KUMA", allow_refresh=False)["hits"]
+        c, note = pawchive.pick_favorited_creator(hits)
+        self.assertEqual(c["id"], "1")
+        self.assertIn("自动选定", note)
+
+    def test_pick_favorited_multi_faved_requires_disambiguation(self):
+        hits = [{"id": "1", "name": "x", "favorited": 10},
+                {"id": "2", "name": "x", "favorited": 3}]
+        c, note = pawchive.pick_favorited_creator(hits)
+        self.assertIsNone(c)
+
+    def test_candidates_format(self):
+        text = pawchive.format_creator_candidates(
+            pawchive.resolve_creators("KUMA",
+                                      allow_refresh=False)["hits"])
+        self.assertIn("kuma#1（收藏 245）", text)
+        self.assertIn("Kuma#2", text)
+
+
+class DupNameGuardTest(_DbTestCase):
+    """同名创作者防混：backfill 拒绝并列出、#id 定向；manual 混列提示与
+    #id 过滤；progress 分节；subdir 仅重名时加 #id 后缀。"""
+
+    def _seed_two_same_name_creators(self):
+        for cid, pid in (("701", "p1"), ("702", "p2")):
+            runtime_db.enqueue_pawchive_posts(
+                "patreon", cid, "双生", [{
+                    "post_id": pid, "title": f"t{pid}",
+                    "published": "2026-10-01", "post_url": f"u{pid}",
+                    "subdir": f"Pawchive/双生/{pid}", "files": [],
+                    "ext_links": [{"kind": "link", "domain": "mega.nz",
+                                   "url": f"https://mega.nz/{pid}",
+                                   "text": "M"}],
+                }])
+
+    def _to_manual(self):
+        import sqlite3 as _sq
+        conn = _sq.connect(config.RUNTIME_DB_FILE)
+        conn.execute("UPDATE pawchive_posts SET status='MANUAL'")
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        # backfill 会置内存扫描锁，用例间必须复位
+        pawchive.state.PAW_SCAN_RUNNING = None
+        pawchive.state.PAW_SCAN_PROGRESS = {}
+
+    async def _backfill(self, ref, fetch_side_effect=None):
+        if fetch_side_effect is None:
+            async def run():
+                return {"id": "p", "attachments": []}
+            fetch_side_effect = run
+        with mock.patch.object(
+                pawchive, "fetch_post_detail",
+                side_effect=fetch_side_effect), \
+                mock.patch.object(pawchive.asyncio, "sleep",
+                                  mock.AsyncMock()):
+            reply = await pawchive.backfill_author(ref)
+            for t in list(pawchive._SPAWNED_SCANS):
+                await t
+        return reply
+
+    def test_backfill_refuses_ambiguous_name(self):
+        self._seed_two_same_name_creators()
+        import asyncio as _aio
+        reply = _aio.run(self._backfill("双生"))
+        self.assertIn("2 个", reply)
+        self.assertIn("双生#701（1 帖）", reply)
+        self.assertIn("双生#702（1 帖）", reply)
+
+    def test_backfill_hash_id_targets_one_creator(self):
+        self._seed_two_same_name_creators()
+        import asyncio as _aio
+        reply = _aio.run(self._backfill("双生#702"))
+        self.assertIn("开始回填", reply)
+        self.assertIn("（1 帖", reply)
+        # 站点已无 1 帖：定向的 702 拉详情返回空 attachments → 不算 gone，
+        # 这里只断言没把 701 的帖子拉进来（检查两帖状态不变）
+        import sqlite3 as _sq
+        conn = _sq.connect(config.RUNTIME_DB_FILE)
+        n = conn.execute(
+            "SELECT COUNT(*) FROM pawchive_posts WHERE creator_id='701'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 1)
+
+    def test_manual_hash_id_filters_and_warns_on_mix(self):
+        self._seed_two_same_name_creators()
+        self._to_manual()
+        text, rows = pawchive.manual_view(creator="双生")
+        self.assertIn("2 个同名创作者", text)
+        self.assertEqual(len(rows), 2)
+        text2, rows2 = pawchive.manual_view(creator="双生#701")
+        self.assertNotIn("同名创作者", text2)
+        self.assertEqual(len(rows2), 1)
+
+    def test_progress_splits_sections_per_id(self):
+        self._seed_two_same_name_creators()
+        text = pawchive.author_progress_text("双生")
+        self.assertIn("2 个创作者", text)
+        self.assertIn("双生#701", text)
+        self.assertIn("双生#702", text)
+        text_one = pawchive.author_progress_text("双生#702")
+        self.assertNotIn("分节报告", text_one)
+        self.assertIn("双生#702 处理进度", text_one)
+
+    def test_subdir_gets_id_suffix_only_on_name_collision(self):
+        posts = [{"id": "9", "title": "t", "published": "2026-10-01T00:00:00",
+                  "attachments": [{"name": "a.png", "path": "/x/a.png"}],
+                  "content": "", "embed": {}}]
+        creator = {"service": "patreon", "id": "701", "name": "双生"}
+        with mock.patch.object(
+                pawchive, "load_creators", return_value=[
+                    {"id": "701", "name": "双生"},
+                    {"id": "702", "name": "双生"}]):
+            recs = pawchive.build_scan_records(creator, posts)
+            self.assertIn("双生#701/", recs[0]["subdir"])
+        with mock.patch.object(
+                pawchive, "load_creators", return_value=[
+                    {"id": "701", "name": "双生"}]):
+            recs = pawchive.build_scan_records(creator, posts)
+            self.assertNotIn("#", recs[0]["subdir"].split("/")[1])

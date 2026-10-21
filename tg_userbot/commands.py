@@ -224,7 +224,7 @@ def _help_text():
         "/paw_att URL|ID|行id —— 附件外链状态\n"
         "/paw_pr URL|ID|行id —— 执行详情报告\n"
         "/paw_find 词；/paw_csv [作者]\n"
-        "/paw_manual [作者|export]；/paw_done 行id|起-止|作者\n"
+        "/paw_manual [作者|名字#id|export]；/paw_done 行id|起-止|作者\n"
         "/paw_fail —— 非死链失败明细\n"
         "/paw_retry 行ID|all；/paw_pause｜/paw_resume\n"
         "/paw_archive —— 归档明细；/paw_archive_del 行id|起-止\n"
