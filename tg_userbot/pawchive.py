@@ -1684,16 +1684,27 @@ def manual_view(limit=10, creator=None):
     lines = [f"{TEXT_PREFIX}：👤 待人工处理{head} {len(posts)} 帖"
              "（处理完外链点 ✅ 标记完成）", ""]
     rows = []
+    budget = 3500   # Telegram 单消息 4096 上限留余量：帖多时截断并给出口
+    used = sum(len(x) for x in lines)
     for p in posts:
+        block = []
         date = (p.get("published") or "")[:10] or "unknown"
-        lines.append(f"#{p['id']} {p['creator_name']}｜{date}｜"
+        block.append(f"#{p['id']} {p['creator_name']}｜{date}｜"
                      f"{(p['title'] or '')[:40]}")
-        lines.append(p["post_url"])
+        block.append(p["post_url"])
         for l in (p.get("ext_links") or [])[:6]:
-            lines.append(f"  · [{l.get('domain')}] {l['url']}")
+            block.append(f"  · [{l.get('domain')}] {l['url']}")
         if len(p.get("ext_links") or []) > 6:
-            lines.append(f"  … 等 {len(p['ext_links']) - 6} 条外链见帖子页")
+            block.append(f"  … 等 {len(p['ext_links']) - 6} 条外链见帖子页")
+        piece = "\n".join(block) + "\n\n"
+        if rows and used + len(piece) > budget:
+            lines.append(
+                f"… 其余 {len(posts) - len(rows)} 帖未显示（消息长度受限）："
+                "用 /paw_manual <作者> 收窄，或 /paw manual export 全量导出")
+            break
+        lines.extend(block)
         lines.append("")
+        used += len(piece)
         row = [Button.inline(f"✅ 完成 #{p['id']}",
                              encode_menu_data("paw_done", str(p["id"])))]
         if p.get("post_url"):

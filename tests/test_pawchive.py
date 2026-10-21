@@ -620,3 +620,29 @@ class ManualViewCreatorFilterTest(_DbTestCase):
         self.assertIn("Alpha", text)
         self.assertIn("SillyTeshii", text)
         self.assertEqual(len(rows), 2)
+
+
+class ManualViewBudgetTest(_DbTestCase):
+    """待人工帖很多时（如 SillyTeshii 294 帖）渲染必须截断——否则
+    MessageTooLongError，命令整条无响应（2026-10-21 生产实测）。"""
+
+    def test_render_truncated_within_telegram_limit(self):
+        posts = [{
+            "post_id": str(i), "title": f"很长很长的标题 {i}",
+            "published": "2026-10-01", "post_url": f"https://pawchive.pw/x/{i}",
+            "subdir": f"s{i}", "files": [],
+            "ext_links": [{"kind": "link", "domain": "mega.nz",
+                           "url": f"https://mega.nz/{i}#k", "text": "M"}],
+        } for i in range(60)]
+        runtime_db.enqueue_pawchive_posts("patreon", "7", "ManyMan", posts)
+        import sqlite3 as _sq
+        conn = _sq.connect(config.RUNTIME_DB_FILE)
+        conn.execute("UPDATE pawchive_posts SET status='MANUAL'")
+        conn.commit()
+        conn.close()
+        text, rows = pawchive.manual_view(creator="ManyMan")
+        self.assertLess(len(text), 4096, "必须落在 Telegram 单消息上限内")
+        self.assertIn("未显示", text)
+        self.assertIn("/paw manual export", text)
+        self.assertLess(len(rows), 60)
+        self.assertGreater(len(rows), 0)
