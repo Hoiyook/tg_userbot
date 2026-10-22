@@ -368,6 +368,9 @@ def build_status_text(snapshot):
 # Reporter
 # ------------------------------------------------------------
 
+_FLOOD_UNTIL = 0.0   # 状态面板限频判罚截止（monotonic），run() 期间跳轮
+
+
 class Reporter:
     """只读观察者：采集快照 → 渲染 → 发/改 Telegram 消息。
 
@@ -595,11 +598,15 @@ class Reporter:
 
         与 `_safe_send` 同源经收口：网络层取消/超时只是「本轮没刷新」，面板
         id 必须保住——丢了就会走重建分支、每轮多一条面板刷屏。
-        """
+
+        FloodWaitError 就地记判罚（shielded 会吞异常，外层 except 收不到，
+        实测 2026-10-22）：run() 据 _FLOOD_UNTIL 跳轮，不再硬撞。"""
         client = self.client
 
         async def _edit():
-            """把三种「非异常」结局转成哨兵值，其余交给收口兜住。"""
+            """把四种「非异常」结局转成哨兵值，其余交给收口兜住。"""
+            from telethon.errors import FloodWaitError
+            global _FLOOD_UNTIL
             try:
                 await client.edit_message(
                     self.target, self.status_message_id,
@@ -609,9 +616,16 @@ class Reporter:
                 return "unchanged"           # 内容没变 = 正常，不是错误
             except MessageIdInvalidError:
                 return "invalid"
+            except FloodWaitError as e:
+                _FLOOD_UNTIL = time.monotonic() + int(e.seconds) + 1
+                logger.warning(
+                    f"🤖 状态面板被限频，罚等 {int(e.seconds)}s（期间暂停刷新）")
+                return "flood"
 
         outcome = await netio.shielded(
             _edit, REPORT_NET_TIMEOUT_SECONDS, "状态面板刷新")
+        if outcome == "flood":
+            return False
         if outcome == "ok":
             self._touch_activity()
             return True
@@ -904,6 +918,9 @@ class Reporter:
         while True:
             if state.STOP_EVENT is not None and state.STOP_EVENT.is_set():
                 return
+            if time.monotonic() < _FLOOD_UNTIL:
+                await asyncio.sleep(REPORT_EVENT_POLL_SECONDS)
+                continue          # 限频判罚期内：跳轮，不硬撞
             try:
                 await self.tick()
             except asyncio.CancelledError:

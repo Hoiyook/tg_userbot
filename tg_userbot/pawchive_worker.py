@@ -858,18 +858,31 @@ async def _panel_send(text):
     return getattr(msg, "id", None) if msg else None
 
 
+_PANEL_FLOOD_UNTIL = 0.0   # 限频判罚截止（monotonic）；期间暂停面板刷新
+
+
 async def _panel_edit(text):
-    """原地编辑面板；返回 "ok" / "unchanged" / "invalid" / None。"""
-    from telethon.errors import MessageNotModifiedError
+    """原地编辑面板；返回 "ok" / "unchanged" / "invalid" / None。
+
+    FloodWaitError 在内层就地记判罚截止（shielded 会吞异常，外层
+    except FloodWaitError 永远收不到，2026-10-22 巡检实证）——
+    _panel_loop 据此跳轮，不再 5s 硬撞把罚时越撞越长。"""
+    from telethon.errors import MessageNotModifiedError, FloodWaitError
     target = state.BOT_ID or "me"
 
     async def _edit():
+        global _PANEL_FLOOD_UNTIL
         try:
             await state.client.edit_message(
                 state.BOT_ID or "me", _PANEL_MSG_ID, text)
             return "ok"
         except MessageNotModifiedError:
             return "unchanged"
+        except FloodWaitError as e:
+            _PANEL_FLOOD_UNTIL = time.monotonic() + int(e.seconds) + 1
+            logger.warning(
+                f"🐾 进度面板被限频，罚等 {int(e.seconds)}s（期间暂停刷新）")
+            return "flood"
         except Exception as e:
             # 类名或消息文本任一含 MessageIdInvalid 都按面板失效处理
             # （Telethon 偶有包装变体，靠字符串兜底更稳）
@@ -931,6 +944,8 @@ async def _panel_loop():
     try:
         while True:
             await asyncio.sleep(interval)
+            if time.monotonic() < _PANEL_FLOOD_UNTIL:
+                continue          # 限频判罚期内：跳轮，不硬撞
             try:
                 await _refresh_panel()
             except asyncio.CancelledError:
