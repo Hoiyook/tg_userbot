@@ -1169,3 +1169,75 @@ class HistoryRerunAuditTest(ScanTest):
             st = listener._load_history_state()["scans"][str(SRC)]
         self.assertEqual(st["cursor"], 500, "同标签中断续扫不动游标")
         self.assertIn("断点续扫", text)
+
+
+class HistoryRecheckTest(unittest.TestCase):
+    """定期复核（对账）：done 条目到期归零全量重扫；未到期/运行中让位。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="hist_rck_", dir=_TMP)
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self._rt = mock.patch.object(config, "RUNTIME_DIR", self.dir)
+        self._rt.start()
+        self.addCleanup(self._rt.stop)
+        listener._HISTORY_PROGRESS.clear()
+        self.addCleanup(listener._HISTORY_PROGRESS.clear)
+
+    def _seed(self, chat_id, status, updated_off, tag="#x", cursor=99):
+        data = listener._load_history_state()
+        data.setdefault("scans", {})[str(chat_id)] = {
+            "tag": tag, "cursor": cursor, "status": status,
+            "label": f"C{chat_id}", "updated_at": time.time() - updated_off}
+        listener._save_history_state(data)
+
+    def test_due_selection(self):
+        self._seed(1, "done", 25 * 3600)     # 到期
+        self._seed(2, "done", 2 * 3600)      # 太新
+        self._seed(3, "running", 48 * 3600)  # 运行中
+        self._seed(4, "interrupted", 48 * 3600)
+        due = listener._due_history_rechecks()
+        self.assertEqual([(c, t) for c, t, _ in due], [(1, "#x")])
+
+    def test_recheck_pass_resets_cursor_and_spawns(self):
+        import asyncio as _a
+        self._seed(5, "done", 30 * 3600)
+        spawned = []
+
+        def fake_spawn(chat_id, tag, label):
+            spawned.append((chat_id, tag))
+        async def run():
+            with mock.patch.object(listener, "_spawn_history_scan",
+                                   side_effect=fake_spawn):
+                return listener._recheck_pass()
+        out = _a.run(run())
+        self.assertEqual(out, [5])
+        self.assertEqual(spawned, [(5, "#x")])
+        st = listener._load_history_state()["scans"]["5"]
+        self.assertEqual(st["cursor"], 0, "复核必须归零重扫")
+
+    def test_recheck_pass_yields_to_running(self):
+        import asyncio as _a
+        # 选取时到期，落盘间隙被手动重跑（变 running）→ 让位不 spawn
+        self._seed(6, "done", 30 * 3600)
+        spawned = []
+
+        def fake_spawn(*a):
+            spawned.append(a)
+            # 模拟选取后状态变化：spawn 前（真实顺序：先改状态再 spawn）
+        async def run():
+            orig = listener._due_history_rechecks
+            def flipped():
+                listener._seed = None   # no-op
+                # 直接把状态改成 running，模拟间隙竞争
+                data = listener._load_history_state()
+                data["scans"]["6"]["status"] = "running"
+                listener._save_history_state(data)
+                return orig()
+            with mock.patch.object(listener, "_due_history_rechecks",
+                                   side_effect=flipped), \
+                    mock.patch.object(listener, "_spawn_history_scan",
+                                      side_effect=fake_spawn):
+                return listener._recheck_pass()
+        out = _a.run(run())
+        self.assertEqual(out, [], "running 让位不重复 spawn")
+        self.assertEqual(spawned, [])

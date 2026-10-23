@@ -1563,6 +1563,64 @@ def resume_interrupted_history_scans():
     return resumed
 
 
+# ---- 定期复核（对账）：done 条目按周期全量重扫 ------------------
+# 抓「扫描结束后才编辑补标签」的漏网旧帖。判重幂等让重扫零成本，
+# 建任务数如实暴露漏网（0 = 干净）。完成通知本身就是审计报告。
+def _due_history_rechecks(now=None):
+    """到期该全量复核的条目：done 且距上次完成 ≥ RECHECK_HOURS。
+    返回 [(chat_id, tag, label)]。"""
+    now = now if now is not None else time.time()
+    gap = float(config.LISTEN_HISTORY_RECHECK_HOURS) * 3600
+    due = []
+    for cid, e in (_load_history_state().get("scans") or {}).items():
+        if e.get("status") != "done" or not e.get("tag"):
+            continue
+        if now - float(e.get("updated_at") or 0) < gap:
+            continue
+        try:
+            due.append((int(cid), e.get("tag"),
+                        e.get("label") or f"chat_{cid}"))
+        except (TypeError, ValueError):
+            continue
+    return due
+
+
+def _recheck_pass():
+    """复核一轮：到期条目归零游标并重扫（须在事件循环内调用）。"""
+    spawned = []
+    for chat_id, tag, label in _due_history_rechecks():
+        data = _load_history_state()
+        e = data["scans"].get(str(chat_id))
+        if not e or e.get("status") != "done":
+            continue   # 选取与落盘间隙状态变了（被手动重跑等），让位
+        e.update({"cursor": 0, "status": "idle", "tag": tag})
+        _save_history_state(data)
+        logger.info(f"📡 历史回扫定期复核：{label} {tag}（全量重扫，判重幂等）")
+        _spawn_history_scan(chat_id, tag, label)
+        spawned.append(chat_id)
+    return spawned
+
+
+async def history_recheck_loop():
+    """历史回扫复核循环：每 RECHECK_POLL 分钟查一次到期条目。"""
+    poll = float(config.LISTEN_HISTORY_RECHECK_POLL_MINUTES) * 60
+    logger.info(
+        f"📡 历史回扫复核循环已启动（done 条目每 "
+        f"{config.LISTEN_HISTORY_RECHECK_HOURS}h 全量复核一次）")
+    try:
+        while True:
+            await asyncio.sleep(poll)
+            try:
+                _recheck_pass()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"📡 历史回扫复核调度异常（下轮再试）：{e}")
+    except asyncio.CancelledError:
+        logger.info("📡 历史回扫复核循环停止")
+        raise
+
+
 # ============================================================
 # 展示 / 菜单 / 命令
 # ============================================================

@@ -1699,6 +1699,12 @@ async def main():
     wl_scan_task = None
     if state.RUNTIME_DB_READY:
         wl_scan_task = asyncio.create_task(_whitelist_scan_loop())
+        # 历史回扫定期复核（对账）：done 条目每 24h 全量重扫一遍，
+        # 抓「扫完后才编辑补标签」的漏网（判重幂等，建任务数即审计结果）
+        history_recheck_task = asyncio.create_task(
+            listener.history_recheck_loop())
+    else:
+        history_recheck_task = None
     # Pawchive worker（帖子生命周期 → Chrome Agent 批量下载）
     pawchive_worker_task = None
     if state.RUNTIME_DB_READY:
@@ -1728,12 +1734,14 @@ async def main():
         # 扫描/Reporter 主循环同理。
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task, pawchive_worker_task, extract_worker_task):
+                  wl_scan_task, history_recheck_task, pawchive_worker_task,
+                  extract_worker_task):
             if t is not None:
                 t.cancel()
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task, pawchive_worker_task, extract_worker_task):
+                  wl_scan_task, history_recheck_task, pawchive_worker_task,
+                  extract_worker_task):
             if t is not None:
                 try:
                     await t

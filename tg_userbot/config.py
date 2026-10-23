@@ -500,6 +500,8 @@ LISTEN_HISTORY_PAGE_INTERVAL_SECONDS = 1.5   # 翻页间隔（防突发）
 LISTEN_HISTORY_LOG_EVERY = 1000         # 每 N 条消息打一行进度
 LISTEN_HISTORY_FAIL_STREAK = 10         # 连续取页失败上限（超过判中断并通知）
 LISTEN_HISTORY_BUDGET_WAIT_SECONDS = 30  # 队列满载时的等待间隔（等 Worker 消化）
+LISTEN_HISTORY_RECHECK_HOURS = 24         # done 条目的自动全量复核周期（对账）
+LISTEN_HISTORY_RECHECK_POLL_MINUTES = 15  # 复核调度轮询周期
 # FloodWait 的服务端等待值上限保护：正常直接采信服务端返回值（规格 §27 明确
 # 不许固定等 60 秒）；只有离谱到超过这个上限（默认 6 小时）才截断并显著告警，
 # 免得一个异常返回值把 Worker 挂死且不留痕。
