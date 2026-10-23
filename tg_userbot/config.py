@@ -493,6 +493,13 @@ LISTEN_WORKER_BACKOFF_MAX_SECONDS = 1800
 # 待执行任务上限（规格 §30）：达到上限 Scanner 停止创建新任务，且**不推进
 # checkpoint**（没入队的消息不能被跳过）。是配置项不是硬编码。
 LISTEN_MAX_PENDING_TASKS = 1000
+# 历史回扫（/listen history，2026-10-23）：整频道翻页扫指定标签。翻页节流
+# 与断点续扫（游标落 RUNTIME_DIR/listen_history.json，重启自动续）。
+LISTEN_HISTORY_PAGE_LIMIT = 200          # 每页消息数（升序 min_id 翻页）
+LISTEN_HISTORY_PAGE_INTERVAL_SECONDS = 1.5   # 翻页间隔（防突发）
+LISTEN_HISTORY_LOG_EVERY = 1000         # 每 N 条消息打一行进度
+LISTEN_HISTORY_FAIL_STREAK = 10         # 连续取页失败上限（超过判中断并通知）
+LISTEN_HISTORY_BUDGET_WAIT_SECONDS = 30  # 队列满载时的等待间隔（等 Worker 消化）
 # FloodWait 的服务端等待值上限保护：正常直接采信服务端返回值（规格 §27 明确
 # 不许固定等 60 秒）；只有离谱到超过这个上限（默认 6 小时）才截断并显著告警，
 # 免得一个异常返回值把 Worker 挂死且不留痕。

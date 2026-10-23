@@ -1689,6 +1689,12 @@ async def main():
         if recovered:
             logger.warning(f"🗄 启动恢复：{recovered} 条租约过期的监听任务已回到待执行")
         listener_worker_task = listener_worker.start_worker()
+        # 历史回扫续扫（/listen history 被中断的）：判重三层挡重复，
+        # 从状态文件游标继续
+        try:
+            listener.resume_interrupted_history_scans()
+        except Exception as e:
+            logger.warning(f"📡 历史回扫续扫失败（忽略，可 /listen history 重跑）：{e}")
     # 白名单扫描生产者（停机补漏链）：与标签监听扫描并列的独立循环
     wl_scan_task = None
     if state.RUNTIME_DB_READY:

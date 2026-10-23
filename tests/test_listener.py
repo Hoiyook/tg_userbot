@@ -33,6 +33,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -888,3 +889,198 @@ class ListenCommandTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ============================================================
+# 历史回扫（/listen history，2026-10-23）
+# ============================================================
+class HistoryScanTest(ScanTest):
+    """历史回扫：整频道翻页扫标签 → 建任务 + 关注评论区；断点续扫。"""
+
+    def setUp(self):
+        super().setUp()
+        self.rt_dir = os.path.join(self.dir, "rt")
+        self._rt = mock.patch.object(config, "RUNTIME_DIR", self.rt_dir)
+        self._rt.start()
+        self.addCleanup(self._rt.stop)
+        listener._HISTORY_PROGRESS.clear()
+        self.addCleanup(listener._HISTORY_PROGRESS.clear)
+        for t in list(listener._HISTORY_TASKS):
+            t.cancel()
+
+    async def test_history_scan_matches_and_dedups(self):
+        msgs = [
+            FakeMessage(1, text="无标签普通帖", fname="a.mp4"),
+            FakeMessage(2, text="好东西 #3D区 收藏", fname="b.mp4"),
+            FakeMessage(3, text="文本无媒体 #3D区", is_media=False),  # 跳过
+            FakeMessage(4, text="另一条 #3D区", fname="c.mp4"),
+        ]
+        cli = FakeClient(messages_by_chat={SRC: msgs})
+        state.client = cli
+        with mock.patch.object(config, "LISTEN_HISTORY_PAGE_LIMIT", 2):
+            await listener._history_scan_run(SRC, "#3D区", "Src")
+        rows = runtime_db.list_listener_tasks()
+        hits = {r["message_id"] for r in rows}
+        self.assertEqual(hits, {2, 4}, "只命中带标签的媒体帖")
+        self.assertTrue(all(r["target_type"] == "saved_messages"
+                            and r["download"] for r in rows))
+        # 关注列表：命中帖进跟进（评论区附件由 follow_scan 收割）
+        follows = runtime_db.list_due_follows(now=time.time() + 9999)
+        self.assertIn(2, {f["post_id"] for f in follows})
+        self.assertIn(4, {f["post_id"] for f in follows})
+        # 状态文件：done + 游标推进到末条
+        st = listener._load_history_state()["scans"][str(SRC)]
+        self.assertEqual(st["status"], "done")
+        self.assertEqual(st["cursor"], 4)
+        self.assertEqual(st["matched"], 2)
+        # 重跑：判重（唯一索引）全吸收，任务不增
+        with mock.patch.object(config, "LISTEN_HISTORY_PAGE_LIMIT", 2):
+            await listener._history_scan_run(SRC, "#3D区", "Src")
+        self.assertEqual(len(runtime_db.list_listener_tasks()),
+                         len(rows))
+
+    async def test_history_scan_album_kept_whole_and_mirror_skipped(self):
+        msgs = [
+            FakeMessage(10, text="相册头 #3D区", grouped_id=77,
+                        fname="p1.jpg"),
+            FakeMessage(11, text="", grouped_id=77, fname="p2.jpg"),
+            FakeMessage(12, text="镜像 #3D区", fname="m.mp4"),
+        ]
+        msgs[2].fwd_from = mock.Mock(channel_post=99)   # 频道帖镜像特征
+        cli = FakeClient(messages_by_chat={SRC: msgs})
+        state.client = cli
+        await listener._history_scan_run(SRC, "#3D区", "Src")
+        rows = runtime_db.list_listener_tasks()
+        self.assertEqual([r["message_id"] for r in rows], [10])
+        self.assertEqual(sorted(rows[0]["payload"]["member_ids"]),
+                         [10, 11], "相册整组建一条任务")
+
+    async def test_history_scan_resume_from_cursor(self):
+        msgs = [FakeMessage(i, text=f"帖{i} #tag", fname=f"{i}.mp4")
+                for i in range(1, 6)]
+        cli = FakeClient(messages_by_chat={SRC: msgs})
+        state.client = cli
+        # 预置游标=3：应只扫 4、5
+        listener._history_scan_entry(SRC, create=True)
+        data = listener._load_history_state()
+        data["scans"][str(SRC)].update({"cursor": 3, "tag": "#tag"})
+        listener._save_history_state(data)
+        await listener._history_scan_run(SRC, "#tag", "Src")
+        rows = runtime_db.list_listener_tasks()
+        self.assertEqual({r["message_id"] for r in rows}, {4, 5})
+        # 只请求过 min_id>=3 的页（不重扫 1-3）
+        min_ids = [kw.get("min_id") for _, kw in cli.get_messages_calls
+                   if "min_id" in kw]
+        self.assertTrue(all(m >= 3 for m in min_ids), min_ids)
+
+    async def test_history_scan_budget_waits(self):
+        msgs = [FakeMessage(1, text="#t", fname="a.mp4")]
+        state.client = FakeClient(messages_by_chat={SRC: msgs})
+        waits = {"n": 0}
+
+        async def fake_sleep(_s):
+            waits["n"] += 1
+        with mock.patch.object(config, "LISTEN_MAX_PENDING_TASKS", 1), \
+                mock.patch.object(
+                    runtime_db, "count_pending_listener_tasks",
+                    side_effect=lambda: 5 if waits["n"] < 2 else 0), \
+                mock.patch.object(listener.asyncio, "sleep", fake_sleep):
+            await listener._history_scan_run(SRC, "#t", "Src")
+        self.assertGreaterEqual(waits["n"], 2, "满载时应等待 Worker 消化")
+        st = listener._load_history_state()["scans"][str(SRC)]
+        self.assertEqual(st["status"], "done")
+
+    async def test_history_scan_fetch_failure_marks_interrupted(self):
+        state.client = FakeClient(messages_by_chat={SRC: []})
+        # 让取页恒失败：_history_page 返回 None（netio 收口失败 → None）
+        with mock.patch.object(listener, "_history_page",
+                               return_value=None), \
+                mock.patch.object(
+                    config, "LISTEN_HISTORY_FAIL_STREAK", 2), \
+                mock.patch.object(listener, "notify",
+                                  mock.Mock(notify_user=mock.AsyncMock())):
+            await listener._history_scan_run(SRC, "#t", "Src")
+        st = listener._load_history_state()["scans"][str(SRC)]
+        self.assertEqual(st["status"], "interrupted")
+
+
+class HistoryCommandTest(unittest.TestCase):
+    """/listen history 命令解析与守卫。"""
+
+    def test_parse(self):
+        self.assertEqual(
+            listener.parse_listen_command("/listen history @c #tag"),
+            ("history", "@c #tag"))
+        self.assertEqual(
+            listener.parse_listen_command("/listen_history 123 t"),
+            ("history", "123 t"))
+
+    def test_usage_without_args(self):
+        import asyncio as _a
+
+        async def run():
+            return await listener._cmd_history("")
+        text = _a.run(run())
+        self.assertIn("用法", text)
+        self.assertIn("/listen history", text)
+
+    def test_tag_auto_prefix(self):
+        import asyncio as _a
+
+        spawned = []
+
+        def fake_spawn(chat_id, tag, label):
+            spawned.append((chat_id, tag, label))
+            return None
+        with mock.patch.object(listener, "_spawn_history_scan",
+                               side_effect=fake_spawn):
+            async def run():
+                return await listener._cmd_history("12345 3D区")
+            text = _a.run(run())
+        self.assertEqual(spawned, [(12345, "#3D区", "chat_12345")])
+        self.assertIn("从频道第一条开始", text)
+
+    def test_running_guard(self):
+        import asyncio as _a
+
+        with mock.patch.object(
+                listener, "_history_scan_entry",
+                return_value={"status": "running", "cursor": 9,
+                              "tag": "#x", "matched": 1}), \
+                mock.patch.object(listener, "_HISTORY_PROGRESS",
+                                  {123: "进行中描述"}):
+            async def run():
+                return await listener._cmd_history("123 #x")
+            text = _a.run(run())
+        self.assertIn("进行中", text)
+        self.assertIn("进行中描述", text)
+
+
+class HistoryResumeTest(unittest.TestCase):
+    """启动续扫：状态文件里 interrupted/running 的条目要被重新拉起。"""
+
+    def test_resume_spawns_interrupted(self):
+        import tempfile as _tf
+        d = _tf.mkdtemp(prefix="hist_resume_")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        cfg = os.path.join(d, "listen_history.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"scans": {
+                "111": {"tag": "#a", "label": "A", "cursor": 5,
+                        "status": "interrupted"},
+                "222": {"tag": "#b", "label": "B", "cursor": 0,
+                        "status": "done"},
+            }}, f)
+        spawned = []
+
+        def fake_spawn(chat_id, tag, label):
+            spawned.append((chat_id, tag, label))
+
+        async def fake_run(*a, **k):
+            return None
+        with mock.patch.object(config, "RUNTIME_DIR", d), \
+                mock.patch.object(listener, "_spawn_history_scan",
+                                  side_effect=fake_spawn):
+            n = listener.resume_interrupted_history_scans()
+        self.assertEqual(n, 1)
+        self.assertEqual(spawned, [(111, "#a", "A")])

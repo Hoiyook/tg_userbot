@@ -1275,6 +1275,262 @@ async def follow_scan(now=None, fetcher=None, sleep=None):
 
 
 # ============================================================
+# 历史回扫（/listen history，2026-10-23）：整频道翻页扫指定标签
+#
+# 与实时链路的分工：实时 Scanner 只从 checkpoint 向前（§16 明确不扫历史）；
+# 历史回扫从频道第一条向后翻，命中标签的帖子走**同一条**建任务管线
+# （_build_tasks + enqueue_listener_tasks + 评论跟进关注），Worker 转发收藏
+# 夹、评论区附件由 follow_scan 按既有节奏收割——不新增第二套执行体。
+#
+# 判重三层全复用：listener_tasks 唯一索引（同锚点不重建任务，重跑/与实时
+# 链路重叠都被吸收）→ 下载侧 file_unique_id 判重 → follow (channel,post)
+# 唯一。断点续扫：游标落 RUNTIME_DIR/listen_history.json，重启自动续。
+# ============================================================
+_HISTORY_TASKS = set()        # 在途回扫后台任务（持引用防 GC）
+_HISTORY_PROGRESS = {}        # chat_id → 人话进度（view_text 展示用）
+
+
+def _history_state_path():
+    return os.path.join(config.RUNTIME_DIR, "listen_history.json")
+
+
+def _load_history_state():
+    try:
+        with open(_history_state_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"scans": {}}
+
+
+def _save_history_state(data):
+    path = _history_state_path()
+    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def _history_scan_entry(chat_id, create=False):
+    data = _load_history_state()
+    entry = data["scans"].get(str(int(chat_id)))
+    if entry is None and create:
+        entry = {"tag": "", "cursor": 0, "status": "idle",
+                 "matched": 0, "created": 0, "duplicate": 0,
+                 "scanned": 0, "label": "", "updated_at": 0}
+        data["scans"][str(int(chat_id))] = entry
+        _save_history_state(data)
+    return entry
+
+
+async def _history_page(chat_id, after_id):
+    """升序取一页历史（min_id=after_id, reverse=True），补齐被页边界切开的
+    相册。返回升序消息列表；**None = 取页失败**（瞬时故障重试），[] = 到底。"""
+    cli = state.client
+    if cli is None:
+        return None
+    got = await netio.shielded(
+        lambda: cli.get_messages(
+            int(chat_id),
+            limit=int(config.LISTEN_HISTORY_PAGE_LIMIT),
+            min_id=int(after_id), reverse=True,
+        ),
+        LISTEN_FETCH_TIMEOUT_SECONDS,
+        f"历史回扫取页（{chat_id} #{after_id}+）",
+    )
+    if got is None:
+        return None
+    msgs = got if isinstance(got, (list, tuple)) else [got]
+    msgs = sorted((m for m in msgs if m is not None), key=lambda m: m.id)
+    return await _complete_boundary_group(chat_id, msgs)
+
+
+async def _history_scan_run(chat_id, tag, label):
+    """历史回扫主体（后台任务）：翻页 → 命中 → 建任务 + 关注评论区。
+
+    命中的帖子与实时链路完全同构：转发收藏夹 + 下载（download=True），
+    帖子进关注列表由 follow_scan 收割评论区附件。"""
+    entry = _history_scan_entry(chat_id, create=True)
+    entry.update({"tag": tag, "label": label, "status": "running"})
+    _save_history_state(_load_history_state())
+    cursor = int(entry.get("cursor") or 0)
+    matched = int(entry.get("matched") or 0)
+    created = int(entry.get("created") or 0)
+    duplicate = int(entry.get("duplicate") or 0)
+    scanned = int(entry.get("scanned") or 0)
+    next_log = scanned + int(config.LISTEN_HISTORY_LOG_EVERY)
+    fail_streak = 0
+    logger.info(
+        f"📡 历史回扫启动：{label} 标签 {tag}"
+        + (f"，断点续扫（从 #{cursor} 之后）" if cursor else "，从第一条开始"))
+
+    def _persist(status, extra=None):
+        data = _load_history_state()
+        e = data["scans"].setdefault(str(int(chat_id)), {})
+        e.update({"tag": tag, "label": label, "cursor": cursor,
+                  "status": status, "matched": matched, "created": created,
+                  "duplicate": duplicate, "scanned": scanned,
+                  "updated_at": int(time.time())})
+        if extra:
+            e.update(extra)
+        _save_history_state(data)
+
+    try:
+        while True:
+            # 背压（§30 同款）：队列满载等 Worker 消化，绝不丢消息
+            while runtime_db.count_pending_listener_tasks() >= \
+                    int(config.LISTEN_MAX_PENDING_TASKS):
+                logger.warning(
+                    f"📡 历史回扫（{label}）队列满载，等待 Worker 消化"
+                    f"（游标停在 #{cursor}）")
+                await asyncio.sleep(
+                    float(config.LISTEN_HISTORY_BUDGET_WAIT_SECONDS))
+            page = await _history_page(chat_id, cursor)
+            if page is None:
+                fail_streak += 1
+                if fail_streak >= int(config.LISTEN_HISTORY_FAIL_STREAK):
+                    logger.warning(
+                        f"📡 历史回扫连续 {fail_streak} 次取页失败"
+                        f"（{label}），标记中断（重启/重跑续扫）")
+                    _persist("interrupted")
+                    return
+                await asyncio.sleep(
+                    float(config.LISTEN_HISTORY_PAGE_INTERVAL_SECONDS) * 2)
+                continue
+            fail_streak = 0
+            if not page:
+                break               # 到底：min_id+reverse 取不到更多
+            page_max = max(m.id for m in page)
+            tasks = []
+            for unit in group_by_album(page):
+                media = [m for m in unit if is_downloadable(m)]
+                media = [m for m in media if not is_channel_mirror(m)]
+                if not media:
+                    continue
+                anchor = min(m.id for m in media)
+                gid = getattr(media[0], "grouped_id", None)
+                text = (pick_group_caption_text(media, gid) if gid
+                        else (getattr(media[0], "message", "") or "").strip())
+                if not tag_matches(text, tag):
+                    continue
+                matched += 1
+                origin = await resolve_origin_snapshot(media[0])
+                tasks.extend(_build_tasks(
+                    chat_id, media, {("saved_messages", None)}, True,
+                    text, anchor, origin))
+                _add_follow_from_scan(chat_id, anchor, text, origin, media[0])
+                logger.info(
+                    f"🏷 历史回扫命中：{label} #{anchor} {tag}"
+                    f"（{'整组 ' + str(len(media)) + ' 成员' if gid else '单条'}）")
+            if tasks:
+                ids = runtime_db.enqueue_listener_tasks(chat_id, tasks)
+                ok = sum(1 for i in ids if i)
+                created += ok
+                duplicate += len(ids) - ok
+            scanned += len(page)
+            cursor = page_max
+            _persist("running")
+            _HISTORY_PROGRESS[int(chat_id)] = (
+                f"{label} {tag}｜已扫 {scanned} 条到 #{cursor}"
+                f"｜命中 {matched}｜建任务 {created}")
+            if scanned >= next_log:
+                next_log = scanned + int(config.LISTEN_HISTORY_LOG_EVERY)
+                logger.info(
+                    f"📡 历史回扫进度：{label} 已扫 {scanned} 条到 #{cursor}"
+                    f"（命中 {matched}，建任务 {created}，重复 {duplicate}）")
+            await asyncio.sleep(
+                float(config.LISTEN_HISTORY_PAGE_INTERVAL_SECONDS))
+        _persist("done")
+        _HISTORY_PROGRESS.pop(int(chat_id), None)
+        logger.info(
+            f"📡 历史回扫完成：{label} {tag}｜共扫 {scanned} 条"
+            f"｜命中 {matched}｜建任务 {created}（重复 {duplicate}）")
+        try:
+            await notify.notify_user(
+                f"📡 历史回扫完成：{label}\n标签 {tag}\n"
+                f"扫描 {scanned} 条｜命中 {matched} 帖｜建任务 {created} 条"
+                f"（重复 {duplicate}）\n"
+                "转发与下载由既有 Worker 处理；评论区附件由评论跟进收割"
+                "（/listen 查看）。")
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        _persist("interrupted")
+        raise
+    except Exception as e:
+        logger.exception(f"📡 历史回扫异常（{label}，游标 #{cursor}）：{e}")
+        _persist("interrupted")
+        try:
+            await notify.notify_user(
+                f"📡 历史回扫中断：{label} {tag}\n已扫到 #{cursor}"
+                f"（命中 {matched}，建任务 {created}）。"
+                "重启后自动续扫，或 /listen history 重跑（判重挡重复）。")
+        except Exception:
+            pass
+
+
+def _spawn_history_scan(chat_id, tag, label):
+    task = asyncio.ensure_future(_history_scan_run(chat_id, tag, label))
+    _HISTORY_TASKS.add(task)
+    task.add_done_callback(_HISTORY_TASKS.discard)
+    return task
+
+
+async def _cmd_history(arg):
+    """`/listen history <聊天> <标签>`：整频道回扫该标签（断点续扫）。"""
+    parts = str(arg or "").split()
+    if len(parts) < 2:
+        return (f"{LISTEN_NOTIFY_PREFIX} 用法：/listen history <聊天> <标签>\n"
+                "　例：/listen history @channel #标签\n"
+                "　聊天可用 @用户名 / 数字 ID；标签不带 # 会自动补\n"
+                "　命中帖子转发收藏夹并下载，评论区附件由评论跟进收割；"
+                "判重三层（任务索引/文件指纹/跟进列表）自动挡重复")
+    chat_spec, tag = parts[0], parts[1]
+    if not tag.startswith("#"):
+        tag = "#" + tag
+    entry = None
+    try:
+        chat_id = int(chat_spec)
+        label = f"chat_{chat_id}"
+    except ValueError:
+        info, err = await resolve_chat(chat_spec)
+        if err:
+            return f"{LISTEN_NOTIFY_PREFIX}：{err}"
+        chat_id, label = info["chat_id"], info["name"]
+    entry = _history_scan_entry(chat_id) or {}
+    if entry.get("status") == "running":
+        return (f"{LISTEN_NOTIFY_PREFIX} 该频道回扫进行中：\n"
+                f"{_HISTORY_PROGRESS.get(int(chat_id)) or entry}")
+    _spawn_history_scan(chat_id, tag, label)
+    resume = entry.get("cursor") and entry.get("status") != "done"
+    return (f"{LISTEN_NOTIFY_PREFIX} 🔁 开始历史回扫：{label} {tag}\n"
+            + ("从断点续扫（已扫过的不会重复建任务）" if resume
+               else "从频道第一条开始翻页")
+            + "\n进度看 /listen（列表顶部）与日志；完成通知")
+
+
+def resume_interrupted_history_scans():
+    """启动时续扫上次被中断的历史回扫（状态文件 status=interrupted）。"""
+    data = _load_history_state()
+    resumed = 0
+    for cid, e in (data.get("scans") or {}).items():
+        if e.get("status") == "running" or e.get("status") == "interrupted":
+            try:
+                chat_id = int(cid)
+            except (TypeError, ValueError):
+                continue
+            label = e.get("label") or f"chat_{cid}"
+            tag = e.get("tag") or ""
+            if not tag:
+                continue
+            _spawn_history_scan(chat_id, tag, label)
+            resumed += 1
+    if resumed:
+        logger.info(f"📡 续扫 {resumed} 个被中断的历史回扫（判重挡重复）")
+    return resumed
+
+
+# ============================================================
 # 展示 / 菜单 / 命令
 # ============================================================
 def _format_interval(minutes) -> str:
@@ -1357,6 +1613,11 @@ def view_text() -> str:
             lines.append(
                 f"   ⬇️ 自动下载：{'开启' if rule.get('download') else '关闭'}")
             lines.append("")
+    if _HISTORY_PROGRESS:
+        lines.append("历史回扫：")
+        for prog in _HISTORY_PROGRESS.values():
+            lines.append(f"  📜 {prog}")
+        lines.append("")
     last = state.LISTEN_LAST_SCAN
     if last:
         lines.append(
@@ -1459,7 +1720,7 @@ def parse_listen_command(text):
     rest = rest.strip()
     if head in ("on", "off", "scan", "list", "failed", "retry"):
         return (head, None)
-    if head in ("add", "del", "interval", "edit"):
+    if head in ("add", "del", "interval", "edit", "history"):
         return (head, rest)
     return ("usage", head)
 
@@ -1473,7 +1734,7 @@ USAGE_TEXT = (
     "    目标可用 me（收藏夹）/ @用户名 / 数字 ID；省略则只转发收藏夹\n"
     "/listen del <序号> — 删除规则\n"
     "/listen interval <分钟> — 设置扫描周期\n"
-    "/listen scan — 立即扫描一次"
+    "/listen scan — 立即扫描一次\n"    "/listen history <聊天> <标签> — 整频道历史回扫该标签"
 )
 
 
@@ -1572,6 +1833,8 @@ async def command_reply(action, arg) -> str:
         return await _cmd_add(arg)
     if action == "scan":
         return summary_text(await scan_all(manual=True))
+    if action == "history":
+        return await _cmd_history(arg)
     return USAGE_TEXT
 
 
