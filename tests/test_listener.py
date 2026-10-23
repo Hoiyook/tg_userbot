@@ -1084,3 +1084,36 @@ class HistoryResumeTest(unittest.TestCase):
             n = listener.resume_interrupted_history_scans()
         self.assertEqual(n, 1)
         self.assertEqual(spawned, [(111, "#a", "A")])
+
+
+class FollowSourceNameTest(ScanTest):
+    """评论附件的目录名兜底（2026-10-23 未分类事故）：follow 快照带频道名。
+
+    根因：评论副本的 fwd_from 因评论者转发隐私只有 from_name 文本、无
+    from_id → get_forward_source 落「未分类」哨兵。频道名必须随 follow
+    快照走，不再依赖副本解析碰运气。"""
+
+    async def test_add_follow_stores_explicit_source_name(self):
+        msg = FakeMessage(5, text="#t", fname="a.mp4")
+        listener._add_follow_from_scan(
+            SRC, 5, "#t", None, msg, source_name="祂录（3D区）")
+        follows = runtime_db.list_due_follows(now=time.time() + 9999)
+        row = next(f for f in follows if f["post_id"] == 5)
+        self.assertEqual(row["source_name"], "祂录（3D区）")
+
+    async def test_origin_from_follow_falls_back_to_rule(self):
+        # 旧 follow 无 source_name：按 channel_id 回查监听规则拿频道名
+        state.LISTEN_RULES = [dict(_rule(), source_name="祂录（3D区）",
+                                   source_chat_id=SRC)]
+        follow = {"channel_id": SRC, "post_id": 9, "caption": "c",
+                  "post_date": None, "source_name": None}
+        origin = listener._origin_from_follow(follow)
+        self.assertEqual(origin["source_name"], "祂录（3D区）")
+
+    async def test_history_scan_follow_carries_label(self):
+        msgs = [FakeMessage(7, text="#tag", fname="a.mp4")]
+        state.client = FakeClient(messages_by_chat={SRC: msgs})
+        await listener._history_scan_run(SRC, "#tag", "神性频道")
+        follows = runtime_db.list_due_follows(now=time.time() + 9999)
+        row = next(f for f in follows if f["post_id"] == 7)
+        self.assertEqual(row["source_name"], "神性频道")

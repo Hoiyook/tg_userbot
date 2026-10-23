@@ -934,7 +934,12 @@ async def _scan_chat(chat_id, rules):
                 # 出现的，跟进靠 follow_scan 按天做。快照存 caption/日期/目录，
                 # 之后十几次检查都不必再回频道取原帖。
                 # 满额只是不再跟进（记日志），**绝不影响上面刚建好的下载任务**。
-                _add_follow_from_scan(chat_id, anchor, text, origin, media[0])
+                _add_follow_from_scan(
+                    chat_id, anchor, text, origin, media[0],
+                    source_name=next(
+                        (r.get("source_name") for r in rules
+                         if int(r.get("source_chat_id", 0)) == int(chat_id)),
+                        None))
         processed_upto = max(processed_upto, unit_max_id)
 
     ids = runtime_db.enqueue_listener_tasks(
@@ -1156,11 +1161,16 @@ async def _fetch_replies(channel_id, post_id, limit):
     return list(getattr(got, "messages", None) or []), None
 
 
-def _add_follow_from_scan(chat_id, post_id, text, origin, message):
+def _add_follow_from_scan(chat_id, post_id, text, origin, message,
+                          source_name=None):
     """把命中标签的帖子写进关注列表（失败只记日志，绝不影响主链路）。
 
     关注是**附加收益**（评论区里的差分），它自己的成败不该波及 Scanner 本轮
     已经建好的下载任务。所以这里整个包在 try 里，任何异常都只是「这次没关注上」。
+
+    source_name：频道的显示名。评论附件副本的 fwd_from 常因评论者转发隐私
+    而无 from_id（只剩 from_name 文本）→ 目录解析落「未分类」（2026-10-23
+    祂录（3D区）回扫实测）；快照里带上频道名，评论任务入队时不再碰运气。
     """
     try:
         caption = (origin or {}).get("caption") or text or ""
@@ -1170,7 +1180,7 @@ def _add_follow_from_scan(chat_id, post_id, text, origin, message):
             post_id=int(post_id),
             caption=caption,
             post_date=(date.isoformat() if hasattr(date, "isoformat") else None),
-            source_name=(origin or {}).get("source_name"),
+            source_name=(origin or {}).get("source_name") or source_name,
         )
     except Exception as e:
         logger.warning(f"📡 帖子 {chat_id}/{post_id} 加入关注列表失败（不影响下载）：{e}")
@@ -1181,13 +1191,24 @@ def _origin_from_follow(follow):
 
     用**建列表时**存下的 caption/日期/目录，不再回频道取原帖——跟进要跑 15 天，
     原帖被编辑或删除都不该让已定下的命名漂移。
+
+    source_name 兜底（2026-10-23）：旧 follow 建于频道名进快照之前——按
+    channel_id 回查监听规则表拿频道名；评论附件的目录解析不再依赖副本
+    fwd_from 碰运气（评论者转发隐私 → from_id 空 → 「未分类」）。
     """
+    source_name = follow.get("source_name")
+    if not source_name:
+        cid = follow.get("channel_id")
+        source_name = next(
+            (r.get("source_name") for r in (state.LISTEN_RULES or [])
+             if int(r.get("source_chat_id", 0) or 0) == int(cid or 0)),
+            None)
     return {
         "peer_id": None,
         "channel_post": follow.get("post_id"),
         "caption": follow.get("caption") or "",
         "date": parse_date(follow.get("post_date")),
-        "source_name": follow.get("source_name"),
+        "source_name": source_name,
     }
 
 
@@ -1418,7 +1439,8 @@ async def _history_scan_run(chat_id, tag, label):
                 tasks.extend(_build_tasks(
                     chat_id, media, {("saved_messages", None)}, True,
                     text, anchor, origin))
-                _add_follow_from_scan(chat_id, anchor, text, origin, media[0])
+                _add_follow_from_scan(chat_id, anchor, text, origin, media[0],
+                                      source_name=label)
                 logger.info(
                     f"🏷 历史回扫命中：{label} #{anchor} {tag}"
                     f"（{'整组 ' + str(len(media)) + ' 成员' if gid else '单条'}）")
