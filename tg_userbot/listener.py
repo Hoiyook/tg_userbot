@@ -1523,11 +1523,22 @@ async def _cmd_history(arg):
     if entry.get("status") == "running":
         return (f"{LISTEN_NOTIFY_PREFIX} 该频道回扫进行中：\n"
                 f"{_HISTORY_PROGRESS.get(int(chat_id)) or entry}")
+    # 重跑语义（对账口，2026-10-23）：已 done 或换标签 → 从头全量重扫。
+    # 判重（任务唯一索引）让重扫零成本幂等——建任务数如实暴露漏网
+    #（0 = 上次完整）；只有 interrupted 且同标签才从断点续。
+    fresh = (not entry or entry.get("tag") != tag
+             or entry.get("status") == "done")
+    if entry and fresh:
+        data = _load_history_state()
+        e = data["scans"].setdefault(str(int(chat_id)), {})
+        e.update({"cursor": 0, "status": "idle", "tag": tag})
+        _save_history_state(data)
     _spawn_history_scan(chat_id, tag, label)
-    resume = entry.get("cursor") and entry.get("status") != "done"
+    resume = (not fresh) and entry.get("cursor")
     return (f"{LISTEN_NOTIFY_PREFIX} 🔁 开始历史回扫：{label} {tag}\n"
             + ("从断点续扫（已扫过的不会重复建任务）" if resume
-               else "从频道第一条开始翻页")
+               else "从频道第一条开始翻页（全量复核，判重挡重复——"
+                    "建任务数为 0 即上次无遗漏）")
             + "\n进度看 /listen（列表顶部）与日志；完成通知")
 
 

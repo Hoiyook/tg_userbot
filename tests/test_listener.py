@@ -1117,3 +1117,55 @@ class FollowSourceNameTest(ScanTest):
         follows = runtime_db.list_due_follows(now=time.time() + 9999)
         row = next(f for f in follows if f["post_id"] == 7)
         self.assertEqual(row["source_name"], "神性频道")
+
+
+class HistoryRerunAuditTest(ScanTest):
+    """重跑语义（对账口）：done 后重跑 = 从头全量复核（判重挡重复，
+    建任务数 0 即无遗漏）；换标签也从头；只有 interrupted 同标签才续扫。"""
+
+    def setUp(self):
+        super().setUp()
+        self.rt_dir = os.path.join(self.dir, "rt2")
+        self._rt = mock.patch.object(config, "RUNTIME_DIR", self.rt_dir)
+        self._rt.start()
+        self.addCleanup(self._rt.stop)
+
+    def test_rerun_after_done_rescans_from_scratch(self):
+        import asyncio as _a
+        spawned = []
+
+        def fake_spawn(chat_id, tag, label):
+            spawned.append((chat_id, tag))
+        # 状态：done，游标在末尾
+        with mock.patch.object(config, "RUNTIME_DIR", self.rt_dir):
+            listener._history_scan_entry(SRC, create=True)
+            data = listener._load_history_state()
+            data["scans"][str(SRC)].update(
+                {"cursor": 999, "status": "done", "tag": "#x"})
+            listener._save_history_state(data)
+            with mock.patch.object(listener, "_spawn_history_scan",
+                                   side_effect=fake_spawn):
+                async def run():
+                    return await listener._cmd_history(f"{SRC} #x")
+                text = _a.run(run())
+            st = listener._load_history_state()["scans"][str(SRC)]
+        self.assertEqual(spawned, [(SRC, "#x")])
+        self.assertEqual(st["cursor"], 0, "done 后重跑必须归零重扫")
+        self.assertIn("全量复核", text)
+
+    def test_interrupted_same_tag_resumes(self):
+        import asyncio as _a
+        with mock.patch.object(config, "RUNTIME_DIR", self.rt_dir):
+            listener._history_scan_entry(SRC, create=True)
+            data = listener._load_history_state()
+            data["scans"][str(SRC)].update(
+                {"cursor": 500, "status": "interrupted", "tag": "#x"})
+            listener._save_history_state(data)
+            with mock.patch.object(listener, "_spawn_history_scan",
+                                   lambda *a: None):
+                async def run():
+                    return await listener._cmd_history(f"{SRC} #x")
+                text = _a.run(run())
+            st = listener._load_history_state()["scans"][str(SRC)]
+        self.assertEqual(st["cursor"], 500, "同标签中断续扫不动游标")
+        self.assertIn("断点续扫", text)
