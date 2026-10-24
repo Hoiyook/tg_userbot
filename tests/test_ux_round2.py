@@ -4431,7 +4431,7 @@ class MemoCommandTest(unittest.TestCase):
                      "stats": "stats", "cleanup": "botclean",
                      "wl_scan": "wl_scan", "cmd_templates": "cmdt",
                      "extract_worker": "115x", "douyin_batch": "dyu",
-                     "shell": "sh"}
+                     "shell": "sh", "dup_scan": "115dup", "ops_report": "report", "inventory": "115inv"}
         # /cd2check 写在 botclean 分支体内（共享 is_botclean_command 入口），
         # 其日志行会被 botclean 家族覆盖
         panel = {name for name, _ in b.BOT_COMMANDS}

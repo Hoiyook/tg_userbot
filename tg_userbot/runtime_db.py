@@ -443,6 +443,75 @@ _SCHEMA = (
     CREATE INDEX IF NOT EXISTS idx_extract_pickup
         ON extract_tasks (status, next_retry_at)
     """,
+    # ============================================================
+    # 115 全盘查重结果（2026-10-23，/115dup）。一次扫描一个 run，
+    # 新 run 落库时清掉旧 run（replace-per-scan：/115dup list 永远
+    # 对着最近一次扫描）。group_id 是 run 内 1..N、按可释放空间降序
+    # ——list 的页序、del 的组号都建立在它上面。
+    # ============================================================
+    """
+    CREATE TABLE IF NOT EXISTS dup_runs (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        root         TEXT NOT NULL,
+        status       TEXT NOT NULL,
+        started_at   INTEGER NOT NULL,
+        finished_at  INTEGER,
+        total_files  INTEGER NOT NULL DEFAULT 0,
+        dup_groups   INTEGER NOT NULL DEFAULT 0,
+        dup_files    INTEGER NOT NULL DEFAULT 0,
+        wasted_bytes INTEGER NOT NULL DEFAULT 0,
+        error        TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS dup_files (
+        run_id     INTEGER NOT NULL,
+        group_id   INTEGER NOT NULL,
+        path       TEXT NOT NULL,
+        size       INTEGER NOT NULL,
+        sha1       TEXT NOT NULL,
+        write_time INTEGER,
+        deleted    INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (run_id, group_id, path)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_dup_files_run
+        ON dup_files (run_id, group_id)
+    """,
+    # ============================================================
+    # 115 全量清单（2026-10-24，/115inv，schema v15）——分类管理的数据
+    # 底座：classify 体检、后续批量迁移 dry-run 校验都从这里读。
+    # 按顶层目录分段扫描：done_tops 记已完成的顶层目录（inv_state），
+    # 每段重扫某顶层目录时先删旧行再写（该目录内的增量以整段重扫为准）。
+    # ============================================================
+    """
+    CREATE TABLE IF NOT EXISTS inv_files (
+        path       TEXT PRIMARY KEY,
+        top        TEXT NOT NULL,
+        ext        TEXT NOT NULL DEFAULT '',
+        size       INTEGER NOT NULL,
+        sha1       TEXT NOT NULL DEFAULT '',
+        write_time INTEGER NOT NULL DEFAULT 0,
+        scanned_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_inv_top
+        ON inv_files (top)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS inv_empty_dirs (
+        path       TEXT PRIMARY KEY,
+        scanned_at INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS inv_state (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )
+    """,
 )
 
 # SQLITE_BUSY / SQLITE_LOCKED 的典型文案（只用于判定是否值得重试）
@@ -791,6 +860,14 @@ def migrate() -> int:
                 logger.info(f"🗄 v13：瞬时故障终结任务回投 {cur.rowcount} 条")
         _write(_v13, "迁移 v13（瞬时 TERMINAL 回投）")
         logger.info("🗄 Runtime DB 迁移：v13（瞬时故障 TERMINAL 存量回投）")
+    if version < 14:
+        # v13 → v14：新增 dup_runs / dup_files（115 全盘查重结果）。纯建表，
+        # 没有数据迁移——旧数据不存在（本功能随 v14 引入）。
+        logger.info("🗄 Runtime DB 迁移：v14（+ dup_runs/dup_files 115 查重）")
+    if version < 15:
+        # v14 → v15：新增 inv_files / inv_empty_dirs / inv_state（115 全量
+        # 清单）。纯建表，清单由 /115inv scan 分段落入。
+        logger.info("🗄 Runtime DB 迁移：v15（+ inv_* 115 全量清单）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -3305,6 +3382,210 @@ def count_manual_links(status=None):
             (str(status),)).fetchone()[0], "统计外链台账"))
     return int(_read(lambda c: _execute(
         c, "SELECT COUNT(*) FROM manual_links").fetchone()[0], "统计外链台账"))
+
+
+# ============================================================
+# 115 全盘查重（2026-10-23，schema v14，/115dup）
+# ============================================================
+# dup_scan 模块的存储层。一次扫描一个 run；**新 run 落库即清旧 run**
+# （replace-per-scan：/115dup list 永远对着最近一次扫描，del 的组号
+# 也在同一次 run 内才有效）。groups 由调用方分好组按序传入——
+# group_id 即序号（1..N，可释放空间降序），这里只管存取。
+def dup_start_run(root, now=None):
+    """开一个 running run，返回 run_id（扫描是分钟级，先占号再回填）。"""
+    def do(conn):
+        cur = _execute(
+            conn,
+            "INSERT INTO dup_runs(root, status, started_at) "
+            "VALUES(?, 'running', ?)",
+            (str(root), _now(now)))
+        return cur.lastrowid
+    return _write(do, "查重 run 开档")
+
+
+def dup_finish_run(run_id, stats, groups, error=None, now=None):
+    """回填 run 统计 + 写入全部组员行 + 清掉旧 run（同一事务）。
+
+    groups: [ {sha1, size, files: [(path, wtime)] } ]（分组序即组号）。
+    error 非 None 时 status='failed'（半份结果也写入，aborted 场景
+    组表照样可查——但提示用户结果不完整）。
+    """
+    run_id = int(run_id)
+
+    def do(conn):
+        rows = []
+        for gid, g in enumerate(groups, start=1):
+            for path, wtime in g["files"]:
+                rows.append((run_id, gid, path, int(g["size"]),
+                             g["sha1"], int(wtime or 0)))
+        if rows:
+            for row in rows:
+                _execute(
+                    conn,
+                    "INSERT OR IGNORE INTO dup_files"
+                    "(run_id, group_id, path, size, sha1, write_time) "
+                    "VALUES(?, ?, ?, ?, ?, ?)", row)
+        _execute(
+            conn,
+            "UPDATE dup_runs SET status=?, finished_at=?, total_files=?, "
+            "dup_groups=?, dup_files=?, wasted_bytes=?, error=? WHERE id=?",
+            ("failed" if error else "done", _now(now),
+             int(stats.get("total_files", 0)), int(stats.get("dup_groups", 0)),
+             int(stats.get("dup_files", 0)), int(stats.get("wasted_bytes", 0)),
+             error, run_id))
+        # replace-per-scan：只留本次 run
+        _execute(conn, "DELETE FROM dup_files WHERE run_id<>?", (run_id,))
+        _execute(conn, "DELETE FROM dup_runs WHERE id<>?", (run_id,))
+    return _write(do, f"查重 run 回填（#{run_id}）")
+
+
+def dup_latest_run():
+    """最近一次 run（任意状态）→ dict 或 None。"""
+    row = _read(lambda c: _execute(
+        c, "SELECT * FROM dup_runs ORDER BY id DESC LIMIT 1"
+    ).fetchone(), "取最近查重 run")
+    return dict(row) if row else None
+
+
+def dup_group_page(run_id, offset, limit):
+    """组分页：[(group_id, size, n, n_alive)] 按组号升序（即可释放降序）。"""
+    rows = _read(lambda c: _execute(
+        c,
+        "SELECT group_id, MIN(size) AS size, COUNT(*) AS n, "
+        "       SUM(1 - deleted) AS n_alive "
+        "FROM dup_files WHERE run_id=? "
+        "GROUP BY group_id ORDER BY group_id LIMIT ? OFFSET ?",
+        (int(run_id), int(limit), int(offset))).fetchall(),
+        "查重组分页")
+    return [dict(r) for r in rows]
+
+
+def dup_group_members(run_id, group_id):
+    """组员全量 [(path, size, sha1, write_time, deleted)]（按写入时间升序）。"""
+    rows = _read(lambda c: _execute(
+        c,
+        "SELECT path, size, sha1, write_time, deleted FROM dup_files "
+        "WHERE run_id=? AND group_id=? ORDER BY write_time, path",
+        (int(run_id), int(group_id))).fetchall(), "查重组员")
+    return [dict(r) for r in rows]
+
+
+def dup_mark_deleted(run_id, group_id, paths):
+    """把组内已删成员打标（删除成功后调用，list/show 能如实反映）。"""
+    run_id, group_id = int(run_id), int(group_id)
+
+    def do(conn):
+        for p in paths:
+            _execute(
+                conn,
+                "UPDATE dup_files SET deleted=1 "
+                "WHERE run_id=? AND group_id=? AND path=?",
+                (run_id, group_id, p))
+    return _write(do, f"查重组员打删标（#{group_id}）")
+
+
+# ============================================================
+# 115 全量清单（2026-10-24，schema v15，/115inv）
+# ============================================================
+def inv_set_state(key, value, now=None):
+    _write(lambda conn: _execute(
+        conn,
+        "INSERT INTO inv_state(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(key), str(value))), f"清单状态写（{key}）")
+
+
+def inv_get_state(key):
+    row = _read(lambda c: _execute(
+        c, "SELECT value FROM inv_state WHERE key=?",
+        (str(key),)).fetchone(), f"清单状态读（{key}）")
+    return row[0] if row else None
+
+
+def inv_replace_top(top, files, empty_dirs, now=None):
+    """一个顶层目录的清单整体替换（删旧行→写新文件行+空目录行，单事务）。
+
+    files: [{path, ext, size, sha1, write_time}]；empty_dirs: [路径]
+    （该顶层目录之下旧的空目录行一并清理，避免移动后留陈迹）。"""
+    top = str(top)
+    ts = _now(now)
+
+    def do(conn):
+        _execute(conn, "DELETE FROM inv_files WHERE top=?", (top,))
+        _execute(conn, "DELETE FROM inv_empty_dirs WHERE path LIKE ?",
+                 (f"/115open/{top}/%",))
+        for f in files:
+            _execute(
+                conn,
+                "INSERT OR REPLACE INTO inv_files"
+                "(path, top, ext, size, sha1, write_time, scanned_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (str(f["path"]), top, str(f.get("ext") or ""),
+                 int(f.get("size") or 0), str(f.get("sha1") or ""),
+                 int(f.get("write_time") or 0), ts))
+        for d in empty_dirs:
+            _execute(
+                conn,
+                "INSERT OR REPLACE INTO inv_empty_dirs(path, scanned_at) "
+                "VALUES(?,?)", (str(d), ts))
+    return _write(do, f"清单落库（{top}，{len(files)} 文件）")
+
+
+def inv_reset(now=None):
+    """清空全部清单（/115inv reset）：行与进度状态一起清。"""
+    def do(conn):
+        _execute(conn, "DELETE FROM inv_files")
+        _execute(conn, "DELETE FROM inv_empty_dirs")
+        _execute(conn, "DELETE FROM inv_state")
+    return _write(do, "清单清空")
+
+
+def inv_by_top():
+    """各顶层目录汇总：[{top, n, bytes, oldest, newest}] 按大小降序。"""
+    rows = _read(lambda c: _execute(
+        c,
+        "SELECT top, COUNT(*), SUM(size), MIN(write_time), MAX(write_time) "
+        "FROM inv_files GROUP BY top ORDER BY SUM(size) DESC",
+    ).fetchall(), "清单按顶层汇总")
+    return [dict(zip(("top", "n", "bytes", "oldest", "newest"), r))
+            for r in rows]
+
+
+def inv_by_top_ext():
+    """顶层×扩展名分布：[{top, ext, n, bytes}]。"""
+    rows = _read(lambda c: _execute(
+        c,
+        "SELECT top, ext, COUNT(*), SUM(size) FROM inv_files "
+        "GROUP BY top, ext",
+    ).fetchall(), "清单按顶层×扩展名")
+    return [dict(zip(("top", "ext", "n", "bytes"), r)) for r in rows]
+
+
+def inv_inbox_stale(tops, before_ts):
+    """收件箱目录中写入早于 before_ts 的滞留文件：[{top, n, bytes}]。"""
+    marks = ",".join("?" for _ in tops)
+    rows = _read(lambda c: _execute(
+        c,
+        f"SELECT top, COUNT(*), SUM(size) FROM inv_files "
+        f"WHERE top IN ({marks}) AND write_time>0 AND write_time<? "
+        f"GROUP BY top", (*[str(t) for t in tops], int(before_ts))
+    ).fetchall(), "清单收件箱滞留")
+    return [dict(zip(("top", "n", "bytes"), r)) for r in rows]
+
+
+def inv_empty_dirs(limit=500):
+    return [r[0] for r in _read(lambda c: _execute(
+        c, "SELECT path FROM inv_empty_dirs ORDER BY path LIMIT ?",
+        (int(limit),)).fetchall(), "清单空目录")]
+
+
+def inv_counts():
+    """(文件总数, 总字节, 空目录数)——状态视图用。"""
+    row = _read(lambda c: _execute(
+        c, "SELECT COUNT(*), COALESCE(SUM(size),0), "
+           "(SELECT COUNT(*) FROM inv_empty_dirs) FROM inv_files"
+    ).fetchone(), "清单计数")
+    return (int(row[0]), int(row[1]), int(row[2]))
 
 
 def list_tables():

@@ -238,7 +238,8 @@ def cd2_menu_buttons():
         [Button.inline("🔴 实时状态", encode_menu_data("bak_status"))],
         [Button.inline("🗂 备份记录", encode_menu_data("bak")),
          Button.inline("🔍 115 对账", encode_menu_data("cd2ck"))],
-        [Button.inline("🗜 115 解压", encode_menu_data("extract"))],
+        [Button.inline("🗜 115 解压", encode_menu_data("extract")),
+         Button.inline("🧹 115 查重", encode_menu_data("dup"))],
         [Button.inline("⬅️ 设置", encode_menu_data("settings")),
          Button.inline("🏠 首页", encode_menu_data("home"))],
     ]

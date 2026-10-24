@@ -126,6 +126,8 @@ _COMMAND_SUBS = {
     "/cmdt": {"add", "del", "run"},
     "/caption_filter": {"add", "del", "test"},
     "/115x": {"stop", "start", "retry", "del"},
+    "/115dup": {"scan", "list", "show", "del", "report"},
+    "/115inv": {"scan", "reset"},
 }
 
 
@@ -257,6 +259,9 @@ def _help_text():
         "/clean｜/clearmsg｜/setcleartime 30s|1m|1h|off\n"
         "/origin —— 解析失败账本；/cd2ck 日志对账；/cd2check —— API 实对账\n"
         "/cd2tasks —— CD2 上传任务明细\n"
+        "/115dup scan|list|show|del|report —— 115 全盘查重（报告可传 115）\n"
+        "/report —— 运维报告传 115（待人工/失败/重试/快照/台账/体检）\n"
+        "/115inv scan [分钟] —— 115 全量清单（分类体检的前置）\n"
         "/115x <115路径> —— 115 解压回传（拉压缩包→解压→回传+对账）\n"
         "/dyu <抖音作者主页> [子目录] —— 作者全作品批量串行下载\n"
         "/manual —— 下载链路操作指引（完整机制文档）\n"
@@ -961,6 +966,29 @@ async def handle_command(event, cmd_text):
         from . import cd2_api
         logger.info("执行命令：/cd2check")
         await _reply(event, await cd2_api.reconcile_reply())
+        return True
+
+    from . import dup_scan
+    if dup_scan.is_dup_command(cmd_text):
+        # 115 全盘查重：scan/list/show/del/report（解析与回复全在模块内）。
+        # scan 是「回执 + 后台 task」——扫描以十分钟计，挂在命令协程上会被
+        # 中途断线连坐杀掉（2026-10-23 实测，导出与回复静默丢失）
+        logger.info(f"执行命令：{cmd_text[:60]}")
+        await _reply(event, await dup_scan.command_reply(cmd_text))
+        return True
+
+    from . import inventory
+    if inventory.is_inv_command(cmd_text):
+        # 115 全量清单：分类管理的数据底座（scan 后台跑，同 /115dup 纪律）
+        logger.info(f"执行命令：{cmd_text[:40]}")
+        await _reply(event, await inventory.command_reply(cmd_text))
+        return True
+
+    from . import ops_report
+    if ops_report.is_report_command(cmd_text):
+        # 运维报告：manual/failed/retry/queue/stats 一键传 115（全只读，秒级）
+        logger.info(f"执行命令：{cmd_text[:40]}")
+        await _reply(event, await ops_report.command_reply(cmd_text))
         return True
 
     if cleanup.is_botclean_command(cmd_text):

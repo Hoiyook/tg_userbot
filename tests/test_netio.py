@@ -91,6 +91,35 @@ class ShieldedTest(unittest.IsolatedAsyncioTestCase):
             await task
         self.assertEqual(child_cancelled, [True], "停服时子任务没被取消")
 
+    async def test_cancel_during_timeout_reap_still_propagates(self):
+        """真取消撞上「超时回收子任务」窗口不得被吞（2026-10-23 全量套件挂死根因）。
+
+        子任务收到取消后慢慢收尾（拉宽竞态窗口），调用方取消恰好落在
+        shielded 回收子任务那一等上——旧实现裸 await task 把它误当「子任务
+        取消完成」吞掉，调用方循环照跑、await task 的测试端永远等不到取消。
+        （子任务随后由 finally 兜底二次取消终结，不依赖它自己的收尾路径。）"""
+        async def slow_die():
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.08)   # 取消收尾慢半拍 → 窗口可命中
+                raise
+
+        async def caller():
+            return await netio.shielded(slow_die, 0.01, "测试请求")
+
+        task = asyncio.create_task(caller())
+        await asyncio.sleep(0.03)           # 超时已触发，正在回收子任务
+        task.cancel()                       # 撞进回收窗口
+        try:
+            await asyncio.wait_for(task, 5)
+        except asyncio.CancelledError:
+            pass                            # 取消原样上抛 = 修复生效
+        except asyncio.TimeoutError:
+            self.fail("任务卡死：取消既没传播也没完成")
+        else:
+            self.fail("真取消被吞：任务正常完成而不是以 CancelledError 收场")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -61,6 +61,9 @@ BOT_COMMANDS = (
     ("up", "上传文件到收藏夹：/up <路径>"),
     ("sh", "命令行：执行 shell 命令，如 /sh ls"),
     ("115x", "115 解压回传：/115x <115路径>；裸命令看状态"),
+    ("115dup", "115 全盘查重：/115dup scan|list|show|del；裸命令看最近结果"),
+    ("report", "运维报告传 115：/report [manual|failed|retry|queue|stats]"),
+    ("115inv", "115 全量清单：/115inv scan [分钟]；裸命令看进度"),
     ("dyu", "抖音作者批量：/dyu <主页链接> [子目录]"),
     ("manual", "下载链路操作指引文档"),
     ("queue", "查看下载队列"),
@@ -717,6 +720,11 @@ async def handle_menu_action(action, arg, event):
         # 对账要 walk 整个下载目录（阻塞），放线程跑；按钮先 answer 过不超时
         out = await asyncio.to_thread(cd2.reconcile_text)
         return out, menu.cd2_menu_buttons()
+    if action == "dup":
+        # 115 查重速览（最近一次 run 的统计；扫描本身走 /115dup scan）
+        from . import dup_scan
+        return await asyncio.to_thread(dup_scan.summary_text), \
+            menu.cd2_menu_buttons()
     if action == "cmdt":
         return cmd_templates.list_text(), cmd_templates.menu_buttons()
     if action == "cmdt_add":

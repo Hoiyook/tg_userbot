@@ -313,8 +313,10 @@ class NetworkResilienceTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.2)
             alive = not task.done()
             task.cancel()
+            # wait_for 护栏：取消若被吞（netio.shielded 曾有此竞态，2026-10-23
+            # 全量套件因此挂死），这里超时失败而不是挂死整个套件
             with self.assertRaises(asyncio.CancelledError):
-                await task
+                await asyncio.wait_for(task, 30)
         self.assertTrue(alive, "僵死请求把汇报循环永久冻住了")
         self.assertGreaterEqual(len(fake.attempts), 2, "超时后下一轮应继续尝试")
 

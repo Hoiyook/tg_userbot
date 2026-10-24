@@ -44,17 +44,16 @@ async def shielded(proc, timeout, what):
             # 调用方被真取消（停服）：回收子任务后原样上抛
             if not task.done():
                 task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+                await asyncio.wait([task])
             raise
         if not task.done():
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            # 回收子任务**不裸 await task**：外层真取消恰好落在这一等上时，
+            # 会被「子任务以 CancelledError 收场」的收尾分支误吞——调用方
+            # 取消丢失、循环照跑（test_reporter 曾因此在全量套件里整个挂死）。
+            # asyncio.wait 只等子任务终结：这里的 CancelledError 只可能是
+            # 外层真取消，原样冒泡。
+            await asyncio.wait([task])
             log_throttled(
                 f"shielded:{what}:timeout",
                 f"⏰ {what} 超时（{timeout}s），本轮跳过")

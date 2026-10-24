@@ -349,6 +349,160 @@ def add_offline_download(urls, to_folder="/115open/云下载"):
         return False, f"{type(e).__name__}: {e}"
 
 
+# ============================================================
+# 115 全盘查重（2026-10-23，/115dup）
+# ============================================================
+# CloudDriveFile.fileHashes 的键是 uint32 算法号：2 = SHA1（实测 115 文件
+# 值为 40 位大写十六进制；115 开放平台 API 2026-08-09 起暂停，这条路只
+# 依赖本机 CD2，不新增账号风险面）
+HASH_KEY_SHA1 = 2
+
+
+def scan_remote(root="/115open", progress=None, deadline_s=None):
+    """递归遍历远端目录树，返回 (files, stats)。
+
+    files: [(full_path, size, sha1, write_time_s)]——sha1 为大写十六进制，
+    无哈希/空文件为 ""；write_time 缺失为 0
+    stats: {dirs, files, no_hash, errors: [(path, msg)], aborted, elapsed_s}
+
+    **不读文件内容**：SHA1 是 115 服务端算好的（秒传基础），GetSubFiles
+    列表直接带出——热缓存下全盘是本地操作，冷目录由 CD2 内部限速拉取。
+    单目录失败记 error 继续走（不因一个坏目录放弃全盘）。
+    progress(stats) 每列完一个目录回调一次（命令层报进度用）。
+    deadline_s 软超时：列完当前目录即停并置 stats["aborted"]=True——
+    宁可半份明确的结果，也不要无限挂着。
+    """
+    import time as _time
+    from collections import deque
+    from .cd2_proto import clouddrive_pb2 as pb
+    stub, md = _md()
+    started = _time.monotonic()
+    stats = {"dirs": 0, "files": 0, "no_hash": 0, "errors": [],
+             "errors_total": 0, "empty_dirs": [], "aborted": False,
+             "elapsed_s": 0.0}
+    out = []
+    queue = deque([root.rstrip("/")])
+    while queue:
+        dir_path = queue.popleft()
+        try:
+            entries = []
+            for reply in stub.GetSubFiles(
+                    pb.ListSubFileRequest(path=dir_path),
+                    metadata=md, timeout=120):
+                entries.extend(reply.subFiles)
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            logger.warning(f"_cd2 列目录失败 {dir_path}：{msg}")
+            stats["errors_total"] += 1   # 全量计数；errors 列表只留样本
+            if len(stats["errors"]) < 50:
+                stats["errors"].append((dir_path, msg[:120]))
+            stats["dirs"] += 1
+            continue
+        if not entries:
+            stats["empty_dirs"].append(dir_path)
+        for f in entries:
+            if f.isDirectory:
+                full = f.fullPathName or (dir_path + "/" + f.name)
+                queue.append(full)
+                continue
+            full = f.fullPathName or (dir_path + "/" + f.name)
+            hashes = getattr(f, "fileHashes", None)
+            sha1 = ""
+            if hashes is not None:
+                sha1 = str(hashes.get(HASH_KEY_SHA1) or "").upper()
+            wtime = int(getattr(f.writeTime, "seconds", 0) or 0)
+            if not sha1:
+                stats["no_hash"] += 1
+            out.append((full, int(f.size), sha1, wtime))
+        stats["dirs"] += 1
+        stats["files"] = len(out)
+        stats["elapsed_s"] = round(_time.monotonic() - started, 1)
+        if progress is not None:
+            try:
+                progress(stats)
+            except Exception:
+                pass   # 进度回调绝不影响扫描本身
+        if deadline_s and _time.monotonic() - started > deadline_s:
+            stats["aborted"] = True
+            break
+    stats["elapsed_s"] = round(_time.monotonic() - started, 1)
+    return out, stats
+
+
+def delete_remotes(paths):
+    """逐个删除远端文件（**回收站**，可恢复；不是永久删）。
+
+    返回 [(path, ok, err)]。逐条而非 DeleteFiles 批量：批量接口失败时
+    不指明具体哪个文件失败，逐条能把失败精确到文件（一组通常就 2-3 个）。
+    """
+    from .cd2_proto import clouddrive_pb2 as pb
+    stub, md = _md()
+    out = []
+    for p in paths:
+        try:
+            r = stub.DeleteFile(pb.FileRequest(path=p),
+                                metadata=md, timeout=60)
+            ok = bool(r.success)
+            err = "" if ok else (r.errorMessage or "未知错误")[:120]
+        except Exception as e:
+            ok, err = False, f"{type(e).__name__}: {e}"[:120]
+        if not ok:
+            logger.warning(f"_cd2 删除远端失败 {p}：{err}")
+        out.append((p, ok, err))
+    return out
+
+
+def upload_to_115(local_paths, target_dir, verify_tries=5, verify_gap_s=3.0,
+                  upload_wait_tries=3, upload_wait_gap_s=2.0,
+                  name_prefix=None):
+    """本地文件批量写 CD2 挂载（=上传 115）→ gRPC 尺寸对账 → 等上传任务清空。
+
+    dup_scan.export_report 与 ops_report 共用的导出尾段（extract_worker
+    解压回传同款「写挂载 + 对账」思路的小文件版）。返回 (ok, note)：
+    任何一步失败即停，note 说明原因；已写挂载但未对账通过也算失败
+    （note 提示稍后自查，CD2 后台大概率仍在传）。
+    name_prefix：上传任务清空判定的文件名前缀（默认取首个文件名）。
+    """
+    import time as _time
+    from .extract_worker import mount_of
+    paths = [str(p) for p in local_paths if os.path.exists(str(p))]
+    if not paths:
+        return False, "没有可上传的本地文件"
+    mount_dir = mount_of(str(target_dir))
+    if mount_dir is None:
+        return False, f"目标目录不在 /115open/ 下：{target_dir}"
+    try:
+        os.makedirs(mount_dir, exist_ok=True)
+        for lp in paths:
+            with open(lp, "rb") as src, \
+                    open(os.path.join(mount_dir, os.path.basename(lp)),
+                         "wb") as dst:
+                dst.write(src.read())
+    except OSError as e:
+        return False, f"挂载写入失败（CD2/挂载不可用？）：{e}"
+    for lp in paths:
+        remote = f"{str(target_dir).rstrip('/')}/{os.path.basename(lp)}"
+        ok_size = False
+        for _ in range(verify_tries):
+            f = find_remote(remote)
+            if f is not None and int(f.size) == os.path.getsize(lp):
+                ok_size = True
+                break
+            _time.sleep(verify_gap_s)
+        if not ok_size:
+            return False, (f"已写挂载但 gRPC 对账未见 {remote}"
+                           "——CD2 可能在传，稍后自查")
+    # CD2 后台上传任务清空（KB 级秒传，通常第一轮就过；超时不算失败）
+    prefix = name_prefix or os.path.basename(paths[0])
+    for _ in range(upload_wait_tries):
+        _total, uploading = upload_files_summary(50)
+        if not any(str(u.get("name", "")).startswith(str(prefix))
+                   for u in uploading):
+            break
+        _time.sleep(upload_wait_gap_s)
+    return True, ""
+
+
 def space_text():
     """/paw status 附加行：115 容量（无令牌/不可用返回空串）。"""
     try:
