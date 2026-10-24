@@ -149,7 +149,10 @@ async def replay_chat(chat_id, execute=True):
             return int(cid) == int(state.MY_ID or 0)
         except (TypeError, ValueError):
             return False
-    cli = state.bot_client if _is_bot_chat(chat_id) else state.client
+    # 拉 history 必须用主客户端：bot 账号 API 无权 GetHistory
+    #（2026-10-24 实测 "API access for bot users is restricted"）；
+    # 主客户端对 bot 对话（与自己的 bot 的私聊）同样可读。
+    cli = state.client
     if cli is None:
         return {"scanned": 0, "found": 0, "executed": 0, "failed": 0,
                 "stale": 0}
