@@ -384,12 +384,29 @@ def scan_remote(root="/115open", progress=None, deadline_s=None):
     queue = deque([root.rstrip("/")])
     while queue:
         dir_path = queue.popleft()
+        aborted_mid = False
         try:
             entries = []
-            for reply in stub.GetSubFiles(
-                    pb.ListSubFileRequest(path=dir_path),
-                    metadata=md, timeout=120):
+            stream = stub.GetSubFiles(
+                pb.ListSubFileRequest(path=dir_path),
+                metadata=md, timeout=120)
+            for reply in stream:
                 entries.extend(reply.subFiles)
+                # 软时限的流内检查（2026-10-24 实测教训）：时限只在目录间
+                # 检查时，巨目录冷缓存的流式列举可以无限拖（每页<120s 就
+                # 不超时），全盘查重卡死 34 分钟零进度。页粒度判停：cancel
+                # 流、弃本目录已收条目（半份目录数据会污染判重口径）。
+                if deadline_s and _time.monotonic() - started > deadline_s:
+                    try:
+                        stream.cancel()
+                    except Exception:
+                        pass   # 假流/已结束流没有 cancel——break 即弃用
+                    stats["errors_total"] += 1
+                    stats["errors"].append(
+                        (dir_path, "时限到，该目录整目录未计（下次重扫）"))
+                    stats["aborted"] = True
+                    aborted_mid = True
+                    break
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             logger.warning(f"_cd2 列目录失败 {dir_path}：{msg}")
@@ -398,6 +415,8 @@ def scan_remote(root="/115open", progress=None, deadline_s=None):
                 stats["errors"].append((dir_path, msg[:120]))
             stats["dirs"] += 1
             continue
+        if aborted_mid:
+            break
         if not entries:
             stats["empty_dirs"].append(dir_path)
         for f in entries:
@@ -501,6 +520,88 @@ def upload_to_115(local_paths, target_dir, verify_tries=5, verify_gap_s=3.0,
             break
         _time.sleep(upload_wait_gap_s)
     return True, ""
+
+
+def move_remote(path, dest_dir, expected_size=None):
+    """移动单个远端文件到 dest_dir。**防丢失三保险**：
+    ① ConflictPolicy=Rename（同名冲突时 CD2 自动改名保留双方，绝不
+    Overwrite——proto 默认值就是 Overwrite，必须显式覆盖）；
+    ② 事后校验：新路径存在且尺寸一致（给了 expected_size 时）；
+    ③ 反丢失断言：新旧路径都不存在 = 硬错误（文件失踪，立即上报）。
+    返回 (ok, msg)。"""
+    from .cd2_proto import clouddrive_pb2 as pb
+    stub, md = _md()
+    src = str(path).rstrip("/")
+    dest = str(dest_dir).rstrip("/")
+    new_path = f"{dest}/{src.rsplit('/', 1)[-1]}"
+    try:
+        r = stub.MoveFile(
+            pb.MoveFileRequest(theFilePaths=[src], destPath=dest,
+                               conflictPolicy=1,   # Rename：冲突保双方
+                               moveAcrossClouds=False,
+                               handleConflictRecursively=True),
+            metadata=md, timeout=120)
+        if not r.success:
+            return False, (r.errorMessage or "移动失败")[:120]
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"[:120]
+    # 事后校验（移动是元数据操作，立即可见）
+    f_new = find_remote(new_path)
+    if f_new is None:
+        if find_remote(src) is not None:
+            return False, "移动后新路径不可见（旧路径仍在，未丢失，请重试）"
+        return False, "⚠️ 新旧路径都不存在——文件可能失踪，请立即核查！"
+    if expected_size is not None and int(f_new.size) != int(expected_size):
+        return False, (f"移动后尺寸不符（新 {f_new.size} ≠ 期望 "
+                       f"{expected_size}）——请核查")
+    return True, ""
+
+
+def rename_remote(path, new_name, expected_size=None):
+    """重命名单个远端文件。防丢失：先预检目标名不存在（RenameFile 无冲突
+    策略参数，同名行为未知——绝不冒险），事后校验新路径存在且旧路径消失。
+    返回 (ok, msg)。"""
+    from .cd2_proto import clouddrive_pb2 as pb
+    stub, md = _md()
+    src = str(path).rstrip("/")
+    name = str(new_name).strip()
+    if not name or "/" in name or name in (".", ".."):
+        return False, f"非法新文件名：{new_name!r}"
+    directory = src.rsplit("/", 1)[0]
+    new_path = f"{directory}/{name}"
+    if find_remote(new_path) is not None:
+        return False, f"目标名已存在：{new_path}（跳过防覆盖）"
+    try:
+        r = stub.RenameFile(pb.RenameFileRequest(theFilePath=src, newName=name),
+                            metadata=md, timeout=60)
+        if not r.success:
+            return False, (r.errorMessage or "重命名失败")[:120]
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"[:120]
+    f_new = find_remote(new_path)
+    if f_new is None:
+        return False, ("⚠️ 重命名后新路径不可见"
+                       + ("（旧路径仍在）" if find_remote(src) is not None
+                          else "，旧路径也消失——请立即核查！"))
+    if expected_size is not None and int(f_new.size) != int(expected_size):
+        return False, f"重命名后尺寸不符（{f_new.size} ≠ {expected_size})"
+    return True, ""
+
+
+def read_remote_text(path):
+    """读远端文本文件（经挂载；utf-8-sig → utf-8 → gbk 三路兜底——
+    Excel 存 CSV 的编码坑）。返回文本或 None。"""
+    from .extract_worker import mount_of
+    mp = mount_of(str(path))
+    if mp is None or not os.path.exists(mp):
+        return None
+    raw = open(mp, "rb").read()
+    for enc in ("utf-8-sig", "utf-8", "gbk"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def space_text():

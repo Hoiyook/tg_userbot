@@ -3444,8 +3444,15 @@ def count_manual_links(status=None):
 # 也在同一次 run 内才有效）。groups 由调用方分好组按序传入——
 # group_id 即序号（1..N，可释放空间降序），这里只管存取。
 def dup_start_run(root, now=None):
-    """开一个 running run，返回 run_id（扫描是分钟级，先占号再回填）。"""
+    """开一个 running run，返回 run_id（扫描是分钟级，先占号再回填）。
+
+    开档前先废掉遗留 running（进程重启/扫描线程死掉的僵尸行）。"""
     def do(conn):
+        _execute(
+            conn,
+            "UPDATE dup_runs SET status='failed', "
+            "error='进程重启中断（遗留 running 废弃）' "
+            "WHERE status='running'")
         cur = _execute(
             conn,
             "INSERT INTO dup_runs(root, status, started_at) "
