@@ -20,6 +20,7 @@ WNACG_THROTTLE_SECONDS；aid 主键判重（重复发链接直接回执已有）
 import asyncio
 import os
 import re
+import time
 from urllib.parse import unquote
 
 import httpx
@@ -35,6 +36,10 @@ _PAUSED = {"paused": False}
 _AID_RE = re.compile(r"aid-(\d+)")
 _ZIP_RE = re.compile(r"(//[a-z0-9.]+/down/[a-z0-9/]+\.zip)")
 _H1_RE = re.compile(r"<h1[^>]*>([^<]{1,300})</h1>")
+# 瞬时故障标记（不占尝试上限，退避无限重试——与 /115x 同语义）
+_TRANSIENT_MARKS = ("下载页请求失败", "ConnectError", "ReadError",
+                    "Timeout", "挂载不可用", "上传超时",
+                    "not found under")
 
 
 # ============================================================
@@ -91,28 +96,38 @@ def _proxy_url():
 # ============================================================
 # 网络步骤
 # ============================================================
-def fetch_album_info_blocking(aid):
-    """拉下载页解析标题与直链（阻塞，放线程跑）。失败抛 RuntimeError。"""
+def fetch_album_info_blocking(aid, retries=3):
+    """拉下载页解析标题与直链（阻塞，放线程跑）。失败抛 RuntimeError。
+
+    网络类瞬时错误（代理节点 TLS 抖动——2026-10-24 实测 ConnectError:
+    EOF 连续出现）内部重试 3 次（5s 退避），单次抖动不再烧任务尝试
+    额度；404/解析失败不重试（永久事实）。"""
     url = f"{config.WNACG_BASE}/download-index-aid-{int(aid)}.html"
     proxy = _proxy_url()
     if proxy is None:
         raise RuntimeError("未配置 TG_PROXY——wnacg HTML 站必须走代理")
-    try:
-        r = httpx.get(url, proxy=proxy, trust_env=False,
-                      headers={"User-Agent": config.WNACG_UA},
-                      timeout=float(config.WNACG_FETCH_TIMEOUT_SECONDS),
-                      follow_redirects=True)
-    except Exception as e:
-        raise RuntimeError(f"下载页请求失败：{type(e).__name__}: {e}") from e
-    if r.status_code == 404:
-        raise RuntimeError(f"aid {aid} 不存在（404）")
-    if r.status_code != 200:
-        raise RuntimeError(f"下载页 HTTP {r.status_code}")
-    title, zip_url = parse_download_page(r.text)
-    if not zip_url:
-        raise RuntimeError("下载页解析不到直链（改版或限额提示页？）")
-    return {"title": title or f"aid_{aid}", "zip_url": zip_url,
-            "filename": sanitize_filename(title or f"aid_{aid}") + ".zip"}
+    last = None
+    for attempt in range(retries):
+        try:
+            r = httpx.get(url, proxy=proxy, trust_env=False,
+                          headers={"User-Agent": config.WNACG_UA},
+                          timeout=float(config.WNACG_FETCH_TIMEOUT_SECONDS),
+                          follow_redirects=True)
+        except Exception as e:
+            last = f"下载页请求失败：{type(e).__name__}: {e}"
+            if attempt < retries - 1:
+                time.sleep(5)
+            continue
+        if r.status_code == 404:
+            raise RuntimeError(f"aid {aid} 不存在（404）")
+        if r.status_code != 200:
+            raise RuntimeError(f"下载页 HTTP {r.status_code}")
+        title, zip_url = parse_download_page(r.text)
+        if not zip_url:
+            raise RuntimeError("下载页解析不到直链（改版或限额提示页？）")
+        return {"title": title or f"aid_{aid}", "zip_url": zip_url,
+                "filename": sanitize_filename(title or f"aid_{aid}") + ".zip"}
+    raise RuntimeError(last or "下载页请求失败：未知错误")
 
 
 def download_zip_blocking(zip_url, dest, expected=None):
@@ -313,6 +328,13 @@ async def _run_one(task):
         raise
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
+        if any(m in err for m in _TRANSIENT_MARKS):
+            # 瞬时故障（代理抖动/挂载抖动）：不占尝试上限，退避无限重试
+            delay = min(300 * (2 ** min(int(task.get("attempts") or 0), 4)), 7200)
+            runtime_db.postpone_wnacg_task(aid, err, delay_seconds=delay)
+            logger.warning(f"📖 [aid {aid}] 瞬时故障不占上限：{err[:80]}"
+                           f"，{delay}s 后重试")
+            return
         st = runtime_db.fail_wnacg_task(
             aid, err, max_attempts=int(getattr(config, "WNACG_MAX_ATTEMPTS", 5)))
         logger.warning(f"📖 [aid {aid}] 失败：{err}"

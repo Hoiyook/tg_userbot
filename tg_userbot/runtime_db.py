@@ -3513,6 +3513,15 @@ def dup_mark_deleted(run_id, group_id, paths):
     return _write(do, f"查重组员打删标（#{group_id}）")
 
 
+def dup_mark_deleted_paths(paths):
+    """按路径给已删成员打标（CSV 执行器用：报告可能跨 run，只认路径）。"""
+    def do(conn):
+        for p in paths:
+            _execute(conn, "UPDATE dup_files SET deleted=1 WHERE path=?",
+                     (str(p),))
+    return _write(do, "查重按路径打删标")
+
+
 # ============================================================
 # 115 全量清单（2026-10-24，schema v15，/115inv）
 # ============================================================
@@ -3808,3 +3817,17 @@ def delete_wnacg_task(aid):
         _execute(conn, "DELETE FROM wnacg_tasks WHERE aid=?", (int(aid),))
 
     _write(do, "移除 wnacg 任务")
+
+
+def postpone_wnacg_task(aid, error, delay_seconds=300, now=None):
+    """瞬时故障退避重投（不烧尝试额度——与 /115x 瞬时分流同语义）。"""
+    now = _now(now)
+
+    def do(conn):
+        _execute(conn, "UPDATE wnacg_tasks SET status=?, error=?, "
+                 "next_retry_at=?, lease_until=NULL, updated_at=? "
+                 "WHERE aid=?",
+                 (WNACG_PENDING, str(error)[:500],
+                  now + int(delay_seconds), now, int(aid)))
+
+    _write(do, "退避 wnacg 任务")

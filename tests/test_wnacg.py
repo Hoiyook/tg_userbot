@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+import httpx
+
 import sys  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import conftest as _btn_shim  # noqa: F401,E402
@@ -21,6 +23,11 @@ os.environ.setdefault("TG_SAVE_FOLDER", _TMP)
 from tg_userbot import config  # noqa: E402
 from tg_userbot import runtime_db  # noqa: E402
 from tg_userbot import wnacg  # noqa: E402
+
+
+class NS:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
 
 
 PAGE = """<html><body>
@@ -222,6 +229,44 @@ class WorkerFlowTest(_DbCase):
         extracts = runtime_db.list_extract_tasks(limit=5)
         self.assertTrue(any(r["archive_name"] == "x.zip"
                             for r in extracts))
+
+    def test_transient_postpone_does_not_burn_attempts(self):
+        runtime_db.enqueue_wnacg_task(700)
+        runtime_db.claim_next_wnacg_task()
+        runtime_db.postpone_wnacg_task(
+            700, "下载页请求失败：ConnectError: EOF", delay_seconds=60)
+        row = runtime_db.get_wnacg_task(700)
+        self.assertEqual(row["status"], runtime_db.WNACG_PENDING)
+        self.assertEqual(row["attempts"], 0, "瞬时故障不烧尝试额度")
+        self.assertIn("ConnectError", row["error"])
+
+    def test_fetch_retries_transient_then_ok(self):
+        calls = {"n": 0}
+
+        def flaky_get(url, **kw):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise httpx.ConnectError("EOF occurred in violation")
+            return NS(status_code=200, text=PAGE)
+        with mock.patch.object(wnacg.time, "sleep"), \
+                mock.patch.object(wnacg.httpx, "get", side_effect=flaky_get), \
+                mock.patch.dict(os.environ, {"TG_PROXY": "socks5://x"}):
+            info = wnacg.fetch_album_info_blocking(1)
+        self.assertEqual(calls["n"], 3)
+        self.assertIn("dl1", info["zip_url"])
+
+    def test_fetch_404_no_retry(self):
+        calls = {"n": 0}
+
+        def always_404(url, **kw):
+            calls["n"] += 1
+            return NS(status_code=404, text="")
+        with mock.patch.object(wnacg.httpx, "get", side_effect=always_404), \
+                mock.patch.dict(os.environ, {"TG_PROXY": "socks5://x"}):
+            with self.assertRaises(RuntimeError) as ctx:
+                wnacg.fetch_album_info_blocking(1)
+        self.assertEqual(calls["n"], 1, "404 是永久事实，不重试")
+        self.assertIn("不存在", str(ctx.exception))
 
     async def test_fail_marks_retryable(self):
         with mock.patch.object(
