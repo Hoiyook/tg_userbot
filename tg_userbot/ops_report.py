@@ -363,27 +363,31 @@ def export_reports(types, target_dir=None):
     target_dir = target_dir or REPORT_DIR_DEFAULT
     out = {"ok": False, "files": [], "local_dir": None, "note": "",
            "remote_dir": str(target_dir)}
+    # 按日期分目录（2026-10-24 owner 指令：日积月累文件太多）；
+    # 本地与 115 两侧同构
     stem_suffix = time.strftime("%Y%m%d-%H%M")
-    local_dir = os.path.join(config.RUNTIME_DIR, "userbot_reports")
+    day = time.strftime("%Y-%m-%d")
+    local_dir = os.path.join(config.RUNTIME_DIR, "userbot_reports", day)
     try:
         os.makedirs(local_dir, exist_ok=True)
         for t in types:
             text, csv_text = _COLLECTORS[t]()
             stem = f"{t}_{stem_suffix}"
+            # utf-8-sig：带 BOM——Excel/老编辑器双击打开不再按 GBK 乱码
             with open(os.path.join(local_dir, f"{stem}.txt"), "w",
-                      encoding="utf-8") as f:
+                      encoding="utf-8-sig") as f:
                 f.write(text)
             out["files"].append(os.path.join(local_dir, f"{stem}.txt"))
             if csv_text:
                 with open(os.path.join(local_dir, f"{stem}.csv"), "w",
-                          encoding="utf-8") as f:
+                          encoding="utf-8-sig") as f:
                     f.write(csv_text)
                 out["files"].append(os.path.join(local_dir, f"{stem}.csv"))
         out["local_dir"] = local_dir
     except OSError as e:
         out["note"] = f"本地存档失败：{e}"
         return out
-    ok, note = cd2_api.upload_to_115(out["files"], target_dir,
+    ok, note = cd2_api.upload_to_115(out["files"], f"{target_dir}/{day}",
                                      name_prefix=None)
     out["ok"] = ok
     out["note"] = note

@@ -153,8 +153,9 @@ class ExportAndCommandTest(_DbTestCase):
 
     def _upload_patches(self):
         def fake_find(remote, force_refresh=False):
-            lp = os.path.join(self.report_dir, "userbot_reports",
-                              remote.rsplit("/", 1)[-1])
+            # 远端路径尾两段 = 日期目录/文件名，镜像本地 userbot_reports 结构
+            day, name = remote.rstrip("/").rsplit("/", 2)[-2:]
+            lp = os.path.join(self.report_dir, "userbot_reports", day, name)
             return NS(size=os.path.getsize(lp)) if os.path.exists(lp) else None
 
         return [
@@ -174,9 +175,19 @@ class ExportAndCommandTest(_DbTestCase):
         self.assertTrue(res["ok"], res["note"])
         # 6 TXT + 2 CSV（failed/retry 各附；classify 需清单，空也出提示文件）
         self.assertEqual(len(res["files"]), 8)
-        mount_out = os.listdir(os.path.join(self.mount_base, "userBot报告"))
+        import time as _t
+        day = _t.strftime("%Y-%m-%d")
+        # 115 侧与本地侧都按日期分目录；内容带 BOM（Excel 双击不乱码）
+        mount_out = os.listdir(
+            os.path.join(self.mount_base, "userBot报告", day))
         self.assertEqual(len(mount_out), 8)
         self.assertTrue(any(f.startswith("manual_") for f in mount_out))
+        local_txt = next(f for f in res["files"] if f.endswith(".txt"))
+        with open(local_txt, "rb") as f:
+            self.assertTrue(f.read(3) == b"\xef\xbb\xbf",
+                            "TXT 须带 UTF-8 BOM")
+        self.assertTrue(local_dir_dated := res["local_dir"].endswith(day),
+                        res["local_dir"])
 
     def test_report_command_reply_ok_and_usage(self):
         self.assertTrue(ops_report.is_report_command("/report"))
