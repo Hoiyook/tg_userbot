@@ -149,14 +149,16 @@ def download_zip_blocking(zip_url, dest, expected=None):
 # ============================================================
 # 115 落盘 + 解压入队
 # ============================================================
-def _mount_dir():
-    from .extract_worker import mount_of
-    return mount_of(config.WNACG_REMOTE_DIR)
+def _remote_dir_for(task):
+    """任务的目标 115 目录：漫画/ 或 漫画/<作者>/。"""
+    base = config.WNACG_REMOTE_DIR
+    sub = (task.get("subdir") or "").strip()
+    return f"{base}/{sub}" if sub else base
 
 
-def _remote_size_blocking(name):
+def _remote_size_blocking(name, remote_dir):
     from . import cd2_api
-    listing = cd2_api.list_remote_dir(config.WNACG_REMOTE_DIR, limit=500)
+    listing = cd2_api.list_remote_dir(remote_dir, limit=500)
     if listing is None:
         return None
     for n, s, _d in listing:
@@ -165,10 +167,10 @@ def _remote_size_blocking(name):
     return None
 
 
-async def _wait_remote_size(name, expect, tries=120, gap=15.0):
+async def _wait_remote_size(name, expect, remote_dir, tries=120, gap=15.0):
     """等 CD2 把挂载写入传到 115（gRPC 轮询对尺寸）。None=超时。"""
     for i in range(tries):
-        size = await asyncio.to_thread(_remote_size_blocking, name)
+        size = await asyncio.to_thread(_remote_size_blocking, name, remote_dir)
         if size is not None and size == int(expect):
             return size
         if i % 8 == 7:
@@ -211,16 +213,20 @@ async def _process_task(task):
     runtime_db.update_wnacg_task(aid, size_bytes=size)
 
     # ③ 落 115：同名同尺寸已在 → 跳拷贝；否则写挂载等 CD2 上传
-    mount_dir = _mount_dir()
+    from .extract_worker import mount_of
+    remote_dir = _remote_dir_for(task)
+    mount_dir = mount_of(remote_dir)
     if mount_dir is None:
-        raise RuntimeError(f"挂载不可用：{config.WNACG_REMOTE_DIR}"
+        raise RuntimeError(f"挂载不可用：{remote_dir}"
                            "（CD2/挂载死了，稍后自动重试）")
-    remote_now = await asyncio.to_thread(_remote_size_blocking,
-                                         task["filename"])
+    remote_now = await asyncio.to_thread(
+        _remote_size_blocking, task["filename"], remote_dir)
     if remote_now != size:
+        # 作者子目录可能不存在：挂载 mkdir 即 CD2 建远端目录
+        os.makedirs(mount_dir, exist_ok=True)
         target = os.path.join(mount_dir, task["filename"])
         await asyncio.to_thread(_copy_with_progress, local, target)
-        got = await _wait_remote_size(task["filename"], size)
+        got = await _wait_remote_size(task["filename"], size, remote_dir)
         if got is None:
             raise RuntimeError("115 上传超时（CD2 未在时限内传完），稍后重试")
     try:
@@ -230,7 +236,7 @@ async def _process_task(task):
 
     # ④ 进 /115x 解压管线（解压 → 回传 → 对账 → 通知全复用）
     ins, _skip = runtime_db.enqueue_extract_tasks(
-        config.WNACG_REMOTE_DIR, [(task["filename"], size)])
+        remote_dir, [(task["filename"], size)])
     if not ins:
         logger.info(f"📖 [aid {aid}] 解压任务已存在（幂等跳过）")
     return {"size": size, "title": task.get("title") or info["title"]}
@@ -291,7 +297,7 @@ async def _run_one(task):
             await notify.notify_user(
                 f"📖 漫画已转 115 并入解压管线\n\n{title}\n"
                 f"大小：{format_size(result['size'])}\n"
-                f"位置：{config.WNACG_REMOTE_DIR}/{task['filename']}\n"
+                f"位置：{_remote_dir_for(task)}/{task['filename']}\n"
                 "解压回传的进度与结果由 115 解压管线另行通知。")
         except Exception:
             pass
@@ -336,8 +342,9 @@ def _status_text():
     for r in rows:
         size = f" {format_size(r['size_bytes'])}" if r.get("size_bytes") else ""
         err = f"｜{str(r['error'])[:28]}" if r.get("error") else ""
+        sub = f"→{r['subdir']}/ " if r.get("subdir") else ""
         lines.append(f"  [{r['status']}] #{r['aid']} "
-                     f"{(r['title'] or '')[:30]}{size}{err}")
+                     f"{(r['title'] or '')[:30]}{size} {sub}{err}")
     lines.append("\n/wnacg retry <aid|all>｜/wnacg del <aid>")
     return "\n".join(lines)[:3900]
 
@@ -373,17 +380,22 @@ def command_reply(cmd_text):
             return f"{TEXT_PREFIX} 用法：/wnacg del <aid>"
         runtime_db.delete_wnacg_task(int(rest))
         return f"{TEXT_PREFIX} 🗑 已移除 #{rest}"
-    aid = parse_wnacg_ref(body)
+    aid = parse_wnacg_ref(head)
     if aid is None:
         return (f"{TEXT_PREFIX} 认不出 wnacg 地址。支持：\n"
-                "  photos-index-aid-N.html / download-index-aid-N.html / 裸 aid")
+                "  photos-index-aid-N.html / download-index-aid-N.html / 裸 aid\n"
+                "  可带作者：/wnacg <地址> <作者名> → 漫画/<作者>/")
+    author = sanitize_filename(rest.strip())[:60] if rest.strip() else None
     existed = runtime_db.get_wnacg_task(aid)
     if existed:
         size = f"｜{format_size(existed['size_bytes'])}" if existed.get("size_bytes") else ""
+        sub = f"/{existed['subdir']}" if existed.get("subdir") else ""
         return (f"{TEXT_PREFIX} #{aid} 已在队列（{existed['status']}{size}）"
-                f"：{existed.get('title') or ''}"[:3900])
-    if runtime_db.enqueue_wnacg_task(aid):
-        return (f"{TEXT_PREFIX} 📥 已入队 #{aid}\n"
+                f"：{existed.get('title') or ''}"
+                f"（→ 漫画{sub or ''}）"[:3900])
+    if runtime_db.enqueue_wnacg_task(aid, subdir=author):
+        where = f"漫画/{author}/" if author else "漫画/"
+        return (f"{TEXT_PREFIX} 📥 已入队 #{aid} → {where}\n"
                 "串行下载中（每本间隔 10s 防限额），完成后通知；"
                 "标题稍后解析回填。")
     return f"{TEXT_PREFIX} #{aid} 入队失败（DB）"

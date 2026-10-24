@@ -268,7 +268,7 @@ def _help_text():
         "/dyu <抖音作者主页> [子目录] —— 作者全作品批量串行下载\n"
         "/manual —— 下载链路操作指引（完整机制文档）\n"
         "/115x 状态｜/115x stop 暂停｜/115x start 恢复\n"
-        "/wnacg <地址|aid> —— wnacg 漫画：下载 zip→115→自动解压\n"
+        "/wnacg <地址|aid> [作者] —— wnacg 漫画→115 漫画[/<作者>]→自动解压\n"
         "/wnacg（状态）｜retry <aid|all>｜del <aid>\n"
         "/botclean on|off —— bot 对话自动清理开关\n"
         "/restart —— 重启 bot（优雅停机，约 30 秒）\n"

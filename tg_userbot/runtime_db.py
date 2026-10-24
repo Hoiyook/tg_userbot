@@ -887,6 +887,16 @@ def migrate() -> int:
     if version < 16:
         # v15 → v16：新增 wnacg_tasks（/wnacg 漫画下载任务）。纯建表。
         logger.info("🗄 Runtime DB 迁移：v16（+ wnacg_tasks 漫画下载）")
+    if version < 17:
+        # v16 → v17：wnacg_tasks 加 subdir（作者子目录，/wnacg <链接> <作者>）。
+        # ALTER 幂等：列已存在即跳过。
+        def _v17(conn):
+            cols = {r["name"] for r in _execute(
+                conn, "PRAGMA table_info(wnacg_tasks)").fetchall()}
+            if "subdir" not in cols:
+                _execute(conn, "ALTER TABLE wnacg_tasks ADD COLUMN subdir TEXT")
+        _write(_v17, "迁移 v17（wnacg_tasks.subdir）")
+        logger.info("🗄 Runtime DB 迁移：v17（wnacg_tasks + subdir）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -3629,6 +3639,7 @@ def _row_to_wnacg(row):
         return None
     return {
         "aid": row["aid"], "title": row["title"], "zip_url": row["zip_url"],
+        "subdir": row["subdir"],
         "filename": row["filename"], "status": row["status"],
         "attempts": int(row["attempts"] or 0),
         "next_retry_at": row["next_retry_at"], "lease_until": row["lease_until"],
@@ -3637,16 +3648,18 @@ def _row_to_wnacg(row):
     }
 
 
-def enqueue_wnacg_task(aid, title=None, now=None):
-    """登记一本漫画（aid 主键判重）。已存在（任何状态）返回 False。"""
+def enqueue_wnacg_task(aid, title=None, subdir=None, now=None):
+    """登记一本漫画（aid 主键判重）。已存在（任何状态）返回 False。
+
+    subdir：作者子目录（/wnacg <链接> <作者> → 漫画/<作者>/），空则落根。"""
     now = _now(now)
 
     def do(conn):
         cur = _execute(
             conn, "INSERT OR IGNORE INTO wnacg_tasks "
-            "(aid, title, status, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (int(aid), title, WNACG_PENDING, now, now))
+            "(aid, title, subdir, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (int(aid), title, subdir, WNACG_PENDING, now, now))
         return bool(cur.rowcount)
 
     return _write(do, "登记 wnacg 任务")

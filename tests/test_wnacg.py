@@ -131,6 +131,22 @@ class CommandTest(_DbCase):
     def test_bad_input(self):
         self.assertIn("认不出", wnacg.command_reply("/wnacg https://x.com/y"))
 
+    def test_author_subdir_routed(self):
+        text = wnacg.command_reply(
+            "/wnacg https://www.wnacg.com/photos-index-aid-777.html 某作者/测试")
+        self.assertIn("已入队 #777", text)
+        self.assertIn("漫画/某作者_测试/", text,
+                      "作者名经 sanitize（/ → _，单层安全名）")
+        row = runtime_db.get_wnacg_task(777)
+        self.assertEqual(row["subdir"], "某作者_测试")
+        task = dict(row)
+        self.assertEqual(wnacg._remote_dir_for(task), "/115open/漫画/某作者_测试")
+
+    def test_no_author_goes_to_root(self):
+        wnacg.command_reply("/wnacg 888")
+        self.assertEqual(wnacg._remote_dir_for(runtime_db.get_wnacg_task(888)),
+                         config.WNACG_REMOTE_DIR)
+
 
 class WorkerFlowTest(_DbCase):
     """worker 全流程 mock：解析 → 下载 → 落 115 → 解压入队。"""
@@ -168,7 +184,7 @@ class WorkerFlowTest(_DbCase):
             return []
 
         def fake_mount(remote_dir):
-            return "/tmp/fake_mount"
+            return os.path.join(_TMP, "fake_mount")
         p1 = mock.patch.object(wnacg, "fetch_album_info_blocking",
                                return_value=info)
         p2 = mock.patch.object(wnacg, "download_zip_blocking",
@@ -176,10 +192,10 @@ class WorkerFlowTest(_DbCase):
         p3 = mock.patch.object(wnacg, "_copy_with_progress",
                                side_effect=fake_copy)
         p4 = mock.patch.object(wnacg, "_remote_size_blocking",
-                               side_effect=lambda name: remote.get(name)
+                               side_effect=lambda name, rd: remote.get(name)
                                if copy_calls else None)
-        p5 = mock.patch.object(wnacg, "_mount_dir",
-                               side_effect=fake_mount)
+        p5 = mock.patch("tg_userbot.extract_worker.mount_of",
+                        side_effect=fake_mount)
         for p in (p1, p2, p3, p4, p5):
             p.start()
             self.addCleanup(p.stop)
