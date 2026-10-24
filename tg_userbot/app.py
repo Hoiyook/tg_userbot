@@ -32,6 +32,7 @@ from . import runtime_db
 from . import sql_templates
 from . import cmd_templates
 from . import extract_worker
+from . import wnacg
 from . import memo
 from . import shell
 from . import reporter
@@ -1705,6 +1706,10 @@ async def main():
             listener.history_recheck_loop())
     else:
         history_recheck_task = None
+    # wnacg 漫画 worker（串行下载 → 115 云下载 → /115x 解压管线）
+    wnacg_task = None
+    if state.RUNTIME_DB_READY:
+        wnacg_task = asyncio.create_task(wnacg.wnacg_worker_loop())
     # Pawchive worker（帖子生命周期 → Chrome Agent 批量下载）
     pawchive_worker_task = None
     if state.RUNTIME_DB_READY:
@@ -1734,13 +1739,13 @@ async def main():
         # 扫描/Reporter 主循环同理。
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task, history_recheck_task, pawchive_worker_task,
+                  wl_scan_task, history_recheck_task, wnacg_task, pawchive_worker_task,
                   extract_worker_task):
             if t is not None:
                 t.cancel()
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task, history_recheck_task, pawchive_worker_task,
+                  wl_scan_task, history_recheck_task, wnacg_task, pawchive_worker_task,
                   extract_worker_task):
             if t is not None:
                 try:

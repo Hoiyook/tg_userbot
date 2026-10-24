@@ -61,6 +61,7 @@ BOT_COMMANDS = (
     ("up", "上传文件到收藏夹：/up <路径>"),
     ("sh", "命令行：执行 shell 命令，如 /sh ls"),
     ("115x", "115 解压回传：/115x <115路径>；裸命令看状态"),
+    ("wnacg", "wnacg 漫画：/wnacg <地址>，下载→115→自动解压"),
     ("115dup", "115 全盘查重：/115dup scan|list|show|del；裸命令看最近结果"),
     ("report", "运维报告传 115：/report [manual|failed|retry|queue|stats]"),
     ("115inv", "115 全量清单：/115inv scan [分钟]；裸命令看进度"),

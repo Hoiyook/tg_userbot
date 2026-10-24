@@ -455,7 +455,7 @@ REPORT_LISTEN = True
 # WAL 依赖 mmap 共享内存、在该文件系统上可能不可用；真机上若探测到 WAL 回落，
 # 可把 DB 挪到应用私有目录。注意：**只允许主进程写**，Chrome Agent 进程绝不
 # 能开连接（见 runtime_db 的「不做 import 期连接」）。
-RUNTIME_DB_SCHEMA_VERSION = 15  # v15：+ inv_*（/115inv 全量清单）
+RUNTIME_DB_SCHEMA_VERSION = 16  # v16：+ wnacg_tasks（/wnacg 漫画下载）
 # 单条写事务等锁的上限（毫秒）与 SQLITE_BUSY/LOCKED 的有限重试（规格 §39：
 # 记日志 → 短暂等待 → 有限次数重试，绝不无限循环、绝不因此崩掉主进程）。
 RUNTIME_DB_BUSY_TIMEOUT_MS = 5000
@@ -1561,6 +1561,17 @@ PAWCHIVE_EXT_LINK_HOSTS = (
 EXTRACT_LEASE_SECONDS = 900         # 单包处理租约（续租每 60s 推一次，
                                     # 时长只关乎「断联后多久判死」，与包多大无关）
 EXTRACT_RECOVER_SECONDS = 600       # 运行期过期租约回收扫描周期
+# ---- wnacg 漫画下载（/wnacg，2026-10-24 实测定稿）----
+# HTML 站（www.wnacg.com）国内直连超时、须走 TG_PROXY 同款代理；CDN 直链
+# （dl*.wn01.download）走代理反而不通、直连可用——两级分流是硬要求。
+# 站点明示每日下载限额：串行 + 节流。zip 落 115 云下载目录进 /115x 解压管线。
+WNACG_BASE = "https://www.wnacg.com"
+WNACG_REMOTE_DIR = "/115open/云下载"
+WNACG_THROTTLE_SECONDS = 10.0          # 相邻两次下载间隔（尊重每日限额）
+WNACG_FETCH_TIMEOUT_SECONDS = 25       # HTML 解析超时
+WNACG_MAX_ATTEMPTS = 5                 # 下载/上传失败重试上限
+WNACG_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36")
 EXTRACT_MAX_ATTEMPTS = 5            # 退避重试上限；超过转 TERMINAL（人工重投）
 EXTRACT_BACKOFF_BASE_SECONDS = 300  # 首败退避 5 分钟
 EXTRACT_BACKOFF_MAX_SECONDS = 7200  # 封顶 2 小时

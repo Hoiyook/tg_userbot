@@ -32,6 +32,7 @@ from . import shell
 from . import upload
 from . import pawchive
 from . import extract_worker
+from . import wnacg
 from . import douyin_batch
 from . import sources
 from . import cmd_templates
@@ -126,6 +127,7 @@ _COMMAND_SUBS = {
     "/cmdt": {"add", "del", "run"},
     "/caption_filter": {"add", "del", "test"},
     "/115x": {"stop", "start", "retry", "del"},
+    "/wnacg": {"retry", "del", "stop", "start"},
     "/115dup": {"scan", "list", "show", "del", "report"},
     "/115inv": {"scan", "reset"},
 }
@@ -266,6 +268,8 @@ def _help_text():
         "/dyu <抖音作者主页> [子目录] —— 作者全作品批量串行下载\n"
         "/manual —— 下载链路操作指引（完整机制文档）\n"
         "/115x 状态｜/115x stop 暂停｜/115x start 恢复\n"
+        "/wnacg <地址|aid> —— wnacg 漫画：下载 zip→115→自动解压\n"
+        "/wnacg（状态）｜retry <aid|all>｜del <aid>\n"
         "/botclean on|off —— bot 对话自动清理开关\n"
         "/restart —— 重启 bot（优雅停机，约 30 秒）\n"
         "/inspect —— 系统巡检（连接/任务/产出/失败/备份）\n"
@@ -688,6 +692,12 @@ async def handle_command(event, cmd_text):
         await _reply(event, "🗜 收到，递归扫描中（大目录树约 1-2 分钟，"
                             "完成后回执入队结果）…")
         await _reply(event, await extract_worker.command_reply(cmd_text))
+        return True
+
+    if cmd_text.startswith("/wnacg"):
+        # wnacg 漫画：地址/aid 入队，串行下载→115→解压管线
+        logger.info(f"执行命令：{cmd_text[:60]}")
+        await _reply(event, wnacg.command_reply(cmd_text))
         return True
 
     if pawchive.is_paw_command(cmd_text):

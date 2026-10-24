@@ -512,6 +512,22 @@ _SCHEMA = (
         value TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS wnacg_tasks (
+        aid          INTEGER PRIMARY KEY,
+        title        TEXT,
+        zip_url      TEXT,
+        filename     TEXT,
+        status       TEXT NOT NULL,
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        next_retry_at INTEGER,
+        lease_until  INTEGER,
+        size_bytes   INTEGER,
+        error        TEXT,
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL
+    )
+    """,
 )
 
 # SQLITE_BUSY / SQLITE_LOCKED 的典型文案（只用于判定是否值得重试）
@@ -868,6 +884,9 @@ def migrate() -> int:
         # v14 → v15：新增 inv_files / inv_empty_dirs / inv_state（115 全量
         # 清单）。纯建表，清单由 /115inv scan 分段落入。
         logger.info("🗄 Runtime DB 迁移：v15（+ inv_* 115 全量清单）")
+    if version < 16:
+        # v15 → v16：新增 wnacg_tasks（/wnacg 漫画下载任务）。纯建表。
+        logger.info("🗄 Runtime DB 迁移：v16（+ wnacg_tasks 漫画下载）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -3594,3 +3613,185 @@ def list_tables():
         lambda c: _execute(
             c, "SELECT name FROM sqlite_master WHERE type='table' "
                "ORDER BY name").fetchall(), "列数据库表")]
+
+
+# ============================================================
+# wnacg_tasks（/wnacg 漫画下载，v16）
+# ============================================================
+WNACG_PENDING = "PENDING"
+WNACG_PROCESSING = "PROCESSING"
+WNACG_DONE = "DONE"
+WNACG_FAILED = "FAILED"
+
+
+def _row_to_wnacg(row):
+    if row is None:
+        return None
+    return {
+        "aid": row["aid"], "title": row["title"], "zip_url": row["zip_url"],
+        "filename": row["filename"], "status": row["status"],
+        "attempts": int(row["attempts"] or 0),
+        "next_retry_at": row["next_retry_at"], "lease_until": row["lease_until"],
+        "size_bytes": row["size_bytes"], "error": row["error"],
+        "created_at": row["created_at"], "updated_at": row["updated_at"],
+    }
+
+
+def enqueue_wnacg_task(aid, title=None, now=None):
+    """登记一本漫画（aid 主键判重）。已存在（任何状态）返回 False。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn, "INSERT OR IGNORE INTO wnacg_tasks "
+            "(aid, title, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (int(aid), title, WNACG_PENDING, now, now))
+        return bool(cur.rowcount)
+
+    return _write(do, "登记 wnacg 任务")
+
+
+def claim_next_wnacg_task(now=None, lease_seconds=900):
+    """领一条到期 PENDING → PROCESSING（乐观锁）；没有返回 None。"""
+    now = _now(now)
+
+    def do(conn):
+        row = _execute(
+            conn, "SELECT aid FROM wnacg_tasks WHERE status=? AND "
+            "(next_retry_at IS NULL OR next_retry_at<=?) ORDER BY aid LIMIT 1",
+            (WNACG_PENDING, now)).fetchone()
+        if row is None:
+            return None
+        cur = _execute(
+            conn, "UPDATE wnacg_tasks SET status=?, lease_until=?, "
+            "updated_at=? WHERE aid=? AND status=?",
+            (WNACG_PROCESSING, now + int(lease_seconds), now,
+             row["aid"], WNACG_PENDING))
+        if not cur.rowcount:
+            return None
+        got = _execute(conn, "SELECT * FROM wnacg_tasks WHERE aid=?",
+                       (row["aid"],)).fetchone()
+        return _row_to_wnacg(got)
+
+    return _write(do, "领取 wnacg 任务")
+
+
+def update_wnacg_task(aid, **fields):
+    """部分字段更新（title/zip_url/filename/size_bytes）。"""
+    if not fields:
+        return
+    sets, params = [], []
+    for k in ("title", "zip_url", "filename", "size_bytes"):
+        if k in fields:
+            sets.append(f"{k}=?")
+            params.append(fields[k])
+    if not sets:
+        return
+    sets.append("updated_at=?")
+    params.append(_now())
+    params.append(int(aid))
+
+    def do(conn):
+        _execute(conn, f"UPDATE wnacg_tasks SET {', '.join(sets)} "
+                       "WHERE aid=?", params)
+
+    _write(do, "更新 wnacg 任务")
+
+
+def complete_wnacg_task(aid, size_bytes=None, now=None):
+    def do(conn):
+        _execute(conn, "UPDATE wnacg_tasks SET status=?, size_bytes=?, "
+                 "lease_until=NULL, error=NULL, updated_at=? WHERE aid=?",
+                 (WNACG_DONE, size_bytes, _now(now), int(aid)))
+
+    _write(do, "完成 wnacg 任务")
+
+
+def fail_wnacg_task(aid, error, max_attempts=5, delay_seconds=300, now=None):
+    """失败分流：未到上限 → 退避重投；到上限 → FAILED（/wnacg retry 可重投）。"""
+    now = _now(now)
+
+    def do(conn):
+        row = _execute(conn, "SELECT attempts FROM wnacg_tasks WHERE aid=?",
+                       (int(aid),)).fetchone()
+        attempts = (int(row["attempts"]) + 1) if row else 1
+        if attempts >= int(max_attempts):
+            _execute(conn, "UPDATE wnacg_tasks SET status=?, attempts=?, "
+                     "error=?, lease_until=NULL, updated_at=? WHERE aid=?",
+                     (WNACG_FAILED, attempts, str(error)[:500], now, int(aid)))
+            return WNACG_FAILED
+        _execute(conn, "UPDATE wnacg_tasks SET status=?, attempts=?, "
+                 "error=?, next_retry_at=?, lease_until=NULL, updated_at=? "
+                 "WHERE aid=?",
+                 (WNACG_PENDING, attempts, str(error)[:500],
+                  now + int(delay_seconds), now, int(aid)))
+        return WNACG_PENDING
+
+    return _write(do, "失败 wnacg 任务")
+
+
+def retry_wnacg_task(aid=None, now=None):
+    """FAILED → PENDING（aid=None 重投全部）。返回重投条数。"""
+    now = _now(now)
+
+    def do(conn):
+        if aid is None:
+            cur = _execute(conn, "UPDATE wnacg_tasks SET status=?, "
+                           "attempts=0, next_retry_at=NULL, lease_until=NULL, "
+                           "updated_at=? WHERE status=?",
+                           (WNACG_PENDING, now, WNACG_FAILED))
+        else:
+            cur = _execute(conn, "UPDATE wnacg_tasks SET status=?, attempts=0, "
+                           "next_retry_at=NULL, lease_until=NULL, updated_at=? "
+                           "WHERE aid=? AND status=?",
+                           (WNACG_PENDING, now, int(aid), WNACG_FAILED))
+        return cur.rowcount
+
+    return _write(do, "重投 wnacg 任务")
+
+
+def list_wnacg_tasks(status=None, limit=30):
+    def do(conn):
+        if status:
+            rows = _execute(
+                conn, "SELECT * FROM wnacg_tasks WHERE status=? "
+                "ORDER BY aid DESC LIMIT ?", (str(status), int(limit))).fetchall()
+        else:
+            rows = _execute(
+                conn, "SELECT * FROM wnacg_tasks ORDER BY aid DESC LIMIT ?",
+                (int(limit),)).fetchall()
+        return [_row_to_wnacg(r) for r in rows]
+
+    return _read(do, "列 wnacg 任务")
+
+
+def get_wnacg_task(aid):
+    row = _read(lambda c: _execute(
+        c, "SELECT * FROM wnacg_tasks WHERE aid=?", (int(aid),)).fetchone(),
+        "查 wnacg 任务")
+    return _row_to_wnacg(row)
+
+
+def recover_expired_wnacg_tasks(now=None):
+    """租约过期的 PROCESSING → PENDING（崩溃自愈）。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(conn, "UPDATE wnacg_tasks SET status=?, "
+                       "lease_until=NULL, updated_at=? "
+                       "WHERE status=? AND lease_until IS NOT NULL "
+                       "AND lease_until<?",
+                       (WNACG_PENDING, now, WNACG_PROCESSING, now))
+        return cur.rowcount
+
+    return _write(do, "恢复过期 wnacg 任务")
+
+
+def delete_wnacg_task(aid):
+    """移除任务记录（/wnacg del；已落 115 的文件不动）。"""
+
+    def do(conn):
+        _execute(conn, "DELETE FROM wnacg_tasks WHERE aid=?", (int(aid),))
+
+    _write(do, "移除 wnacg 任务")
