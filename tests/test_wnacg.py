@@ -24,7 +24,7 @@ from tg_userbot import wnacg  # noqa: E402
 
 
 PAGE = """<html><body>
-<h1>目白阿尔丹去按摩(真按摩)[卖瓜老板个人翻译].zip</h1>
+<h1 class="text-xl font-bold">目白阿尔丹去按摩(真按摩)[卖瓜老板个人翻译].zip</h1>
 <a href="//dl1.wn01.download/down/3984/8fbe3bea4181951625e6aab6e00d9884.zip?n=xxx">點擊下載</a>
 </body></html>"""
 
@@ -48,6 +48,12 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(
             url, "https://dl1.wn01.download/down/3984/"
                  "8fbe3bea4181951625e6aab6e00d9884.zip")
+
+    def test_title_fallback_from_title_tag(self):
+        title, url = wnacg.parse_download_page(
+            "<title>某本子.zip 下載 - 紳士漫畫</title>"
+            '<a href="//dl1.x/down/1/2.zip">d</a>')
+        self.assertEqual(title, "某本子")
 
     def test_download_page_garbage(self):
         self.assertEqual(wnacg.parse_download_page("<html>404</html>"),

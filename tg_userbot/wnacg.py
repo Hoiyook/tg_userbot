@@ -34,7 +34,7 @@ _STOP = {"requested": False}
 _PAUSED = {"paused": False}
 _AID_RE = re.compile(r"aid-(\d+)")
 _ZIP_RE = re.compile(r"(//[a-z0-9.]+/down/[a-z0-9/]+\.zip)")
-_H1_RE = re.compile(r"<h1>([^<]{1,300})</h1>")
+_H1_RE = re.compile(r"<h1[^>]*>([^<]{1,300})</h1>")
 
 
 # ============================================================
@@ -71,6 +71,15 @@ def parse_download_page(html):
         if title.lower().endswith(".zip"):
             title = title[:-4].strip()
         title = unquote(title)
+    if not title:
+        # <title> 兜底：「标题.zip 下載 - 紳士漫畫…」取前段
+        m2 = re.search(r"<title>([^<]{1,300})</title>", html or "")
+        if m2:
+            t = m2.group(1).split(" 下載")[0].strip()
+            if t.lower().endswith(".zip"):
+                t = t[:-4].strip()
+            if t:
+                title = unquote(t)
     return title, zip_url
 
 
