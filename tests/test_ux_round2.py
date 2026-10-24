@@ -4420,7 +4420,10 @@ class MemoCommandTest(unittest.TestCase):
         import re
         self.assertIn("memo", config.REGISTERED_COMMAND_NAMES)
         from tg_userbot import bot as b, commands as c
-        src = inspect.getsource(c.handle_command)
+        # dispatch 面跨两层：handle_command（cmdq 台账 wrapper）+
+        # _handle_command_inner（真正的分支体，2026-10-24 拆分）。
+        src = inspect.getsource(c.handle_command) + \
+            inspect.getsource(c._handle_command_inner)
         handled = set(re.findall(
             r'cmd_text(?:\.lower\(\))?'
             r'(?:\.startswith\(| == )"/(\w+)', src))

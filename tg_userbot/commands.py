@@ -33,6 +33,7 @@ from . import upload
 from . import pawchive
 from . import extract_worker
 from . import wnacg
+from . import cmdq
 from . import douyin_batch
 from . import sources
 from . import cmd_templates
@@ -128,7 +129,7 @@ _COMMAND_SUBS = {
     "/caption_filter": {"add", "del", "test"},
     "/115x": {"stop", "start", "retry", "del"},
     "/wnacg": {"retry", "del", "stop", "start"},
-    "/115dup": {"scan", "list", "show", "del", "report"},
+    "/115dup": {"scan", "list", "show", "del", "report", "apply"},
     "/115inv": {"scan", "reset"},
 }
 
@@ -261,7 +262,7 @@ def _help_text():
         "/clean｜/clearmsg｜/setcleartime 30s|1m|1h|off\n"
         "/origin —— 解析失败账本；/cd2ck 日志对账；/cd2check —— API 实对账\n"
         "/cd2tasks —— CD2 上传任务明细\n"
-        "/115dup scan|list|show|del|report —— 115 全盘查重（报告可传 115）\n"
+        "/115dup scan|…|apply —— 115 查重＋审表执行（deleted/移动/重命名）\n"
         "/report —— 运维报告传 115（待人工/失败/重试/快照/台账/体检）\n"
         "/115inv scan [分钟] —— 115 全量清单（分类体检的前置）\n"
         "/115x <115路径> —— 115 解压回传（拉压缩包→解压→回传+对账）\n"
@@ -269,6 +270,7 @@ def _help_text():
         "/manual —— 下载链路操作指引（完整机制文档）\n"
         "/115x 状态｜/115x stop 暂停｜/115x start 恢复\n"
         "/wnacg <地址|aid> [作者] —— wnacg 漫画→115 漫画[/<作者>]→自动解压\n"
+        "/cmdq [成功|失败|待执行] —— 指令台账（离线回放执行情况）\n"
         "/wnacg（状态）｜retry <aid|all>｜del <aid>\n"
         "/botclean on|off —— bot 对话自动清理开关\n"
         "/restart —— 重启 bot（优雅停机，约 30 秒）\n"
@@ -309,10 +311,36 @@ def _schedule_restart(delay=2.0):
 
 
 async def handle_command(event, cmd_text):
+    """指令统一入口。返回是否有 handler 处理。
 
-    # 多词指令规范化（2026-09-25）：/paw plan 与 /paw_plan 归一为下划线
-    # 标准形，此后全链路（审计/分发）只见标准形
+    cmdq 挂钩（2026-10-24）：在线执行的指令也入台账（幂等，回放不重执行）；
+    台账自身的任何失败都不影响指令执行。"""
+    from . import cmdq
     cmd_text = _canonical_command(cmd_text)
+    try:
+        await cmdq.record_live(event, cmd_text)
+    except Exception:
+        pass
+    try:
+        handled = await _handle_command_inner(event, cmd_text)
+    except Exception:
+        raise
+    finally:
+        # 终态落账（失败也落——REPLY 已发出；error 面由异常分支补记）
+        try:
+            msg = getattr(event, "message", None)
+            chat_id = getattr(event, "chat_id", None)
+            if msg is not None and chat_id is not None:
+                from .runtime_db import finish_cmd, get_cmd_status
+                if get_cmd_status(chat_id, msg.id) is not None:
+                    finish_cmd(chat_id, msg.id,
+                               "SUCCESS" if handled else "FAILED")
+        except Exception:
+            pass
+    return handled
+
+
+async def _handle_command_inner(event, cmd_text):
 
     # 功能使用审计（2026-09-24）：只记已注册指令，失败不影响命令
     _record_usage(cmd_text)
@@ -692,6 +720,13 @@ async def handle_command(event, cmd_text):
         await _reply(event, "🗜 收到，递归扫描中（大目录树约 1-2 分钟，"
                             "完成后回执入队结果）…")
         await _reply(event, await extract_worker.command_reply(cmd_text))
+        return True
+
+    if cmd_text.startswith("/cmdq"):
+        # 指令台账查询：成功/失败/待执行
+        logger.info(f"执行命令：{cmd_text[:60]}")
+        arg = cmd_text.split(None, 1)[1] if len(cmd_text.split()) > 1 else ""
+        await _reply(event, cmdq.status_reply(arg))
         return True
 
     if cmd_text.startswith("/wnacg"):

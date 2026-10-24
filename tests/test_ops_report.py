@@ -173,14 +173,15 @@ class ExportAndCommandTest(_DbTestCase):
                 self.addCleanup(p.stop)
             res = ops_report.export_reports(list(ops_report.REPORT_TYPES))
         self.assertTrue(res["ok"], res["note"])
-        # 6 TXT + 2 CSV（failed/retry 各附；classify 需清单，空也出提示文件）
-        self.assertEqual(len(res["files"]), 8)
+        # 7 TXT + 2 CSV（failed/retry 各附；classify 空也出提示文件；
+        # cmdq 指令台账 2026-10-24 起入全套）
+        self.assertEqual(len(res["files"]), 9)
         import time as _t
         day = _t.strftime("%Y-%m-%d")
         # 115 侧与本地侧都按日期分目录；内容带 BOM（Excel 双击不乱码）
         mount_out = os.listdir(
             os.path.join(self.mount_base, "userBot报告", day))
-        self.assertEqual(len(mount_out), 8)
+        self.assertEqual(len(mount_out), 9)
         self.assertTrue(any(f.startswith("manual_") for f in mount_out))
         local_txt = next(f for f in res["files"] if f.endswith(".txt"))
         with open(local_txt, "rb") as f:

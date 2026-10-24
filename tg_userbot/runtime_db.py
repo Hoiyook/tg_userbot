@@ -513,6 +513,25 @@ _SCHEMA = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS cmd_ledger (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id     INTEGER NOT NULL,
+        msg_id      INTEGER NOT NULL,
+        cmd_text    TEXT NOT NULL,
+        status      TEXT NOT NULL,
+        error       TEXT,
+        received_at INTEGER NOT NULL,
+        executed_at INTEGER,
+        UNIQUE (chat_id, msg_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cmd_cursors (
+        chat_id         TEXT PRIMARY KEY,      -- int 或 "me"（文本键兼容收藏夹）
+        last_seen_msg_id INTEGER NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS wnacg_tasks (
         aid          INTEGER PRIMARY KEY,
         title        TEXT,
@@ -887,6 +906,10 @@ def migrate() -> int:
     if version < 16:
         # v15 → v16：新增 wnacg_tasks（/wnacg 漫画下载任务）。纯建表。
         logger.info("🗄 Runtime DB 迁移：v16（+ wnacg_tasks 漫画下载）")
+    if version < 18:
+        # v17 → v18：+ cmd_ledger / cmd_cursors（指令回放台账与水位线，
+        # /cmdq）。纯建表。
+        logger.info("🗄 Runtime DB 迁移：v18（+ cmd_ledger/cmd_cursors 指令回放）")
     if version < 17:
         # v16 → v17：wnacg_tasks 加 subdir（作者子目录，/wnacg <链接> <作者>）。
         # ALTER 幂等：列已存在即跳过。
@@ -3831,3 +3854,114 @@ def postpone_wnacg_task(aid, error, delay_seconds=300, now=None):
                   now + int(delay_seconds), now, int(aid)))
 
     _write(do, "退避 wnacg 任务")
+
+
+# ============================================================
+# cmd_ledger / cmd_cursors（指令回放台账 + 水位线，/cmdq，v18）
+# ============================================================
+CMD_PENDING = "PENDING"
+CMD_RUNNING = "RUNNING"
+CMD_SUCCESS = "SUCCESS"
+CMD_FAILED = "FAILED"
+CMD_STALE = "STALE"       # 离线太久（超期保护）跳过未执行
+
+
+
+
+def _cmd_chat_key(chat_id):
+    """chat 键归一：数字（含字符串数字）→ int；"me" 等字符串原样。"""
+    try:
+        return int(chat_id)
+    except (TypeError, ValueError):
+        return str(chat_id)
+
+def _row_to_cmd_ledger(row):
+    if row is None:
+        return None
+    return {
+        "id": row["id"], "chat_id": row["chat_id"], "msg_id": row["msg_id"],
+        "cmd_text": row["cmd_text"], "status": row["status"],
+        "error": row["error"], "received_at": row["received_at"],
+        "executed_at": row["executed_at"],
+    }
+
+
+def record_cmd(chat_id, msg_id, cmd_text, now=None):
+    """指令入账（UNIQUE(chat_id,msg_id) 判重：恰好执行一次的锚点）。
+    已存在返回 False。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn, "INSERT OR IGNORE INTO cmd_ledger "
+            "(chat_id, msg_id, cmd_text, status, received_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (_cmd_chat_key(chat_id), int(msg_id), str(cmd_text)[:2000],
+             CMD_PENDING, now))
+        return bool(cur.rowcount)
+
+    return _write(do, "指令入账")
+
+
+def finish_cmd(chat_id, msg_id, status, error=None, now=None):
+    """终态落账（SUCCESS/FAILED/STALE）。"""
+    now = _now(now)
+
+    def do(conn):
+        _execute(conn, "UPDATE cmd_ledger SET status=?, error=?, "
+                 "executed_at=? WHERE chat_id=? AND msg_id=?",
+                 (str(status), (None if error is None else str(error)[:500]),
+                  now, _cmd_chat_key(chat_id), int(msg_id)))
+
+    _write(do, "指令落终态")
+
+
+def get_cmd_status(chat_id, msg_id):
+    row = _read(lambda c: _execute(
+        c, "SELECT * FROM cmd_ledger WHERE chat_id=? AND msg_id=?",
+        (_cmd_chat_key(chat_id), int(msg_id))).fetchone(), "查指令状态")
+    return _row_to_cmd_ledger(row)
+
+
+def list_cmd_ledger(status=None, limit=30):
+    def do(conn):
+        if status:
+            rows = _execute(
+                conn, "SELECT * FROM cmd_ledger WHERE status=? "
+                "ORDER BY id DESC LIMIT ?", (str(status), int(limit))).fetchall()
+        else:
+            rows = _execute(
+                conn, "SELECT * FROM cmd_ledger ORDER BY id DESC LIMIT ?",
+                (int(limit),)).fetchall()
+        return [_row_to_cmd_ledger(r) for r in rows]
+
+    return _read(do, "列指令台账")
+
+
+def cmd_ledger_counts():
+    def do(conn):
+        return dict(_execute(
+            conn, "SELECT status, COUNT(*) FROM cmd_ledger "
+            "GROUP BY status").fetchall())
+
+    return _read(do, "统计指令台账")
+
+
+def get_cmd_cursor(chat_id):
+    row = _read(lambda c: _execute(
+        c, "SELECT last_seen_msg_id FROM cmd_cursors WHERE chat_id=?",
+        (_cmd_chat_key(chat_id),)).fetchone(), "查指令水位线")
+    return int(row["last_seen_msg_id"]) if row else None
+
+
+def advance_cmd_cursor(chat_id, msg_id):
+    """水位线只前进不后退。"""
+
+    def do(conn):
+        _execute(
+            conn, "INSERT INTO cmd_cursors (chat_id, last_seen_msg_id) "
+            "VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET "
+            "last_seen_msg_id=MAX(last_seen_msg_id, excluded.last_seen_msg_id)",
+            (_cmd_chat_key(chat_id), int(msg_id)))
+
+    _write(do, "推进指令水位线")

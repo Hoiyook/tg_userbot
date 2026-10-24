@@ -308,6 +308,9 @@ class SearchByNoteTest(_MlinksDbBase):
         from tg_userbot import commands
         import inspect
         src = inspect.getsource(commands.handle_command)
+        if 'is_retry_command' not in src:
+            # dispatch 体拆分后（2026-10-24）：/links 分支在 inner
+            src = inspect.getsource(commands._handle_command_inner)
         self.assertIn('startswith("/links ")', src)
         self.assertIn("keyword=keyword", src)
 
@@ -376,6 +379,8 @@ from tg_userbot import runtime_db  # noqa: E402
 
 # 按钮属性兼容垫片（unittest discover 不加载 conftest.py——Telethon 1.45 起
 # 回调数据挪进 .type.data，这里补回顶层 .data/.url 让既有断言保持原样）
+import sys  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import conftest as _btn_shim  # noqa: F401
 
 
@@ -660,10 +665,12 @@ class SearchByNoteTest(_MlinksDbBase):
         self.assertNotIn("krakenfiles.com/two 备份", text)  # 无备注行
 
     def test_command_passes_keyword(self):
-        """/links <词> 分发：commands.py 把参数传进 links_view。"""
+        """/links <词> 分发：把参数传进 links_view。
+
+        dispatch 体拆分（2026-10-24）：分支在 _handle_command_inner。"""
         from tg_userbot import commands
         import inspect
-        src = inspect.getsource(commands.handle_command)
+        src = inspect.getsource(commands._handle_command_inner)
         self.assertIn('startswith("/links ")', src)
         self.assertIn("keyword=keyword", src)
 

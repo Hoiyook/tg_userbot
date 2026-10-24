@@ -25,10 +25,12 @@ import time
 
 from . import cd2_api
 from . import config
+from . import runtime_db
 from . import state
 from .log import logger
 
-REPORT_TYPES = ("manual", "failed", "retry", "queue", "stats", "classify")
+REPORT_TYPES = ("manual", "failed", "retry", "queue", "stats",
+                 "classify", "cmdq")
 STATS_DEFAULT_DAYS = 3
 
 # 类型桶（classify 用）：扩展名 → 内容类型
@@ -347,7 +349,31 @@ _COLLECTORS = {
     "queue": lambda: _collect_queue(),
     "stats": lambda: _collect_stats(STATS_DEFAULT_DAYS),
     "classify": lambda: _collect_classify(),
+    "cmdq": lambda: _collect_cmdq(),
 }
+
+
+def _collect_cmdq():
+    """指令台账（/cmdq 同源）：状态计数 + 最近明细（含失败原因）。"""
+    import time as _t
+    try:
+        counts = runtime_db.cmd_ledger_counts()
+    except Exception as e:
+        return f"📥 指令台账：读取失败（{e}）", None
+    if not counts:
+        return "📥 指令台账：空（尚无指令记录）", None
+    zh = {"SUCCESS": "✅成功", "FAILED": "❌失败", "PENDING": "⏳待执行",
+          "RUNNING": "🔄执行中", "STALE": "🕳过期跳过"}
+    lines = ["📥 指令台账",
+             "计数：" + " ".join(f"{zh.get(k, k)}{n}"
+                                for k, n in sorted(counts.items())), ""]
+    for r in runtime_db.list_cmd_ledger(limit=30):
+        ts = _t.strftime("%m-%d %H:%M", _t.localtime(r["executed_at"] or
+                                                     r["received_at"]))
+        err = f"｜{str(r['error'] or '')[:40]}" if r.get("error") else ""
+        lines.append(f"{ts} {zh.get(r['status'], r['status'])}"
+                     f"｜{r['cmd_text'][:44]}{err}")
+    return "\n".join(lines), None
 
 
 # ============================================================
@@ -359,8 +385,8 @@ def export_reports(types, target_dir=None):
     每类一个 TXT（failed/retry 附 CSV）；单类失败不断整个导出
     （运维报告的价值在「有多少出多少」）。
     """
-    from .dup_scan import REPORT_DIR_DEFAULT
-    target_dir = target_dir or REPORT_DIR_DEFAULT
+    from .dup_scan import dated_report_dir
+    target_dir = target_dir or dated_report_dir()
     out = {"ok": False, "files": [], "local_dir": None, "note": "",
            "remote_dir": str(target_dir)}
     # 按日期分目录（2026-10-24 owner 指令：日积月累文件太多）；
@@ -387,7 +413,7 @@ def export_reports(types, target_dir=None):
     except OSError as e:
         out["note"] = f"本地存档失败：{e}"
         return out
-    ok, note = cd2_api.upload_to_115(out["files"], f"{target_dir}/{day}",
+    ok, note = cd2_api.upload_to_115(out["files"], target_dir,
                                      name_prefix=None)
     out["ok"] = ok
     out["note"] = note
@@ -402,7 +428,8 @@ USAGE = ("📤 /report [类型] —— 运维报告一键传 115"
          "　retry —— 待重试明细（附 CSV）\n"
          "　queue —— 运行快照（在途/积压/各链路存量/115 容量）\n"
          "　stats —— 台账（默认 3 天）\n"
-         "　classify —— 分类体检（需先 /115inv scan 建清单）")
+         "　classify —— 分类体检（需先 /115inv scan 建清单）\n"
+         "（报告落 userBot报告/日期/ 子目录）")
 
 
 async def command_reply(cmd_text):

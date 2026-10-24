@@ -33,6 +33,7 @@ from . import sql_templates
 from . import cmd_templates
 from . import extract_worker
 from . import wnacg
+from . import cmdq
 from . import memo
 from . import shell
 from . import reporter
@@ -1708,8 +1709,24 @@ async def main():
         history_recheck_task = None
     # wnacg 漫画 worker（串行下载 → 115 云下载 → /115x 解压管线）
     wnacg_task = None
+    cmdq_task = None
     if state.RUNTIME_DB_READY:
         wnacg_task = asyncio.create_task(wnacg.wnacg_worker_loop())
+        # 指令回放：启动时补离线指令 + 周期扫水位线（兜重连缺口）
+        try:
+            recovered_cmds = cmdq.recover_stale_running()
+            if recovered_cmds:
+                logger.info(f"📥 启动恢复：{recovered_cmds} 条中断指令回到待执行")
+            total, fails = await cmdq.replay_all()
+            if total["found"]:
+                logger.info(f"📥 启动回放：扫 {total['scanned']} 条，"
+                            f"执行 {total['executed']} 成功 / "
+                            f"{total['failed']} 失败 / {total['stale']} 过期")
+                if total["failed"]:
+                    await cmdq._notify_failed(fails, total["failed"])
+        except Exception as e:
+            logger.warning(f"📥 启动回放失败（周期循环会兜底）：{e}")
+        cmdq_task = asyncio.create_task(cmdq.replay_loop())
     # Pawchive worker（帖子生命周期 → Chrome Agent 批量下载）
     pawchive_worker_task = None
     if state.RUNTIME_DB_READY:
@@ -1739,13 +1756,15 @@ async def main():
         # 扫描/Reporter 主循环同理。
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task, history_recheck_task, wnacg_task, pawchive_worker_task,
+                  wl_scan_task, history_recheck_task, wnacg_task, cmdq_task,
+                  pawchive_worker_task,
                   extract_worker_task):
             if t is not None:
                 t.cancel()
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task, history_recheck_task, wnacg_task, pawchive_worker_task,
+                  wl_scan_task, history_recheck_task, wnacg_task, cmdq_task,
+                  pawchive_worker_task,
                   extract_worker_task):
             if t is not None:
                 try:

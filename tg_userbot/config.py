@@ -455,7 +455,7 @@ REPORT_LISTEN = True
 # WAL 依赖 mmap 共享内存、在该文件系统上可能不可用；真机上若探测到 WAL 回落，
 # 可把 DB 挪到应用私有目录。注意：**只允许主进程写**，Chrome Agent 进程绝不
 # 能开连接（见 runtime_db 的「不做 import 期连接」）。
-RUNTIME_DB_SCHEMA_VERSION = 17  # v17：wnacg_tasks + subdir（作者子目录）
+RUNTIME_DB_SCHEMA_VERSION = 18  # v18：+ cmd_ledger/cmd_cursors（指令回放）
 # 单条写事务等锁的上限（毫秒）与 SQLITE_BUSY/LOCKED 的有限重试（规格 §39：
 # 记日志 → 短暂等待 → 有限次数重试，绝不无限循环、绝不因此崩掉主进程）。
 RUNTIME_DB_BUSY_TIMEOUT_MS = 5000
@@ -1570,6 +1570,12 @@ WNACG_REMOTE_DIR = "/115open/漫画"   # /wnacg <链接> [作者] → 漫画[/<�
 WNACG_THROTTLE_SECONDS = 10.0          # 相邻两次下载间隔（尊重每日限额）
 WNACG_FETCH_TIMEOUT_SECONDS = 25       # HTML 解析超时
 WNACG_MAX_ATTEMPTS = 5                 # 下载/上传失败重试上限
+# ---- 指令回放（/cmdq，2026-10-24）----
+# 入口聊天额外项（bot 对话与收藏夹内置）：填 @username / 数字 id 即生效，
+# 如 CMDQ_EXTRA_INTAKES = ("@zhilin01",)
+CMDQ_EXTRA_INTAKES = ()
+CMDQ_STALE_DAYS = 7                  # 离线超过此天数的指令跳过不执行（🕳）
+
 WNACG_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36")
 EXTRACT_MAX_ATTEMPTS = 5            # 退避重试上限；超过转 TERMINAL（人工重投）
