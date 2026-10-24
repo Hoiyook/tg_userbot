@@ -157,8 +157,15 @@ def _remote_dir_for(task):
 
 
 def _remote_size_blocking(name, remote_dir):
+    """gRPC 列目录找文件尺寸；目录不存在/不可读一律 None（= 文件不在）。
+
+    新作者子目录首跑会踩「find by path not found」的 gRPC 异常（目录
+    尚未建/CD2 尚未同步），吞掉按「不在」处理——轮询自会等到它出现。"""
     from . import cd2_api
-    listing = cd2_api.list_remote_dir(remote_dir, limit=500)
+    try:
+        listing = cd2_api.list_remote_dir(remote_dir, limit=500)
+    except Exception:
+        return None
     if listing is None:
         return None
     for n, s, _d in listing:
@@ -219,11 +226,12 @@ async def _process_task(task):
     if mount_dir is None:
         raise RuntimeError(f"挂载不可用：{remote_dir}"
                            "（CD2/挂载死了，稍后自动重试）")
+    # 作者子目录可能不存在：挂载 mkdir 即 CD2 建远端目录——必须先建，
+    # 后续 gRPC 列目录/上传对账才有处可查（首跑实测教训）
+    os.makedirs(mount_dir, exist_ok=True)
     remote_now = await asyncio.to_thread(
         _remote_size_blocking, task["filename"], remote_dir)
     if remote_now != size:
-        # 作者子目录可能不存在：挂载 mkdir 即 CD2 建远端目录
-        os.makedirs(mount_dir, exist_ok=True)
         target = os.path.join(mount_dir, task["filename"])
         await asyncio.to_thread(_copy_with_progress, local, target)
         got = await _wait_remote_size(task["filename"], size, remote_dir)

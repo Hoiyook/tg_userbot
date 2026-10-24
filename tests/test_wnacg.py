@@ -142,6 +142,16 @@ class CommandTest(_DbCase):
         task = dict(row)
         self.assertEqual(wnacg._remote_dir_for(task), "/115open/漫画/某作者_测试")
 
+    def test_remote_size_swallows_grpc_not_found(self):
+        # 新作者子目录首跑：gRPC 列目录抛「find by path not found」→ None
+        import tg_userbot.cd2_api as cd2
+        with mock.patch.object(
+                cd2, "list_remote_dir",
+                side_effect=RuntimeError(
+                    'find by path: "/115open/漫画/新作者" not found')):
+            self.assertIsNone(wnacg._remote_size_blocking(
+                "x.zip", "/115open/漫画/新作者"))
+
     def test_no_author_goes_to_root(self):
         wnacg.command_reply("/wnacg 888")
         self.assertEqual(wnacg._remote_dir_for(runtime_db.get_wnacg_task(888)),
