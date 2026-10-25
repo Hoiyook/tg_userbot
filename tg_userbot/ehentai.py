@@ -31,7 +31,7 @@ _TORRENT_URL_RE = re.compile(
 _TORRENT_ROW_RE = re.compile(
     r"<tr[^>]*>(.*?)</tr>", re.S)
 _TORRENT_CELL_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.S)
-_SEEDS_RE = re.compile(r"Seeds?:?\s*(\d+)", re.I)
+_SEEDS_RE = re.compile(r"Seeds?:?\s*(?:<[^>]+>\s*)*(\d+)", re.I)
 _POSTED_NAME_RE = re.compile(r"Posted:.*?\n(.*?)\nClose", re.S)
 _HATH_LINK_RE = re.compile(r"href=\"(https?://[^\"']+?/archive/[^\"]+)\"")
 _COST_RE = re.compile(r"Download Cost:\s*([\d,]+)\s*GP", re.I)
@@ -80,9 +80,10 @@ def parse_torrent_page(html):
         # 内层 .zip/.rar 名（种子内容名）优先；无则用链接段
         name = ""
         for c in cells:
-            cm = re.search(r"([^\"]+\.(?:zip|rar|7z))", c)
+            cm = re.search(r"([A-Za-z0-9\u3040-\u30ff\u4e00-\u9fff][^<>]*?"
+                           r"\.(?:zip|rar|7z))", c)
             if cm:
-                name = cm.group(1).strip()
+                name = re.sub(r"<[^>]+>", "", cm.group(1)).strip()
                 break
         out.append((seeds, name, u.group(1)))
     out.sort(key=lambda t: -t[0])
@@ -211,6 +212,12 @@ async def process_gallery(gid, token, author=None):
                 return f"{TEXT_PREFIX} ❌ 种子解析失败：{e}"
         else:
             magnet = torrent_util.magnet_from(name or f"ehentai_{gid}", ih)
+        # 目标目录不存在 CD2 会拒（NOT_FOUND，wnacg 首跑同款坑）：
+        # 先经挂载 makedirs 让 CD2 建远端目录再提交
+        from .extract_worker import mount_of
+        mount_dir = mount_of(where)
+        if mount_dir is not None:
+            os.makedirs(mount_dir, exist_ok=True)
         ok, err = await asyncio.to_thread(
             cd2_api.add_offline_download, magnet, where)
         if not ok and "10008" not in (err or "") and "已存在" not in (err or ""):
