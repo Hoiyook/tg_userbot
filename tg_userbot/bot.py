@@ -1167,7 +1167,11 @@ async def bot_message_handler(event):
     torrent_urls = [u for u in manual_links.extract_urls(text)
                     if torrent_offline.is_torrent_url(u)]
     if torrent_urls:
-        out = await torrent_offline.handle_torrent_url(torrent_urls[0])
+        out = await torrent_offline.handle_torrent_url(
+            torrent_urls[0],
+            to_folder=(torrent_offline.resolve_to_folder(a)
+                       if (a := torrent_offline.trailing_author(
+                           text, torrent_urls[0])) else None))
         await _send_owner(out, [[
             Button.inline("📋 离线任务", menu.encode_menu_data("cd2tasks")),
             Button.inline("🏠 首页", menu.encode_menu_data("home"))]])

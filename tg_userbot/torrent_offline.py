@@ -115,13 +115,52 @@ def spawn_watch(to_folder, label="", known_names=None):
     return t
 
 
-def _submit(magnet):
+DEFAULT_TO = "/115open/云下载"
+
+
+def resolve_to_folder(arg=None):
+    """下载目标目录：显式 /115open 路径原样；裸 token 当作者 → 漫画/<作者>/。
+
+    （2026-10-25 owner 需求：磁链/种子后面跟作者名，落到作者目录。）"""
+    from .naming import sanitize_filename
+    q = str(arg or "").strip()
+    if not q:
+        return DEFAULT_TO
+    if q.startswith("/115open/"):
+        return q.rstrip("/")
+    return "/115open/漫画/" + (sanitize_filename(q)[:60] or "未命名")
+
+
+def ensure_remote_dir(to_folder):
+    """目标目录不存在 CD2 离线会拒（NOT_FOUND）——经挂载 makedirs 建之。"""
+    import os
+    from .extract_worker import mount_of
+    mount_dir = mount_of(to_folder)
+    if mount_dir is not None:
+        os.makedirs(mount_dir, exist_ok=True)
+
+
+def trailing_author(text, url):
+    """消息文本里 url 之外的裸 token = 作者（如「<链接> 某作者」）。
+
+    返回作者串或 None；不认 / 开头（防把命令/路径误当作者）。"""
+    import re as _re
+    rest = str(text or "").replace(url, " ")
+    for tok in _re.split(r"\s+", rest.strip()):
+        if tok and not tok.startswith(("/", "magnet:", "http", "ed2k:")):
+            return tok
+    return None
+
+
+def _submit(magnet, to_folder=None):
     """丢给 CD2 离线（独立函数便于测试 mock）。返回 (ok, err)。"""
     from . import cd2_api
-    return cd2_api.add_offline_download(magnet, "/115open/云下载")
+    to_folder = to_folder or DEFAULT_TO
+    ensure_remote_dir(to_folder)
+    return cd2_api.add_offline_download(magnet, to_folder)
 
 
-async def handle_torrent_url(url):
+async def handle_torrent_url(url, to_folder=None):
     """🧲 入口一：.torrent 直链 → 磁力 → 提交 115 离线。返回回执文案。
 
     URL 尾段自带 infohash（ehtracker 等形态）时免下载秒提交；否则下载
@@ -145,27 +184,27 @@ async def handle_torrent_url(url):
             logger.warning(f"🧲 种子下载失败：{e}")
             return f"🧲 种子下载失败：{e}"
     try:
-        ok, err = await asyncio.to_thread(_submit, magnet)
+        ok, err = await asyncio.to_thread(_submit, magnet, to_folder)
     except Exception as e:
         return f"🧲 离线提交失败：{e}"
     if not ok:
         if "10008" in (err or "") or "已存在" in (err or ""):
             # 已在列表 ≠ 已完成：照样挂守望，完成后通知（否则重发链接
             # 永远拿不到完成反馈）
-            spawn_watch("/115open/云下载", label=name)
+            spawn_watch(to_folder or DEFAULT_TO, label=name)
             return "🧲 该种子已在 115 离线列表中（完成后会通知你）"
         return f"🧲 离线提交被拒绝：{err}"
     lines = ["🧲 种子已转为 115 离线任务", f"名称：{name}"]
     if info:
         lines.append(f"内容 {format_size(info['size'])}｜"
                      f"{'⚠️ 私有种子' if info['private'] else '公开种子'}")
-    lines.append("CD2 离线拉取到 /115open/云下载（完成后会通知你）")
-    spawn_watch("/115open/云下载", label=name)
+    lines.append(f"CD2 离线拉取到 {to_folder or DEFAULT_TO}（完成后会通知你）")
+    spawn_watch(to_folder or DEFAULT_TO, label=name)
     from .text import fit_4096
     return fit_4096("\n".join(lines))
 
 
-async def handle_torrent_bytes(data):
+async def handle_torrent_bytes(data, to_folder=None):
     """🧲 入口二：.torrent 文件字节 → 转磁力 → 提交 115 离线。"""
     from .naming import format_size
     try:
@@ -176,13 +215,13 @@ async def handle_torrent_bytes(data):
     except Exception as e:
         return f"🧲 种子解析失败：{e}"
     try:
-        ok, err = await asyncio.to_thread(_submit, magnet)
+        ok, err = await asyncio.to_thread(_submit, magnet, to_folder)
     except Exception as e:
         return f"🧲 离线提交失败：{e}"
     if not ok:
         if "10008" in (err or "") or "已存在" in (err or ""):
             # 已在列表 ≠ 已完成：照样挂守望（同 handle_torrent_url）
-            spawn_watch("/115open/云下载", label=info["name"])
+            spawn_watch(to_folder or DEFAULT_TO, label=info["name"])
             return "🧲 该种子已在 115 离线列表中（完成后会通知你）"
         return f"🧲 离线提交被拒绝：{err}"
     lines = ["🧲 种子已转为 115 离线任务", f"名称：{info['name']}",
@@ -190,6 +229,6 @@ async def handle_torrent_bytes(data):
              f"{'⚠️ 私有种子' if info['private'] else '公开种子'}",
              "CD2 离线拉取到 /115open/云下载",
              "完成后会通知你（默认守望 30 分钟）"]
-    spawn_watch("/115open/云下载", label=info["name"])
+    spawn_watch(to_folder or DEFAULT_TO, label=info["name"])
     from .text import fit_4096
     return fit_4096("\n".join(lines))

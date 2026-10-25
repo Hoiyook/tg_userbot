@@ -1493,25 +1493,37 @@ async def find_reply(term):
 
 
 async def offline_reply(urls):
-    """/paw offline <磁力|ED2K|HTTP 链接（\n 分隔）>：丢给 CD2 离线下载到 115。"""
+    """/paw offline <磁力|ED2K|HTTP 链接（\n 分隔）> [作者|/115open路径]。
+
+    尾随裸 token 当作者 → 漫画/<作者>/（owner 2026-10-25）；给 /115open
+    开头路径则原样。缺省仍 云下载/。"""
     from . import cd2_api
-    urls = [u.strip() for u in str(urls or "").splitlines() if u.strip()]
-    if not urls:
-        return (f"{TEXT_PREFIX}\n用法：/paw offline <链接（可多行）>\n"
-                "支持磁力/ED2K/HTTP 直链，CD2 离线下载到 /115open/云下载")
-    joined = "\n".join(urls)
+    from . import torrent_offline as to
+    raw = str(urls or "").strip()
+    lines_in = [u.strip() for u in raw.splitlines() if u.strip()]
+    if not lines_in:
+        return (f"{TEXT_PREFIX}\n用法：/paw offline <链接（可多行）> [作者]\n"
+                "支持磁力/ED2K/HTTP 直链；尾随作者 → /115open/漫画/<作者>/，"
+                "缺省 /115open/云下载")
+    to_folder = to.DEFAULT_TO
+    last = lines_in[-1]
+    if not last.startswith(("magnet:", "http", "ed2k:")):
+        to_folder = to.resolve_to_folder(last)
+        lines_in = lines_in[:-1]
+        if not lines_in:
+            return f"{TEXT_PREFIX}\n❌ 没有链接可提交"
+    joined = "\n".join(lines_in)
+    to.ensure_remote_dir(to_folder)
     try:
         ok, err = await asyncio.to_thread(
-            cd2_api.add_offline_download, joined, "/115open/云下载")
+            cd2_api.add_offline_download, joined, to_folder)
     except Exception as e:
         return f"{TEXT_PREFIX}\n❌ 提交失败：{e}"
     if ok:
-        logger.info(f"🐾 Pawchive 离线下载已提交 {len(urls)} 条")
-        from . import torrent_offline
-        torrent_offline.spawn_watch("/115open/云下载",
-                                    label=f"离线 {len(urls)} 条")
-        return (f"{TEXT_PREFIX}\n✅ 已提交 {len(urls)} 条离线下载到 "
-                "/115open/云下载（完成后会通知）")
+        logger.info(f"🐾 Pawchive 离线下载已提交 {len(lines_in)} 条 → {to_folder}")
+        to.spawn_watch(to_folder, label=f"离线 {len(lines_in)} 条")
+        return (f"{TEXT_PREFIX}\n✅ 已提交 {len(lines_in)} 条离线下载到 "
+                f"{to_folder}（完成后会通知）")
     return f"{TEXT_PREFIX}\n❌ 提交失败：{err}"
 
 

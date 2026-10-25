@@ -145,3 +145,62 @@ class CommandTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TorrentFolderTest(unittest.TestCase):
+    """种子/磁链目标目录路由（owner 2026-10-25：尾随作者 → 漫画/作者/）。"""
+
+    def test_resolve_to_folder(self):
+        from tg_userbot import torrent_offline as to
+        self.assertEqual(to.resolve_to_folder(None), "/115open/云下载")
+        self.assertEqual(to.resolve_to_folder("/115open/漫画/直路径"),
+                         "/115open/漫画/直路径")
+        self.assertEqual(to.resolve_to_folder("某作者/测试"),
+                         "/115open/漫画/某作者_测试")
+
+    def test_trailing_author(self):
+        from tg_userbot import torrent_offline as to
+        url = "https://ehtracker.org/get/1/x/abc.torrent"
+        self.assertEqual(
+            to.trailing_author(f"{url} 某作者", url), "某作者")
+        self.assertIsNone(to.trailing_author(url, url))
+        self.assertIsNone(to.trailing_author(f"{url} /cmd", url),
+                          "斜杠开头不认作者")
+
+    def test_handle_torrent_url_routes_folder(self):
+        import asyncio
+        from tg_userbot import torrent_offline as to
+        url = ("https://ehtracker.org/get/1/x/"
+               "f24ad3a354e466e7095a9b29a96324018d76a0b8.torrent")
+        submit = mock.MagicMock(return_value=(True, None))
+        watch = mock.MagicMock()
+
+        async def run():
+            with mock.patch.object(to, "_submit", submit), \
+                    mock.patch.object(to, "spawn_watch", watch):
+                return await to.handle_torrent_url(
+                    url, to_folder="/115open/漫画/作者甲")
+        out = asyncio.run(run())
+        self.assertIn("作者甲", out)
+        magnet, folder = submit.call_args[0][0], submit.call_args[0][1]
+        self.assertEqual(folder, "/115open/漫画/作者甲")
+        self.assertEqual(watch.call_args[0][0], "/115open/漫画/作者甲")
+
+    def test_paw_offline_author_routes(self):
+        import asyncio
+        from tg_userbot import pawchive
+        add = mock.MagicMock(return_value=(True, None))
+        from tg_userbot import torrent_offline as to
+        watch = mock.MagicMock()
+
+        async def run():
+            with mock.patch("tg_userbot.cd2_api.add_offline_download", add), \
+                    mock.patch.object(to, "spawn_watch", watch), \
+                    mock.patch.object(to, "ensure_remote_dir"):
+                return await pawchive.offline_reply(
+                    "magnet:?xt=urn:btih:aaa\n某作者乙")
+        out = asyncio.run(run())
+        self.assertIn("漫画/某作者乙", out)
+        joined, folder = add.call_args[0][0], add.call_args[0][1]
+        self.assertEqual(folder, "/115open/漫画/某作者乙")
+        self.assertIn("btih:aaa", joined)

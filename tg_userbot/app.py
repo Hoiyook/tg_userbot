@@ -714,10 +714,16 @@ async def new_message_handler(event):
                     f"🧲 Saved Messages 收到种子直链：{torrent_urls[0][:60]}")
 
                 _torrent_urls = torrent_urls
+                # 尾随裸 token 当作者（owner 2026-10-25）：链接行之外的
+                # 词 → 漫画/<作者>/；无则缺省 云下载/
+                _torrent_arg = torrent_offline.trailing_author(
+                    text, torrent_urls[0])
 
                 async def _torrent_job():
                     out = await torrent_offline.handle_torrent_url(
-                        _torrent_urls[0])
+                        _torrent_urls[0], to_folder=(
+                            torrent_offline.resolve_to_folder(_torrent_arg)
+                            if _torrent_arg else None))
                     try:
                         await event.reply(out, link_preview=False)
                     except Exception as e:
