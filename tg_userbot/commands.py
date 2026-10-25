@@ -35,6 +35,7 @@ from . import extract_worker
 from . import wnacg
 from . import cmdq
 from . import health
+from . import ehentai
 from . import douyin_batch
 from . import sources
 from . import cmd_templates
@@ -266,12 +267,16 @@ def _help_text():
         "/115dup scan|…|apply —— 115 查重＋审表执行（deleted/移动/重命名）\n"
         "/report —— 运维报告传 115（待人工/失败/重试/快照/台账/体检）\n"
         "/115inv scan [分钟] —— 115 全量清单（分类体检的前置）\n"
+        "/x <@作者> —— 下载 X 作者作品（gallery-dl+Agent 登录态）\n"
+        "/pixiv <ID|用户名> —— 下载 Pixiv 画师作品（App API，"
+        "用户名自动解析成 ID；裸命令看已跟列表）\n"
         "/115x <115路径> —— 115 解压回传（拉压缩包→解压→回传+对账）\n"
         "/dyu <抖音作者主页> [子目录] —— 作者全作品批量串行下载\n"
         "/manual —— 下载链路操作指引（完整机制文档）\n"
         "/115x 状态｜/115x stop 暂停｜/115x start 恢复\n"
         "/wnacg <地址|aid> [作者] —— wnacg 漫画→115 漫画[/<作者>]→自动解压\n"
         "/cmdq [成功|失败|待执行] —— 指令台账（离线回放执行情况）\n"
+        "/ehentai <画廊URL> [作者] —— 种子优先，无种子走原包→漫画/作者\n"
         "/now —— 系统现在在干什么（各链路实时状态）\n"
         "/health —— 一键巡检（连接/磁盘/队列/卡死嫌疑）\n"
         "/wnacg（状态）｜retry <aid|all>｜del <aid>\n"
@@ -731,6 +736,12 @@ async def _handle_command_inner(event, cmd_text):
         await _reply(event, health.render_health())
         return True
 
+    if cmd_text.startswith("/ehentai"):
+        # e-hentai 画廊：种子优先（免登录）→ 原包回退（cookie+GP）→ 漫画/作者/
+        logger.info(f"执行命令：{cmd_text[:60]}")
+        await _reply(event, await ehentai.command_reply(cmd_text))
+        return True
+
     if cmd_text.startswith("/now"):
         # 实时状态：各 worker 当前活动 + 队列深度 + 卡死嫌疑
         await _reply(event, health.render_now())
@@ -1034,6 +1045,20 @@ async def _handle_command_inner(event, cmd_text):
         # 中途断线连坐杀掉（2026-10-23 实测，导出与回复静默丢失）
         logger.info(f"执行命令：{cmd_text[:60]}")
         await _reply(event, await dup_scan.command_reply(cmd_text))
+        return True
+
+    from . import x_dl
+    if x_dl.is_x_command(cmd_text):
+        # X 作者作品下载（gallery-dl + Agent cookie；后台 task + 通知）
+        logger.info(f"执行命令：{cmd_text[:40]}")
+        await _reply(event, await x_dl.command_reply(cmd_text))
+        return True
+
+    from . import pixiv_dl
+    if pixiv_dl.is_pixiv_command(cmd_text):
+        # Pixiv 画师作品下载（gallery-dl App API + refresh_token）
+        logger.info(f"执行命令：{cmd_text[:40]}")
+        await _reply(event, await pixiv_dl.command_reply(cmd_text))
         return True
 
     from . import inventory

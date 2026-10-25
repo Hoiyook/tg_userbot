@@ -615,6 +615,9 @@ DOUYIN_COOKIE = _SECRET_CONFIG.get("douyin_cookie", "")
 # 直链本身公开、不需要它）。从 tg_secrets.json 的 pawchive_cookie 字段
 # 读取，缺省空串 → 清单照常生成、faved 全为 None，不硬性要求配置。
 PAWCHIVE_COOKIE = _SECRET_CONFIG.get("pawchive_cookie", "")
+# e-hentai 会话 cookie（原包路 archiver.php 用；种子路不需要）。
+# /ehentai cookie <粘贴> 写入 tg_secrets.json 的 ehentai_cookie 字段
+EHENTAI_COOKIE = _SECRET_CONFIG.get("ehentai_cookie", "")
 
 # 抖音 Web 端通用请求头（f2 详情接口 + CDN 直链下载共用）。CDN 直链对
 # UA/Referer 敏感：裸请求（无 UA）会被 douyinvod 拒绝 403，下载必须带。
@@ -812,6 +815,43 @@ def save_pawchive_cookie(value, path=None):
     PAWCHIVE_COOKIE = value
     return None
 
+
+def save_ehentai_cookie(value, path=None):
+    """把 e-hentai 会话 cookie 写入 tg_secrets.json（原子替换）并更新内存。
+
+    与 save_pawchive_cookie 同款纪律：重新读盘保留其它字段；运行时动态读
+    config.EHENTAI_COOKIE 属性，同步更新后立即作用于下一次原包请求。"""
+    global EHENTAI_COOKIE
+    target = path or SECRETS_FILE
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except FileNotFoundError:
+        data = {}
+    except Exception:
+        return "tg_secrets.json 解析失败，拒绝覆盖（请手工修复该文件）"
+
+    value = str(value or "").strip()
+    data["ehentai_cookie"] = value
+
+    tmp_path = target + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, target)
+    except Exception as e:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return f"写入失败：{type(e).__name__}: {e}"
+
+    EHENTAI_COOKIE = value
+    return None
+
 # ------------------------------------------------------------
 # 持久化下载队列：任务先入队（媒体存消息引用、平台链接存完整 URL），
 # 重启后自动恢复执行。失败任务移入 retry 列表停靠，由用户手动重试。
@@ -874,7 +914,7 @@ REGISTERED_COMMAND_NAMES = frozenset({name for name in (
     "logpath", "links", "help", "start", "cd2ck", "cmdhis",
     "usage", "help2", "restart", "inspect", "memo",
     "botclean", "cd2check", "cd2tasks", "manual", "115x", "115dup",
-    "report", "115inv", "dyu",
+    "report", "115inv", "x", "dyu", "pixiv",
     "chrome", "chrome_start", "chrome_stop", "chrome_status",
     "chrome_tasks", "chrome_cancel",
     # /paw 子命令标准形
