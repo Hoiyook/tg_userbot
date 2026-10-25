@@ -33,6 +33,7 @@ from .naming import format_size, sanitize_filename
 TEXT_PREFIX = "📖"
 _STOP = {"requested": False}
 _PAUSED = {"paused": False}
+_CURRENT = {}   # /now 实时视图用：{"aid", "title", "stage"}
 _AID_RE = re.compile(r"aid-(\d+)")
 _ZIP_RE = re.compile(r"(//[a-z0-9.]+/down/[a-z0-9/]+\.zip)")
 _H1_RE = re.compile(r"<h1[^>]*>([^<]{1,300})</h1>")
@@ -312,6 +313,7 @@ async def _run_one(task):
     title = task.get("title") or f"aid_{aid}"
     logger.info(f"📖 [aid {aid}] 开始：{title}")
     try:
+        _CURRENT.update({"aid": aid, "title": title, "stage": "下载/上传"})
         result = await _process_task(task)
         runtime_db.complete_wnacg_task(aid, size_bytes=result["size"])
         logger.info(f"📖 [aid {aid}] 完成：{title}（{format_size(result['size'])}）"
@@ -347,6 +349,8 @@ async def _run_one(task):
                     f"原因：{err[:200]}\n可用 /wnacg retry {aid} 重投。")
         except Exception:
             pass
+    finally:
+        _CURRENT.clear()
 
 
 def release_inflight():

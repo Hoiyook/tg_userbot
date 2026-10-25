@@ -39,6 +39,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
 from datetime import datetime
 
@@ -553,6 +554,7 @@ _SCHEMA = (
 _BUSY_MARKERS = ("locked", "busy")
 
 _CONN = None
+_DB_LOCK = threading.RLock()
 _JOURNAL_MODE = None
 _OPEN_PATH = None      # 当前连接对应的路径（sqlite3.Connection 不允许挂自定义属性）
 
@@ -632,18 +634,19 @@ def _write(proc, what):
     失败点正好落在**业务语句**上，而不是事务控制语句上。
     """
     def run():
-        conn = _conn()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            out = proc(conn)
-        except BaseException:
+        with _DB_LOCK:   # 跨线程事务互斥（见 _DB_LOCK 声明处注释）
+            conn = _conn()
+            conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.execute("ROLLBACK")
-            except Exception as e:      # 回滚都失败：只记日志，原异常优先
-                logger.warning(f"🗄 Runtime DB 回滚失败（{what}）：{e}")
-            raise
-        conn.execute("COMMIT")
-        return out
+                out = proc(conn)
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception as e:  # 回滚都失败：只记日志，原异常优先
+                    logger.warning(f"🗄 Runtime DB 回滚失败（{what}）：{e}")
+                raise
+            conn.execute("COMMIT")
+            return out
 
     try:
         return _retry(run, what)
@@ -661,7 +664,8 @@ def _read(proc, what):
     进而把整个历史当新消息扫下来。
     """
     def run():
-        return proc(_conn())
+        with _DB_LOCK:   # 与写事务互斥：读也不再与 BEGIN/COMMIT 交错
+            return proc(_conn())
 
     try:
         return _retry(run, what)
@@ -3972,3 +3976,65 @@ def advance_cmd_cursor(chat_id, msg_id):
             (_cmd_chat_key(chat_id), int(msg_id)))
 
     _write(do, "推进指令水位线")
+
+
+# ============================================================
+# 健康巡检计数（/health /now / 卡死哨兵，2026-10-25）
+# ============================================================
+def queue_health_counts(now=None, recent_minutes=30):
+    """全部队列的一次性只读快照：状态计数 + 到期待办 + 过期租约 + 近期完成。
+
+    卡死哨兵的判据全在这份数据里（DB 驱动，不改各 worker）：
+      有 due 活 + recent_completions==0 → 疑似整体卡死；
+      expired>0 → 幽灵 PROCESSING（各 recover 循环自愈中，反复出现才是事）。
+    """
+    now = _now(now)
+    cut = now - int(recent_minutes) * 60
+
+    def counts(conn, table, status_col="status"):
+        return dict(_execute(
+            conn, f"SELECT {status_col}, COUNT(*) FROM {table} "
+            f"GROUP BY {status_col}").fetchall())
+
+    def do(conn):
+        out = {}
+
+        def blk(table, lease_col="lease_until", retry_col="next_retry_at",
+                done_col=None, done_status="COMPLETED",
+                upd_col="updated_at"):
+            c = counts(conn, table)
+            due, expired, recent = 0, 0, 0
+            if c.get("PENDING"):
+                due = _execute(
+                    conn, f"SELECT COUNT(*) FROM {table} WHERE status='PENDING' "
+                    f"AND ({retry_col} IS NULL OR {retry_col}<=?)",
+                    (now,)).fetchone()[0]
+            if c.get("PROCESSING") and lease_col:
+                expired = _execute(
+                    conn, f"SELECT COUNT(*) FROM {table} WHERE "
+                    f"status='PROCESSING' AND {lease_col} IS NOT NULL "
+                    f"AND {lease_col}<?", (now,)).fetchone()[0]
+            if done_col:
+                recent = _execute(
+                    conn, f"SELECT COUNT(*) FROM {table} WHERE "
+                    f"status=? AND {done_col}>=?",
+                    (done_status, cut)).fetchone()[0]
+            return {"counts": c, "due": int(due), "expired": int(expired),
+                    "recent_done": int(recent)}
+
+        out["extract"] = blk("extract_tasks", done_col="updated_at")
+        out["pawchive"] = blk("pawchive_posts", done_col="completed_at")
+        out["listener"] = blk("listener_tasks", done_col="completed_at")
+        out["wnacg"] = blk("wnacg_tasks", done_status="DONE",
+                           done_col="updated_at")
+        out["download"] = {"counts": counts(conn, "download_tasks",
+                                            "state")}
+        out["recent_dl_history"] = int(_execute(
+            conn, "SELECT COUNT(*) FROM download_history WHERE ts>=?",
+            (cut,)).fetchone()[0])
+        out["dup_running_long"] = int(_execute(
+            conn, "SELECT COUNT(*) FROM dup_runs WHERE status='running' "
+            "AND started_at<?", (now - 5400,)).fetchone()[0])
+        return out
+
+    return _read(do, "健康巡检计数")

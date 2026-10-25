@@ -34,6 +34,7 @@ from . import cmd_templates
 from . import extract_worker
 from . import wnacg
 from . import cmdq
+from . import health
 from . import memo
 from . import shell
 from . import reporter
@@ -1710,6 +1711,7 @@ async def main():
     # wnacg 漫画 worker（串行下载 → 115 云下载 → /115x 解压管线）
     wnacg_task = None
     cmdq_task = None
+    health_monitor_task = None
     if state.RUNTIME_DB_READY:
         wnacg_task = asyncio.create_task(wnacg.wnacg_worker_loop())
         # 指令回放：启动时补离线指令 + 周期扫水位线（兜重连缺口）
@@ -1727,6 +1729,8 @@ async def main():
         except Exception as e:
             logger.warning(f"📥 启动回放失败（周期循环会兜底）：{e}")
         cmdq_task = asyncio.create_task(cmdq.replay_loop())
+        # 卡死哨兵：DB 快照判卡死 + 代理失联，通知带 30min 冷却
+        health_monitor_task = health.start_monitor()
     # Pawchive worker（帖子生命周期 → Chrome Agent 批量下载）
     pawchive_worker_task = None
     if state.RUNTIME_DB_READY:
@@ -1756,14 +1760,14 @@ async def main():
         # 扫描/Reporter 主循环同理。
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task, history_recheck_task, wnacg_task, cmdq_task,
+                  wl_scan_task, history_recheck_task, wnacg_task, cmdq_task, health_monitor_task,
                   pawchive_worker_task,
                   extract_worker_task):
             if t is not None:
                 t.cancel()
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task, history_recheck_task, wnacg_task, cmdq_task,
+                  wl_scan_task, history_recheck_task, wnacg_task, cmdq_task, health_monitor_task,
                   pawchive_worker_task,
                   extract_worker_task):
             if t is not None:

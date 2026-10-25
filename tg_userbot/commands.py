@@ -34,6 +34,7 @@ from . import pawchive
 from . import extract_worker
 from . import wnacg
 from . import cmdq
+from . import health
 from . import douyin_batch
 from . import sources
 from . import cmd_templates
@@ -271,6 +272,8 @@ def _help_text():
         "/115x 状态｜/115x stop 暂停｜/115x start 恢复\n"
         "/wnacg <地址|aid> [作者] —— wnacg 漫画→115 漫画[/<作者>]→自动解压\n"
         "/cmdq [成功|失败|待执行] —— 指令台账（离线回放执行情况）\n"
+        "/now —— 系统现在在干什么（各链路实时状态）\n"
+        "/health —— 一键巡检（连接/磁盘/队列/卡死嫌疑）\n"
         "/wnacg（状态）｜retry <aid|all>｜del <aid>\n"
         "/botclean on|off —— bot 对话自动清理开关\n"
         "/restart —— 重启 bot（优雅停机，约 30 秒）\n"
@@ -720,6 +723,17 @@ async def _handle_command_inner(event, cmd_text):
         await _reply(event, "🗜 收到，递归扫描中（大目录树约 1-2 分钟，"
                             "完成后回执入队结果）…")
         await _reply(event, await extract_worker.command_reply(cmd_text))
+        return True
+
+    if cmd_text.startswith("/health"):
+        # 一键巡检：连接/磁盘/挂载/代理/staging/死段/全部队列
+        logger.info(f"执行命令：{cmd_text[:60]}")
+        await _reply(event, health.render_health())
+        return True
+
+    if cmd_text.startswith("/now"):
+        # 实时状态：各 worker 当前活动 + 队列深度 + 卡死嫌疑
+        await _reply(event, health.render_now())
         return True
 
     if cmd_text.startswith("/cmdq"):

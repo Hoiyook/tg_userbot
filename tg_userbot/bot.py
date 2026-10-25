@@ -63,6 +63,8 @@ BOT_COMMANDS = (
     ("115x", "115 解压回传：/115x <115路径>；裸命令看状态"),
     ("wnacg", "wnacg 漫画：/wnacg <地址>，下载→115→自动解压"),
     ("cmdq", "指令台账：/cmdq [成功|失败|待执行]（离线回放执行情况）"),
+    ("now", "实时状态：/now 看系统现在在干什么"),
+    ("health", "一键巡检：/health（连接/磁盘/队列/卡死）"),
     ("115dup", "115 全盘查重：/115dup scan|list|show|del；裸命令看最近结果"),
     ("report", "运维报告传 115：/report [manual|failed|retry|queue|stats]"),
     ("115inv", "115 全量清单：/115inv scan [分钟]；裸命令看进度"),
