@@ -449,6 +449,110 @@ async def backfill_author(name):
             "预计需一段时间）\n进度看 /paw status，完成后通知")
 
 
+
+
+# ============================================================
+# 定期 backfill（owner 2026-10-25）：所有扫过的作者轮巡回填
+# ------------------------------------------------------------
+# 目的：站点帖子「后来补附件」（deferred/temp_url 后挂）与「后补收藏」
+# 不会漏。对账三层已有：帖级 UNIQUE(service,creator,post)、文件级
+# (url,filename)、下载侧 file_unique_id——重扫零重复下载。
+# 风控：串行一次一作者 + 帖间 2.5s 节流 + 全局周期 3 天 + 每轮上限
+# PAWB_MAX_AUTHORS_PER_ROUND，且让位人工扫描（PAW_SCAN_RUNNING）。
+# ============================================================
+PAWB_STATE_FILE = "pawb_state.json"
+PAWB_ROUND_HOURS = 72            # 全量作者一轮的周期
+PAWB_MAX_AUTHORS_PER_ROUND = 3   # 单轮最多处理作者数（每轮只啃一点）
+PAWB_POST_GAP = 2.5              # 帖间节流（与手动 backfill 同款）
+
+
+def _pawb_state_path():
+    return os.path.join(config.PAWCHIVE_DATA_DIR, PAWB_STATE_FILE)
+
+
+def _load_pawb_state():
+    import json as _j
+    try:
+        with open(_pawb_state_path(), encoding="utf-8") as f:
+            return _j.load(f)
+    except (OSError, ValueError):
+        return {"cursor": 0, "last_round": 0}
+
+
+def _save_pawb_state(st):
+    import json as _j
+    os.makedirs(config.PAWCHIVE_DATA_DIR, exist_ok=True)
+    tmp = _pawb_state_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        _j.dump(st, f, ensure_ascii=False)
+    os.replace(tmp, _pawb_state_path())
+
+
+def list_scanned_creators():
+    """已扫过的作者（按首帖时间升序稳定排序，含每作者帖数）。"""
+    try:
+        return runtime_db.list_backfill_creators()
+    except runtime_db.DbUnavailable:
+        return []
+
+
+async def backfill_round(start_index=0):
+    """跑一轮：从游标起取 PAWB_MAX_AUTHORS_PER_ROUND 个作者串行回填。
+
+    返回 (处理数, 汇总文案)。人工扫描进行中则整轮让位。"""
+    creators = list_scanned_creators()
+    if not creators:
+        return 0, "没有已扫作者"
+    todo = []
+    idx = start_index % len(creators)
+    for _ in range(min(PAWB_MAX_AUTHORS_PER_ROUND, len(creators))):
+        c = creators[idx]
+        todo.append(c)
+        idx = (idx + 1) % len(creators)
+    done = 0
+    summaries = []
+    for c in todo:
+        if state.PAW_SCAN_RUNNING is not None:
+            summaries.append(f"⏸ 让位人工扫描（{state.PAW_SCAN_RUNNING}）")
+            break
+        out = await backfill_author(f"{c['creator_name']}#{c['creator_id']}")
+        done += 1
+        # backfill_author 返回回执文案；摘要取首行
+        summaries.append(out.strip().splitlines()[0][:60])
+        await asyncio.sleep(10)   # 作者间隔
+    next_cursor = (start_index + done) % max(len(creators), 1)
+    return done, "\n".join(summaries), next_cursor
+
+
+async def backfill_loop():
+    """定期轮巡循环（每 6h 醒一次，全量一轮摊到 72h）。"""
+    logger.info("🐾 定期 backfill 循环已启动"
+                f"（全量一轮 {PAWB_ROUND_HOURS}h，每次醒最多 "
+                f"{PAWB_MAX_AUTHORS_PER_ROUND} 个作者）")
+    try:
+        while True:
+            await asyncio.sleep(6 * 3600)
+            try:
+                st = _load_pawb_state()
+                n_creators = len(list_scanned_creators())
+                if not n_creators:
+                    continue
+                # 全量摊销：每 6h 醒，一轮 72h=12 次醒；每次最多 3 作者
+                # 38 作者 → 约 2.2 天转完一圈
+                result = await backfill_round(st.get("cursor", 0))
+                done, text, next_cursor = result
+                if done:
+                    st.update({"cursor": next_cursor})
+                    _save_pawb_state(st)
+                    logger.info(f"🐾 定期 backfill 本轮 {done} 作者：{text[:80]}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"🐾 定期 backfill 轮异常（下轮再试）：{e}")
+    except asyncio.CancelledError:
+        logger.info("🐾 定期 backfill 循环停止")
+        raise
+
 def author_progress_text(name):
     """/paw progress <作者名|名字#id|数字id>：按作者的处理进度总览（只读）。
 
@@ -2345,7 +2449,8 @@ async def _reply_plan(event, arg):
         return
     await ack_stale_creators(
         lambda t: event.reply(f"{TEXT_PREFIX}\n{t}", link_preview=False))
-    scope = "notfaved"
+    # owner 指令（2026-10-25）：不再过滤已收藏帖子——默认全收
+    scope = "all"
     since = None
     parts = (arg or "").split()
     if parts and parts[-1].lower() == "all":

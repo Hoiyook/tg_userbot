@@ -548,6 +548,24 @@ _SCHEMA = (
         updated_at   INTEGER NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS asmr_tasks (
+        rj           INTEGER PRIMARY KEY,   -- RJ 数字号（判重主键）
+        title        TEXT,
+        circle       TEXT,                  -- 社团名（展示用）
+        only_filter  TEXT,                  -- only <关键词>：路径命中才下（空=全量）
+        total_files  INTEGER NOT NULL DEFAULT 0,  -- 信息性计数（真相=API 文件树）
+        done_files   INTEGER NOT NULL DEFAULT 0,
+        status       TEXT NOT NULL,
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        next_retry_at INTEGER,
+        lease_until  INTEGER,
+        size_bytes   INTEGER,               -- 总字节（信息性）
+        error        TEXT,
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL
+    )
+    """,
 )
 
 # SQLITE_BUSY / SQLITE_LOCKED 的典型文案（只用于判定是否值得重试）
@@ -910,10 +928,6 @@ def migrate() -> int:
     if version < 16:
         # v15 → v16：新增 wnacg_tasks（/wnacg 漫画下载任务）。纯建表。
         logger.info("🗄 Runtime DB 迁移：v16（+ wnacg_tasks 漫画下载）")
-    if version < 18:
-        # v17 → v18：+ cmd_ledger / cmd_cursors（指令回放台账与水位线，
-        # /cmdq）。纯建表。
-        logger.info("🗄 Runtime DB 迁移：v18（+ cmd_ledger/cmd_cursors 指令回放）")
     if version < 17:
         # v16 → v17：wnacg_tasks 加 subdir（作者子目录，/wnacg <链接> <作者>）。
         # ALTER 幂等：列已存在即跳过。
@@ -924,6 +938,13 @@ def migrate() -> int:
                 _execute(conn, "ALTER TABLE wnacg_tasks ADD COLUMN subdir TEXT")
         _write(_v17, "迁移 v17（wnacg_tasks.subdir）")
         logger.info("🗄 Runtime DB 迁移：v17（wnacg_tasks + subdir）")
+    if version < 18:
+        # v17 → v18：+ cmd_ledger / cmd_cursors（指令回放台账与水位线，
+        # /cmdq）。纯建表。
+        logger.info("🗄 Runtime DB 迁移：v18（+ cmd_ledger/cmd_cursors 指令回放）")
+    if version < 19:
+        # v18 → v19：新增 asmr_tasks（/asmr 音声下载任务，RJ 主键）。纯建表。
+        logger.info("🗄 Runtime DB 迁移：v19（+ asmr_tasks 音声下载）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -1216,6 +1237,24 @@ def complete_listener_task(task_id, now=None, detail=None):
     else:
         logger.warning(f"🗄 任务 #{task_id} 不在 PROCESSING，忽略完成标记")
     return ok
+
+
+STATUS_DISMISSED = "DISMISSED"
+
+
+def delete_listener_task(task_id, failed_only=True):
+    """「删除」失败任务 = 转 DISMISSED 忽略态（/listen_failed del）。
+
+    不做物理删除：task_events 外键挂着它（台账数据源），且 §8 判重
+    唯一索引以行为准——忽略态从一切 FAILED 视图消失（语义上已删），
+    台账/判重完好。只许 FAILED → DISMISSED（活任务不可误删）。"""
+    def do(conn):
+        cur = _execute(
+            conn, "UPDATE listener_tasks SET status=?, "
+                  "lease_until=NULL WHERE id=? AND status=?",
+            (STATUS_DISMISSED, int(task_id), STATUS_FAILED))
+        return bool(cur.rowcount)
+    return _write(do, "删除监听失败任务")
 
 
 def retry_listener_task(task_id, next_retry_at, error=None, now=None):
@@ -1618,11 +1657,35 @@ def insert_pawchive_deferred_file(post_row, url, filename, now=None):
 
 
 def pawchive_status_counts():
-    """各状态帖子计数（/paw status 视图）。"""
+    """各状态帖子计数（/paw status 视图）。FAILED 计**活跃失败**——
+    站点死链（404）是永久事实不再盯（2026-10-27 定档：不统计），
+    明细走 pawchive_failed_active_count / pawchive_dead_link_count。"""
     rows = _read(lambda c: _execute(
         c, "SELECT status, COUNT(*) FROM pawchive_posts GROUP BY status"
     ).fetchall(), "统计 Pawchive 帖子状态")
-    return {r[0]: int(r[1]) for r in rows}
+    out = {r[0]: int(r[1]) for r in rows}
+    dead = pawchive_dead_link_count()
+    if dead:
+        out[PAW_POST_FAILED] = max(0, out.get(PAW_POST_FAILED, 0) - dead)
+    return out
+
+
+def pawchive_failed_active_count():
+    """FAILED 且非死链的帖子数（值得重试的部分）。"""
+    return _read(lambda c: _execute(
+        c, "SELECT COUNT(*) FROM pawchive_posts WHERE status=? AND "
+           "COALESCE(last_error,'') NOT LIKE ?",
+        (PAW_POST_FAILED, "%" + PAW_DEAD_LINK_MARK + "%")
+    ).fetchone()[0], "统计活跃失败帖子") or 0
+
+
+def pawchive_dead_link_count():
+    """FAILED 且 error 含死链标记的帖子数（永久事实，只记账）。"""
+    return _read(lambda c: _execute(
+        c, "SELECT COUNT(*) FROM pawchive_posts WHERE status=? AND "
+           "COALESCE(last_error,'') LIKE ?",
+        (PAW_POST_FAILED, "%" + PAW_DEAD_LINK_MARK + "%")
+    ).fetchone()[0], "统计死链帖子") or 0
 
 
 def get_pawchive_post(row_id):
@@ -3466,6 +3529,25 @@ def dup_start_run(root, now=None):
     return _write(do, "查重 run 开档")
 
 
+def dup_recover_stale_runs(now=None):
+    """启动清理：进程重启遗留的 running run → failed（带原因）。
+
+    开档时也会废僵尸，但那是「下次扫描才触发」；启动即清让 /115dup
+    list 不再显示误导性的「尚未完成」。
+    """
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE dup_runs SET status='failed', finished_at=?, "
+            "error='进程重启中断（启动清理）' WHERE status='running'",
+            (_now(now),))
+        return cur.rowcount
+    n = _write(do, "清理遗留查重 run")
+    if n:
+        logger.warning(f"🧹 启动清理：{n} 条遗留 running 查重 run 已标记中止")
+    return int(n or 0)
+
+
 def dup_finish_run(run_id, stats, groups, error=None, now=None):
     """回填 run 统计 + 写入全部组员行 + 清掉旧 run（同一事务）。
 
@@ -3829,6 +3911,20 @@ def get_wnacg_task(aid):
     return _row_to_wnacg(row)
 
 
+def release_wnacg_task(aid, now=None):
+    """PROCESSING → PENDING（优雅停机取消在途，不等 15 分钟租约）。"""
+    def do(conn):
+        cur = _execute(
+            conn, "UPDATE wnacg_tasks SET status=?, lease_until=NULL, "
+            "updated_at=? WHERE aid=? AND status=?",
+            (WNACG_PENDING, _now(now), str(aid), WNACG_PROCESSING))
+        return bool(cur.rowcount)
+    ok = _write(do, "释放 wnacg 任务")
+    if ok:
+        logger.info(f"📖 wnacg 任务 {aid} 已放回待处理（停机取消）")
+    return ok
+
+
 def recover_expired_wnacg_tasks(now=None):
     """租约过期的 PROCESSING → PENDING（崩溃自愈）。"""
     now = _now(now)
@@ -3865,6 +3961,236 @@ def postpone_wnacg_task(aid, error, delay_seconds=300, now=None):
                   now + int(delay_seconds), now, int(aid)))
 
     _write(do, "退避 wnacg 任务")
+
+
+# ============================================================
+# asmr_tasks（/asmr 音声下载，v19）
+# ============================================================
+ASMR_PENDING = "PENDING"
+ASMR_PROCESSING = "PROCESSING"
+ASMR_DONE = "DONE"
+ASMR_FAILED = "FAILED"
+
+
+def _row_to_asmr(row):
+    if row is None:
+        return None
+    return {
+        "rj": row["rj"], "title": row["title"], "circle": row["circle"],
+        "only_filter": row["only_filter"],
+        "total_files": int(row["total_files"] or 0),
+        "done_files": int(row["done_files"] or 0),
+        "status": row["status"], "attempts": int(row["attempts"] or 0),
+        "next_retry_at": row["next_retry_at"], "lease_until": row["lease_until"],
+        "size_bytes": row["size_bytes"], "error": row["error"],
+        "created_at": row["created_at"], "updated_at": row["updated_at"],
+    }
+
+
+def enqueue_asmr_task(rj, title=None, circle=None, only_filter=None,
+                      total_files=None, size_bytes=None, now=None):
+    """登记一部音声作品（RJ 主键判重）。已存在（任何状态）返回 False。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(
+            conn, "INSERT OR IGNORE INTO asmr_tasks "
+            "(rj, title, circle, only_filter, total_files, size_bytes, "
+            "status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (int(rj), title, circle, (only_filter or None),
+             int(total_files or 0), size_bytes, ASMR_PENDING, now, now))
+        return bool(cur.rowcount)
+
+    return _write(do, "登记 asmr 任务")
+
+
+def claim_next_asmr_task(now=None, lease_seconds=900):
+    """领一条到期 PENDING → PROCESSING（乐观锁）；没有返回 None。"""
+    now = _now(now)
+
+    def do(conn):
+        row = _execute(
+            conn, "SELECT rj FROM asmr_tasks WHERE status=? AND "
+            "(next_retry_at IS NULL OR next_retry_at<=?) ORDER BY rj LIMIT 1",
+            (ASMR_PENDING, now)).fetchone()
+        if row is None:
+            return None
+        cur = _execute(
+            conn, "UPDATE asmr_tasks SET status=?, lease_until=?, "
+            "updated_at=? WHERE rj=? AND status=?",
+            (ASMR_PROCESSING, now + int(lease_seconds), now,
+             row["rj"], ASMR_PENDING))
+        if not cur.rowcount:
+            return None
+        got = _execute(conn, "SELECT * FROM asmr_tasks WHERE rj=?",
+                       (row["rj"],)).fetchone()
+        return _row_to_asmr(got)
+
+    return _write(do, "领取 asmr 任务")
+
+
+def update_asmr_task(rj, **fields):
+    """部分字段更新（title/circle/total_files/done_files/size_bytes）。"""
+    if not fields:
+        return
+    sets, params = [], []
+    for k in ("title", "circle", "total_files", "done_files", "size_bytes"):
+        if k in fields:
+            sets.append(f"{k}=?")
+            params.append(fields[k])
+    if not sets:
+        return
+    sets.append("updated_at=?")
+    params.append(_now())
+    params.append(int(rj))
+
+    def do(conn):
+        _execute(conn, f"UPDATE asmr_tasks SET {', '.join(sets)} "
+                       "WHERE rj=?", params)
+
+    _write(do, "更新 asmr 任务")
+
+
+def renew_asmr_lease(rj, lease_seconds=900, now=None):
+    """在途续租（长作品逐文件续——单部可达数 GB/数十分钟，不续会误报
+    过期租约）。只对 PROCESSING 生效。"""
+    def do(conn):
+        cur = _execute(
+            conn, "UPDATE asmr_tasks SET lease_until=?, updated_at=? "
+            "WHERE rj=? AND status=?",
+            (_now(now) + int(lease_seconds), _now(now), int(rj),
+             ASMR_PROCESSING))
+        return bool(cur.rowcount)
+
+    return _write(do, "续租 asmr 任务")
+
+
+def complete_asmr_task(rj, size_bytes=None, total_files=None, now=None):
+    def do(conn):
+        _execute(conn, "UPDATE asmr_tasks SET status=?, size_bytes=?, "
+                 "total_files=?, lease_until=NULL, error=NULL, updated_at=? "
+                 "WHERE rj=?",
+                 (ASMR_DONE, size_bytes, total_files, _now(now), int(rj)))
+
+    _write(do, "完成 asmr 任务")
+
+
+def fail_asmr_task(rj, error, max_attempts=5, delay_seconds=300, now=None):
+    """失败分流：未到上限 → 退避重投；到上限 → FAILED（/asmr retry 可重投）。"""
+    now = _now(now)
+
+    def do(conn):
+        row = _execute(conn, "SELECT attempts FROM asmr_tasks WHERE rj=?",
+                       (int(rj),)).fetchone()
+        attempts = (int(row["attempts"]) + 1) if row else 1
+        if attempts >= int(max_attempts):
+            _execute(conn, "UPDATE asmr_tasks SET status=?, attempts=?, "
+                     "error=?, lease_until=NULL, updated_at=? WHERE rj=?",
+                     (ASMR_FAILED, attempts, str(error)[:500], now, int(rj)))
+            return ASMR_FAILED
+        _execute(conn, "UPDATE asmr_tasks SET status=?, attempts=?, "
+                 "error=?, next_retry_at=?, lease_until=NULL, updated_at=? "
+                 "WHERE rj=?",
+                 (ASMR_PENDING, attempts, str(error)[:500],
+                  now + int(delay_seconds), now, int(rj)))
+        return ASMR_PENDING
+
+    return _write(do, "失败 asmr 任务")
+
+
+def postpone_asmr_task(rj, error, delay_seconds=300, now=None):
+    """瞬时故障退避重投（不烧尝试额度——网络抖动/挂载抖动类）。"""
+    now = _now(now)
+
+    def do(conn):
+        _execute(conn, "UPDATE asmr_tasks SET status=?, error=?, "
+                 "next_retry_at=?, lease_until=NULL, updated_at=? "
+                 "WHERE rj=?",
+                 (ASMR_PENDING, str(error)[:500],
+                  now + int(delay_seconds), now, int(rj)))
+
+    _write(do, "退避 asmr 任务")
+
+
+def retry_asmr_task(rj=None, now=None):
+    """FAILED → PENDING（rj=None 重投全部）。返回重投条数。"""
+    now = _now(now)
+
+    def do(conn):
+        if rj is None:
+            cur = _execute(conn, "UPDATE asmr_tasks SET status=?, "
+                           "attempts=0, next_retry_at=NULL, lease_until=NULL, "
+                           "done_files=0, updated_at=? WHERE status=?",
+                           (ASMR_PENDING, now, ASMR_FAILED))
+        else:
+            cur = _execute(conn, "UPDATE asmr_tasks SET status=?, attempts=0, "
+                           "next_retry_at=NULL, lease_until=NULL, "
+                           "done_files=0, updated_at=? "
+                           "WHERE rj=? AND status=?",
+                           (ASMR_PENDING, now, int(rj), ASMR_FAILED))
+        return cur.rowcount
+
+    return _write(do, "重投 asmr 任务")
+
+
+def list_asmr_tasks(status=None, limit=30):
+    def do(conn):
+        if status:
+            rows = _execute(
+                conn, "SELECT * FROM asmr_tasks WHERE status=? "
+                "ORDER BY rj DESC LIMIT ?", (str(status), int(limit))).fetchall()
+        else:
+            rows = _execute(
+                conn, "SELECT * FROM asmr_tasks ORDER BY rj DESC LIMIT ?",
+                (int(limit),)).fetchall()
+        return [_row_to_asmr(r) for r in rows]
+
+    return _read(do, "列 asmr 任务")
+
+
+def get_asmr_task(rj):
+    row = _read(lambda c: _execute(
+        c, "SELECT * FROM asmr_tasks WHERE rj=?", (int(rj),)).fetchone(),
+        "查 asmr 任务")
+    return _row_to_asmr(row)
+
+
+def release_asmr_task(rj, now=None):
+    """PROCESSING → PENDING（优雅停机取消在途，不等租约自愈）。"""
+    def do(conn):
+        cur = _execute(
+            conn, "UPDATE asmr_tasks SET status=?, lease_until=NULL, "
+            "updated_at=? WHERE rj=? AND status=?",
+            (ASMR_PENDING, _now(now), int(rj), ASMR_PROCESSING))
+        return bool(cur.rowcount)
+    ok = _write(do, "释放 asmr 任务")
+    if ok:
+        logger.info(f"🎧 asmr 任务 RJ{rj} 已放回待处理（停机取消）")
+    return ok
+
+
+def recover_expired_asmr_tasks(now=None):
+    """租约过期的 PROCESSING → PENDING（崩溃自愈）。"""
+    now = _now(now)
+
+    def do(conn):
+        cur = _execute(conn, "UPDATE asmr_tasks SET status=?, "
+                       "lease_until=NULL, updated_at=? "
+                       "WHERE status=? AND lease_until IS NOT NULL "
+                       "AND lease_until<?",
+                       (ASMR_PENDING, now, ASMR_PROCESSING, now))
+        return cur.rowcount
+
+    return _write(do, "恢复过期 asmr 任务")
+
+
+def delete_asmr_task(rj):
+    """移除任务记录（/asmr del；已落 115 的文件不动）。"""
+
+    def do(conn):
+        _execute(conn, "DELETE FROM asmr_tasks WHERE rj=?", (int(rj),))
+
+    _write(do, "移除 asmr 任务")
 
 
 # ============================================================
@@ -4027,6 +4353,8 @@ def queue_health_counts(now=None, recent_minutes=30):
         out["listener"] = blk("listener_tasks", done_col="completed_at")
         out["wnacg"] = blk("wnacg_tasks", done_status="DONE",
                            done_col="updated_at")
+        out["asmr"] = blk("asmr_tasks", done_status="DONE",
+                          done_col="updated_at")
         out["download"] = {"counts": counts(conn, "download_tasks",
                                             "state")}
         out["recent_dl_history"] = int(_execute(
@@ -4038,3 +4366,18 @@ def queue_health_counts(now=None, recent_minutes=30):
         return out
 
     return _read(do, "健康巡检计数")
+
+
+def list_backfill_creators():
+    """已扫过的作者清单（定期 backfill 轮巡用）：按最早入库升序稳定排序。"""
+
+    def do(conn):
+        rows = _execute(
+            conn, "SELECT creator_id, creator_name, COUNT(*) n, "
+            "MIN(id) first_row FROM pawchive_posts "
+            "GROUP BY creator_id, creator_name ORDER BY first_row").fetchall()
+        return [{"creator_id": r["creator_id"],
+                 "creator_name": r["creator_name"], "posts": int(r["n"])}
+                for r in rows]
+
+    return _read(do, "列已扫作者")

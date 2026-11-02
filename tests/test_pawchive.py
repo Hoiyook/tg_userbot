@@ -834,3 +834,64 @@ class DupNameGuardTest(_DbTestCase):
                     {"id": "701", "name": "双生"}]):
             recs = pawchive.build_scan_records(creator, posts)
             self.assertNotIn("#", recs[0]["subdir"].split("/")[1])
+
+
+class BackfillRoundTest(unittest.TestCase):
+    """定期 backfill 轮巡：游标推进 / 让位人工扫描 / 空库静默。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="pawb_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+
+    def test_round_advances_cursor(self):
+        import asyncio
+        from tg_userbot import pawchive as paw
+        for i, (cid, name) in enumerate((("1", "甲"), ("2", "乙"), ("3", "丙"))):
+            runtime_db.enqueue_pawchive_posts("patreon", cid, name, [{
+                "post_id": f"p{i}", "title": "t", "published": "2026-10-01",
+                "post_url": f"u{i}", "subdir": f"s{i}", "files": [],
+                "ext_links": []}])
+        calls = []
+
+        async def fake_backfill(ref):
+            calls.append(ref)
+            return f"🔁 开始回填 {ref}"
+        with mock.patch.object(paw, "backfill_author",
+                               side_effect=fake_backfill), \
+                mock.patch.object(paw, "PAWB_MAX_AUTHORS_PER_ROUND", 2):
+            done, text, cursor = asyncio.run(paw.backfill_round(0))
+        self.assertEqual(done, 2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(cursor, 2, "游标推进到下一个作者")
+
+    def test_round_yields_to_manual_scan(self):
+        import asyncio
+        from tg_userbot import pawchive as paw
+        runtime_db.enqueue_pawchive_posts("patreon", "9", "丁", [{
+            "post_id": "p", "title": "t", "published": "2026-10-01",
+            "post_url": "u", "subdir": "s", "files": [], "ext_links": []}])
+        import tg_userbot.state as st
+        st.PAW_SCAN_RUNNING = "人工扫描中"
+        self.addCleanup(setattr, st, "PAW_SCAN_RUNNING", None)
+        calls = []
+
+        async def fake_backfill(ref):
+            calls.append(ref)
+            return "x"
+        with mock.patch.object(paw, "backfill_author",
+                               side_effect=fake_backfill):
+            done, text, cursor = asyncio.run(paw.backfill_round(0))
+        self.assertEqual(done, 0)
+        self.assertEqual(calls, [])
+
+    def test_scope_all_default(self):
+        # owner 2026-10-25：默认不过滤已收藏（scope=all）
+        from tg_userbot import pawchive as paw
+        src = paw._reply_plan.__code__.co_consts
+        self.assertIn("all", src)

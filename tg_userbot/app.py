@@ -18,6 +18,7 @@ from telethon import TelegramClient, events
 from telethon.network.connection import ConnectionTcpFull, ConnectionTcpObfuscated
 
 from . import state
+from . import api_server
 from . import netio
 from . import notify
 from . import commands
@@ -33,8 +34,10 @@ from . import sql_templates
 from . import cmd_templates
 from . import extract_worker
 from . import wnacg
+from . import asmr_dl
 from . import cmdq
 from . import health
+from . import pawchive
 from . import memo
 from . import shell
 from . import reporter
@@ -50,6 +53,7 @@ from . import bot
 from . import workers
 from . import pawchive_worker
 from .config import (
+    API_ENABLED,
     API_HASH,
     API_ID,
     AUTO_CLEAN_SAVED_MESSAGES,
@@ -58,6 +62,9 @@ from .config import (
     BOT_SESSION_NAME,
     BOT_TOKEN,
     BOT_USERNAME,
+    CHROME_REPORT_INTERVAL_MINUTES,
+    STATE_BACKUP_INTERVAL_HOURS,
+    RUNTIME_DIR,
     CONNECTION_TYPE,
     DOUYIN_BOT_USERNAME,
     INSTAGRAM_BOT_USERNAME,
@@ -198,6 +205,17 @@ async def _maintenance_loop():
             raise
         except Exception as e:
             logger.warning(f"🔍 每日巡检报告发送失败（不影响维护）：{e}")
+        # 每日失败报告自动推送（2026-10-29 定档：有限档失败烧到终态的
+        # 明细按日期推 115 的 userBot 报告；有新增才推）
+        try:
+            from . import ops_report as _opr
+            _r = await _opr.daily_failed_push()
+            if _r:
+                logger.info(_r)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"📤 每日失败报告推送失败（不影响维护）：{e}")
         # Cookie 每日体检：已配置才查。只对「确认失效」（401/登录墙）提醒；
         # 网络抖动（校验失败）不是失效——站点慢时误报会吓到用户去重贴
         # Cookie（2026-09-24），这类明天自愈，只留日志
@@ -560,6 +578,97 @@ async def _listener_loop():
         await asyncio.sleep(delay)
 
 
+async def _chrome_report_loop():
+    """Chrome 下载台账定时上传（2026-10-31 owner 定档）：每
+    CHROME_REPORT_INTERVAL_MINUTES 把 chrome 报告传 115 的 userBot报告/日期/。
+
+    成功只记日志（避免烦扰）；失败才通知——网络/挂载恢复后下一轮自然补上。
+    本地必有存档（ops_report 的 userbot_reports/日/），上传失败不丢数据。
+    """
+    from . import ops_report
+    await asyncio.sleep(300)   # 启动 5 分钟后先出第一份
+    while True:
+        try:
+            res = await asyncio.to_thread(ops_report.export_reports, ["chrome"])
+            if res.get("ok"):
+                logger.info("📊 Chrome 台账已传 115："
+                            f"{res.get('remote_dir')}（{len(res.get('files', []))} 个文件）")
+            else:
+                logger.warning(f"📊 Chrome 台账上传未完成：{res.get('note')}")
+                try:
+                    await notify.notify_user(
+                        f"📊 Chrome 台账上传未完成：{res.get('note')}\n"
+                        f"本地存档：{res.get('local_dir')}")
+                except Exception:
+                    pass
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            logger.error(f"📊 Chrome 台账生成异常（{type(e).__name__}: {e}）")
+        await asyncio.sleep(CHROME_REPORT_INTERVAL_MINUTES * 60)
+
+
+async def _state_backup_loop():
+    """每日状态备份（2026-11-01 owner 定档）：Runtime DB 快照 + 去重/监听/
+    台账等关键状态文件打包传 115——机器没了也能恢复全部状态。
+
+    不含任何 secrets（tg_secrets.json 在仓库根，不在打包范围）。本地 zip
+    滚动保留 2 份；115 侧「系统备份」类型保留 7 份（prune keep_by_type）。
+    """
+    from . import cd2_api
+    from . import maintenance
+    from . import ops_report
+    import zipfile
+    await asyncio.sleep(600)   # 启动 10 分钟后首跑（错开启动高峰）
+    while True:
+        try:
+            db_path = await asyncio.to_thread(
+                maintenance.backup_db, RUNTIME_DIR)
+            stamp = time.strftime("%Y%m%d-%H%M")
+            zip_path = os.path.join(RUNTIME_DIR,
+                                    f"系统备份_{stamp}.zip")
+            members = [db_path] + [
+                os.path.join(RUNTIME_DIR, name)
+                for name in ("bili_archive.txt", "x_archive.txt",
+                             "x_state.json", "caption_filter.json",
+                             "sql_templates.json", "chrome_tasks.json",
+                             "watch_dirs.json")
+                if os.path.isfile(os.path.join(RUNTIME_DIR, name))]
+            with zipfile.ZipFile(zip_path, "w",
+                                 zipfile.ZIP_DEFLATED) as z:
+                for p in members:
+                    z.write(p, os.path.basename(p))
+            from .dup_scan import dated_report_dir
+            target = dated_report_dir()
+            ok, note = await asyncio.to_thread(
+                cd2_api.upload_to_115, [zip_path], target)
+            if ok:
+                logger.info(f"🗄 状态备份已传 115：{target}"
+                            f"（{len(members)} 个成员文件）")
+                try:
+                    await asyncio.to_thread(
+                        ops_report.prune_old_reports,
+                        keep_by_type={"系统备份": 7})
+                except Exception as e:
+                    logger.warning(f"🗄 备份去旧失败（不影响本次上传）：{e}")
+            else:
+                logger.warning(f"🗄 状态备份上传失败：{note}")
+            import glob
+            zips = sorted(glob.glob(os.path.join(RUNTIME_DIR,
+                                                 "系统备份_*.zip")),
+                          key=os.path.getmtime, reverse=True)
+            for old_zip in zips[2:]:
+                try:
+                    os.remove(old_zip)
+                except OSError:
+                    pass
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            logger.error(f"🗄 状态备份异常（{type(e).__name__}: {e}）")
+        await asyncio.sleep(STATE_BACKUP_INTERVAL_HOURS * 3600)
+
+
 async def _whitelist_scan_loop():
     """白名单扫描生产者后台循环：按 WHITELIST_SCAN_INTERVAL_SECONDS 补漏。
 
@@ -617,6 +726,22 @@ def _install_stop_handlers(stop_event):
 async def new_message_handler(event):
     try:
         message = event.message
+
+        # ── 套壳 app 的 Telegram 中转通道（2026-11-01）──────────────
+        # 手机上 Tailscale 与代理互斥（安卓单 VPN），app 的分享不走直连：
+        # 它持 bot token 经 Bot API 以 bot 身份把「🛰 <原文>」发进 bot
+        # 对话，主账号在这里收到。只认 🛰 标记前缀——bot 发的其它消息
+        # （控制面板通知等）一律照旧忽略；标记不在通知前缀清单里（单测钉）。
+        _relay_text = (message.message or "").strip()
+        if (
+            state.BOT_ID
+            and event.chat_id == state.BOT_ID
+            and _relay_text.startswith(api_server.APP_RELAY_MARKER)
+        ):
+            _payload = _relay_text[len(api_server.APP_RELAY_MARKER):].strip()
+            if _payload:
+                asyncio.create_task(api_server.handle_app_relay(_payload))
+            return
 
         # 只处理 Saved Messages（"me"）与白名单 chat
         chat_kind, source_override = whitelist.classify_message_chat(
@@ -736,10 +861,23 @@ async def new_message_handler(event):
                 asyncio.create_task(_torrent_job())
                 return
 
+            # B站链接自动识别（2026-10-31 owner 定档）：直接发
+            # bilibili/b23 链接即按 /bili 处理，不必打前缀。必须在外链
+            # 台账**之前**拦——否则 B站链接会被登记成「待处理外链」。
+            from . import bili_dl
+            if bili_dl.looks_like_bili(text):
+                reply = await bili_dl.auto_reply(text)
+                await event.reply(reply, link_preview=False)
+                return
+
             # 非抖音/IG 的外链（MEGA/网盘等）→ 手动外链台账：登记（默认
             # 未处理）+ 查重（台账历史 + Pawchive 已完成外链）。命中早退
             # ——链接消息不是转发评论，不进标注捕获。
-            if manual_links.extract_urls(text):
+            # 转发消息不记（2026-10-30）：台账语义是「我在外面找到的链接」，
+            # 频道帖自带链接转发进来（iwara/t.me 宣传链接等）不算手工外链
+            # ——2026-10-30 实查 250 行里混入大量转发链接，即此因。
+            if not getattr(message, "fwd_from", None) \
+                    and manual_links.extract_urls(text):
                 reply, buttons = manual_links.observe(text)
                 await event.reply(reply, buttons=buttons or None,
                                   link_preview=False)
@@ -1508,6 +1646,15 @@ async def main():
     state.QUEUE = queue.load_queue_any()
     state.client.add_event_handler(new_message_handler, events.NewMessage())
 
+    # 本地 API（套壳 app / 手机看板的唯一数据面）：**尽早拉起**——刻意排在
+    # 用户登录 / bot 登录之前：两次登录都走代理，节点抖动时可能长时间
+    # 无响应，API 不能陪葬（2026-11-01 实测两次卡死，公网看板 502）。
+    # 此刻 state.QUEUE / runtime DB / 路径已全部就绪，start_api 只读这些。
+    # 启动失败只告警，绝不影响主功能；随 STOP_EVENT 收尾（finally 统一取消）
+    api_task = None
+    if API_ENABLED:
+        api_task = asyncio.create_task(api_server.start_api())
+
     logger.info("=====================")
     logger.info("🚀 TG Userbot v2.10 正在启动")
     logger.info(f"运行平台：{'Termux/Android' if IS_TERMUX else 'macOS/桌面'}")
@@ -1538,6 +1685,9 @@ async def main():
     )
     if BOT_TOKEN:
         logger.info(f"🤖 bot 菜单：{BOT_USERNAME}")
+    if API_ENABLED:
+        logger.info("🌐 本地 API：已启用（bind/port/token 见 tg_secrets.json api 段，"
+                    "启动结果看 start_api 日志行）")
     logger.info("自动重试：3 次")
     logger.info(f"并发下载数：{state.DOWNLOAD_CONCURRENCY}（/thread 可调，每条占一条独立连接）")
     logger.info(
@@ -1620,6 +1770,12 @@ async def main():
 
     # Chrome Agent 结果通知轮询（读 chrome_tasks.json 终态 → 通知收藏夹）
     asyncio.create_task(chrome_client.notify_loop())
+
+    # Chrome 下载台账定时上传 115（成功静默，失败才通知）
+    asyncio.create_task(_chrome_report_loop())
+
+    # 每日状态备份（DB 快照+状态文件 → 115）
+    asyncio.create_task(_state_backup_loop())
 
     # bot 按钮菜单：登录失败只影响菜单，不影响主功能
     if BOT_TOKEN:
@@ -1716,10 +1872,14 @@ async def main():
         history_recheck_task = None
     # wnacg 漫画 worker（串行下载 → 115 云下载 → /115x 解压管线）
     wnacg_task = None
+    # asmr 音声 worker（串行逐文件 → 115 声音/asmr/RJ号/）
+    asmr_task = None
     cmdq_task = None
     health_monitor_task = None
+    pawb_task = None
     if state.RUNTIME_DB_READY:
         wnacg_task = asyncio.create_task(wnacg.wnacg_worker_loop())
+        asmr_task = asyncio.create_task(asmr_dl.asmr_worker_loop())
         # 指令回放：启动时补离线指令 + 周期扫水位线（兜重连缺口）
         try:
             recovered_cmds = cmdq.recover_stale_running()
@@ -1737,6 +1897,9 @@ async def main():
         cmdq_task = asyncio.create_task(cmdq.replay_loop())
         # 卡死哨兵：DB 快照判卡死 + 代理失联，通知带 30min 冷却
         health_monitor_task = health.start_monitor()
+        # Pawchive 定期 backfill：所有已扫作者轮巡回填（对账三层挡重复，
+        # 串行+节流防风控），让位人工扫描
+        pawb_task = asyncio.create_task(pawchive.backfill_loop())
     # Pawchive worker（帖子生命周期 → Chrome Agent 批量下载）
     pawchive_worker_task = None
     if state.RUNTIME_DB_READY:
@@ -1745,6 +1908,66 @@ async def main():
             logger.warning(
                 f"🗄 启动恢复：{recovered_paw} 条租约过期的 Pawchive 帖子已回到待处理")
         pawchive_worker_task = pawchive_worker.start_worker()
+
+
+    # ── 重启恢复汇总（2026-10-25「重启不丢在途任务」定档）──
+    # 有 DB 租约的 worker 上面各自恢复过；这里补齐无租约的长任务
+    # （查重扫描遗留 run / 查重表执行中断 / gallery-dl 系下载中断自动
+    # 续跑），并聚合成一条通知——用户一眼知道重启救回了什么。
+    _recovery_notes = []
+    # 前面各恢复段在 RUNTIME_DB_READY=False 时不会定义这些计数——
+    # 用 locals() 安全取（缺省 0），避免汇总块把启动炸掉
+    _cnt = locals()
+    if _cnt.get("recovered"):
+        _recovery_notes.append(
+            f"监听任务 {_cnt['recovered']} 条回到待执行")
+    if _cnt.get("recovered_cmds"):
+        _recovery_notes.append(
+            f"中断指令 {_cnt['recovered_cmds']} 条回到待执行")
+    if _cnt.get("recovered_paw"):
+        _recovery_notes.append(
+            f"Pawchive 帖子 {_cnt['recovered_paw']} 条回到待处理")
+    try:
+        from . import dup_scan as _dup_scan
+        _n = _dup_scan.recover_stale_runs()
+        if _n:
+            _recovery_notes.append(f"查重扫描 {_n} 条遗留 running 已标记中止"
+                                   "（/115dup scan 重扫）")
+    except Exception as e:
+        logger.warning(f"🧹 查重遗留 run 启动清理失败：{e}")
+    try:
+        from . import ops_apply as _ops_apply
+        _mark = _ops_apply.recover_interrupted()
+        if _mark:
+            _recovery_notes.append(
+                f"查重表执行被重启打断：{_mark.get('csv')}"
+                "——重发同命令幂等续跑（已处理行自动跳过）")
+    except Exception as e:
+        logger.warning(f"📋 查重表执行中断标记读取失败：{e}")
+    try:
+        from . import x_dl as _x_dl
+        _author = await _x_dl.resume_interrupted()
+        if _author:
+            _recovery_notes.append(
+                f"X 下载续跑已启动：@{_author}（archive 幂等防重复）")
+    except Exception as e:
+        logger.warning(f"🐦 X 下载续跑失败（可手动 /x 重发）：{e}")
+    try:
+        from . import pixiv_dl as _pixiv_dl
+        _ptarget = await _pixiv_dl.resume_interrupted()
+        if _ptarget:
+            _recovery_notes.append(
+                f"Pixiv 下载续跑已启动：{_ptarget}（archive 幂等防重复）")
+    except Exception as e:
+        logger.warning(f"🎨 Pixiv 下载续跑失败（可手动 /pixiv 重发）：{e}")
+    if _recovery_notes:
+        logger.warning("🔄 重启恢复：" + "；".join(_recovery_notes))
+        try:
+            from . import notify as _notify
+            await _notify.notify_user(
+                "🔄 重启恢复：\n- " + "\n- ".join(_recovery_notes))
+        except Exception:
+            pass
     # Runtime Reporter（只读观察者）：发启动通知 + 后台刷新状态面板
     reporter_instance, reporter_task = await _start_reporter()
 
@@ -1761,20 +1984,29 @@ async def main():
                 raise
             except Exception:
                 logger.exception("🤖 Reporter 关闭通知失败（不影响退出）")
+        # gallery-dl 系子进程先回收（X/Pixiv 中断下载；to_thread 里的
+        # 子进程不受协程取消影响，不杀会成孤儿与续跑并发打架）
+        try:
+            from . import x_dl as _x_dl
+            _x_dl.shutdown_children()
+        except Exception as e:
+            logger.warning(f"🐦 gallery-dl 子进程停机回收失败：{e}")
         # 取消后台服务任务：主客户端挂在 run_until_disconnected，取消会触发其
         # finally 里的 disconnect，随后以 CancelledError 收尾；bot 探活/重放
         # 扫描/Reporter 主循环同理。
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task, history_recheck_task, wnacg_task, cmdq_task, health_monitor_task,
-                  pawchive_worker_task,
+                  wl_scan_task, history_recheck_task, wnacg_task, asmr_task,
+                  cmdq_task, health_monitor_task,
+                  pawchive_worker_task, api_task,
                   extract_worker_task):
             if t is not None:
                 t.cancel()
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
-                  wl_scan_task, history_recheck_task, wnacg_task, cmdq_task, health_monitor_task,
-                  pawchive_worker_task,
+                  wl_scan_task, history_recheck_task, wnacg_task, asmr_task,
+                  cmdq_task, health_monitor_task,
+                  pawchive_worker_task, api_task,
                   extract_worker_task):
             if t is not None:
                 try:
@@ -1786,6 +2018,14 @@ async def main():
         # Worker 已在取消时把手上的任务放回 PENDING；这里兜底再释放一次
         listener_worker.release_inflight()
         pawchive_worker.release_inflight()
+        try:
+            wnacg.release_inflight()
+        except Exception as e:
+            logger.warning(f"📖 wnacg 在途任务释放失败：{e}")
+        try:
+            asmr_dl.release_inflight()
+        except Exception as e:
+            logger.warning(f"🎧 asmr 在途任务释放失败：{e}")
         try:
             extract_worker.release_inflight()
         except Exception as e:
