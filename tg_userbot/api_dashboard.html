@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TG Userbot 控制台</title>
+<style>
+  :root {
+    --bg:#f4f6f9; --card:#ffffff; --line:#e5e9f0; --line2:#dbe2ea;
+    --tx:#111827; --tx2:#64748b; --tx3:#94a3b8;
+    --blue:#2563eb; --blue-bg:#eef4ff; --blue-line:#dbe7ff;
+    --green:#16a34a; --green-bg:#ecfdf5;
+    --amber:#d97706; --amber-bg:#fffbeb;
+    --red:#dc2626; --red-bg:#fef2f2;
+    --code:#0f172a; --code-tx:#cbd5e1;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { background:var(--bg); color:var(--tx);
+         font-family:-apple-system,"PingFang SC","Noto Sans SC",sans-serif;
+         font-size:15px; padding-bottom:150px; }
+  .wrap { padding:14px 14px 0; max-width:560px; margin:0 auto; }
+  header { display:flex; align-items:center; gap:10px; padding:12px 2px 10px; }
+  header h1 { font-size:21px; font-weight:800; letter-spacing:.2px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--green);
+         box-shadow:0 0 0 3px var(--green-bg); }
+  .dot.off { background:var(--red); box-shadow:0 0 0 3px var(--red-bg); }
+  .badge { margin-left:auto; font-size:11px; color:var(--tx2);
+           background:var(--card); border:1px solid var(--line);
+           border-radius:20px; padding:3px 10px; }
+  .sub { color:var(--tx2); font-size:12px; margin-bottom:12px; }
+  .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-bottom:10px; }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:14px;
+          padding:12px 6px; text-align:center; box-shadow:0 1px 2px rgba(16,24,40,.04); }
+  .stat b { display:block; font-size:22px; color:var(--tx); }
+  .stat span { font-size:11.5px; color:var(--tx2); }
+  .bytes { color:var(--tx2); font-size:12.5px; margin-bottom:16px; }
+  .bytes b { color:var(--tx); }
+  h2 { font-size:13px; color:var(--tx2); font-weight:700; margin:6px 0 9px;
+       letter-spacing:.6px; text-transform:uppercase; }
+  .task { background:var(--card); border:1px solid var(--line); border-radius:14px;
+          padding:12px 13px; margin-bottom:9px; box-shadow:0 1px 2px rgba(16,24,40,.04); }
+  .task .name { font-size:13.5px; margin-bottom:8px; word-break:break-all; line-height:1.45;
+                color:var(--tx); }
+  .bar { height:6px; border-radius:3px; background:#e8edf3; overflow:hidden; margin-bottom:7px; }
+  .bar i { display:block; height:100%; background:linear-gradient(90deg,#3b82f6,#22d3ee);
+           border-radius:3px; width:0; transition:width .8s linear; }
+  .meta { display:flex; gap:10px; font-size:12px; color:var(--tx2); }
+  .meta .pct { margin-left:auto; color:var(--blue); font-weight:600;
+               font-variant-numeric:tabular-nums; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 12px; }
+  .chip { background:var(--blue-bg); color:var(--blue); font-size:13px;
+          border-radius:20px; padding:8px 14px; border:1px solid var(--blue-line); }
+  .chip:active { filter:brightness(.95); }
+  .chip.mini { padding:6px 14px; font-size:12.5px; }
+  .chip.on { background:var(--green-bg); color:var(--green); border-color:#bbe9d0; }
+  .chip.off { background:#f1f5f9; color:var(--tx3); border-color:var(--line); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px;
+          padding:14px; margin-bottom:14px; box-shadow:0 1px 2px rgba(16,24,40,.04); }
+  .row { display:flex; gap:8px; align-items:center; }
+  input[type=text], input[type=number] { flex:1; background:#fff; border:1px solid var(--line2);
+        color:var(--tx); border-radius:10px; padding:11px 12px; font-size:14px; min-width:0; }
+  input::placeholder { color:var(--tx3); }
+  button { background:var(--blue); color:#fff; border:0; border-radius:10px;
+           padding:11px 16px; font-size:14px; font-weight:600; }
+  button.ghost { background:#fff; color:var(--tx); border:1px solid var(--line2); font-weight:500; }
+  .fb { font-size:13px; margin-top:9px; min-height:18px; line-height:1.5; word-break:break-all;
+        color:var(--tx2); }
+  .fb.ok { color:var(--green); } .fb.bad { color:var(--red); }
+  .qrow { display:flex; align-items:center; gap:11px; background:var(--card); border:1px solid var(--line);
+          border-radius:14px; padding:11px 13px; margin-bottom:8px;
+          box-shadow:0 1px 2px rgba(16,24,40,.04); }
+  .qrow .info { flex:1; min-width:0; }
+  .nm { font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--tx); }
+  .nm.wrap { white-space:normal; overflow:visible; text-overflow:clip; word-break:break-all; line-height:1.55; }
+  .dt { font-size:11.5px; color:var(--tx3); margin-top:3px; }
+  .tag { font-size:11px; border-radius:6px; padding:2px 7px; flex-shrink:0; font-weight:600; }
+  .t-run { color:var(--blue); background:var(--blue-bg); }
+  .t-wait { color:var(--tx2); background:#f1f5f9; }
+  .t-retry { color:var(--amber); background:var(--amber-bg); }
+  .hline { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:9px 12px;
+           margin-bottom:7px; font-size:12px; color:var(--tx2); word-break:break-all; line-height:1.5;
+           font-variant-numeric:tabular-nums; }
+  .out { background:var(--code); border-radius:12px; padding:13px;
+         font-family:Menlo,monospace; font-size:11.5px; color:var(--code-tx); line-height:1.65;
+         white-space:pre-wrap; word-break:break-all; max-height:320px; overflow-y:auto;
+         margin:8px 0 16px; display:none; }
+  .note { color:var(--tx3); font-size:11.5px; line-height:1.7;
+          border:1px dashed var(--line2); border-radius:10px; padding:10px 12px; margin:14px 0 20px;
+          background:#fbfcfe; }
+  nav { position:fixed; bottom:0; left:0; right:0; display:flex;
+        background:rgba(255,255,255,.98); border-top:1px solid var(--line);
+        padding:8px 0 84px; box-shadow:0 -4px 16px rgba(16,24,40,.05); }
+  nav div { flex:1; text-align:center; font-size:11px; color:var(--tx3); padding:3px 0; }
+  nav div .e { display:block; font-size:21px; margin-bottom:2px; filter:grayscale(1) opacity(.55); }
+  nav div.on { color:var(--blue); } nav div.on .e { filter:none; }
+  .page { display:none; } .page.on { display:block; }
+  h3 { font-size:13.5px; color:var(--tx); font-weight:700; margin:18px 0 8px; }
+  .setrow { display:flex; align-items:center; gap:10px; background:var(--card); border:1px solid var(--line);
+            border-radius:14px; padding:12px 14px; margin-bottom:8px; font-size:14px; flex-wrap:wrap; }
+  .setrow .lbl { flex:1; min-width:110px; }
+  .setrow .ctl { display:flex; align-items:center; gap:8px; }
+  input[type=range] { width:130px; accent-color:var(--blue); }
+  .mini { font-size:12.5px; padding:7px 14px; }
+  /* 结果面板：全高底部卡片（flex 列布局——正文占满剩余空间滚动，
+     不依赖 vh 单位，任何 WebView 都不会被压扁） */
+  #ovl { position:fixed; inset:0; background:rgba(15,23,42,.5); display:none;
+         align-items:flex-end; justify-content:center; z-index:99; }
+  .ovl-card { background:#fff; width:100%; max-width:640px; margin:0 auto;
+              height:90%; border-radius:18px 18px 0 0;
+              display:flex; flex-direction:column;
+              padding:16px 18px calc(14px + env(safe-area-inset-bottom));
+              box-shadow:0 -12px 40px rgba(15,23,42,.3); }
+  .ovl-head { display:flex; align-items:center; gap:10px; flex-shrink:0;
+              padding-bottom:10px; border-bottom:1px solid var(--line); }
+  .ovl-ico { font-size:26px; }
+  .ovl-title { font-size:18px; font-weight:800; flex:1; }
+  .ovl-title.ok { color:var(--green); } .ovl-title.bad { color:var(--red); }
+  .ovl-x { background:var(--card); border:1px solid var(--line); color:var(--tx2);
+           border-radius:10px; padding:6px 12px; font-size:13px; }
+  .ovl-body { flex:1; min-height:0; overflow-y:auto; -webkit-overflow-scrolling:touch;
+              margin-top:12px; font-size:14.5px; color:#334155; line-height:1.75;
+              white-space:pre-wrap; word-break:break-all; }
+  .ovl-body.mono { background:var(--code); color:var(--code-tx);
+                   font-family:Menlo,monospace; font-size:12.5px;
+                   border-radius:12px; padding:14px; }
+  .ovl-btn { margin-top:14px; width:100%; flex-shrink:0; }
+  .crow { display:flex; gap:10px; align-items:baseline; padding:9px 4px;
+          border-bottom:1px solid var(--line); cursor:pointer; }
+  .crow:last-child { border-bottom:0; }
+  .crow:active { background:var(--blue-bg); }
+  .ccmd { font-family:Menlo,monospace; font-size:12.5px; color:var(--blue);
+          font-weight:600; flex-shrink:0; }
+  .cdesc { font-size:12px; color:var(--tx2); }
+  .t-done { color:var(--green); background:var(--green-bg); }
+  /* 导航徽标：队列/待重试有货时角标提醒 */
+  .bdg { position:absolute; top:-4px; right:calc(50% - 22px); min-width:16px;
+         height:16px; border-radius:8px; background:var(--red); color:#fff;
+         font-size:10px; line-height:16px; padding:0 4px; font-weight:700;
+         display:none; }
+  nav div { position:relative; }
+  /* 粘性快捷栏（总览顶部常驻高频操作） */
+  .sticky { position:sticky; top:0; z-index:5; background:var(--bg);
+            padding:6px 0 8px; margin-bottom:4px; }
+  .sticky .chips { margin-bottom:0; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>TG Userbot</h1>
+  <span class="badge" id="uptime">–</span>
+</header>
+<div class="wrap">
+  <div class="sub" id="conn">连接中…</div>
+
+  <!-- ── 总览 ─────────────────────────── -->
+  <section class="page on" id="p-home">
+    <div class="sticky">
+      <div class="chips">
+        <span class="chip" onclick="location.reload()">🔃 刷新页面</span>
+        <span class="chip" onclick="act('health')">🩺 巡检</span>
+        <span class="chip" onclick="act('now')">ℹ️ 在干嘛</span>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat"><b id="s-run">–</b><span>在途</span></div>
+      <div class="stat"><b id="s-q">–</b><span>排队</span></div>
+      <div class="stat"><b id="s-r">–</b><span>待重试</span></div>
+      <div class="stat"><b id="s-d">–</b><span>今日成功</span></div>
+    </div>
+    <div class="bytes" id="bytes">–</div>
+
+    <h2>实时进度</h2>
+    <div id="live"></div>
+
+    <h2>快捷操作</h2>
+    <div class="chips">
+      <span class="chip" onclick="act('wl_scan')">🔄 白名单扫描</span>
+      <span class="chip" onclick="act('listen_scan')">📡 监听扫描</span>
+      <span class="chip" onclick="act('retry_all')">🔁 重放失败</span>
+      <span class="chip" onclick="act('clean')">🧹 清理临时</span>
+      <span class="chip" onclick="act('health')">🩺 一键巡检</span>
+      <span class="chip" onclick="act('now')">ℹ️ 现在在干嘛</span>
+    </div>
+    <h2>☁️ 备份到 115（CD2 实时）</h2>
+    <div class="chips">
+      <span class="chip" onclick="loadBackup()">🔄 刷新</span>
+      <span class="chip" onclick="runCmdDirect('/cd2ck')">🔍 备份对账</span>
+      <span class="chip" onclick="runCmdDirect('/cd2check')">📋 完整对账</span>
+    </div>
+    <div id="backup"><div class="note">加载中…</div></div>
+
+    <div class="note">与 bot 菜单、/queue、/stats 同一套状态（单一真相源）；
+      通知仍走 Telegram 控制面板，这里不再重复推送。</div>
+  </section>
+
+  <!-- ── 队列 ─────────────────────────── -->
+  <section class="page" id="p-queue">
+    <h2>下载队列</h2>
+    <div id="queue"></div>
+    <h2>待重试</h2>
+    <div id="retry"></div>
+    <h2>Chrome Agent 任务</h2>
+    <div class="chips">
+      <span class="chip" onclick="loadChrome()">🔄 刷新任务</span>
+      <span class="chip" onclick="act('chrome_start')">▶️ 启动 Agent</span>
+      <span class="chip" onclick="act('chrome_stop')">⏹ 停止 Agent</span>
+    </div>
+    <div id="chromeBars"></div>
+    <div class="out" id="chrome" style="display:block"></div>
+    <div class="card">
+      <div class="row">
+        <input type="text" id="cc" placeholder="要取消的任务：序号或 task_id">
+        <button class="ghost" onclick="cancelChrome()">🛑 取消</button>
+      </div>
+      <div class="fb" id="ccfb"></div>
+    </div>
+  </section>
+
+  <!-- ── 发现 ─────────────────────────── -->
+  <section class="page" id="p-find">
+    <h2>🔍 找文件（队列 / 日志 / 历史三源查询）</h2>
+    <div class="card">
+      <div class="row">
+        <input type="text" id="fq" placeholder="文件名 / caption 里的任意字段子串">
+        <button onclick="doFind()">查询</button>
+      </div>
+      <div class="fb" id="fqfb"></div>
+    </div>
+    <div class="out" id="fout" style="display:block"></div>
+
+    <h2>🔗 粘贴链接入队</h2>
+    <div class="card">
+      <div class="row">
+        <input type="text" id="u" placeholder="抖音 / B站 / 种子 / 任意链接">
+        <button onclick="submit()">入队</button>
+      </div>
+      <div class="fb" id="fb">与往收藏夹发这条消息同语义：本地解析优先，失败自动转解析 bot / 外链台账。</div>
+    </div>
+
+    <h2>🕘 粘贴历史（含处理状态）</h2>
+    <div class="chips">
+      <span class="chip" onclick="loadPastes()">🔄 刷新</span>
+      <span class="chip" onclick="runCmdDirect('/cmdhis')">📜 完整历史</span>
+    </div>
+    <div id="pastes"><div class="note">加载中…</div></div>
+
+    <h2>👤 待人工处理链接（/links 同一台账）</h2>
+    <div class="chips">
+      <span class="chip" onclick="loadLinks()">🔄 刷新</span>
+    </div>
+    <div id="linksP"><div class="note">加载中…</div></div>
+  </section>
+
+  <!-- ── 台账 ─────────────────────────── -->
+  <section class="page" id="p-ledger">
+    <h2>台账（/stats 同源）</h2>
+    <div class="chips" id="daysChips">
+      <span class="chip on" data-d="1" onclick="loadStats(1)">今日</span>
+      <span class="chip" data-d="3" onclick="loadStats(3)">3 天</span>
+      <span class="chip" data-d="7" onclick="loadStats(7)">7 天</span>
+    </div>
+    <div class="out" id="ledger" style="display:block">加载中…</div>
+    <h2>最近完成</h2>
+    <div id="hist"></div>
+  </section>
+
+  <!-- ── 回填计划 ──────────────────────── -->
+  <section class="page" id="p-paw">
+    <h2>回填执行计划（/paw schedule 同源）</h2>
+    <div class="note">每 6h 醒一次 × 每次最多 3 个作者；人工扫描进行时该轮让位顺延。
+      与 /paw_schedule 完全同一份数据（单一真相源）。</div>
+    <div class="out" id="pawSched" style="display:block">加载中…</div>
+    <div class="note" style="margin-top:12px">/paw backfill &lt;作者&gt; 可插队立即回填。</div>
+  </section>
+
+  <!-- ── 指令中心 ──────────────────────── -->
+  <section class="page" id="p-cmds">
+    <h2>⌨ 万能输入（白名单内全部指令）</h2>
+    <div class="card">
+      <div class="row">
+        <input type="text" id="cmdIn" placeholder="输入指令，如 /find 笑纳 或 /bili <BV号>">
+        <button onclick="runCmd()">执行</button>
+      </div>
+      <div class="fb" id="cmdfb">点下面任一指令自动填入，可改参数后执行；结果弹卡显示成败与详情。</div>
+    </div>
+    <div id="cmdGroups">加载中…</div>
+    <div class="note">执行语义 = 在 bot 对话里发这条指令（同一套分发逻辑）；
+      高危指令（/sh 任意命令、/sql、/restart、/up、/paw_cookie）刻意不开放。</div>
+  </section>
+
+  <!-- ── 设置 ─────────────────────────── -->
+  <section class="page" id="p-set">
+    <h2>下载</h2>
+    <div class="setrow">
+      <span class="lbl">并发路数（1–25）</span>
+      <span class="ctl"><input type="range" id="th" min="1" max="25" value="10">
+        <b id="thv">10</b>
+        <button class="ghost mini" onclick="applyThread()">应用</button></span>
+    </div>
+    <div class="setrow">
+      <span class="lbl">重复去重</span>
+      <span class="ctl">
+        <span class="chip mini on" id="t-dedup-on" onclick="act('dedup_on')">开</span>
+        <span class="chip mini off" id="t-dedup-off" onclick="act('dedup_off')">关</span>
+      </span>
+    </div>
+    <div class="setrow">
+      <span class="lbl">标签监听</span>
+      <span class="ctl">
+        <span class="chip mini on" id="t-listen-on" onclick="act('listen_on')">开</span>
+        <span class="chip mini off" id="t-listen-off" onclick="act('listen_off')">关</span>
+      </span>
+    </div>
+
+    <h3>Pawchive</h3>
+    <div class="chips">
+      <span class="chip" onclick="act('paw_status')">📊 状态</span>
+      <span class="chip" onclick="act('paw_pause')">⏸ 暂停</span>
+      <span class="chip" onclick="act('paw_resume')">▶️ 恢复</span>
+    </div>
+
+    <h3>Chrome Agent / CloudDrive2</h3>
+    <div class="chips">
+      <span class="chip" onclick="act('chrome_start')">▶️ 启动 Chrome</span>
+      <span class="chip" onclick="act('chrome_stop')">⏹ 停止 Chrome</span>
+      <span class="chip" onclick="act('cd2_start')">🖥 启动 CD2</span>
+      <span class="chip" onclick="act('cd2_stop')">🛑 停止 CD2</span>
+    </div>
+
+    <div class="note" style="margin-top:16px">所有开关与 bot 菜单【⚙ 设置】读写同一份配置——
+      哪边改都实时生效。/sql 等 owner-only 能力刻意不进 API。</div>
+  </section>
+</div>
+
+<nav>
+  <div class="on" data-p="p-home"><span class="e">📊</span>总览</div>
+  <div data-p="p-queue"><span class="bdg" id="bdg-queue"></span><span class="e">📥</span>队列</div>
+  <div data-p="p-find"><span class="e">🔍</span>发现</div>
+  <div data-p="p-ledger"><span class="e">📈</span>台账</div>
+  <div data-p="p-paw"><span class="e">🐾</span>回填</div>
+  <div data-p="p-cmds"><span class="e">⌨</span>指令</div>
+  <div data-p="p-set"><span class="e">⚙️</span>设置</div>
+</nav>
+
+<!-- 结果面板 -->
+<div id="ovl">
+  <div class="ovl-card">
+    <div class="ovl-head">
+      <span class="ovl-ico" id="ovlico">✅</span>
+      <span class="ovl-title ok" id="ovltitle">执行成功</span>
+      <span class="ovl-x" onclick="closeOvl()">✕ 关闭</span>
+    </div>
+    <div class="ovl-body mono" id="ovlbody"></div>
+    <button class="ovl-btn" onclick="closeOvl()">好 的</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  const p = new URLSearchParams(location.search);
+  if (p.get("token")) localStorage.setItem("nagram_token", p.get("token"));
+})();
+const TOK = () => localStorage.getItem("nagram_token") || "";
+const H = () => ({ "Content-Type": "application/json", "X-Token": TOK() });
+function esc(s){ return (s||"").replace(/[&<>"]/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function fmtMB(n){ return n == null ? "–" : (n/1048576).toFixed(1)+" MB"; }
+function fmtGB(n){ return n == null ? "–" : n+" GB"; }
+
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({headers: H()}, opts||{}));
+  if (r.status === 401) {
+    const t = prompt("访问令牌：");
+    if (t) { localStorage.setItem("nagram_token", t); return api(path, opts); }
+    throw new Error("未授权");
+  }
+  return r.json();
+}
+
+/* 结果面板：成功/失败 + 完整详情（正文恒为等宽滚动块，占满面板剩余空间） */
+function showResult(ok, msg, pending) {
+  msg = (msg || "").trim() || (ok ? "完成" : "未知错误");
+  // 剥掉回复统一代码块化带来的 ``` 围栏行
+  msg = msg.replace(/^```[a-z]*\n/i, "").replace(/\n```$/i, "").trim();
+  document.getElementById("ovlico").textContent = pending ? "⏳" : (ok ? "✅" : "❌");
+  const t = document.getElementById("ovltitle");
+  t.textContent = pending ? "执行中" : (ok ? "执行成功" : "执行失败");
+  t.className = "ovl-title " + (pending ? "" : (ok ? "ok" : "bad"));
+  document.getElementById("ovlbody").textContent = msg;
+  document.getElementById("ovl").style.display = "flex";
+}
+function closeOvl(){ document.getElementById("ovl").style.display = "none"; }
+function setFb(id, ok, msg) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.className = "fb " + (ok ? "ok" : "bad");
+}
+
+async function refresh() {
+  try {
+    const d = await api("/api/status");
+    const s = d.stats || {};
+    document.getElementById("conn").textContent =
+      "已连接 · " + (d.save_folder||"") + " · 并发 " + (d.concurrency??"–")
+      + " · 磁盘余 " + fmtGB(d.disk_free_gb);
+    document.getElementById("dot").className = "dot";
+    document.getElementById("uptime").textContent =
+      "已运行 " + Math.floor((d.uptime_s||0)/3600) + "h"
+      + Math.floor(((d.uptime_s||0)%3600)/60) + "m";
+    document.getElementById("s-run").textContent = s.in_flight??"–";
+    document.getElementById("s-q").textContent = s.queued??"–";
+    document.getElementById("s-r").textContent = s.retry??"–";
+    document.getElementById("s-d").textContent = s.done_today??"–";
+    document.getElementById("bytes").innerHTML =
+      "今日成功容量 <b>" + ((s.bytes_today||0)/1073741824).toFixed(2) + " GB</b>"
+      + " · 拦重 " + (s.dedup_hit_today||0) + " · 失败 " + (s.failed_today||0);
+    let live = (d.in_flight||[]).map(t =>
+      '<div class="task"><div class="name">' + esc(t.name) + '</div>' +
+      '<div class="bar"><i style="width:' + (t.percent||0) + '%"></i></div>' +
+      '<div class="meta"><span>' + fmtMB(t.downloaded) +
+      (t.total ? " / " + fmtMB(t.total) : "") + '</span>' +
+      '<span class="pct">' + (t.percent==null?"–":t.percent+"%") + '</span></div></div>');
+    (d.chrome_progress && d.chrome_progress.items || []).forEach(p => {
+      const pct = (p.total && p.total > 0)
+        ? Math.min(100, Math.round(p.received * 100 / p.total)) : null;
+      live.push('<div class="task"><div class="name">🌐 Chrome ' + esc(p.filename || "(下载中)") + '</div>' +
+        '<div class="bar"><i style="width:' + (pct || 0) + '%"></i></div>' +
+        '<div class="meta"><span>' + fmtMB(p.received) +
+        (p.total ? " / " + fmtMB(p.total) : "") + '</span>' +
+        (p.speed ? '<span>' + fmtMB(p.speed) + '/s</span>' : '') +
+        '<span class="pct">' + (pct == null ? "下载中…" : pct + "%") + '</span></div></div>');
+    });
+    if (d.bili && d.bili.label)
+      live.push('<div class="task"><div class="name">📺 B站 ' + esc(d.bili.label) +
+        (d.bili.item ? "（第 " + esc(d.bili.item) + " 个）" : "") + '</div>' +
+        '<div class="bar"><i style="width:' + (d.bili.pct||0) + '%"></i></div>' +
+        '<div class="meta"><span>串行下载中</span><span class="pct">' +
+        (d.bili.pct||0) + '%</span></div></div>');
+    document.getElementById("live").innerHTML =
+      live.join("") || '<div class="note">当前没有在途下载</div>';
+    document.getElementById("queue").innerHTML = (d.queue||[]).map((t, idx) =>
+      '<div class="qrow"><div class="info"><div class="nm">' + esc(t.name) +
+      '</div><div class="dt">' + esc(t.platform) + " · " + esc(t.id) +
+      '</div></div><button class="ghost mini" onclick="queueDel(' + (idx+1) +
+      ')">✕</button><span class="tag t-wait">排队</span></div>').join("")
+      || '<div class="note">队列空</div>';
+    document.getElementById("retry").innerHTML = (d.retry||[]).map((t, idx) =>
+      '<div class="qrow"><div class="info"><div class="nm">' + esc(t.name) +
+      '</div><div class="dt">' + esc(t.platform) + " · 已试 " + t.attempts + " 次" +
+      '</div></div><button class="ghost mini" onclick="retryOne(' + (idx+1) +
+      ')">🔁</button></div>').join("")
+      || '<div class="note">没有待重试任务 🎉</div>';
+    // 导航徽标：队列/待重试有货时提醒（本页可见时不标）
+    const onQueuePage = document.getElementById("p-queue").classList.contains("on");
+    const bq = document.getElementById("bdg-queue");
+    const n = (s.queued||0) + (s.retry||0);
+    bq.style.display = (n > 0 && !onQueuePage) ? "block" : "none";
+    bq.textContent = n > 99 ? "99+" : n;
+    const tg = d.toggles || {};
+    const setOn = (id, on) => {
+      document.getElementById(id + "-on").className  = "chip mini " + (on ? "on" : "off");
+      document.getElementById(id + "-off").className = "chip mini " + (on ? "off" : "on");
+    };
+    setOn("t-dedup", tg.dedup); setOn("t-listen", tg.listen);
+    document.getElementById("th").value = d.concurrency || 10;
+    document.getElementById("thv").textContent = d.concurrency || 10;
+  } catch (e) {
+    document.getElementById("dot").className = "dot off";
+    document.getElementById("conn").textContent = "❌ 后端不可达：" + e;
+  }
+}
+
+/* 所有动作：结果一律弹卡，成败一目了然 */
+async function act(name, body) {
+  try {
+    const d = await api("/api/action/" + name,
+      {method:"POST", body: JSON.stringify(body||{})});
+    showResult(!!d.ok, d.message || d.error || "");
+    refresh();
+  } catch (e) { showResult(false, String(e)); }
+}
+
+async function submit() {
+  const el = document.getElementById("u");
+  const text = el.value.trim();
+  if (!text) return;
+  setFb("fb", null, "提交中…（本地解析最长约 30s/条）");
+  try {
+    const d = await api("/api/enqueue", {method:"POST",
+      body: JSON.stringify({text})});
+    setFb("fb", d.ok, (d.ok ? "✅ " : "❌ ") + (d.message || d.error || ""));
+    if (d.ok) el.value = "";
+    refresh();
+  } catch (e) { setFb("fb", false, "❌ 网络错误：" + e); }
+}
+document.getElementById("u").addEventListener("keydown",
+  e => { if (e.key === "Enter") submit(); });
+
+async function doFind() {
+  const q = document.getElementById("fq").value.trim();
+  if (q.length < 2) { setFb("fqfb", false, "关键字至少 2 个字符"); return; }
+  setFb("fqfb", null, "查询中…");
+  try {
+    const d = await api("/api/find?q=" + encodeURIComponent(q));
+    setFb("fqfb", d.ok, d.ok ? "" : "❌ " + (d.error || ""));
+    showLong("fout", d.ok ? d.text : (d.error || "无结果"));
+  } catch (e) { setFb("fqfb", false, "❌ " + e); }
+}
+function showLong(preId, text) {
+  const el = document.getElementById(preId);
+  el.style.display = "block"; el.textContent = text || "（空）";
+}
+document.getElementById("fq").addEventListener("keydown",
+  e => { if (e.key === "Enter") doFind(); });
+
+async function loadChrome() {
+  try {
+    const d = await api("/api/chrome");
+    showLong("chrome", d.ok ? d.text : (d.error || "读取失败"));
+    const items = (d.progress && d.progress.items) || [];
+    document.getElementById("chromeBars").innerHTML = items.map(p => {
+      const pct = (p.total && p.total > 0)
+        ? Math.min(100, Math.round(p.received * 100 / p.total)) : null;
+      return '<div class="task"><div class="name">🌐 ' + esc(p.filename || "(未命名)") + '</div>' +
+        '<div class="bar"><i style="width:' + (pct || 0) + '%"></i></div>' +
+        '<div class="meta"><span>' + fmtMB(p.received) +
+        (p.total ? " / " + fmtMB(p.total) : "") + '</span>' +
+        (p.speed ? '<span>' + fmtMB(p.speed) + '/s</span>' : '') +
+        '<span class="pct">' + (pct == null ? "下载中…" : pct + "%") + '</span></div></div>';
+    }).join("");
+  } catch (e) { showLong("chrome", "❌ " + e); }
+}
+async function cancelChrome() {
+  const id = document.getElementById("cc").value.trim();
+  if (!id) return;
+  try {
+    const d = await api("/api/action/chrome_cancel",
+      {method:"POST", body: JSON.stringify({id})});
+    setFb("ccfb", d.ok, (d.ok ? "✅ " : "❌ ") + (d.message || d.error || ""));
+    if (d.ok) document.getElementById("cc").value = "";
+    loadChrome();
+  } catch (e) { setFb("ccfb", false, "❌ " + e); }
+}
+
+async function loadStats(days) {
+  document.querySelectorAll("#daysChips .chip").forEach(c =>
+    c.classList.toggle("on", c.dataset.d == days));
+  showLong("ledger", "加载中…");
+  try {
+    const d = await api("/api/stats?days=" + days);
+    showLong("ledger", d.ok ? d.text : (d.error || "读取失败"));
+  } catch (e) { showLong("ledger", "❌ " + e); }
+}
+async function loadPawSchedule() {
+  showLong("pawSched", "加载中…");
+  try {
+    const d = await api("/api/paw_schedule");
+    showLong("pawSched", d.ok ? d.text : (d.error || "读取失败"));
+  } catch (e) { showLong("pawSched", "❌ " + e); }
+}
+async function loadHistory() {
+  try {
+    const d = await api("/api/history?n=30");
+    document.getElementById("hist").innerHTML = (d.lines||[]).map(l =>
+      '<div class="hline">' + esc(l) + '</div>').join("")
+      || '<div class="note">还没有下载记录</div>';
+  } catch (e) {
+    document.getElementById("hist").innerHTML =
+      '<div class="note">读取失败：' + esc(String(e)) + '</div>';
+  }
+}
+
+async function loadPastes() {
+  try {
+    const d = await api("/api/pastes?n=30");
+    const kc = k => k === "done" ? "t-done" : k === "bad" ? "t-retry"
+      : k === "run" ? "t-run" : k === "pending" ? "t-wait"
+      : k === "retry" ? "t-retry" : "t-wait";
+    document.getElementById("pastes").innerHTML = (d.items||[]).map(p => {
+      const when = new Date(p.ts * 1000).toLocaleString("zh-CN", {hour12: false});
+      return '<div class="qrow"><div class="info"><div class="nm wrap">' +
+        esc(p.url || p.text || "") + '</div><div class="dt">' +
+        esc(p.routed || "") + " · " + when + '</div></div>' +
+        '<span class="tag ' + kc(p.kind) + '">' + esc(p.status) + '</span></div>';
+    }).join("") || '<div class="note">还没有粘贴记录</div>';
+  } catch (e) {
+    document.getElementById("pastes").innerHTML = '<div class="note">❌ ' + esc(String(e)) + '</div>';
+  }
+}
+async function loadLinks() {
+  try {
+    const d = await api("/api/links");
+    const head = '<div class="note">未处理 ' + (d.pending||[]).length +
+      ' 条 · 历史已完成 ' + (d.done_count||0) + ' 条</div>';
+    document.getElementById("linksP").innerHTML = head + (d.pending||[]).map(p =>
+      '<div class="qrow"><div class="info"><div class="nm wrap">' + esc(p.url) +
+      '</div><div class="dt">' + esc(p.note || p.host || "") + ' · #' + p.id +
+      '</div></div><button class="ghost mini" onclick="doneLink(' + p.id +
+      ')">✅ 完成</button></div>').join("")
+      || '<div class="note">没有待人工处理的链接 🎉</div>';
+  } catch (e) {
+    document.getElementById("linksP").innerHTML = '<div class="note">❌ ' + esc(String(e)) + '</div>';
+  }
+}
+async function doneLink(id) {
+  try {
+    const d = await api("/api/links_done", {method:"POST",
+      body: JSON.stringify({id})});
+    showResult(!!d.ok, d.message || d.error || "");
+    loadLinks();
+  } catch (e) { showResult(false, String(e)); }
+}
+
+/* 队列/待重试行内操作：/api/cmd 标准形（queue_del N / retry N），
+   结果走统一弹卡 */
+async function queueDel(n) {
+  if (!confirm("从队列移除第 " + n + " 条？（执行中的会先取消在途下载）")) return;
+  try {
+    const d = await api("/api/cmd", {method:"POST",
+      body: JSON.stringify({cmd: "/queue_del " + n})});
+    showResult(!!d.ok, d.text || d.error || "");
+    refresh();
+  } catch (e) { showResult(false, String(e)); }
+}
+async function retryOne(n) {
+  try {
+    const d = await api("/api/cmd", {method:"POST",
+      body: JSON.stringify({cmd: "/retry " + n})});
+    showResult(!!d.ok, d.text || d.error || "");
+    refresh();
+  } catch (e) { showResult(false, String(e)); }
+}
+
+async function applyThread() {
+  const n = document.getElementById("th").value;
+  await act("thread", {n: +n});
+}
+document.getElementById("th").addEventListener("input",
+  e => { document.getElementById("thv").textContent = e.target.value; });
+
+async function loadCmds() {
+  try {
+    const d = await api("/api/commands");
+    if (!d.ok) { document.getElementById("cmdGroups").textContent = d.error; return; }
+    document.getElementById("cmdGroups").innerHTML = d.groups.map(g =>
+      '<h3>' + esc(g.name) + '</h3><div class="card">' +
+      g.items.map(it =>
+        '<div class="crow" onclick="useCmd(\'' + it.cmd + '\')">' +
+        '<span class="ccmd">' + esc(it.cmd) + '</span>' +
+        '<span class="cdesc">' + esc(it.desc) + '</span></div>').join("") +
+      '</div>').join("");
+  } catch (e) {
+    document.getElementById("cmdGroups").textContent = "❌ " + e;
+  }
+}
+function useCmd(cmd) {
+  const el = document.getElementById("cmdIn");
+  el.value = cmd + " ";
+  el.focus();
+  document.getElementById("cmdfb").textContent = "已填入 " + cmd +
+    " —— 补上参数后点执行";
+}
+async function runCmd() {
+  const cmd = document.getElementById("cmdIn").value.trim();
+  if (!cmd) return;
+  setFb("cmdfb", null, "执行中…（最长 90s）");
+  try {
+    const d = await api("/api/cmd", {method:"POST",
+      body: JSON.stringify({cmd})});
+    showResult(!!d.ok, d.ok ? d.text : (d.error || "失败"));
+    if (d.ok) setFb("cmdfb", true, "✅ 已执行 " + d.cmd);
+  } catch (e) { setFb("cmdfb", false, "❌ " + e); }
+}
+document.getElementById("cmdIn").addEventListener("keydown",
+  e => { if (e.key === "Enter") runCmd(); });
+
+document.querySelectorAll("nav div").forEach(t => t.onclick = () => {
+  document.querySelectorAll("nav div").forEach(x => x.classList.remove("on"));
+  document.querySelectorAll(".page").forEach(x => x.classList.remove("on"));
+  t.classList.add("on");
+  document.getElementById(t.dataset.p).classList.add("on");
+  if (t.dataset.p === "p-ledger") { loadStats(1); loadHistory(); }
+  if (t.dataset.p === "p-queue") loadChrome();
+  if (t.dataset.p === "p-queue") document.getElementById("bdg-queue").style.display = "none";
+  else refresh();   // 切页即刷新徽标状态
+  if (t.dataset.p === "p-find") { loadPastes(); loadLinks(); }
+  if (t.dataset.p === "p-cmds") loadCmds();
+  if (t.dataset.p === "p-paw") loadPawSchedule();
+  window.scrollTo(0, 0);
+});
+async function loadBackup() {
+  const el = document.getElementById("backup");
+  try {
+    const d = await api("/api/backup");
+    if (!d.ok) { el.innerHTML = '<div class="note">☁️ ' + esc(d.error || "不可用") + '</div>'; return; }
+    const c = d.counts || {};
+    let html = '<div class="qrow"><div class="info"><div class="nm">⬇️ 下载 ' + (c.download ?? "–") +
+      ' · ⬆️ 上传 ' + (c.upload ?? "–") + ' · 复制 ' + (c.copy ?? "–") +
+      '</div><div class="dt">CD2 全部任务计数</div></div></div>';
+    html += (d.tasks || []).map(t => {
+      const bad = /error|fatal/i.test(t.status);
+      return '<div class="qrow"><div class="info"><div class="nm">' + esc(t.name) +
+        '</div><div class="dt">' + esc(t.dest || "") + '</div></div>' +
+        '<span class="tag ' + (bad ? "t-retry" : "t-run") + '">' + esc(t.status) +
+        (t.pct != null ? " " + t.pct + "%" : "") + '</span></div>';
+    }).join("");
+    el.innerHTML = html ||
+      '<div class="note">当前没有在途上传——CD2 是批量间歇备份，完成一批才出现在这里</div>';
+  } catch (e) { el.innerHTML = '<div class="note">❌ ' + esc(String(e)) + '</div>'; }
+}
+async function runCmdDirect(cmd) {
+  showResult(true, "执行 " + cmd + " …", true);
+  try {
+    const d = await api("/api/cmd", {method:"POST", body: JSON.stringify({cmd})});
+    showResult(!!d.ok, d.text || d.error || "");
+  } catch (e) { showResult(false, String(e)); }
+}
+
+setInterval(refresh, 2000);
+setInterval(loadBackup, 60000);
+setInterval(loadChrome, 5000);
+refresh();
+loadBackup();
+</script>
+</body>
+</html>
