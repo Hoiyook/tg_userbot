@@ -162,16 +162,33 @@ def _paste_status(p):
     """回查一条粘贴记录的当前处理状态（尽力而为，查询失败不炸）。"""
     routed, ref, url = p.get("routed"), p.get("ref"), p.get("url")
     try:
-        if routed == "iwara" and ref:
-            from . import chrome_agent
-            tasks = chrome_agent.load_tasks(config.CHROME_TASKS_FILE)
-            t = next((x for x in tasks if x.get("task_id") == ref), None)
-            if t:
-                text, kind = _CHROME_STATUS_VIEW.get(
-                    t.get("status"), (t.get("status") or "未知", "info"))
-                if t.get("filename"):
-                    text += f" · {t['filename']}"
-                return text, kind
+        if routed in ("iwara", "iwara_dup"):
+            # ① 有 ref → chrome 任务实时状态（排队/下载中/完成/失败）
+            if ref:
+                from . import chrome_agent
+                tasks = chrome_agent.load_tasks(config.CHROME_TASKS_FILE)
+                t = next((x for x in tasks if x.get("task_id") == ref), None)
+                if t:
+                    text, kind = _CHROME_STATUS_VIEW.get(
+                        t.get("status"), (t.get("status") or "未知", "info"))
+                    if t.get("filename"):
+                        text += f" · {t['filename']}"
+                    return text, kind
+            # ② 兜底：按视频 ID 查既往成功——ref 缺失、任务滚出窗口、
+            #    去重拦截三种情况都能对上（与 dispatch 判重同一数据源）
+            from .iwara import extract_iwara_video_id
+            vid = (extract_iwara_video_id(url or "")
+                   or extract_iwara_video_id(str(p.get("text") or "")))
+            if vid:
+                from . import iwara as iwara_mod
+                try:
+                    hit = iwara_mod.find_previous_success(vid)
+                except Exception:
+                    hit = None
+                if hit:
+                    fname = hit.get("filename") or ""
+                    return ("✅ 已处理（重复拦截）"
+                            + (f" · {fname}" if fname else ""), "done")
         if routed in ("douyin",) and ref:
             last = None
             for e in stats.load_events():
@@ -474,6 +491,7 @@ async def dispatch_link_text(text: str) -> dict:
         except Exception:
             _hit = None
         if _hit:
+            _log_paste(text, iwara_urls[0], "iwara_dup", None)
             return {"ok": True, "routed": "iwara_dup",
                     "message": iwara_mod.duplicate_text(_hit)}
         ev = _HeadlessEvent()

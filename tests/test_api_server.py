@@ -417,6 +417,32 @@ class HistoryAndDashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(data["ok"])
         self.assertIn("db炸了", data["error"])
 
+    async def test_pastes_iwara_dedup_fallback(self):
+        """iwara 粘贴状态兜底：任务查不到 → 按视频 ID 查既往成功（重复拦截）。"""
+        from tg_userbot import iwara, api_server
+        path = os.path.join(_TMP, "paste_log_test.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": 0, "text": "https://www.iwara.tv/video/wogdabc",
+                "url": "https://www.iwara.tv/video/wogdabc",
+                "routed": "iwara", "ref": None}) + "\n")
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        with mock.patch.object(api_server, "_PASTE_LOG_FILE", path), \
+             mock.patch.object(iwara, "find_previous_success",
+                               return_value={"filename": "xx.mp4",
+                                             "notified_at": "2026-11-02 09:42"}):
+            client = make_client()
+            await client.start_server()
+            try:
+                data = await (await client.get("/api/pastes?n=10")).json()
+            finally:
+                await client.close()
+        self.assertTrue(data["ok"])
+        row = next(x for x in data["items"] if x.get("routed") == "iwara")
+        self.assertIn("重复拦截", row["status"])
+        self.assertIn("xx.mp4", row["status"])
+        self.assertEqual(row["kind"], "done")
+
 
 class StartApiGuardTest(unittest.IsolatedAsyncioTestCase):
     """start_api 的裸暴露防线：非 loopback + 无 token 必须拒绝启动。"""

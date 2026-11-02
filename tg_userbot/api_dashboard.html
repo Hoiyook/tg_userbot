@@ -440,13 +440,13 @@ async function refresh() {
     document.getElementById("live").innerHTML =
       live.join("") || '<div class="note">当前没有在途下载</div>';
     document.getElementById("queue").innerHTML = (d.queue||[]).map((t, idx) =>
-      '<div class="qrow"><div class="info"><div class="nm">' + esc(t.name) +
+      '<div class="qrow"><div class="info"><div class="nm wrap">' + esc(t.name) +
       '</div><div class="dt">' + esc(t.platform) + " · " + esc(t.id) +
       '</div></div><button class="ghost mini" onclick="queueDel(' + (idx+1) +
       ')">✕</button><span class="tag t-wait">排队</span></div>').join("")
       || '<div class="note">队列空</div>';
     document.getElementById("retry").innerHTML = (d.retry||[]).map((t, idx) =>
-      '<div class="qrow"><div class="info"><div class="nm">' + esc(t.name) +
+      '<div class="qrow"><div class="info"><div class="nm wrap">' + esc(t.name) +
       '</div><div class="dt">' + esc(t.platform) + " · 已试 " + t.attempts + " 次" +
       '</div></div><button class="ghost mini" onclick="retryOne(' + (idx+1) +
       ')">🔁</button></div>').join("")
