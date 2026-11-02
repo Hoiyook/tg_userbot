@@ -870,6 +870,35 @@ async def new_message_handler(event):
                 await event.reply(reply, link_preview=False)
                 return
 
+            # t.me 帖子链接（2026-11-02 owner）：bot 自己就是 Telegram
+            # 客户端，直接拉原帖媒体入队——不再落外链台账。消息自身带
+            # 媒体时不抢占（caption 里的 t.me 宣传链接不构成下载指令）；
+            # 粘贴文本剥掉链接后的剩余部分当命名标注（与手工转发评论
+            # 同款继承）。
+            if not is_downloadable(message):
+                from . import tme as _tme_mod
+                _tme_urls = _tme_mod.extract_tme_post_urls(text)
+                if _tme_urls:
+                    _label = _tme_mod.strip_link_text(text, _tme_urls)
+                    if _label:
+                        _record_me_label(_label)
+                        logger.info(
+                            f"🏷 t.me 粘贴标注：\"{_label}\"")
+
+                    async def _tme_job():
+                        try:
+                            out = await _tme_mod.handle_tme_url(_tme_urls[0])
+                        except Exception as e:
+                            logger.exception(f"t.me 处理异常：{e}")
+                            out = f"❌ t.me 处理异常：{type(e).__name__}"
+                        try:
+                            await event.reply(out, link_preview=False)
+                        except Exception as e:
+                            logger.warning(f"t.me 回执回帖失败：{e}")
+
+                    asyncio.create_task(_tme_job())
+                    return
+
             # 非抖音/IG 的外链（MEGA/网盘等）→ 手动外链台账：登记（默认
             # 未处理）+ 查重（台账历史 + Pawchive 已完成外链）。命中早退
             # ——链接消息不是转发评论，不进标注捕获。
@@ -1060,11 +1089,16 @@ def _origin_date(origin):
         return None
 
 
-async def _enqueue_me(message, no_label_wait=False):
+async def _enqueue_me(message, no_label_wait=False, chat_id=None):
     """Saved Messages 原消息入队：相册无自身文字的成员先继承同组说明再入队。
 
     no_label_wait：启动对账补入队时为 True——跳过尾随评论的宽限等待
     （停机窗口的评论若真存在，等不到；不为对账拖慢启动）。
+
+    chat_id：下载 Worker 回拉媒体的坐标（2026-11-03 t.me 直下）。缺省
+    None = state.MY_ID（收藏夹原消息，转发/直发场景）；t.me 帖子链接拉来
+    的频道原帖必须传频道自身 id——消息 id 在频道坐标系里，落在收藏夹
+    坐标系只会「原消息已被删除」。
 
     手工转发评论（窗口内的待关联标注）一并继承为命名标注——Telegram 把它发成
     「评论 + 紧跟媒体」；一条评论后连续转发的 N 条媒体都拿到同一条标注。
@@ -1091,7 +1125,9 @@ async def _enqueue_me(message, no_label_wait=False):
     origin_chat = origin.get("peer_id") if origin else None
     origin_msg = origin.get("channel_post") if origin else None
     await enqueue_media(
-        message, state.MY_ID, _origin_folder(origin),
+        message,
+        state.MY_ID if chat_id is None else chat_id,
+        _origin_folder(origin),
         album_caption=album_caption,
         user_label=user_label or None,
         parent_date=_origin_date(origin),

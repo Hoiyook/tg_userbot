@@ -1173,6 +1173,16 @@ async def _handle_command_inner(event, cmd_text):
         logger.info(f"执行命令：/clean | 删除 {count} 个临时文件")
         return True
 
+    if cmd_text == "/tme_backfill":
+        # 历史台账里的 t.me 帖子链接回灌：拉帖入队（file_unique_id 去重
+        # 护栏已有，重复条目不会重下）+ 逐条销账
+        from . import tme as _tme
+        await _reply(event, "🔁 回灌中：处理台账里 PENDING 的 t.me 链接…")
+        out = await _tme.backfill_pending()
+        await _reply(event, out, link_preview=False)
+        logger.info("执行命令：/tme_backfill")
+        return True
+
     if cmd_text == "/cd2ck":
         # 115 备份对账：walk 大目录 + 读备份日志是阻塞活，放线程跑
         await _reply(event, "🔍 对账中：扫描本地滞留媒体 × 近 3 天备份日志…")

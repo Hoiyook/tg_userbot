@@ -162,6 +162,8 @@ def _paste_status(p):
     """回查一条粘贴记录的当前处理状态（尽力而为，查询失败不炸）。"""
     routed, ref, url = p.get("routed"), p.get("ref"), p.get("url")
     try:
+        if routed == "tme":
+            return "📥 已入队下载（t.me 帖）", "run"
         if routed in ("iwara", "iwara_dup"):
             # ① 有 ref → chrome 任务实时状态（排队/下载中/完成/失败）
             if ref:
@@ -513,6 +515,14 @@ async def dispatch_link_text(text: str) -> dict:
     if bili_dl.looks_like_bili(text):
         reply = await bili_dl.auto_reply(text)
         return {"ok": True, "routed": "bili", "message": reply}
+
+    # t.me 帖子链接 → bot 自己的客户端拉原帖入队（收藏夹同款路径）
+    from . import tme as _tme
+    _tme_urls = _tme.extract_tme_post_urls(text)
+    if _tme_urls:
+        out = await _tme.handle_tme_url(_tme_urls[0])
+        _log_paste(text, _tme_urls[0], "tme", None)
+        return {"ok": True, "routed": "tme", "message": out}
 
     if not manual_links.extract_urls(text):
         return {"ok": False, "routed": None, "message": "没有识别到可处理的链接"}
