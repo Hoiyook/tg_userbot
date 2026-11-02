@@ -524,11 +524,64 @@ async def backfill_round(start_index=0):
     return done, "\n".join(summaries), next_cursor
 
 
+def backfill_schedule_text():
+    """回填执行计划（/paw schedule）：每个作者下一次回填的预计时间。
+
+    游标式轮巡：creator 序（首帖入库升序）从 cursor 起每轮（6h 醒一次）
+    啃 PAWB_MAX_AUTHORS_PER_ROUND 个。第 i 个待访作者的位次 =
+    (cursor + i)，其醒次 = 位次 // 每轮作者数，预计时间 = loop 起点 +
+    (醒次+1)×6h。给出的是「预计」，醒后若撞人工扫描会顺延（如实标注）。"""
+    import math
+    creators = list_scanned_creators()
+    if not creators:
+        return f"{TEXT_PREFIX}\n还没有已扫作者（先 /paw plan <作者>）"
+    st = _load_pawb_state()
+    cursor = int(st.get("cursor", 0)) % len(creators)
+    started = float(st.get("loop_started", 0) or 0)
+    if not started:
+        # 循环刚启动还没写过状态：以进程内已知值兜底（首醒在 6h 后）
+        started = time.time()
+    per = int(PAWB_MAX_AUTHORS_PER_ROUND)
+    wake_h = 6
+    now = time.time()
+    lines = [f"{TEXT_PREFIX} 回填执行计划（{len(creators)} 作者，"
+             f"全量一轮 ≈{math.ceil(len(creators) / per) * wake_h}h）", ""]
+    # 排序展示：按「下次执行时间从近到远」
+    rows = []
+    for i in range(len(creators)):
+        pos = (cursor + i) % len(creators)
+        c = creators[pos]
+        wake_idx = i // per + 1
+        eta = started + wake_idx * wake_h * 3600
+        rows.append((eta, c, i == 0))
+    rows.sort(key=lambda r: r[0])
+    for eta, c, is_next in rows[:20]:
+        when = time.strftime("%m-%d %H:%M", time.localtime(eta))
+        delta_h = (eta - now) / 3600
+        mark = "⏭ 下一批" if is_next else ("🕒 已逾期" if eta < now else "　")
+        lines.append(f"{mark} {when}（{delta_h:+.0f}h）　"
+                     f"{c['creator_name'][:24]}（{c['posts']} 帖）")
+    if len(rows) > 20:
+        lines.append(f"… 另 {len(rows) - 20} 个作者按序轮转（每 {wake_h}h "
+                     f"推进 {per} 个）")
+    lines.append("")
+    lines.append("节奏：每 6h 醒一次 × 每次 3 作者；人工扫描进行时该轮让位顺延；"
+                 "游标重启不丢。/paw backfill <作者> 可插队立即回填")
+    return "\n".join(lines)[:3900]
+
+
 async def backfill_loop():
     """定期轮巡循环（每 6h 醒一次，全量一轮摊到 72h）。"""
     logger.info("🐾 定期 backfill 循环已启动"
                 f"（全量一轮 {PAWB_ROUND_HOURS}h，每次醒最多 "
                 f"{PAWB_MAX_AUTHORS_PER_ROUND} 个作者）")
+    try:
+        st = _load_pawb_state()
+        if not st.get("loop_started"):
+            st["loop_started"] = time.time()
+            _save_pawb_state(st)
+    except Exception:
+        pass
     try:
         while True:
             await asyncio.sleep(6 * 3600)
@@ -2274,6 +2327,7 @@ def parse_paw_command(text):
     head_l = head.lstrip("_").lower()
     if head_l in ("help", "status", "plan", "search", "retry", "pause",
                   "resume", "manual", "done", "archive", "att", "post",
+                 "schedule",
                   "cookie", "csv", "find", "pr", "since", "fail",
                   "progress", "backfill", "notify", "offline"):
         return (head_l, rest.strip() or None)
@@ -2336,6 +2390,9 @@ async def command_reply(event, cmd_text):
         return
     if action == "backfill":
         await event.reply(await backfill_author(arg), link_preview=False)
+        return
+    if action == "schedule":
+        await event.reply(backfill_schedule_text(), link_preview=False)
         return
     if action == "notify":
         await event.reply(notify_toggle_reply(arg), link_preview=False)

@@ -10,6 +10,7 @@ import atexit
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -895,3 +896,50 @@ class BackfillRoundTest(unittest.TestCase):
         from tg_userbot import pawchive as paw
         src = paw._reply_plan.__code__.co_consts
         self.assertIn("all", src)
+
+
+class BackfillScheduleTest(unittest.TestCase):
+    """回填执行计划：时间排序 / 下一批标记 / 空库文案。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="pawbs_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        self._dd = mock.patch.object(config, "PAWCHIVE_DATA_DIR", self.dir)
+        self._dd.start()
+        self.addCleanup(self._dd.stop)
+
+    def test_schedule_lists_creators_sorted(self):
+        from tg_userbot import pawchive as paw
+        import json
+        for i, (cid, name) in enumerate((("1", "甲"), ("2", "乙"), ("3", "丙"),
+                                         ("4", "丁"))):
+            runtime_db.enqueue_pawchive_posts("patreon", cid, name, [{
+                "post_id": f"p{i}", "title": "t", "published": "2026-10-01",
+                "post_url": f"u{i}", "subdir": f"s{i}", "files": [],
+                "ext_links": []}])
+        with open(os.path.join(self.dir, "pawb_state.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"cursor": 0, "loop_started": time.time()}, f)
+        text = paw.backfill_schedule_text()
+        self.assertIn("回填执行计划", text)
+        self.assertIn("甲", text)
+        self.assertIn("下一批", text)
+        self.assertIn("每 6h 醒一次", text)
+
+    def test_schedule_empty_db(self):
+        from tg_userbot import pawchive as paw
+        text = paw.backfill_schedule_text()
+        self.assertIn("还没有已扫作者", text)
+
+    def test_paw_schedule_command_routes(self):
+        from tg_userbot import pawchive as paw
+        self.assertEqual(paw.parse_paw_command("/paw_schedule"),
+                         ("schedule", None))
+        self.assertEqual(paw.parse_paw_command("/paw schedule"),
+                         ("schedule", None))

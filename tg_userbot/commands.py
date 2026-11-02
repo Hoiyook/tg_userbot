@@ -8,6 +8,7 @@ CLEAR_INTERVAL_SECONDS / CLEAR_TIME_CHANGED）一律读 state.*；跨模块函�
 以模块对象调用。
 """
 import asyncio
+from pathlib import Path
 import time
 
 from . import state
@@ -33,6 +34,7 @@ from . import upload
 from . import pawchive
 from . import extract_worker
 from . import wnacg
+from . import asmr_dl
 from . import cmdq
 from . import health
 from . import ehentai
@@ -47,6 +49,7 @@ from .config import (
     DOWNLOAD_CONCURRENCY_MIN,
     LOG_FILE,
     LOG_RETENTION_DAYS,
+    DATA_ROOT,
     DOWNLOAD_DIR,
     SQL_CONSOLE_MAX_ROWS,
 )
@@ -120,7 +123,7 @@ _COMMAND_SUBS = {
     "/paw": {"help", "status", "plan", "search", "retry", "pause",
              "resume", "manual", "done", "archive", "att", "post",
              "cookie", "csv", "find", "pr", "since", "fail",
-             "progress", "backfill", "notify"},
+             "progress", "backfill", "schedule", "notify"},
     "/listen": {"on", "off", "scan", "list", "add", "del", "interval",
                 "edit", "failed", "retry"},
     "/wl": {"list", "add", "del", "scan", "since"},
@@ -131,9 +134,14 @@ _COMMAND_SUBS = {
     "/caption_filter": {"add", "del", "test"},
     "/115x": {"stop", "start", "retry", "del"},
     "/wnacg": {"retry", "del", "stop", "start"},
+    "/asmr": {"retry", "del", "stop", "start"},
     "/115dup": {"scan", "list", "show", "del", "report", "apply"},
     "/115inv": {"scan", "reset"},
 }
+
+
+# /extract 后台解压任务的防重入标志（串行一次一轮，I/O 重）
+_EXTRACT_RUNNING = False
 
 
 def _canonical_command(text):
@@ -236,6 +244,7 @@ def _help_text():
         "/paw_retry 行ID|all；/paw_pause｜/paw_resume\n"
         "/paw_archive —— 归档明细；/paw_archive_del 行id|起-止\n"
         "/paw_backfill 作者 —— 回填历史帖（补站点后补的数据）\n"
+        "/paw_schedule —— 回填执行计划（每作者下次回填时间）\n"
         "/memo 内容 —— 备忘录：随手记；/memo 查看列表\n"
         "/memo del 序号｜/memo clear —— 删除/清空\n"
         "/paw_since 日期|off —— 默认时间下限\n"
@@ -254,13 +263,15 @@ def _help_text():
         "/sql 一条SQL —— 诊断控制台\n"
         "/sqlt 列表｜/sqlt_add 名 SQL｜/sqlt_del 名｜/sqlt 名\n"
         "/listen 列表｜/listen_on｜/listen_off｜/listen_scan\n"
-        "/listen_failed —— 失败任务明细（/listen_retry 行id 重试）\n"
+        "/listen_failed —— 失败任务明细（/listen_retry 行id 重试｜"
+        "/listen_failed del 行id 删除）\n"
         "/listen_add 聊天 标签 [目标,目标] [on|off]｜/listen_edit 序号\n"
         "/listen_del 序号｜/listen_interval 分钟\n"
         "/wl 列表｜/wl_add ID或@名｜/wl_del ID或序号｜/wl_scan\n"
         "/wl_since 聊天 消息id —— 回补存量\n"
         "/caption_filter 列表｜/caption_filter_add 规则\n"
         "/caption_filter_del 序号｜/caption_filter_test 原文\n"
+        "/extract <子目录> [dry] —— 递归解压压缩包到同名目录（成功才删）\n"
         "/clean｜/clearmsg｜/setcleartime 30s|1m|1h|off\n"
         "/origin —— 解析失败账本；/cd2ck 日志对账；/cd2check —— API 实对账\n"
         "/cd2tasks —— CD2 上传任务明细\n"
@@ -272,9 +283,13 @@ def _help_text():
         "用户名自动解析成 ID；裸命令看已跟列表）\n"
         "/115x <115路径> —— 115 解压回传（拉压缩包→解压→回传+对账）\n"
         "/dyu <抖音作者主页> [子目录] —— 作者全作品批量串行下载\n"
+        "/bili <BV号|URL|b23短链|合集URL> —— B站视频/合集下载（archive "
+        "持久去重：单视频重发跳过、合集重跑只收新视频；画质按 cookie "
+        "账号档位，设置→🌐 B站Cookie）\n"
         "/manual —— 下载链路操作指引（完整机制文档）\n"
         "/115x 状态｜/115x stop 暂停｜/115x start 恢复\n"
         "/wnacg <地址|aid> [作者] —— wnacg 漫画→115 漫画[/<作者>]→自动解压\n"
+        "/asmr <asmr-300链接|RJ号> [only 关键词] —— 音声作品→115 声音/asmr/RJ号/"
         "/cmdq [成功|失败|待执行] —— 指令台账（离线回放执行情况）\n"
         "/ehentai <画廊URL> [作者] —— 种子优先，无种子走原包→漫画/作者\n"
         "/paw offline <磁链|种子> [作者] —— 离线到 漫画/<作者>/（缺省云下载）\n"
@@ -761,6 +776,12 @@ async def _handle_command_inner(event, cmd_text):
         await _reply(event, wnacg.command_reply(cmd_text))
         return True
 
+    if asmr_dl.is_asmr_command(cmd_text):
+        # asmr-300/Kikoeru 音声：链接/RJ号入队，串行下载→115 声音/asmr/
+        logger.info(f"执行命令：{cmd_text[:60]}")
+        await _reply(event, await asmr_dl.command_reply(cmd_text))
+        return True
+
     if pawchive.is_paw_command(cmd_text):
         # Pawchive：扫描/收藏对比/Chrome 批量下载（解析与回复全在模块内）
         logger.info(f"执行命令：{cmd_text[:60]}")
@@ -802,6 +823,10 @@ async def _handle_command_inner(event, cmd_text):
         action, arg = parsed_listen
         logger.info(f"执行命令：/listen {action}")
         if action == "failed":
+            arg_s = str(arg or "").strip()
+            if arg_s.lower().startswith("del"):
+                await _reply(event, listener.delete_failed_task(arg_s))
+                return True
             from telethon import Button
             from .menu import encode_menu_data as _enc
             await _reply(event, listener.failed_tasks_text(),
@@ -1027,6 +1052,59 @@ async def _handle_command_inner(event, cmd_text):
         logger.info(f"执行命令：/paw_backfill {a}")
         return True
 
+    if cmd_text == "/extract" or cmd_text.startswith("/extract "):
+        import os
+        from . import extract_dir
+        arg = cmd_text[len("/extract"):].strip()
+        logger.info(f"执行命令：/extract {arg[:60]}")
+        rel, dry = extract_dir.parse_extract_args(arg)
+        if not rel:
+            await _reply(event,
+                         "🗜 用法：/extract <V1 数据卷内的目录> [dry]\n"
+                         "递归解压该目录下的压缩包到同名文件夹（成功才删）。\n"
+                         "例：/extract 仓鼠_杂项；末尾加 dry = 只预览")
+            return True
+        base = Path(DATA_ROOT).resolve()   # 整个数据卷（含下载目录与媒体库）
+        target = (base / rel).resolve()
+        if target != base and not str(target).startswith(str(base) + os.sep):
+            await _reply(event, "❌ 路径必须在下载目录内")
+            return True
+        if not target.is_dir():
+            await _reply(event, f"❌ 目录不存在：{rel}")
+            return True
+        global _EXTRACT_RUNNING
+        if not dry and _EXTRACT_RUNNING:
+            await _reply(event, "🗜 已有一个解压任务在跑（串行执行），完成后再试")
+            return True
+        if dry:
+            lines, _st = await asyncio.to_thread(
+                extract_dir.extract_directory, str(target), True, 3600)
+            await _reply(event, "\n".join(lines))
+            return True
+        # 真实解压：后台 task（大包以分钟计，回复先行，完成通知进面板）
+        _EXTRACT_RUNNING = True
+
+        async def _extract_job():
+            global _EXTRACT_RUNNING
+            from . import notify as _notify   # 函数内导入（house 风格）
+            try:
+                lines, st = await asyncio.to_thread(
+                    extract_dir.extract_directory, str(target), False, 3600)
+                await _notify.notify_user("\n".join(lines))
+            except Exception as e:
+                logger.exception(f"/extract 后台解压失败：{e}")
+                try:
+                    await _notify.notify_user(
+                        f"🗜 解压任务失败：{type(e).__name__}: {e}")
+                except Exception:
+                    pass
+            finally:
+                _EXTRACT_RUNNING = False
+
+        asyncio.create_task(_extract_job())
+        await _reply(event, f"🗜 已开始递归解压：{rel}（后台执行，完成后通知）")
+        return True
+
     if cmd_text == "/cd2tasks" or cmd_text.startswith("/cd2tasks "):
         from . import cd2_api
         logger.info("执行命令：/cd2tasks")
@@ -1053,6 +1131,13 @@ async def _handle_command_inner(event, cmd_text):
         # X 作者作品下载（gallery-dl + Agent cookie；后台 task + 通知）
         logger.info(f"执行命令：{cmd_text[:40]}")
         await _reply(event, await x_dl.command_reply(cmd_text))
+        return True
+
+    from . import bili_dl
+    if bili_dl.is_bili_command(cmd_text):
+        # B站视频下载（yt-dlp + bilibili cookie；后台 task + 通知）
+        logger.info(f"执行命令：{cmd_text[:40]}")
+        await _reply(event, await bili_dl.command_reply(cmd_text))
         return True
 
     from . import pixiv_dl
