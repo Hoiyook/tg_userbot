@@ -832,3 +832,181 @@ class V13TransientRequeueTest(_DbTestCase):
                 for r in runtime_db.list_extract_tasks(limit=100)}
         self.assertEqual(rows["抖.zip"], rdb.EXTRACT_PENDING)
         self.assertEqual(rows["没.zip"], rdb.EXTRACT_TERMINAL)
+
+
+class CrossThreadWriteLockTest(_DbTestCase):
+    """2026-10-25 生产事故回归：to_thread 里的长事务与主循环写库共享
+    同一连接并发，曾撞出 "cannot start a transaction within a
+    transaction"。_write/_read 现持 _DB_LOCK 事务级互斥。"""
+
+    def test_concurrent_writes_from_threads_never_nest(self):
+        import threading
+        errors = []
+
+        def writer(n):
+            for i in range(20):
+                try:
+                    runtime_db._write(lambda conn, n=n, i=i: runtime_db._execute(
+                        conn, "INSERT INTO schema_meta(key, value) "
+                              "VALUES(?, ?)",
+                        (f"lock_{n}_{i}", "v")), f"并发写 {n}-{i}")
+                except Exception as e:
+                    errors.append(f"{n}-{i}: {e}")
+
+        threads = [threading.Thread(target=writer, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [], f"并发写出现错误：{errors[:3]}")
+        n = runtime_db._read(lambda c: runtime_db._execute(
+            c, "SELECT COUNT(*) FROM schema_meta WHERE key LIKE 'lock_%'"
+        ).fetchone()[0], "数并发行")
+        self.assertEqual(n, 80)
+
+
+class OfflineWatchTest(unittest.TestCase):
+    """offline_watch（v20）：登记 → 列 WATCHING → 置 DONE 全链路。"""
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp(prefix="tg_ow_")
+        self._saved = runtime_db._CONN
+        runtime_db._CONN = None
+        self.dbpath = os.path.join(self._td, "tg.db")
+        runtime_db.init_db(self.dbpath)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        try:
+            runtime_db.close_db()
+        except Exception:
+            pass
+        runtime_db._CONN = self._saved
+        shutil.rmtree(self._td, ignore_errors=True)
+
+    def test_roundtrip(self):
+        wid = runtime_db.add_offline_watch(
+            "/115open/漫画/作者A", "离线 2 条", {"a.zip", "b/"},
+            info_hash="ABCDEF1234")
+        self.assertTrue(wid)
+        rows = runtime_db.list_offline_watching()
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["to_folder"], "/115open/漫画/作者A")
+        self.assertEqual(r["info_hash"], "abcdef1234")   # 小写规整
+        self.assertEqual(r["known_names"], {"a.zip", "b/"})
+        runtime_db.mark_offline_done(wid)
+        self.assertEqual(runtime_db.list_offline_watching(), [])
+
+
+class TaskDomainTest(unittest.TestCase):
+    """TaskDomain 工厂（v21）：全生命周期语义（对齐 wnacg 实战版）。"""
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp(prefix="tg_td_")
+        self._saved = runtime_db._CONN
+        runtime_db._CONN = None
+        self.dbpath = os.path.join(self._td, "tg.db")
+        runtime_db.init_db(self.dbpath)
+        self.dom = runtime_db.TaskDomain(
+            table="bili_tasks", key="url", what="测试任务")
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        try:
+            runtime_db.close_db()
+        except Exception:
+            pass
+        runtime_db._CONN = self._saved
+        shutil.rmtree(self._td, ignore_errors=True)
+
+    def test_enqueue_claim_complete_roundtrip(self):
+        self.assertTrue(self.dom.enqueue("https://b23.tv/a"))
+        self.assertFalse(self.dom.enqueue("https://b23.tv/a"))   # 判重
+        task = self.dom.claim_next()
+        self.assertEqual(task["status"], "PROCESSING")
+        self.assertEqual(task["url"], "https://b23.tv/a")
+        self.dom.update("https://b23.tv/a", kind="video", label="视频A")
+        self.dom.complete("https://b23.tv/a")
+        row = self.dom.get("https://b23.tv/a")
+        self.assertEqual(row["status"], "DONE")
+        self.assertEqual(row["label"], "视频A")
+        self.assertIsNone(row["error"])
+
+    def test_fail_backoff_then_dead_and_retry(self):
+        self.dom.enqueue("u1")
+        self.dom.claim_next()
+        # 1-4 次：退避重投；第 5 次：FAILED 终态
+        for i in range(4):
+            st = self.dom.fail("u1", f"错{i}")
+            self.assertEqual(st, "PENDING")
+        st = self.dom.fail("u1", "错5")
+        self.assertEqual(st, "FAILED")
+        self.assertEqual(self.dom.retry("u1"), 1)
+        self.assertEqual(self.dom.get("u1")["status"], "PENDING")
+
+    def test_lease_release_and_recover(self):
+        self.dom.enqueue("u2")
+        task = self.dom.claim_next()
+        # 未过期租约不回收
+        self.assertEqual(self.dom.recover_expired(), 0)
+        # 手动释放（停机路径）
+        self.assertTrue(self.dom.release("u2"))
+        self.assertEqual(self.dom.get("u2")["status"], "PENDING")
+        # 过期租约回收
+        task = self.dom.claim_next(lease_seconds=-1)
+        self.assertEqual(self.dom.recover_expired(), 1)
+        self.assertEqual(self.dom.get("u2")["status"], "PENDING")
+
+    def test_fifo_claim_order_and_delete_by_id(self):
+        for u in ("u-a", "u-b", "u-c"):
+            self.dom.enqueue(u)
+        self.assertEqual(self.dom.claim_next()["url"], "u-a")   # FIFO
+        rows = self.dom.list()
+        self.assertEqual(rows[0]["url"], "u-c")   # 列表最近在前
+        self.dom.delete(rows[0]["id"])
+        self.assertIsNone(self.dom.get("u-c"))
+
+
+class TaskDomainBackoffTest(unittest.TestCase):
+    """TaskDomain.fail 指数退避（与 queue._backoff_delay 同式）。"""
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp(prefix="tg_bk_")
+        self._saved = runtime_db._CONN
+        runtime_db._CONN = None
+        self.dbpath = os.path.join(self._td, "tg.db")
+        runtime_db.init_db(self.dbpath)
+        self.dom = runtime_db.TaskDomain(table="bili_tasks", key="url",
+                                         what="t")
+        self.dom.enqueue("u")
+        self.dom.claim_next()
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        try:
+            runtime_db.close_db()
+        except Exception:
+            pass
+        runtime_db._CONN = self._saved
+        shutil.rmtree(self._td, ignore_errors=True)
+
+    def test_exponential_backoff_doubling(self):
+        import time as _t
+        delays = []
+        for _ in range(3):
+            self.dom.fail("u", "错")   # 未达上限走退避
+            row = self.dom.get("u")
+            delays.append(row["next_retry_at"] - _t.time())
+            self.dom.claim_next()
+        self.assertGreater(delays[0], 50)     # 首次 ≈60s
+        self.assertGreater(delays[1], delays[0])   # 翻倍
+        self.assertGreater(delays[2], delays[1])
+
+    def test_fixed_delay_still_supported(self):
+        import time as _t
+        before = _t.time()
+        self.dom.fail("u", "错", delay_seconds=300)
+        row = self.dom.get("u")
+        d = row["next_retry_at"] - before
+        self.assertTrue(290 <= d <= 310, f"固定 300s 语义保持: {d}")

@@ -1,0 +1,5 @@
+ScriptRunner/.gradle/
+ScriptRunner/build/
+ScriptRunner/app/build/
+ScriptRunner/local.properties
+ScriptRunner/screenshot*.png

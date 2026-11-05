@@ -11,6 +11,7 @@ import asyncio
 from pathlib import Path
 import time
 
+from .spawn import spawn
 from . import state
 from . import config
 from . import msg_history
@@ -256,7 +257,12 @@ def _help_text():
         "/chrome_start｜/chrome_stop｜/chrome_status\n"
         "/chrome_tasks；/chrome_cancel 序号\n"
         "\n"
-        "【工具/系统】\n"
+        "\n【pixeldrain】\n"
+        "/pd <链接> [目录] —— 中转下载（列表/单文件均可，重跑即续传）\n"
+        "/pdst [tag] —— 各任务进度\n"
+        "/pdst [tag] —— 各任务进度；/pdjobs —— 任务列表\n"
+        "/pdclean <链接> —— 清理云端中转（本地确认完好后再清）\n"
+        "\n【工具/系统】\n"
         "/sh [命令]；/sh cd 目录 —— 命令行（黑名单纪律）\n"
         "/up 路径 —— 上传到收藏夹\n"
         "/cmdt 列表｜/cmdt_add 名 命令｜/cmdt_del 名｜/cmdt_run 名\n"
@@ -729,6 +735,11 @@ async def _handle_command_inner(event, cmd_text):
                     "since=只要该日期之后的作品（f2 枚举）。\n"
                     "发 /dyu 可随时看批量进度。")
             return True
+        # 忙检查前置（2026-11-05 审计修复）：run_dyu 的忙拒绝返回值
+        # 曾被裸 create_task 丢弃——用户看到「开始枚举」回执后再无音讯
+        if douyin_batch.enum_busy():
+            await _reply(event, "⏳ 已有一个 /dyu 枚举在进行中，稍后再发。")
+            return True
         # 先回执（枚举要几分钟），后台跑，进度走通知
         await _reply(event, f"🎵 开始枚举作者作品：{url_arg}\n"
                             "（翻页中，完成后通知汇总；作品将逐条串行下载）")
@@ -1064,10 +1075,18 @@ async def _handle_command_inner(event, cmd_text):
                          "递归解压该目录下的压缩包到同名文件夹（成功才删）。\n"
                          "例：/extract 仓鼠_杂项；末尾加 dry = 只预览")
             return True
-        base = Path(DATA_ROOT).resolve()   # 整个数据卷（含下载目录与媒体库）
-        target = (base / rel).resolve()
+        # 用户可能贴绝对路径（/Volumes/V1/…）或数据卷内相对路径——都接受；
+        # 绝对路径校验其落在 DATA_ROOT 下，相对路径按 DATA_ROOT 拼接
+        base = Path(DATA_ROOT).resolve()
+        if rel.startswith(str(base)):
+            target = Path(rel).resolve()
+        elif rel.startswith("/"):
+            await _reply(event, "❌ 路径必须在数据卷（/Volumes/V1）内")
+            return True
+        else:
+            target = (base / rel).resolve()
         if target != base and not str(target).startswith(str(base) + os.sep):
-            await _reply(event, "❌ 路径必须在下载目录内")
+            await _reply(event, "❌ 路径必须在数据卷（/Volumes/V1）内")
             return True
         if not target.is_dir():
             await _reply(event, f"❌ 目录不存在：{rel}")
@@ -1101,7 +1120,7 @@ async def _handle_command_inner(event, cmd_text):
             finally:
                 _EXTRACT_RUNNING = False
 
-        asyncio.create_task(_extract_job())
+        spawn(_extract_job(), "递归解压任务")
         await _reply(event, f"🗜 已开始递归解压：{rel}（后台执行，完成后通知）")
         return True
 
@@ -1138,6 +1157,13 @@ async def _handle_command_inner(event, cmd_text):
         # B站视频下载（yt-dlp + bilibili cookie；后台 task + 通知）
         logger.info(f"执行命令：{cmd_text[:40]}")
         await _reply(event, await bili_dl.command_reply(cmd_text))
+        return True
+
+    from . import pd_dl
+    if pd_dl.is_pd_command(cmd_text):
+        # pixeldrain 下载（pd_daemon 桥接：/pd /pdst /pdclean）
+        logger.info(f"执行命令：{cmd_text[:40]}")
+        await _reply(event, await pd_dl.command_reply(cmd_text))
         return True
 
     from . import pixiv_dl

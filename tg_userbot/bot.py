@@ -18,6 +18,7 @@ from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from telethon.utils import get_peer_id
 
+from .spawn import spawn
 from . import state
 from . import text as text_mod
 from . import manual_links
@@ -62,14 +63,19 @@ BOT_COMMANDS = (
     ("sh", "命令行：执行 shell 命令，如 /sh ls"),
     ("115x", "115 解压回传：/115x <115路径>；裸命令看状态"),
     ("wnacg", "wnacg 漫画：/wnacg <地址>，下载→115→自动解压"),
+    ("asmr", "ASMR 音声：/asmr <asmr-300链接|RJ号> [only 关键词]；裸命令看队列"),
     ("ehentai", "e-hentai 画廊：/ehentai <URL> [作者]，种子优先"),
     ("cmdq", "指令台账：/cmdq [成功|失败|待执行]（离线回放执行情况）"),
     ("now", "实时状态：/now 看系统现在在干什么"),
     ("health", "一键巡检：/health（连接/磁盘/队列/卡死）"),
     ("115dup", "115 全盘查重：/115dup scan|list|show|del；裸命令看最近结果"),
-    ("report", "运维报告传 115：/report [manual|failed|retry|queue|stats]"),
+    ("report", "运维报告传 115：/report [manual|failed|retry|queue|stats|chrome]"),
     ("115inv", "115 全量清单：/115inv scan [分钟]；裸命令看进度"),
     ("x", "X 作者作品下载：/x @作者；裸命令看已跟列表"),
+    ("bili", "B站视频/合集下载：/bili <BV号|链接|合集URL>；裸命令看状态"),
+    ("pd", "pixeldrain 下载：/pd <链接> [目录]；裸命令看任务"),
+    ("pdst", "pixeldrain 进度：/pdst [tag]；裸命令看全部"),
+    ("pdclean", "pixeldrain 清理云端中转：/pdclean <链接>"),
     ("dyu", "抖音作者批量：/dyu <主页链接> [子目录]"),
     ("pixiv", "Pixiv 画师下载：/pixiv <ID|用户名>；裸命令看已跟列表"),
     ("manual", "下载链路操作指引文档"),
@@ -134,6 +140,7 @@ BOT_COMMANDS = (
     ("botclean", "bot 对话自动清理开关：/botclean on|off"),
     ("cd2check", "CloudDrive2 备份对账：本地媒体 vs 115 远端"),
     ("cd2tasks", "CD2 上传任务：查看正在往 115 传输的文件"),
+    ("extract", "递归解压目录：/extract <子目录> [dry]"),
     ("cmdt_add", "保存命令模板：/cmdt_add 名字 命令"),
     ("cmdt_del", "删除命令模板：/cmdt_del 名字"),
     ("cmdt_run", "执行命令模板：/cmdt_run 名字"),
@@ -164,6 +171,7 @@ async def register_bot_commands(client):
 def _clear_input_states():
     """清掉全部输入窗口等待状态（open_input_window 与 ❌ 取消共用）。"""
     state.COOKIE_INPUT_UNTIL = 0.0
+    state.BILI_COOKIE_INPUT_UNTIL = 0.0
     state.FIND_INPUT_UNTIL = 0.0
     state.CAPTION_INPUT_UNTIL = 0.0
     state.CAPTION_INPUT_MODE = ""
@@ -200,14 +208,15 @@ def open_input_window(kind):
     给后者的文本吃掉——cookie 排最前、代价也最重（一段 Caption 规则或标签
     会被当成抖音 cookie 存进 tg_secrets.json）。
 
-    kind：\"cookie\" / \"find\" / \"add\"|\"del\"|\"test\"（Caption 清洗）
-    / \"listen_chat\"|\"listen_tag\"|\"listen_target\"（标签监听向导）
-    / \"wl_since\"（白名单回补）/ \"sqlt\"（新增 SQL 模板）
+    kind：\"cookie\" / \"bili_cookie\" / \"find\" / \"add\"|\"del\"|\"test\"
+    （Caption 清洗）/ \"listen_chat\"|\"listen_tag\"|\"listen_target\"
+    （标签监听向导）/ \"wl_since\"（白名单回补）/ \"sqlt\"（新增 SQL 模板）
     / \"sh\"（命令行：文本当命令执行）/ \"up\"（上传：文本当文件路径）
     / \"paw_search\"|\"paw_cookie\"|\"paw_post\"|\"paw_find\"（Pawchive：
     作者名 / Cookie / 帖子引用 / 查询关键词）。
     """
     state.COOKIE_INPUT_UNTIL = 0.0
+    state.BILI_COOKIE_INPUT_UNTIL = 0.0
     state.FIND_INPUT_UNTIL = 0.0
     state.CAPTION_INPUT_UNTIL = 0.0
     state.CAPTION_INPUT_MODE = ""
@@ -224,6 +233,10 @@ def open_input_window(kind):
     state.CMDT_INPUT_UNTIL = 0.0
     if kind == "cookie":
         state.COOKIE_INPUT_UNTIL = (
+            time.monotonic() + config.COOKIE_INPUT_WINDOW_SECONDS
+        )
+    elif kind == "bili_cookie":
+        state.BILI_COOKIE_INPUT_UNTIL = (
             time.monotonic() + config.COOKIE_INPUT_WINDOW_SECONDS
         )
     elif kind == "find":
@@ -503,7 +516,7 @@ async def handle_menu_action(action, arg, event):
     if action == "clearmsg":
         # 🗑 清程序消息：与 /clearmsg 同一套双入口甄别（bot 对话语境下
         # 清 bot 对话的程序消息）。清理约 1 分钟，先回执再后台干活
-        asyncio.create_task(commands.handle_command(event, "/clearmsg"))
+        spawn(commands.handle_command(event, "/clearmsg"), "/clearmsg 清理")
         return ("🧹 已开始清理本对话的程序消息（约 1 分钟，完成后逐条回报）",
                 menu.back_home_buttons())
     if action == "mlink_done":
@@ -819,6 +832,49 @@ async def handle_menu_action(action, arg, event):
             f"{sess}",
             menu.cookie_menu_buttons(),
         )
+    if action == "bili_cookie":
+        return menu.bili_cookie_status_text(), menu.bili_cookie_menu_buttons()
+    if action == "bili_cookie_set":
+        open_input_window("bili_cookie")
+        return (
+            "🌐 请直接发送 B站 cookie 内容（整段粘贴，发到本对话；"
+            "在已登录 bilibili.com 的浏览器 DevTools → Network 里复制"
+            "任意请求的 Cookie 请求头）。\n\n"
+            "⚠️ 你发的这条消息会被立即删除；"
+            f"{config.COOKIE_INPUT_WINDOW_SECONDS} 秒内有效，"
+            "超时请重新点【✏️ 更新】。发送 / 开头的命令可取消。",
+            input_cancel_buttons(),
+        )
+    if action == "bili_cookie_clear":
+        err = config.save_bilibili_cookie("")
+        if err:
+            return f"❌ {err}", menu.bili_cookie_menu_buttons()
+        return (
+            "🗑 已清除（实时生效，/bili 将以游客画质下载，最高 480P）",
+            menu.bili_cookie_menu_buttons(),
+        )
+    if action == "bili_cookie_imp":
+        # 读浏览器 Cookie 库可能等钥匙串授权框，放线程池，不阻塞事件循环
+        from . import browser_cookies
+        browser = (arg or "").strip().lower()
+        cookie, err = await asyncio.get_event_loop().run_in_executor(
+            None, browser_cookies.load_browser_cookie_string,
+            browser, "bilibili.com")
+        if err:
+            return f"❌ {err}", menu.bili_cookie_menu_buttons()
+        err = config.save_bilibili_cookie(cookie)
+        if err:
+            return f"❌ {err}", menu.bili_cookie_menu_buttons()
+        saved = config.BILIBILI_COOKIE
+        sess = ("含登录态 SESSDATA ✅" if "sessdata=" in saved.lower()
+                else "⚠️ 未检测到 SESSDATA（可能非登录态）")
+        return (
+            f"🌐 已从 {browser} 导入 B站 cookie 并实时生效\n\n"
+            f"长度：{len(saved)} 字符\n"
+            f"片段：{config.mask_douyin_cookie(saved)}\n"
+            f"{sess}",
+            menu.bili_cookie_menu_buttons(),
+        )
     if action == "queue":
         return queue.format_queue_text(state.QUEUE), menu.queue_menu_buttons()
     if action == "queue_del":
@@ -1001,6 +1057,15 @@ async def bot_message_handler(event):
             return
         state.COOKIE_INPUT_UNTIL = 0.0
 
+    # B站 cookie 等待窗口（与抖音同款互斥窗口；抖音的排最前代价也最重）
+    if (state.BILI_COOKIE_INPUT_UNTIL
+            and time.monotonic() < state.BILI_COOKIE_INPUT_UNTIL):
+        if not text.startswith("/"):
+            state.BILI_COOKIE_INPUT_UNTIL = 0.0
+            await _handle_bili_cookie_input(event, text)
+            return
+        state.BILI_COOKIE_INPUT_UNTIL = 0.0
+
     # 查询等待窗口：普通文本当作 /find 的关键字，执行后窗口即关。
     if state.FIND_INPUT_UNTIL and time.monotonic() < state.FIND_INPUT_UNTIL:
         if not text.startswith("/"):
@@ -1158,6 +1223,18 @@ async def bot_message_handler(event):
                   if extract_iwara_video_id(u)]
     if iwara_urls:
         from . import chrome_client
+        from . import iwara as iwara_mod
+        # URL 判重（2026-10-26 定档）：成功过才拦截；失败/取消不拦
+        _vid = extract_iwara_video_id(iwara_urls[0])
+        try:
+            _hit = iwara_mod.find_previous_success(_vid) if _vid else None
+        except Exception:
+            _hit = None
+        if _hit:
+            logger.info(f"⏭️ iwara 判重拦截（视频 {_vid}，首次成功 "
+                        f"{(_hit.get('notified_at') or '')[:16]}）")
+            await event.reply(iwara_mod.duplicate_text(_hit))
+            return
         out = await chrome_client.handle_chrome_command(
             event, "/chrome " + iwara_urls[0],
             owner_id=chrome_client.resolve_owner_id(state.MY_ID))
@@ -1186,6 +1263,20 @@ async def bot_message_handler(event):
         buf = io.BytesIO()
         await state.bot_client.download_media(message, out=buf)
         out = await torrent_offline.handle_torrent_bytes(buf.getvalue())
+        await _send_owner(out, menu.back_home_buttons())
+        return
+
+    # 站点链接自动识别（2026-11-05 owner 实测补：B站/X 只挂在收藏夹路由，
+    # bot 对话发裸链接曾直接落外链台账——配置同款 AUTOROUTE_* 可关）。
+    # 文本+链接混合形态（「标题 https://b23.tv/x」）由各自 auto_reply 抽取。
+    from . import bili_dl as _bili
+    from . import x_dl as _x_dl
+    if config.AUTOROUTE_BILI and _bili.looks_like_bili(text):
+        out = await _bili.auto_reply(text)
+        await _send_owner(out, menu.back_home_buttons())
+        return
+    if config.AUTOROUTE_X and _x_dl.looks_like_x(text):
+        out = await _x_dl.auto_reply(text)
         await _send_owner(out, menu.back_home_buttons())
         return
 
@@ -1495,6 +1586,34 @@ async def _handle_cookie_input(event, text):
     await state.bot_client.send_message(
         state.MY_ID,
         "✅ 抖音 Cookie 已更新，实时生效\n\n"
+        f"长度：{len(cookie)} 字符\n"
+        f"片段：{config.mask_douyin_cookie(cookie)}\n"
+        f"{sess}",
+    )
+
+
+async def _handle_bili_cookie_input(event, text):
+    """处理 B站 cookie 等待窗口内发来的文本（同款纪律：先删原文再存）。"""
+    try:
+        await event.delete()
+    except Exception as e:
+        logger.warning(f"删除 B站 cookie 消息失败（不影响保存）：{e}")
+
+    if not text:
+        await state.bot_client.send_message(state.MY_ID, "❌ 内容为空，已取消")
+        return
+
+    err = config.save_bilibili_cookie(text)
+    if err:
+        await state.bot_client.send_message(state.MY_ID, f"❌ 保存失败：{err}")
+        return
+
+    cookie = config.BILIBILI_COOKIE
+    sess = ("含登录态 SESSDATA ✅" if "sessdata=" in cookie.lower()
+            else "⚠️ 未检测到 SESSDATA（可能非登录态，画质最高 480P）")
+    await state.bot_client.send_message(
+        state.MY_ID,
+        "✅ B站 Cookie 已更新，实时生效\n\n"
         f"长度：{len(cookie)} 字符\n"
         f"片段：{config.mask_douyin_cookie(cookie)}\n"
         f"{sess}",

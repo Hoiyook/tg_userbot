@@ -116,6 +116,13 @@ async def _rate_limit_middleware(request, handler):
 # iwara/Chrome=chrome_tasks、台账=runtime_db），查询失败不影响返回。
 
 _PASTE_LOG_FILE = os.path.join(config.RUNTIME_DIR, "paste_log.jsonl")
+
+# ── PWA 静态资产（2026-11-02）────────────────────────────
+# manifest / SW / 图标 / 分享接收页必须**免鉴权可取**——PWA 安装与系统
+# 分享面板不携带令牌；页面内不含敏感信息，数据端点仍全部鉴权。
+_PWA_DIR = Path(__file__).with_name("pwa")
+_PWA_PUBLIC_PATHS = ("/manifest.json", "/sw.js", "/share",
+                     "/icons/icon-192.png", "/icons/icon-512.png")
 _PASTE_LOG_MAX = 500
 
 
@@ -163,6 +170,50 @@ def _paste_status(p):
     routed, ref, url = p.get("routed"), p.get("ref"), p.get("url")
     try:
         if routed == "tme":
+            # ref = JSON [[chat_id, msg_id], …]（v2.16 起写入）——
+            # 用 origin_chat_id/origin_msg_id 在当前队列里定位任务状态；
+            # 老记录无 ref → 静态文案
+            if not ref:
+                return "📥 已入队下载（t.me 帖）", "run"
+            try:
+                pairs = json.loads(ref)
+            except ValueError:
+                return "📥 已入队下载（t.me 帖）", "run"
+            q = state.QUEUE or {}
+            found = None
+            for r in (q.get("tasks") or []) + (q.get("retry") or []):
+                oc = r.get("origin_chat_id")
+                om = r.get("origin_msg_id")
+                for pair in pairs:
+                    if oc is not None and om is not None and \
+                            [oc, om] == list(pair):
+                        found = r
+                        break
+                if found:
+                    break
+            if found:
+                last_ev = None
+                for e in stats.load_events():
+                    if e.get("task_id") == found.get("id"):
+                        last_ev = e
+                ev = last_ev.get("ev") if last_ev else "QUEUED"
+                text, kind = _EVENTS_STATUS_VIEW.get(
+                    ev, (ev, "info"))
+                fname = found.get("final_name") or ""
+                if fname:
+                    text += f" · {fname[:40]}"
+                return text, kind
+            # 队列里没有（已完成的任务会被移除）→ 查历史/日志关键词
+            url_hint = (url or "").rsplit("/", 1)[-1]
+            if url_hint:
+                for e in stats.load_events():
+                    label = e.get("label") or ""
+                    if url_hint in label or e.get("task_id") == ref:
+                        text, kind = _EVENTS_STATUS_VIEW.get(
+                            e.get("ev"), ("已完成", "done"))
+                        return f"✅ 已完成 · {label[:40]}" if e.get("ev") == \
+                            "SUCCESS" else (text, kind)
+                return "✅ 已处理完成（已出队列）", "done"
             return "📥 已入队下载（t.me 帖）", "run"
         if routed in ("iwara", "iwara_dup"):
             # ① 有 ref → chrome 任务实时状态（排队/下载中/完成/失败）
@@ -237,7 +288,7 @@ async def handle_links(request):
         done_n = runtime_db.count_manual_links(status="DONE")
     except Exception as e:
         logger.exception(f"API 台账读取失败：{e}")
-        return _json({"ok": False, "error": f"读取失败：{e}"}, 500)
+        return _json({"ok": False, "error": "台账读取失败（详见服务端日志）"}, 500)
     rows = [{"id": r["id"], "url": r["url"], "host": r.get("host") or "",
              "note": r.get("note") or ""} for r in pending]
     return _json({"ok": True, "pending": rows, "done_count": done_n})
@@ -256,7 +307,7 @@ async def handle_links_done(request):
         ok = runtime_db.manual_link_done(int(link_id))
     except Exception as e:
         logger.exception(f"API 台账标记完成失败：{e}")
-        return _json({"ok": False, "error": f"标记失败：{e}"}, 500)
+        return _json({"ok": False, "error": "标记失败（详见服务端日志）"}, 500)
     return _json({"ok": bool(ok),
                   "message": "✅ 已标记完成" if ok else "ℹ️ 该条不存在或已不是待处理"})
 
@@ -331,7 +382,9 @@ def token_ok(request) -> bool:
 
 @web.middleware
 async def _auth_middleware(request, handler):
-    if not token_ok(request):
+    if request.path in _PWA_PUBLIC_PATHS:
+        pass                                   # PWA 静态资产免鉴权
+    elif not token_ok(request):
         return web.json_response(
             {"ok": False, "error": "令牌无效或缺失（Authorization: Bearer / "
                                    "X-Token 头 / ?token= 任选其一）"},
@@ -341,7 +394,9 @@ async def _auth_middleware(request, handler):
     # 访问留痕（2026-11-01 排查手机端可达性）：来源 IP + XFF（Funnel 代理
     # 会带手机出口 IP）+ 路径 + 状态码——用户「打不开」时一眼看出请求
     # 是否到达、卡在哪一层
-    logger.info(f"🌐 API {request.method} {request.path_qs} ← {request.remote}"
+    # 安全（2026-11-05 审计）：不记 path_qs——?token= 查询通道的令牌会
+    # 明文落日志；只记 path，query 是否带 token 一律不体现
+    logger.info(f"🌐 API {request.method} {request.path} ← {request.remote}"
                 f" xff={request.headers.get('X-Forwarded-For', '-')} → {resp.status}")
     return resp
 
@@ -396,6 +451,7 @@ def build_status() -> dict:
     try:
         from . import bili_dl as _bili
         bili = dict(getattr(_bili, "_BILI_RUNNING", {}) or {})
+        bili["pending"] = _bili.bili_pending_list()   # DB 队列 PENDING 行
     except Exception:
         bili = {}
     try:
@@ -570,8 +626,7 @@ async def handle_enqueue(request):
                                "链接可能已部分受理，请看控制面板通知"}, 504)
     except Exception as e:
         logger.exception(f"API 链接分流异常：{e}")
-        return _json({"ok": False, "error": f"处理失败：{type(e).__name__}: {e}"},
-                     500)
+        return _json({"ok": False, "error": "处理失败（详见服务端日志）"}, 500)
     return _json(result, 200 if result.get("ok") else 400)
 
 
@@ -691,9 +746,65 @@ async def handle_action(request):
     except Exception as e:
         logger.exception(f"API 动作 {name} 执行异常：{e}")
         return _json({"ok": False,
-                      "error": f"动作执行失败：{type(e).__name__}: {e}"}, 500)
+                      "error": "动作执行失败（详见服务端日志）"}, 500)
     # 白名单新增了键却没写分支时绝不返回 None（aiohttp 会 500）
     return _json({"ok": False, "error": f"动作 {name} 尚未实现"}, 500)
+
+
+async def handle_queues(request):
+    """全部下载队列聚合摘要（2026-11-05 统一队列·读侧 union）。
+
+    主媒体队列走内存 state.QUEUE；各 worker 域走 runtime_db（bili/wnacg/
+    asmr/extract）。任一域读取失败只降级该域（error 字段），不影响其它。
+    """
+    out = []
+
+    # ① 主媒体队列（内存）
+    try:
+        from . import state as _state
+        async with _state.QUEUE_LOCK:
+            tasks = list(_state.QUEUE.get("tasks", []))
+            retry = list(_state.QUEUE.get("retry", []))
+        out.append({"name": "媒体队列", "emoji": "📥",
+                    "pending": len(tasks), "retry": len(retry),
+                    "running": len([r for r in tasks
+                                    if r.get("status") == "downloading"]),
+                    "items": [f"{r.get('platform', '?')}:{str(r.get('name') or r.get('url') or '')[:36]}"
+                              for r in tasks[:5]]})
+    except Exception as e:
+        out.append({"name": "媒体队列", "emoji": "📥", "error": str(e)[:80]})
+
+    # ② bili（DB）
+    try:
+        from . import runtime_db
+        d = runtime_db.BILI_TASKS
+        out.append({"name": "B站", "emoji": "📺",
+                    "pending": d.count(status="PENDING"),
+                    "running": d.count(status="PROCESSING"),
+                    "failed": d.count(status="FAILED"),
+                    "items": [(r.get("label") or r["url"])[:36]
+                              for r in d.list(status="PENDING", limit=5)]})
+    except Exception as e:
+        out.append({"name": "B站", "emoji": "📺", "error": str(e)[:80]})
+
+    # ③④ wnacg / asmr（DB 域）
+    for name, emoji, fn in (("wnacg 漫画", "📖", "list_wnacg_tasks"),
+                            ("asmr 音声", "🎧", "list_asmr_tasks")):
+        try:
+            from . import runtime_db
+            rows = getattr(runtime_db, fn)(limit=200)
+            from collections import Counter
+            counts = Counter(r["status"] for r in rows)
+            out.append({"name": name, "emoji": emoji,
+                        "pending": counts.get("PENDING", 0),
+                        "running": counts.get("PROCESSING", 0),
+                        "failed": counts.get("FAILED", 0),
+                        "items": [str(r.get("title") or r.get("aid") or r.get("rj"))[:36]
+                                  for r in rows[:5]]})
+        except Exception as e:
+            out.append({"name": name, "emoji": emoji, "error": str(e)[:80]})
+
+    return _json({"ok": True, "queues": out})
 
 
 async def handle_stats(request):
@@ -707,7 +818,7 @@ async def handle_stats(request):
         text = stats.stats_text(days)
     except Exception as e:
         logger.exception(f"API 台账渲染失败：{e}")
-        return _json({"ok": False, "error": f"台账渲染失败：{e}"}, 500)
+        return _json({"ok": False, "error": "台账渲染失败（详见服务端日志）"}, 500)
     return _json({"ok": True, "days": days, "text": text})
 
 
@@ -721,7 +832,7 @@ async def handle_find(request):
         text = finder.find_media(q)
     except Exception as e:
         logger.exception(f"API find 查询失败：{e}")
-        return _json({"ok": False, "error": f"查询失败：{e}"}, 500)
+        return _json({"ok": False, "error": "查询失败（详见服务端日志）"}, 500)
     return _json({"ok": True, "q": q, "text": text})
 
 
@@ -748,12 +859,12 @@ async def handle_backup(request):
         total, files = await asyncio.wait_for(
             asyncio.to_thread(cd2_api.upload_files_summary, 10), timeout=30)
     except RuntimeError as e:
-        return _json({"ok": False, "error": f"CD2 不可达：{e}"})
+        return _json({"ok": False, "error": f"CD2 不可达：{e}"}, 503)
     except asyncio.TimeoutError:
-        return _json({"ok": False, "error": "CD2 查询超时（30s）——稍后再试"})
+        return _json({"ok": False, "error": "CD2 查询超时（30s）——稍后再试"}, 504)
     except Exception as e:
         logger.exception(f"API backup 查询失败：{e}")
-        return _json({"ok": False, "error": f"查询失败：{type(e).__name__}: {e}"}, 500)
+        return _json({"ok": False, "error": "查询失败（详见服务端日志）"}, 500)
     try:
         counts = await asyncio.wait_for(
             asyncio.to_thread(cd2_api.tasks_count), timeout=30)
@@ -766,13 +877,44 @@ async def handle_backup(request):
                   "tasks": tasks})
 
 
+_PWA_FILES = {
+    "manifest.json": ("manifest.json", "application/manifest+json"),
+    "sw.js": ("sw.js", "application/javascript"),
+    "icon-192.png": ("icons/icon-192.png", "image/png"),
+    "icon-512.png": ("icons/icon-512.png", "image/png"),
+}
+
+
+async def handle_pwa_file(request):
+    """PWA 静态文件（manifest/sw/icons），免鉴权可取（白名单硬编码）。"""
+    name = os.path.basename(request.path)
+    if name not in _PWA_FILES:
+        return _json({"ok": False, "error": "not found"}, 404)
+    path = _PWA_DIR / _PWA_FILES[name][0]
+    if not path.is_file():
+        return _json({"ok": False, "error": f"缺失: {name}"}, 404)
+    ctype = _PWA_FILES[name][1]
+    if ctype.startswith("image/"):
+        return web.Response(body=path.read_bytes(), content_type=ctype)
+    return web.Response(text=path.read_text(encoding="utf-8"),
+                        content_type=ctype)
+
+
+async def handle_share_page(request):
+    """分享接收页：系统分享面板 → PWA share_target 落地。"""
+    path = _PWA_DIR / "share.html"
+    return web.Response(text=path.read_text(encoding="utf-8"),
+                        content_type="text/html", charset="utf-8")
+
+
 async def handle_history(request):
     try:
         n = int(request.query.get("n", 20))
     except ValueError:
         n = 20
     n = max(1, min(n, 200))
-    lines = history.get_history_lines(n)
+    kind = (request.query.get("kind") or "").strip() or None
+    lines = history.get_history_lines(n, kind=kind)
     return _json({"ok": True, "lines": lines})
 
 
@@ -785,6 +927,17 @@ async def handle_paw_schedule(request):
         logger.exception(f"API 回填计划渲染失败：{e}")
         return _json({"ok": False, "error": f"回填计划渲染失败：{e}"}, 500)
     return _json({"ok": True, "text": text})
+
+
+async def handle_paw_backfill(request):
+    """回填执行情况三段式：当前状态 / 下一批作者 / 历史轮次记录。"""
+    from . import pawchive
+    try:
+        data = pawchive.backfill_status_overview()
+    except Exception as e:
+        logger.exception(f"API 回填执行情况读取失败：{e}")
+        return _json({"ok": False, "error": f"读取失败：{e}"}, 500)
+    return _json({"ok": True, **data})
 
 
 # ── 指令中心（2026-11-01）：全部指令的无头执行 ───────────────
@@ -856,6 +1009,45 @@ _GROUP_ORDER = ("📊 监控与查询", "📺 平台下载", "📥 下载与队�
                 "☁️ CD2 与 115")
 
 
+async def handle_pd_status(request):
+    """pixeldrain 进度：?tag= 单任务；缺省全部任务。薄封装 pd_daemon。"""
+    from . import pd_dl
+    tag = request.query.get("tag") or None
+    return _json(pd_dl.api_status(tag))
+
+
+async def handle_pd_jobs(request):
+    """pixeldrain 任务列表（含进程存活）。"""
+    from . import pd_dl
+    return _json(pd_dl.api_jobs())
+
+
+async def handle_pd_start(request):
+    """启动 pixeldrain 下载：body {"link": "...", "dest": "可选"}。"""
+    from . import pd_dl
+    try:
+        body = await request.json()
+    except Exception:
+        return _json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+    link = str(body.get("link") or "").strip()
+    if not link:
+        return _json({"ok": False, "error": "缺少 link"}, 400)
+    return _json(pd_dl.api_start(link, body.get("dest") or None))
+
+
+async def handle_pd_clean(request):
+    """清理 pixeldrain 云端中转：body {"link": "..."}。"""
+    from . import pd_dl
+    try:
+        body = await request.json()
+    except Exception:
+        return _json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+    link = str(body.get("link") or "").strip()
+    if not link:
+        return _json({"ok": False, "error": "缺少 link"}, 400)
+    return _json(pd_dl.api_clean(link))
+
+
 async def handle_commands_registry(request):
     """指令中心的面板数据：分组 + 每条指令的用法说明（bot 注册表同源）。"""
     safe = _safe_command_names()
@@ -922,8 +1114,7 @@ async def handle_cmd(request):
                                "结果看控制面板通知"}, 504)
     except Exception as e:
         logger.exception(f"API 指令执行失败：{cmd[:60]}")
-        return _json({"ok": False, "error": f"执行失败：{type(e).__name__}: {e}"},
-                     500)
+        return _json({"ok": False, "error": "执行失败（详见服务端日志）"}, 500)
     if not handled:
         return _json({"ok": False, "error": f"未识别的指令：/{head}"}, 400)
     text = "\n\n".join(r for r in ev.replies if r).strip()
@@ -933,24 +1124,37 @@ async def handle_cmd(request):
 
 def make_app() -> web.Application:
     """组装 aiohttp 应用（独立出来便于测试注入）。"""
-    app = web.Application(middlewares=[_auth_middleware, _rate_limit_middleware],
+    # 限流在最外层（2026-11-05 审计）：此前鉴权在外，未带 token 的请求
+    # 不限流且每条写一行 INFO（Funnel 暴露面被刷日志）
+    app = web.Application(middlewares=[_rate_limit_middleware, _auth_middleware],
                           client_max_size=1024 * 1024)
     app.add_routes([
         web.get("/", handle_dashboard),
         web.get("/api/status", handle_status),
         web.get("/api/stats", handle_stats),
+        web.get("/api/queues", handle_queues),
         web.get("/api/find", handle_find),
         web.get("/api/chrome", handle_chrome),
         web.get("/api/backup", handle_backup),
+        web.get("/share", handle_share_page),
+        web.get("/manifest.json", handle_pwa_file),
+        web.get("/sw.js", handle_pwa_file),
+        web.get("/icons/icon-192.png", handle_pwa_file),
+        web.get("/icons/icon-512.png", handle_pwa_file),
         web.get("/api/pastes", handle_pastes),
         web.get("/api/links", handle_links),
         web.post("/api/links_done", handle_links_done),
         web.get("/api/commands", handle_commands_registry),
+        web.get("/api/pd/status", handle_pd_status),
+        web.get("/api/pd/jobs", handle_pd_jobs),
+        web.post("/api/pd/start", handle_pd_start),
+        web.post("/api/pd/clean", handle_pd_clean),
         web.post("/api/cmd", handle_cmd),
         web.post("/api/enqueue", handle_enqueue),
         web.post("/api/action/{name}", handle_action),
         web.get("/api/history", handle_history),
         web.get("/api/paw_schedule", handle_paw_schedule),
+        web.get("/api/paw_backfill", handle_paw_backfill),
     ])
     return app
 

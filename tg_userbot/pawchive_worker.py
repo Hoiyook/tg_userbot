@@ -283,11 +283,29 @@ def _extract_archive_sync(archive_path):
     2026-09-30 起委托 extract_util.extract_archive（共享给 115 解压回传）：
     本场景 dest=同名目录、成功即删压缩包（与原行为逐字一致）；成功/失败
     判定、加密检测、炸弹守卫、staging 改名全部收在 extract_util 一处。
+
+    密码候选链（2026-11-03，与 /extract、/115x 同一条链）：password 状态
+    时用 extract_dir.password_candidates 逐个重试（bsdtar 路支持
+    ZipCrypto/AES）——X锥类来源的「密码zxc.txt」/ 文件名 # 段自动命中。
     """
     from .extract_util import extract_archive
+    from .extract_dir import password_candidates
     status, detail, _files = extract_archive(
         archive_path, dest=_archive_dest(archive_path), delete_source=True)
-    return status, detail
+    if status != "password":
+        return status, detail
+    # extra=帖子目录名（/115x 同款：目录名常带密码提示，2026-11-05 审计补齐）
+    extra = os.path.basename(_archive_dest(archive_path).rstrip("/"))
+    for pwd in password_candidates(archive_path, extra=extra):
+        logger.info(f"🗜 需密码，尝试候选「{pwd[:16]}」")
+        status, detail, _files = extract_archive(
+            archive_path, dest=_archive_dest(archive_path),
+            delete_source=True, password=pwd)
+        if status == "extracted":
+            detail = f"（用密码 {pwd[:16]}）{detail}"
+            return status, detail
+    return "password", (f"候选 {'、'.join(c[:16] for c in password_candidates(archive_path))}"
+                        " 均失败")
 
 
 
@@ -579,15 +597,17 @@ async def _download_post_files(post, files):
                 # 成功后删压缩包；解压产物随 CD2 一并备份到 115
                 fname_l = (f["filename"] or "").lower()
                 if (config.PAWCHIVE_EXTRACT_ARCHIVES
-                        and fname_l.endswith((".zip", ".rar"))):
+                        and fname_l.endswith((".zip", ".rar", ".7z"))):
                     target = _target_path(post, f["filename"])
                     try:
                         est, detail = await _extract_archive_serial(target)
                         if est in ("extracted", "extracted_timeout"):
                             logger.info(
                                 f"🗜 解压完成：{f['filename']} → {detail}")
+                        elif est == "password":
                             logger.info(
-                                f"🗜 压缩包需密码，保留原样：{f['filename']}")
+                                f"🗜 压缩包需密码（候选均失败），"
+                                f"保留原样：{f['filename']}")
                         else:
                             logger.warning(
                                 f"🗜 解压未完成（{est}），压缩包保留："
@@ -1040,21 +1060,19 @@ async def _auto_requeue_429():
         logger.error(f"🐾 429 自动重投扫描失败（本轮跳过）：{e}")
         return 0
     targets = []
+    skipped_over_limit = 0
     for p in rows:
-        dbg_files = runtime_db.list_pawchive_files(p["id"])
-        logger.warning(
-            f"DBG sweep: #{p['id']} attempts={p.get('attempts')} "
-            f"files={[(f['status'], f.get('error')) for f in dbg_files]}")
         if int(p.get("attempts") or 0) > int(
                 config.PAWCHIVE_429_AUTO_RETRY_MAX_ATTEMPTS):
-            logger.warning("DBG sweep: 跳过（超限）")
+            skipped_over_limit += 1
             continue
         if _is_429_only_failure(p):
-            logger.warning(f"DBG sweep: 命中 target #{p['id']}")
             targets.append(p["id"])
-    if not targets:
-        logger.warning("DBG sweep: 无 target")
-        return 0
+    # 降噪（2026-10-29）：逐帖明细是排障期临时日志，每 15 分钟 warning
+    # 一遍刷屏——降为汇总一行；要明细走 /paw_fail 与 115 报告
+    logger.info(
+        f"🐾 429 自动重投扫描：FAILED {len(rows)}｜命中 {len(targets)}｜"
+        f"超限跳过 {skipped_over_limit}")
     requeued = runtime_db.retry_pawchive_posts(row_ids=targets)
     if requeued:
         logger.info(

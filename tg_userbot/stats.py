@@ -524,7 +524,79 @@ def _event_text(events, days, today, log_path, history_path):
         f" + 最终失败 {s['failed_final']} + 移除 {s['removed']}"
         f" + 拦截 {s['dedup_hit']} + 进行中 {s['active']}{tail}",
     ]
+    lines += _channels_lines(today)
     return "\n".join(lines)
+
+
+def _channels_lines(today=None):
+    """🌐 下载渠道段（2026-11-05 owner：台账覆盖各下载渠道）。
+
+    各 DB 队列域（B站/X/Pixiv/wnacg/asmr）计数 + 今日完成；iwara 经
+    Chrome，行内只给当前在途（从 chrome_tasks 数）。任一域读取失败
+    降级为「-」，不影响整段台账。"""
+    import datetime as _dt
+    day_start = int(_dt.datetime.combine(
+        today or _dt.date.today(), _dt.time.min).timestamp())
+    lines = ["", "🌐 下载渠道"]
+
+    def _fmt(pending, running, failed, done_today):
+        bits = []
+        if running:
+            bits.append(f"在途 {running}")
+        bits.append(f"排队 {pending}")
+        if failed:
+            bits.append(f"失败 {failed}")
+        bits.append(f"今日完成 {done_today}")
+        return "｜".join(bits)
+
+    try:
+        from . import runtime_db
+        for name, dom, emoji in (("B站", runtime_db.BILI_TASKS, "📺"),
+                                 ("X", runtime_db.XN_TASKS, "🐦"),
+                                 ("Pixiv", runtime_db.XI_TASKS, "🎨")):
+            try:
+                txt = _fmt(dom.count(status="PENDING"),
+                           dom.count(status="PROCESSING"),
+                           dom.count(status="FAILED"),
+                           dom.count_since("DONE", day_start))
+                lines.append(emoji + " " + name + "：" + txt)
+            except Exception as e:
+                lines.append(f"{emoji} {name}：-（{str(e)[:30]}）")
+        try:
+            wn = runtime_db.list_wnacg_tasks(limit=500)
+            from collections import Counter
+            c = Counter(r["status"] for r in wn)
+            done_today = sum(1 for r in wn if r["status"] == "DONE"
+                             and (r.get("updated_at") or 0) >= day_start)
+            lines.append("📖 wnacg：" + _fmt(
+                c.get("PENDING", 0), c.get("PROCESSING", 0),
+                c.get("FAILED", 0), done_today))
+        except Exception as e:
+            lines.append(f"📖 wnacg：-（{str(e)[:30]}）")
+        try:
+            am = runtime_db.list_asmr_tasks(limit=500)
+            from collections import Counter
+            c = Counter(r["status"] for r in am)
+            done_today = sum(1 for r in am if r["status"] == "DONE"
+                             and (r.get("updated_at") or 0) >= day_start)
+            lines.append("🎧 asmr：" + _fmt(
+                c.get("PENDING", 0), c.get("PROCESSING", 0),
+                c.get("FAILED", 0), done_today))
+        except Exception as e:
+            lines.append(f"🎧 asmr：-（{str(e)[:30]}）")
+        try:
+            from . import chrome_client
+            tasks = chrome_client.chrome_agent.load_tasks(
+                chrome_client.CHROME_TASKS_FILE)
+            iw = [t for t in tasks
+                  if t.get("status") not in chrome_client.chrome_agent
+                  .TERMINAL_STATUSES]
+            lines.append(f"🛰 iwara（Chrome）：在途 {len(iw)}")
+        except Exception as e:
+            lines.append(f"🛰 iwara（Chrome）：-（{str(e)[:30]}）")
+    except Exception as e:
+        lines.append(f"（渠道段读取失败：{str(e)[:50]}）")
+    return lines
 
 
 def _header(days, today):

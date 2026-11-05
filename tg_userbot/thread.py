@@ -10,6 +10,7 @@ import json
 import re
 import asyncio
 
+from .spawn import spawn
 from . import state
 from . import workers
 from .config import (
@@ -67,7 +68,7 @@ def apply_thread_limit(value):
     state.DOWNLOAD_WORKER_TARGET = n
     if state.DOWNLOAD_WORKER_QUEUE is not None:
         try:
-            asyncio.create_task(workers.sync_pool_to_target())
+            spawn(workers.sync_pool_to_target(), "下载 worker 扩缩容")
         except Exception as e:
             logger.warning(f"调度下载 worker 扩缩容失败：{e}")
     save_thread_config(n)

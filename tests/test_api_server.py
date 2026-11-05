@@ -15,9 +15,11 @@
 import asyncio
 import atexit
 import json
+import atexit as _atexit
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -31,8 +33,18 @@ from tg_userbot import config as _cfg  # noqa: E402
 # 本机启用本地 API 后真实 tg_secrets.json 带 api.token——不抹掉的话，
 # 未显式 patch token 的用例全撞 401。只动 API 相关配置（进程内），
 # 不动 TG_SECRETS_FILE：cd2/ops_report 等测试要读真实 secrets 的 cd2 段。
+# 泄漏修复（2026-11-05 审计）：保存原值，atexit 恢复——此前模块级直接
+# 覆盖永不恢复，按字母序污染后续测试文件（config 全局被改）。
 _cfg.API_TOKEN = ""
 _cfg.API_ENABLED = False
+_ORIG_API_TOKEN = _cfg.API_TOKEN
+_ORIG_API_ENABLED = _cfg.API_ENABLED
+
+
+@_atexit.register
+def _restore_api_config():
+    _cfg.API_TOKEN = _ORIG_API_TOKEN
+    _cfg.API_ENABLED = _ORIG_API_ENABLED
 
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 
@@ -40,6 +52,7 @@ from tg_userbot import api_server  # noqa: E402
 from tg_userbot import config  # noqa: E402
 from tg_userbot import state  # noqa: E402
 from tg_userbot import chrome_agent  # noqa: E402
+from tg_userbot import pawchive  # noqa: E402
 from tg_userbot import runtime_db as runtime_db_mod  # noqa: E402
 
 
@@ -372,7 +385,19 @@ class HistoryAndDashboardTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await client.close()
         self.assertEqual(data["lines"], ["a | b"])
-        gh.assert_called_once_with(5)
+        gh.assert_called_once_with(5, kind=None)
+        # kind 过滤透传（渠道分类，2026-11-05）
+        with mock.patch.object(history, "get_history_lines",
+                               return_value=["x | B站"]) as gh2:
+            client = make_client()
+            await client.start_server()
+            try:
+                data = await (await client.get(
+                    "/api/history?n=5&kind=B%E7%AB%99")).json()
+            finally:
+                await client.close()
+        self.assertEqual(data["lines"], ["x | B站"])
+        gh2.assert_called_once_with(5, kind="B站")
 
     async def test_dashboard_html_served(self):
         client = make_client()
@@ -690,7 +715,9 @@ class ActionV2Test(unittest.IsolatedAsyncioTestCase):
             finally:
                 await client.close()
         self.assertFalse(data["ok"])
-        self.assertIn("炸了", data["error"])
+        # 2026-11-05 审计修复：内部异常细节不再外泄（原断言 assertIn("炸了")）
+        self.assertIn("详见服务端日志", data["error"])
+        self.assertNotIn("炸了", data["error"])
 
 
 class RateLimitTest(unittest.TestCase):
@@ -1066,5 +1093,257 @@ class LinksEndpointsTest(unittest.IsolatedAsyncioTestCase):
             resp = await client.post("/api/links_done",
                                      data=json.dumps({"id": "abc"}))
             self.assertEqual(resp.status, 400)
+        finally:
+            await client.close()
+
+
+class PwaAssetsTest(unittest.IsolatedAsyncioTestCase):
+    """PWA 资产路由：manifest/SW/图标/分享页——免鉴权可取（安装与分享面板不带令牌）。"""
+
+    async def test_manifest_served_without_auth(self):
+        client = make_client()
+        await client.start_server()
+        try:
+            resp = await client.get("/manifest.json")
+            self.assertEqual(resp.status, 200)
+            data = await resp.json()
+            self.assertEqual(data["name"], "TG Userbot 控制台")
+            self.assertIn("share_target", data)
+            self.assertEqual(data["share_target"]["action"], "/share")
+        finally:
+            await client.close()
+
+    async def test_sw_and_icons_served(self):
+        client = make_client()
+        await client.start_server()
+        try:
+            sw = await client.get("/sw.js")
+            self.assertEqual(sw.status, 200)
+            self.assertIn("javascript", sw.headers["Content-Type"])
+            icon = await client.get("/icons/icon-192.png")
+            self.assertEqual(icon.status, 200)
+            self.assertEqual(icon.headers["Content-Type"], "image/png")
+            body = await icon.read()
+            self.assertEqual(body[:4], b"\x89PNG")
+        finally:
+            await client.close()
+
+    async def test_share_page_renders(self):
+        client = make_client()
+        await client.start_server()
+        try:
+            resp = await client.get("/share?text=hello&url=https://x.com/a")
+            self.assertEqual(resp.status, 200)
+            body = await resp.text()
+            self.assertIn("分享到下载器", body)
+            self.assertIn("加入下载队列", body)
+        finally:
+            await client.close()
+
+
+class PawBackfillEndpointTest(unittest.IsolatedAsyncioTestCase):
+    """/api/paw_backfill：三段式数据源（当前/下一批/历史）全 mock。"""
+
+    async def test_overview_shape(self):
+        from tg_userbot import pawchive
+        overview = {
+            "current": {"cursor": 1, "total_creators": 38,
+                        "loop_started": "11-02 00:00", "full_round_h": 72,
+                        "per_round": 3, "wake_hours": 6},
+            "next_batch": [{"name": "作者A", "posts": 20,
+                            "eta": "11-03 00:00", "overdue": True}],
+            "history": [{"ts": 1793800000, "author_count": 3,
+                         "summary": "🐾 本轮 3 作者", "cursor": 1}],
+        }
+        with mock.patch.object(pawchive, "backfill_status_overview",
+                               return_value=overview):
+            client = make_client()
+            await client.start_server()
+            try:
+                data = await (await client.get("/api/paw_backfill")).json()
+            finally:
+                await client.close()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["current"]["total_creators"], 38)
+        self.assertEqual(data["next_batch"][0]["name"], "作者A")
+        self.assertEqual(len(data["history"]), 1)
+
+    async def test_overview_error_500(self):
+        from tg_userbot import pawchive
+        with mock.patch.object(pawchive, "backfill_status_overview",
+                               side_effect=RuntimeError("炸了")):
+            client = make_client()
+            await client.start_server()
+            try:
+                resp = await client.get("/api/paw_backfill")
+                self.assertEqual(resp.status, 500)
+                data = await resp.json()
+            finally:
+                await client.close()
+        self.assertIn("炸了", data["error"])
+
+    def test_history_log_and_read(self):
+        d = tempfile.mkdtemp()
+        orig = pawchive.PAWB_HISTORY_FILE
+        pawchive.PAWB_HISTORY_FILE = os.path.join(d, "h.jsonl")
+        try:
+            pawchive.log_backfill_round(3, "本轮 3 作者", 4)
+            pawchive.log_backfill_round(1, "让位人工扫描", 4)
+            items = pawchive.read_backfill_history(10)
+            self.assertEqual(len(items), 2)
+            self.assertEqual(items[0]["summary"], "让位人工扫描")  # 新→旧
+            self.assertEqual(items[1]["author_count"], 3)
+        finally:
+            pawchive.PAWB_HISTORY_FILE = orig
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class PawBackfillDeferredTest(unittest.TestCase):
+    """顺延判定与重启快醒：状态概览的 last_run_at/deferred 语义。"""
+
+    def _overview(self, history, overdue_first=True):
+        d = tempfile.mkdtemp(dir=_TMP)
+        orig_file = pawchive.PAWB_HISTORY_FILE
+        pawchive.PAWB_HISTORY_FILE = os.path.join(d, "h.jsonl")
+        try:
+            for ts, summary in history:
+                pawchive.log_backfill_round(1, summary, 0)
+                # 覆写 ts 为指定值（log 用当前时间）
+                lines = open(pawchive.PAWB_HISTORY_FILE,
+                             encoding="utf-8").readlines()
+                e = json.loads(lines[-1])
+                e["ts"] = ts
+                lines[-1] = json.dumps(e, ensure_ascii=False) + "\n"
+                open(pawchive.PAWB_HISTORY_FILE, "w",
+                     encoding="utf-8").writelines(lines)
+            with mock.patch.object(pawchive, "list_scanned_creators",
+                                   return_value=[{"creator_name": "A",
+                                                  "posts": 5}]), \
+                 mock.patch.object(
+                     pawchive, "_load_pawb_state",
+                     return_value={"cursor": 0,
+                                   # loop started 13h ago: first wake
+                                   # (6h) already overdue
+                                   "loop_started": 1793900000.0
+                                   - 13 * 3600}), \
+                 mock.patch.object(pawchive.time, "time",
+                                   return_value=1793900000.0):
+                return pawchive.backfill_status_overview()
+        finally:
+            pawchive.PAWB_HISTORY_FILE = orig_file
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_deferred_when_overdue_and_no_recent_run(self):
+        # 首批逾期 7h，且历史里最近执行也在 7h 前 → deferred=True
+        now = 1793900000.0
+        ov = self._overview([(now - 7 * 3600, "旧一轮")])
+        self.assertTrue(ov["current"]["deferred"])
+        self.assertTrue(ov["current"]["last_run_at"])
+
+    def test_not_deferred_when_recently_ran(self):
+        # 6h 内有实际执行 → 不算顺延（正常节奏内）
+        now = 1793900000.0
+        ov = self._overview([(now - 2 * 3600, "刚跑过一轮")])
+        self.assertFalse(ov["current"]["deferred"])
+
+    def test_not_deferred_when_not_overdue(self):
+        # 预计时间在未来（next_batch overdue=False）→ 不算顺延
+        now = 1793900000.0
+        ov = self._overview([(now - 30 * 60, "刚跑过一轮")])
+        # _load_pawb_state loop_started=0 → started 兜底 now（被 mock 为
+        # 固定值）→ eta = now+6h，未逾期
+        self.assertFalse(ov["current"]["deferred"])
+
+
+class TmePasteStatusTest(unittest.TestCase):
+    """t.me 粘贴历史状态回查：ref 定位队列任务 + 无 ref 兼容。"""
+
+    def test_resolve_via_queue_record(self):
+        import json as _json
+        from tg_userbot import stats
+        pairs = [[-1001234, 500]]
+        ref = _json.dumps(pairs)
+        queue = {"tasks": [], "retry": [{
+            "id": "abc123", "origin_chat_id": -1001234,
+            "origin_msg_id": 500, "final_name": "24-11-03 帖子视频.mp4"}]}
+        events = [{"task_id": "abc123", "ev": "RUNNING"}]
+        with mock.patch.object(state, "QUEUE", queue), \
+             mock.patch.object(api_server.stats, "load_events",
+                               return_value=events):
+            text, kind = api_server._paste_status(
+                {"routed": "tme", "ref": ref, "url": "https://t.me/x/500"})
+        self.assertEqual(kind, "run")
+        self.assertIn("下载中", text)
+        self.assertIn("帖子视频", text)
+
+    def test_completed_task_reports_done(self):
+        import json as _json
+        ref = _json.dumps([[-1001234, 500]])
+        queue = {"tasks": [], "retry": []}   # 已完成出队
+        events = [{"task_id": "abc", "ev": "SUCCESS", "label": "视频.mp4"}]
+        with mock.patch.object(state, "QUEUE", queue), \
+             mock.patch.object(api_server.stats, "load_events",
+                               return_value=events):
+            text, kind = api_server._paste_status(
+                {"routed": "tme", "ref": ref, "url": "https://t.me/x/500"})
+        self.assertEqual(kind, "done")
+
+    def test_no_ref_static_fallback(self):
+        text, kind = api_server._paste_status(
+            {"routed": "tme", "ref": None, "url": "https://t.me/x/1"})
+        self.assertEqual(kind, "run")
+        self.assertIn("已入队", text)
+
+    def test_enqueue_callback_collects_pairs(self):
+        # tme 分支：入队回调把 (chat_id, msg_id) 收进 ref（JSON）
+        import asyncio
+        from tg_userbot import tme as tme_mod
+        collected = []
+
+        async def fake_enqueue(msg):
+            collected.append(msg)
+
+        async def fake_fetcher(ref, ids=None):
+            class M:
+                id = 500
+                chat_id = -1001234
+                grouped_id = None
+            return M()
+
+        # fetcher 签名是 (ref, ids=...)——handle_tme_url 用 ids=mid 调用；
+        # 上面定义已匹配。失败原因：无 grouped_id 时走单条路，ok。
+
+        # is_downloadable 需要 True——mock 掉
+        with mock.patch("tg_userbot.sources.is_downloadable",
+                        return_value=True), \
+             mock.patch.object(tme_mod, "_channel_title",
+                               return_value="测试频道"):
+            out = asyncio.run(tme_mod.handle_tme_url(
+                "https://t.me/channame/500", fetcher=fake_fetcher,
+                enqueue=fake_enqueue, on_enqueued=collected.append))
+        self.assertIn("已入队", out)
+        # enqueue 与 on_enqueued 各触发一次（同一条 msg）→ collected 2 条
+        self.assertEqual(len(collected), 2)
+        self.assertEqual(collected[0].chat_id, -1001234)
+
+
+class QueuesAggregateTest(unittest.IsolatedAsyncioTestCase):
+    """/api/queues 聚合：各域摘要 + 单域降级不影响其它。"""
+
+    async def test_aggregate_shape_and_degradation(self):
+        client = make_client()
+        await client.start_server()
+        try:
+            resp = await client.get("/api/queues")
+            data = await resp.json()
+            self.assertEqual(resp.status, 200)
+            self.assertTrue(data["ok"])
+            names = [q["name"] for q in data["queues"]]
+            self.assertIn("媒体队列", names)
+            self.assertIn("B站", names)
+            self.assertIn("wnacg 漫画", names)
+            # 每个域要么带计数要么带 error（降级不崩）
+            for q in data["queues"]:
+                self.assertTrue("error" in q or "pending" in q)
         finally:
             await client.close()

@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#2563eb">
+<link rel="apple-touch-icon" href="/icons/icon-192.png">
 <title>TG Userbot 控制台</title>
 <style>
   :root {
@@ -157,7 +160,7 @@
   <section class="page on" id="p-home">
     <div class="sticky">
       <div class="chips">
-        <span class="chip" onclick="location.reload()">🔃 刷新页面</span>
+        <span class="chip" onclick="refreshAll()">🔃 刷新数据</span>
         <span class="chip" onclick="act('health')">🩺 巡检</span>
         <span class="chip" onclick="act('now')">ℹ️ 在干嘛</span>
       </div>
@@ -196,6 +199,8 @@
 
   <!-- ── 队列 ─────────────────────────── -->
   <section class="page" id="p-queue">
+    <h2>全部队列</h2>
+    <div id="queuesAll" class="card"><div class="note">读取中…</div></div>
     <h2>下载队列</h2>
     <div id="queue"></div>
     <h2>待重试</h2>
@@ -262,12 +267,34 @@
     </div>
     <div class="out" id="ledger" style="display:block">加载中…</div>
     <h2>最近完成</h2>
-    <div id="hist"></div>
+    <div class="card">
+      <h3>🎬 媒体（抖音/监听/收藏夹）</h3><div id="hist-media"></div>
+    </div>
+    <div class="card">
+      <h3>📺 B站</h3><div id="hist-bili"></div>
+    </div>
+    <div class="card">
+      <h3>🐦 X</h3><div id="hist-x"></div>
+    </div>
+    <div class="card">
+      <h3>🛰 iwara</h3><div id="hist-iwara"></div>
+    </div>
   </section>
 
   <!-- ── 回填计划 ──────────────────────── -->
   <section class="page" id="p-paw">
-    <h2>回填执行计划（/paw schedule 同源）</h2>
+    <h2>当前状态（游标 / 节奏）</h2>
+    <div id="pawCur"><div class="note">加载中…</div></div>
+    <h2>下一批作者</h2>
+    <div id="pawNext"></div>
+    <h2>回填执行记录（每轮一条，新→旧）</h2>
+    <div class="chips">
+      <span class="chip" onclick="loadPawBackfill()">🔄 刷新</span>
+      <span class="chip" onclick="runCmdDirect('/paw_backfill status')">🧩 补扫状态</span>
+      <span class="chip" onclick="runCmdDirect('/paw schedule')">📅 执行计划文本</span>
+    </div>
+    <div id="pawHist"></div>
+    <h2>执行计划（/paw schedule 同源）</h2>
     <div class="note">每 6h 醒一次 × 每次最多 3 个作者；人工扫描进行时该轮让位顺延。
       与 /paw_schedule 完全同一份数据（单一真相源）。</div>
     <div class="out" id="pawSched" style="display:block">加载中…</div>
@@ -275,6 +302,25 @@
   </section>
 
   <!-- ── 指令中心 ──────────────────────── -->
+  <section class="page" id="p-pd">
+    <h2>🛰 pixeldrain 直链下载</h2>
+    <div class="card">
+      <div class="row">
+        <input type="text" id="pdLink" placeholder="https://pixeldrain.com/l/xxxx 或 /file/xxxx#key">
+        <button onclick="pdStart()">开始</button>
+        <button class="ghost" onclick="loadPD()">刷新</button>
+      </div>
+      <div class="fb" id="pdfb">粘贴链接开始下载；重复开始同一链接是幂等的（自动续传/跳过已中转）。</div>
+      <div class="row" style="margin-top:8px">
+        <input type="text" id="pdCleanLink" placeholder="要清理云端中转的链接（本地确认完好后再清）">
+        <button class="ghost" onclick="pdClean()">清理云端</button>
+      </div>
+    </div>
+    <div id="pdJobs">加载中…</div>
+    <div class="note">下载管线 = pd_daemon(127.0.0.1:8791) → GitHub runner 中转 → 本地拉回
+      （SHA256 逐文件校验）。daemon 不可达时这里会显示连接错误。</div>
+  </section>
+
   <section class="page" id="p-cmds">
     <h2>⌨ 万能输入（白名单内全部指令）</h2>
     <div class="card">
@@ -339,6 +385,7 @@
   <div data-p="p-find"><span class="e">🔍</span>发现</div>
   <div data-p="p-ledger"><span class="e">📈</span>台账</div>
   <div data-p="p-paw"><span class="e">🐾</span>回填</div>
+  <div data-p="p-pd"><span class="e">🛰</span>直链</div>
   <div data-p="p-cmds"><span class="e">⌨</span>指令</div>
   <div data-p="p-set"><span class="e">⚙️</span>设置</div>
 </nav>
@@ -363,8 +410,12 @@
 })();
 const TOK = () => localStorage.getItem("nagram_token") || "";
 const H = () => ({ "Content-Type": "application/json", "X-Token": TOK() });
-function esc(s){ return (s||"").replace(/[&<>"]/g, c =>
-  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function esc(s){
+  // 类型防御（2026-11-03）：对象/数组/数字一律先 String()——某个字段
+  // 意外非字符串时页面崩掉比显示难看代价大
+  if (s !== null && s !== undefined && typeof s !== "string") s = String(s);
+  return (s || "").replace(/[&<>"]/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function fmtMB(n){ return n == null ? "–" : (n/1048576).toFixed(1)+" MB"; }
 function fmtGB(n){ return n == null ? "–" : n+" GB"; }
 
@@ -431,14 +482,30 @@ async function refresh() {
         (p.speed ? '<span>' + fmtMB(p.speed) + '/s</span>' : '') +
         '<span class="pct">' + (pct == null ? "下载中…" : pct + "%") + '</span></div></div>');
     });
+    (d.bili && d.bili.pending || []).forEach((p, i) => {
+      live.push('<div class="qrow"><div class="info"><div class="nm">' +
+        esc(p.url) + '</div><div class="dt">B站 待办 · 第 ' + (i+1) +
+        ' 位</div></div><span class="tag t-wait">排队</span></div>');
+    });
     if (d.bili && d.bili.label)
       live.push('<div class="task"><div class="name">📺 B站 ' + esc(d.bili.label) +
         (d.bili.item ? "（第 " + esc(d.bili.item) + " 个）" : "") + '</div>' +
         '<div class="bar"><i style="width:' + (d.bili.pct||0) + '%"></i></div>' +
         '<div class="meta"><span>串行下载中</span><span class="pct">' +
         (d.bili.pct||0) + '%</span></div></div>');
-    document.getElementById("live").innerHTML =
-      live.join("") || '<div class="note">当前没有在途下载</div>';
+    // 等待队列：排队的任务跟在在途后面（最多 5 条 + 折叠汇总）
+    const waiting = d.queue || [];
+    waiting.slice(0, 5).forEach(t => {
+      live.push('<div class="qrow"><div class="info"><div class="nm">' +
+        esc(t.name) + '</div><div class="dt">' + esc(t.platform || "") +
+        '</div></div><span class="tag t-wait">排队</span></div>');
+    });
+    if (waiting.length > 5)
+      live.push('<div class="note">… 另有 ' + (waiting.length - 5) +
+        ' 个在队列中（📥 队列页看全部）</div>');
+    if (!live.length)
+      live.push('<div class="note">当前没有在途下载</div>');
+    document.getElementById("live").innerHTML = live.join("");
     document.getElementById("queue").innerHTML = (d.queue||[]).map((t, idx) =>
       '<div class="qrow"><div class="info"><div class="nm wrap">' + esc(t.name) +
       '</div><div class="dt">' + esc(t.platform) + " · " + esc(t.id) +
@@ -544,6 +611,7 @@ async function cancelChrome() {
 }
 
 async function loadStats(days) {
+  if (days) _curDays = days;   // 记住当前窗口，refreshAll 用
   document.querySelectorAll("#daysChips .chip").forEach(c =>
     c.classList.toggle("on", c.dataset.d == days));
   showLong("ledger", "加载中…");
@@ -560,15 +628,23 @@ async function loadPawSchedule() {
   } catch (e) { showLong("pawSched", "❌ " + e); }
 }
 async function loadHistory() {
-  try {
-    const d = await api("/api/history?n=30");
-    document.getElementById("hist").innerHTML = (d.lines||[]).map(l =>
-      '<div class="hline">' + esc(l) + '</div>').join("")
-      || '<div class="note">还没有下载记录</div>';
-  } catch (e) {
-    document.getElementById("hist").innerHTML =
-      '<div class="note">读取失败：' + esc(String(e)) + '</div>';
-  }
+  // 渠道分类（2026-11-05 owner）：媒体/B站/X/iwara 各自列表
+  const targets = [["hist-media", null, "还没有媒体下载记录"],
+                   ["hist-bili", "B站", "还没有 B站 下载记录"],
+                   ["hist-x", "X", "还没有 X 下载记录"],
+                   ["hist-iwara", "iwara", "还没有 iwara 下载记录"]];
+  await Promise.all(targets.map(async ([elId, kind, empty]) => {
+    const el = document.getElementById(elId);
+    try {
+      const q = kind ? ("&kind=" + encodeURIComponent(kind)) : "";
+      const d = await api("/api/history?n=10" + q);
+      el.innerHTML = (d.lines||[]).map(l =>
+        '<div class="hline">' + esc(l) + '</div>').join("")
+        || '<div class="note">' + esc(empty) + '</div>';
+    } catch (e) {
+      el.innerHTML = '<div class="note">读取失败：' + esc(String(e)) + '</div>';
+    }
+  }));
 }
 
 async function loadPastes() {
@@ -632,6 +708,44 @@ async function retryOne(n) {
   } catch (e) { showResult(false, String(e)); }
 }
 
+async function loadPawBackfill() {
+  // 当前状态
+  try {
+    const d = await api("/api/paw_backfill");
+    if (!d.ok) { document.getElementById("pawCur").innerHTML =
+      '<div class="note">❌ ' + esc(d.error) + '</div>'; return; }
+    const c = d.current || {};
+    document.getElementById("pawCur").innerHTML =
+      '<div class="card"><div class="meta" style="font-size:13px">' +
+      '作者总数 <b style="color:var(--tx)">' + c.total_creators + '</b> · ' +
+      '游标位置 ' + c.cursor + ' · 每 ' + c.wake_hours + 'h 醒一次 × ' +
+      c.per_round + ' 作者 · 全量一轮 ≈ <b style="color:var(--tx)">' +
+      c.full_round_h + 'h</b>' +
+      (c.loop_started ? " · 循环起点 " + esc(c.loop_started) : "") +
+      '</div>' +
+      '<div class="meta" style="margin-top:8px;font-size:13px">' +
+      '上次实际执行：' + (c.last_run_at ? esc(c.last_run_at) : "尚无记录") +
+      (c.deferred ? ' · <span style="color:var(--amber)">⏳ 该醒次被顺延'
+        + '（撞人工扫描或重启）——游标没丢，下轮自动补</span>' : '') +
+      '</div></div>';
+    document.getElementById("pawNext").innerHTML = (d.next_batch||[]).map(p =>
+      '<div class="qrow"><div class="info"><div class="nm wrap">' + esc(p.name) +
+      '</div><div class="dt">' + p.posts + ' 帖 · 预计 ' + esc(p.eta) +
+      (p.overdue ? " · 已逾期（撞人工扫描会顺延）" : "") +
+      '</div></div><span class="tag ' + (p.overdue?"t-retry":"t-run") + '">' +
+      (p.overdue ? "🕒" : "⏭") + '</span></div>').join("")
+      || '<div class="note">还没有已扫作者（先 /paw_plan）</div>';
+    document.getElementById("pawHist").innerHTML = (d.history||[]).map(h => {
+      const when = new Date(h.ts * 1000).toLocaleString("zh-CN", {hour12: false});
+      return '<div class="hline">🐾 ' + when + ' · 回填 ' + h.author_count +
+        ' 作者 · 游标→' + h.cursor + '\n' + esc(h.summary) + '</div>';
+    }).join("") || '<div class="note">还没有执行记录（每 6h 一轮，'
+      + '轮完自动记录在这里）</div>';
+  } catch (e) {
+    document.getElementById("pawCur").innerHTML = '<div class="note">❌ ' + e + '</div>';
+  }
+}
+
 async function applyThread() {
   const n = document.getElementById("th").value;
   await act("thread", {n: +n});
@@ -639,6 +753,40 @@ async function applyThread() {
 document.getElementById("th").addEventListener("input",
   e => { document.getElementById("thv").textContent = e.target.value; });
 
+async function loadPD() {
+  const el = document.getElementById("pdJobs");
+  try {
+    const d = await api("/api/pd/jobs");
+    if (!d.ok) { el.innerHTML = '<div class="note">🛰 ' + esc(d.error || "不可用") + '</div>'; return; }
+    const jobs = d.jobs || {};
+    const names = Object.keys(jobs);
+    if (!names.length) { el.innerHTML = '<div class="note">📭 没有 pixeldrain 任务。粘贴链接点「开始」。</div>'; return; }
+    el.innerHTML = names.map(tag => {
+      const j = jobs[tag];
+      const st = j.alive ? "🟢 运行中" : "⚪ 已结束";
+      return '<div class="qrow"><div class="info"><div class="nm">' + st + ' ' + esc(tag) +
+        '</div><div class="dt">' + esc(j.dest || "") + ' · 启动 ' + esc(j.started || "?") + '</div></div></div>';
+    }).join("");
+  } catch (e) { el.innerHTML = '<div class="note">❌ ' + esc(String(e)) + '</div>'; }
+}
+async function pdStart() {
+  const link = document.getElementById("pdLink").value.trim();
+  const fb = document.getElementById("pdfb");
+  if (!link) { setFb("pdfb", false, "先粘贴 pixeldrain 链接"); return; }
+  try {
+    const r = await api("/api/pd/start", { method: "POST", body: JSON.stringify({ link }) });
+    setFb("pdfb", !!r.ok, r.ok ? ("🚀 已开始（" + (r.tag || "") + "）") : ("❌ " + (r.error || "失败")));
+    loadPD();
+  } catch (e) { setFb("pdfb", false, "❌ " + e); }
+}
+async function pdClean() {
+  const link = document.getElementById("pdCleanLink").value.trim();
+  if (!link) { setFb("pdfb", false, "先填要清理的链接"); return; }
+  try {
+    const r = await api("/api/pd/clean", { method: "POST", body: JSON.stringify({ link }) });
+    setFb("pdfb", !!r.ok, r.ok ? "🧹 已清理" : ("❌ " + (r.error || "失败")));
+  } catch (e) { setFb("pdfb", false, "❌ " + e); }
+}
 async function loadCmds() {
   try {
     const d = await api("/api/commands");
@@ -682,10 +830,12 @@ document.querySelectorAll("nav div").forEach(t => t.onclick = () => {
   document.getElementById(t.dataset.p).classList.add("on");
   if (t.dataset.p === "p-ledger") { loadStats(1); loadHistory(); }
   if (t.dataset.p === "p-queue") loadChrome();
+  if (t.dataset.p === "p-paw") loadPawBackfill();
   if (t.dataset.p === "p-queue") document.getElementById("bdg-queue").style.display = "none";
   else refresh();   // 切页即刷新徽标状态
   if (t.dataset.p === "p-find") { loadPastes(); loadLinks(); }
   if (t.dataset.p === "p-cmds") loadCmds();
+  if (t.dataset.p === "p-pd") loadPD();
   if (t.dataset.p === "p-paw") loadPawSchedule();
   window.scrollTo(0, 0);
 });
@@ -717,11 +867,113 @@ async function runCmdDirect(cmd) {
   } catch (e) { showResult(false, String(e)); }
 }
 
-setInterval(refresh, 2000);
+// 轮询退避（2026-11-05 审计）：fetch 失败（后端重启/网络抖动）时把主
+// 轮询间隔翻倍（上限 30s），成功即恢复 2s——避免慢/挂时请求堆积
+let _pollMs = 2000;
+async function loadQueuesAll() {
+  try {
+    const d = await api("/api/queues");
+    const el = document.getElementById("queuesAll");
+    if (!d.ok) { el.innerHTML = '<div class="note">❌ ' + esc(d.error) + '</div>'; return; }
+    el.innerHTML = d.queues.map(q => {
+      if (q.error) return '<div class="qrow"><div class="info"><div class="nm">' +
+        esc(q.name) + '</div><div class="dt">' + esc(q.error) +
+        '</div></div><span class="tag t-retry">不可用</span></div>';
+      const bits = [];
+      if (q.running) bits.push("在途 " + q.running);
+      if (q.pending) bits.push("排队 " + q.pending);
+      if (q.retry) bits.push("待重试 " + q.retry);
+      if (q.failed) bits.push("失败 " + q.failed);
+      const stat = bits.length ? bits.join(" · ") : "空闲";
+      const items = (q.items || []).map(x => esc(x)).join("、");
+      return '<div class="qrow"><div class="info"><div class="nm">' +
+        esc(q.emoji + " " + q.name) + '</div><div class="dt">' +
+        esc(stat) + (items ? "｜" + items : "") +
+        '</div></div></div>';
+    }).join("");
+  } catch (e) { /* 主循环退避已处理 */ }
+}
+async function _refreshLoop() {
+  try { await refresh(); _pollMs = 2000; }
+  catch (e) { _pollMs = Math.min(_pollMs * 2, 30000); }
+  setTimeout(_refreshLoop, _pollMs);
+}
+setInterval(loadQueuesAll, 5000);
+loadQueuesAll();
+
+// ── 应用内刷新（2026-11-05 owner：点按钮/下拉屏都不跳浏览器）──
+// refreshAll 把页面所有数据 loader 跑一遍（纯 fetch，无导航——
+// location.reload() 在 PWA standalone 里会弹浏览器，实测淘汰）
+let _curDays = 1;
+async function refreshAll() {
+  const jobs = [refresh(), loadStats(_curDays), loadHistory(),
+                loadQueuesAll(), loadChrome(), loadBackup(),
+                loadPastes(), loadLinks(), loadPawSchedule(),
+                loadPawBackfill(), loadPD(), loadCmds()];
+  await Promise.allSettled(jobs);
+  const dot = document.getElementById("dot");
+  if (dot) { dot.className = "dot ok"; setTimeout(
+    () => { dot.className = "dot"; }, 1200); }
+}
+
+// ── 下拉刷新：scrollTop==0 时继续下拉超过阈值 → 触发 refreshAll ──
+(function () {
+  let startY = 0, pulling = false;
+  const THRESHOLD = 72;
+  const bar = document.createElement("div");
+  bar.textContent = "↓ 下拉刷新";
+  bar.style.cssText = (
+    "position:fixed;top:0;left:50%;transform:translate(-50%,-100%);" +
+    "transition:transform .18s, opacity .18s;z-index:9999;" +
+    "background:#2563eb;color:#fff;font-size:13px;font-weight:700;" +
+    "padding:8px 18px;border-radius:0 0 12px 12px;opacity:0;");
+  document.addEventListener("DOMContentLoaded", () => document.body.appendChild(bar));
+  if (document.body) document.body.appendChild(bar);
+  document.addEventListener("touchstart", (e) => {
+    if ((window.scrollY || document.documentElement.scrollTop) <= 0) {
+      startY = e.touches[0].clientY;
+      pulling = true;
+    }
+  }, {passive: true});
+  document.addEventListener("touchmove", (e) => {
+    if (!pulling) return;
+    const dy = e.touches[0].clientY - startY;
+    if (dy > 0 && dy <= THRESHOLD * 1.4) {
+      const p = Math.min(1, dy / THRESHOLD);
+      bar.style.transform = `translate(-50%, ${-100 + p * 100}%)`;
+      bar.style.opacity = String(p);
+      bar.textContent = dy >= THRESHOLD ? "↻ 松手刷新" : "↓ 下拉刷新";
+    }
+  }, {passive: true});
+  document.addEventListener("touchend", (e) => {
+    if (!pulling) return;
+    pulling = false;
+    const dy = e.changedTouches[0].clientY - startY;
+    bar.style.transform = "translate(-50%,-100%)";
+    bar.style.opacity = "0";
+    if (dy >= THRESHOLD) {
+      bar.textContent = "↻ 刷新中…";
+      bar.style.transform = "translate(-50%, 0)";
+      bar.style.opacity = "1";
+      refreshAll().finally(() => {
+        bar.textContent = "✅ 已刷新";
+        setTimeout(() => {
+          bar.style.transform = "translate(-50%,-100%)";
+          bar.style.opacity = "0";
+        }, 700);
+      });
+    }
+  }, {passive: true});
+})();
+_refreshLoop();
 setInterval(loadBackup, 60000);
 setInterval(loadChrome, 5000);
 refresh();
 loadBackup();
+// PWA：注册 Service Worker（可安装到主屏幕 + 系统分享面板接收）
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch(() => {});
+}
 </script>
 </body>
 </html>

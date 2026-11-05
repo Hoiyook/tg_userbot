@@ -256,6 +256,13 @@ RESUME_EXTRA_RETRIES = 12
 # 失败入榜时记 next_retry_at，后台每 AUTO_RETRY_SWEEP_SECONDS 扫一次，
 # 到期且未在执行的重放。手动 /retry、/retry all 不受这些约束（立即执行）。
 AUTO_RETRY_SWEEP_SECONDS = 60      # 后台扫描间隔（秒）
+# ── 分享链接自动识别（2026-11-05 owner：直接发链接即下载，不落外链台账）──
+# Saved Messages 里检测到对应站点链接 → 自动入各自下载队列；关掉的回落
+# 外链台账。文本+链接混合形态（如「标题 https://b23.tv/xxx」）自动抽链接。
+AUTOROUTE_BILI = True    # bilibili.com / b23.tv → B站队列（/bili）
+AUTOROUTE_X = True       # x.com / twitter.com（推文/作者页）→ X 队列（/x）
+AUTOROUTE_DOUYIN = True  # 抖音分享 → 抖音管线（既有行为，纳入配置可关）
+
 AUTO_RETRY_BASE_DELAY = 60         # 首次退避（秒）
 AUTO_RETRY_MAX_DELAY = 1800        # 退避封顶（30 分钟）——坏窗口内不至于空转
 # 自动重试次数上限已移除（2026-09-20 用户决策）：死文件由
@@ -455,7 +462,7 @@ REPORT_LISTEN = True
 # WAL 依赖 mmap 共享内存、在该文件系统上可能不可用；真机上若探测到 WAL 回落，
 # 可把 DB 挪到应用私有目录。注意：**只允许主进程写**，Chrome Agent 进程绝不
 # 能开连接（见 runtime_db 的「不做 import 期连接」）。
-RUNTIME_DB_SCHEMA_VERSION = 18  # v18：+ cmd_ledger/cmd_cursors（指令回放）
+RUNTIME_DB_SCHEMA_VERSION = 22  # v22：+ xn_tasks/xi_tasks（X/Pixiv 队列）
 # 单条写事务等锁的上限（毫秒）与 SQLITE_BUSY/LOCKED 的有限重试（规格 §39：
 # 记日志 → 短暂等待 → 有限次数重试，绝不无限循环、绝不因此崩掉主进程）。
 RUNTIME_DB_BUSY_TIMEOUT_MS = 5000
@@ -485,7 +492,7 @@ LISTEN_WORKER_MIN_FORWARD_INTERVAL_SECONDS = 5.0
 # 必须显著大于单次转发的正常耗时（含 FloodWait 等待之外的部分）。
 LISTEN_WORKER_LEASE_SECONDS = 600
 # 临时错误的最大自动重试次数（attempts 上限），超过转 FAILED 等人看。
-LISTEN_WORKER_MAX_ATTEMPTS = 8
+LISTEN_WORKER_MAX_ATTEMPTS = 5    # 2026-10-29 owner 定档：有限档统一 5 次
 # 重试退避：与 queue._backoff_delay 同款「base × 2^(attempts-1) 封顶 max」，
 # 复用同一风格而不是另设计一套（规格 §26）。
 LISTEN_WORKER_BACKOFF_BASE_SECONDS = 60
@@ -618,6 +625,12 @@ PAWCHIVE_COOKIE = _SECRET_CONFIG.get("pawchive_cookie", "")
 # e-hentai 会话 cookie（原包路 archiver.php 用；种子路不需要）。
 # /ehentai cookie <粘贴> 写入 tg_secrets.json 的 ehentai_cookie 字段
 EHENTAI_COOKIE = _SECRET_CONFIG.get("ehentai_cookie", "")
+# 哔哩哔哩会话 cookie（SESSDATA 等）：/bili 下载最高画质必需——游客最高
+# 480P，普通登录 1080P，大会员解锁 1080P60/4K/HDR/杜比/8K。设置菜单
+# 「🌐 B站Cookie」粘贴或从浏览器导入；缺省空串 → /bili 仍可用（游客
+# 画质）并提示。scripts/get_cookie.py <域名> --save 也能写任意站点的
+# 同名字段。
+BILIBILI_COOKIE = _SECRET_CONFIG.get("bilibili_cookie", "")
 
 # 抖音 Web 端通用请求头（f2 详情接口 + CDN 直链下载共用）。CDN 直链对
 # UA/Referer 敏感：裸请求（无 UA）会被 douyinvod 拒绝 403，下载必须带。
@@ -684,6 +697,7 @@ MENU_ACTIONS = (
     "queue", "queue_del", "retry", "retry_run", "retry_del", "retry_all",
     "cd2", "cd2_stop", "bak", "bak_status", "stats", "wl_scan",
     "cookie", "cookie_set", "cookie_clear", "cookie_imp",
+    "bili_cookie", "bili_cookie_set", "bili_cookie_clear", "bili_cookie_imp",
     "dedup", "dedup_toggle",
     "find",
     "capf", "capf_add", "capf_del", "capf_test", "capf_reset", "capf_clear",
@@ -852,6 +866,43 @@ def save_ehentai_cookie(value, path=None):
     EHENTAI_COOKIE = value
     return None
 
+
+def save_bilibili_cookie(value, path=None):
+    """把哔哩哔哩会话 cookie 写入 tg_secrets.json（原子替换）并更新内存。
+
+    与 save_pawchive_cookie 同款纪律：重新读盘保留其它字段；运行时动态读
+    config.BILIBILI_COOKIE 属性，同步更新后立即作用于下一次 /bili 下载。"""
+    global BILIBILI_COOKIE
+    target = path or SECRETS_FILE
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except FileNotFoundError:
+        data = {}
+    except Exception:
+        return "tg_secrets.json 解析失败，拒绝覆盖（请手工修复该文件）"
+
+    value = str(value or "").strip()
+    data["bilibili_cookie"] = value
+
+    tmp_path = target + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, target)
+    except Exception as e:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return f"写入失败：{type(e).__name__}: {e}"
+
+    BILIBILI_COOKIE = value
+    return None
+
 # ------------------------------------------------------------
 # 持久化下载队列：任务先入队（媒体存消息引用、平台链接存完整 URL），
 # 重启后自动恢复执行。失败任务移入 retry 列表停靠，由用户手动重试。
@@ -914,7 +965,8 @@ REGISTERED_COMMAND_NAMES = frozenset({name for name in (
     "logpath", "links", "help", "start", "cd2ck", "cmdhis",
     "usage", "help2", "restart", "inspect", "memo",
     "botclean", "cd2check", "cd2tasks", "manual", "115x", "115dup",
-    "report", "115inv", "x", "dyu", "pixiv",
+    "report", "115inv", "x", "dyu", "pixiv", "asmr", "bili",
+    "pd", "pdst", "pdjobs", "pdclean",
     "chrome", "chrome_start", "chrome_stop", "chrome_status",
     "chrome_tasks", "chrome_cancel",
     # /paw 子命令标准形
@@ -1505,16 +1557,27 @@ CHROME_PROFILE_DIR = os.path.expanduser("~/tg_chrome_agent_profile")
 CHROME_AGENT_OWNER_ID = (_SECRET_CONFIG.get("chrome_agent") or {}).get(
     "owner_id")
 # 单任务最大尝试次数与单次尝试超时（秒）（规格 29/30）
-CHROME_DOWNLOAD_RETRIES = 3
+CHROME_DOWNLOAD_RETRIES = 10   # 2026-10-31 owner 定档：Chrome 例外 10 次
 CHROME_DOWNLOAD_TIMEOUT = 1800
-# RETRY_WAIT 到下次执行的等待秒数
+# RETRY_WAIT 到下次执行的等待秒数（前 5 次固定用）
 CHROME_RETRY_WAIT_SECONDS = 30
+# 重试等待（2026-10-31 owner 定档）：前 5 次固定 CHROME_RETRY_WAIT_SECONDS，
+# 第 6 次起指数退避 base×2^k（2/4/8/16/32 分钟）——网络不稳时跨抖动窗口
+CHROME_RETRY_BACKOFF_BASE_SECONDS = 120
 # 等待 CDP 端口就绪的超时秒数（拉起专用 Chrome 后轮询 /json/version）
 CHROME_CDP_CONNECT_TIMEOUT = 60
 # Agent 轮询周期（秒）：认领请求、监视下载目录
 CHROME_POLL_SECONDS = 1.0
+# 每日状态备份（2026-11-01 owner 定档）：DB 快照+去重/监听/台账等状态文件
+# 打包传 115——机器没了也能恢复全部状态（不含 secrets）。24h 一轮。
+STATE_BACKUP_INTERVAL_HOURS = 24
+# Chrome 台账定时上传（2026-10-31 owner 定档）：/115open/userBot报告/日期/，
+# 每隔 N 分钟一份 chrome 报告（空间足可频繁）；本地必有存档，上传失败仅记日志
+CHROME_REPORT_INTERVAL_MINUTES = 120
 # 持久化文件（规格 24：两进程各写各的，temp+os.replace 原子写）
 CHROME_TASKS_FILE = os.path.join(RUNTIME_DIR, "chrome_tasks.json")
+# Chrome 实时下载进度（2026-11-01）：Agent 独占写（节流 1s），API/看板只读
+CHROME_PROGRESS_FILE = os.path.join(RUNTIME_DIR, "chrome_progress.json")
 CHROME_REQUESTS_FILE = os.path.join(RUNTIME_DIR, "chrome_requests.json")
 # 取消请求：User Bot 独占写、Agent 只读（与 chrome_requests.json 同款单向通道）
 CHROME_CANCEL_REQUESTS_FILE = os.path.join(
@@ -1609,6 +1672,14 @@ WNACG_BASE = "https://www.wnacg.com"
 WNACG_REMOTE_DIR = "/115open/漫画"   # /wnacg <链接> [作者] → 漫画[/<作者>]/
 WNACG_THROTTLE_SECONDS = 10.0          # 相邻两次下载间隔（尊重每日限额）
 WNACG_FETCH_TIMEOUT_SECONDS = 25       # HTML 解析超时
+# 重试额度统一说明（2026-10-29）：有限档一律 5 次
+# （例外：CHROME_DOWNLOAD_RETRIES 2026-10-31 owner 定档 10 次）——
+# WNACG_MAX_ATTEMPTS/ASMR_MAX_ATTEMPTS/EXTRACT_MAX_ATTEMPTS/
+# PAWCHIVE_429_AUTO_RETRY_MAX_ATTEMPTS/GALLERY_DL_AUTO_RETRY_MAX
+# gallery-dl 系（X/Pixiv）失败自动重跑（2026-10-26 定档）
+GALLERY_DL_AUTO_RETRY_MAX = 5          # 非零退出整跑重试次数（archive 幂等只补漏；2026-10-29 统一 5）
+GALLERY_DL_AUTO_RETRY_BASE_DELAY = 300  # 首次重跑等待（秒），×3 递增
+GALLERY_DL_AUTO_RETRY_MAX_DELAY = 1800  # 退避封顶（30 分钟）
 WNACG_MAX_ATTEMPTS = 5                 # 下载/上传失败重试上限
 # ---- 指令回放（/cmdq，2026-10-24）----
 # 入口聊天额外项（bot 对话与收藏夹内置）：填 @username / 数字 id 即生效，
@@ -1618,6 +1689,32 @@ CMDQ_STALE_DAYS = 7                  # 离线超过此天数的指令跳过不�
 
 WNACG_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36")
+# ---- asmr-300 / Kikoeru 音声下载（/asmr，2026-10-26 实测定稿）----
+# 站点 = Kikoeru（asmr.one 同款）镜像：SPA 壳无内容，数据全在 JSON API。
+# 域名分三台：网页壳/API（api.asmr-200.com）国内直连超时、必须走 TG_PROXY
+# 同款代理，且 www 会拦 Accept-Language: en（403 反爬页）——API 请求统一带
+# zh 头；文件直链 CDN（mediaDownloadUrl 指向 raw.* 域）直连可用、支持 Range、
+# 不支持 HEAD（死链预检只能 Range GET）。直链永远取 API 返回原文，不拼 URL。
+# 镜像可能换域名：tg_secrets.json 的 asmr.api_base 或环境变量 TG_ASMR_API
+# 可覆盖（机器相关值不进代码）。
+ASMR_API_BASE = ((os.environ.get("TG_ASMR_API") or "").strip()
+                 or (_SECRET_CONFIG.get("asmr") or {}).get("api_base")
+                 or "https://api.asmr-200.com").rstrip("/")
+ASMR_REMOTE_DIR = "/115open/声音/asmr"   # 落盘：声音/asmr/RJ号/（盘上既有约定）
+ASMR_THROTTLE_SECONDS = 3.0              # 相邻文件间隔（社区公益库，克制）
+ASMR_FETCH_TIMEOUT_SECONDS = 25          # API 元数据/文件树超时
+ASMR_FILE_TIMEOUT_SECONDS = 60.0         # 单文件下载读超时（流式分块）
+ASMR_MAX_ATTEMPTS = 5                    # 作品级失败重试上限（瞬时故障不占）
+ASMR_UPLOAD_WAIT_TRIES = 40              # 收尾等 CD2 后台上传的轮数
+ASMR_UPLOAD_WAIT_GAP_SECONDS = 15.0      # 轮间隔（合计约 10 分钟封顶）
+ASMR_ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9"  # www 拦 en 头；API 统一带上防镜像收紧
+ASMR_COPY_CHECK_SECONDS = 60         # 挂载拷贝看门狗：轮询 dst 增长周期
+ASMR_COPY_STALL_SECONDS = 900        # 无进展超限（FUSE 冻结）→ 转重试
+ASMR_RECOVER_SECONDS = 600           # 周期租约回收间隔（框架调度）
+ASMR_STALL_WINDOW_SECONDS = 60.0     # 下载流速看门狗：观测窗口
+ASMR_STALL_FLOOR_BYTES = 262144      # 窗口内低于此字节数 = CDN 涓流判死
+ASMR_DL_CHECK_SECONDS = 30.0         # 协程侧 .part 看门狗：轮询间隔
+ASMR_DL_STALL_SECONDS = 240.0        # .part 零增长超限（>内部合法静默窗）→ 弃线程重试
 EXTRACT_MAX_ATTEMPTS = 5            # 退避重试上限；超过转 TERMINAL（人工重投）
 EXTRACT_BACKOFF_BASE_SECONDS = 300  # 首败退避 5 分钟
 EXTRACT_BACKOFF_MAX_SECONDS = 7200  # 封顶 2 小时
@@ -1666,6 +1763,20 @@ _legacy_root = _legacy_migration_root()
 _migrated_legacy = (
     _migrate_legacy_data(_legacy_root) if _legacy_root else None)
 log.configure(LOG_FILE, LOG_RETENTION_DAYS)
+
+# ------------------------------------------------------------
+# 本地 API（2026-11-01）：套壳 app / 手机看板的唯一数据面。
+# 配置 = tg_secrets.json 的 "api" 段：
+#   "api": {"enabled": true, "bind": "127.0.0.1", "port": 8765, "token": "…"}
+# token 为空 → 只允许绑定 loopback（本机免鉴权可信）；配非 loopback 的
+# bind 必须同时给 token，否则 API 拒绝启动（防局域网/公网裸暴露）。
+# 依赖 aiohttp（Termux 同样 pip install aiohttp）。
+# ------------------------------------------------------------
+_API_CFG = _SECRET_CONFIG.get("api") or {}
+API_ENABLED = bool(_API_CFG.get("enabled"))
+API_BIND = str(_API_CFG.get("bind") or "127.0.0.1")
+API_PORT = int(_API_CFG.get("port") or 8765)
+API_TOKEN = str(_API_CFG.get("token") or "")
 if _migrated_runtime_files:
     log.logger.info(
         "已把历史运行时文件迁入 runtime/ 目录："

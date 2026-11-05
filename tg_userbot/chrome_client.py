@@ -16,6 +16,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime
 
 from . import chrome_agent
@@ -27,6 +28,7 @@ from .config import (
     CHROME_CDP_HOST,
     CHROME_CDP_PORT,
     CHROME_DOWNLOAD_DIR,
+    CHROME_PROGRESS_FILE,
     CHROME_REQUESTS_FILE,
     CHROME_TASKS_FILE,
 )
@@ -487,6 +489,25 @@ async def cdp_available():
 # chrome_requests.json（User Bot 独占写；规格 24/32）
 # ------------------------------------------------------------
 
+def read_progress(path=None, max_age_s=90):
+    """chrome_progress.json → Agent 写的实时下载进度；过期/缺失 → None。
+
+    Agent 独占写（节流 1s）；下载结束/取消/Agent 死亡后条目会被清掉或
+    停更——超过 max_age_s 视为过期不再展示假进度。"""
+    path = path or CHROME_PROGRESS_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if time.time() - data.get("updated_at", 0) > max_age_s:
+        return None
+    items = [i for i in data.get("items", []) if isinstance(i, dict)]
+    return {"updated_at": data.get("updated_at"), "items": items}
+
+
 def load_requests(path=None):
     path = path or CHROME_REQUESTS_FILE
     try:
@@ -502,9 +523,27 @@ def load_requests(path=None):
         reqs, list) else []
 
 
+_REQUESTS_KEEP_DONE = 200   # 已通知终态记录保留条数（对齐 tasks 的 200 条）
+
+
+def _prune_requests(reqs):
+    """裁剪已通知的终态记录到最近 N 条（2026-11-05 审计：requests 台账
+    只进不出，172KB 且每次提交全量刷盘）。未通知（notified_at 空）的
+    记录**绝不裁**——那是待通知承诺。返回 (裁剪后, 裁掉数)。"""
+    done = [r for r in reqs if r.get("notified_at")]
+    pending = [r for r in reqs if not r.get("notified_at")]
+    keep = done[-_REQUESTS_KEEP_DONE:]
+    return pending + keep, len(done) - len(keep)
+
+
 def save_requests(reqs, path=None):
     """原子写请求文件；**失败上抛**——提交回执必须以落盘成功为准
-    （吞掉异常会让用户看到假「已提交」，2026-09-26 任务书 二十一）。"""
+    （吞掉异常会让用户看到假「已提交」，2026-09-26 任务书 二十一）。
+    写前裁剪终态台账（未通知记录保留，见 _prune_requests）。"""
+    reqs, pruned = _prune_requests(reqs)
+    if pruned:
+        logger.info(f"🧹 Chrome requests 台账裁剪终态 {pruned} 条"
+                    f"（保留最近 {_REQUESTS_KEEP_DONE} 条）")
     path = path or CHROME_REQUESTS_FILE
     temp_path = path + ".tmp"
     with open(temp_path, "w", encoding="utf-8") as f:
@@ -598,11 +637,18 @@ def get_request(task_id, path=None):
                  if r.get("task_id") == task_id), None)
 
 
-def mark_notified(task_id, path=None):
+def mark_notified(task_id, path=None, outcome=None, filename=None):
+    """打已通知标记；outcome（终态）与 filename 随写——请求台账只进
+    不出，是「哪些 URL 成功过」的唯一持久层（iwara 判重的数据源，
+    2026-10-26）。"""
     reqs = load_requests(path)
     for r in reqs:
         if r.get("task_id") == task_id:
             r["notified_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if outcome is not None:
+                r["outcome"] = str(outcome)
+            if filename:
+                r["filename"] = str(filename)
     save_requests(reqs, path)
 
 
@@ -879,7 +925,18 @@ async def notify_pending_results():
             continue
         try:
             await send_owner_message(rec.get("chat_id"), result_text(task))
-            mark_notified(task["task_id"])
+            if ("iwara" in str(rec.get("url") or "").lower()
+                    and task.get("status") == "SUCCESS"):
+                from .history import append_history
+                from datetime import datetime as _dt
+                append_history(
+                    f"{_dt.now().strftime('%Y-%m-%d %H:%M:%S')} | iwara | "
+                    f"{task.get('filename') or str(rec.get('url'))[:60]} | - | "
+                    "来源：iwara（Chrome）")
+
+            mark_notified(task["task_id"],
+                          outcome=task.get("status"),
+                          filename=task.get("filename"))
             logger.info(
                 f"📨 Chrome 结果已通知 [{task['task_id'][:8]}] "
                 f"{task.get('status')}")

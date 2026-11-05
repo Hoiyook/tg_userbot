@@ -31,7 +31,6 @@ from .log import logger
 from .naming import format_size, sanitize_filename
 
 TEXT_PREFIX = "📖"
-_STOP = {"requested": False}
 _PAUSED = {"paused": False}
 _CURRENT = {}   # /now 实时视图用：{"aid", "title", "stage"}
 _AID_RE = re.compile(r"aid-(\d+)")
@@ -282,29 +281,8 @@ def _copy_with_progress(src, dst):
 # Worker
 # ============================================================
 async def wnacg_worker_loop():
-    """常驻循环：串行一次一本，节流间隔，任何一轮异常吞掉不退出。"""
-    logger.info("📖 wnacg worker 已启动（串行一次一本，"
-                f"节流 {config.WNACG_THROTTLE_SECONDS}s，落 {config.WNACG_REMOTE_DIR}）")
-    try:
-        runtime_db.recover_expired_wnacg_tasks()
-    except Exception as e:
-        logger.warning(f"📖 wnacg 任务租约恢复失败：{e}")
-    while not _STOP["requested"]:
-        try:
-            if _PAUSED["paused"]:
-                await asyncio.sleep(5.0)
-                continue
-            task = runtime_db.claim_next_wnacg_task()
-            if task is None:
-                await asyncio.sleep(5.0)
-                continue
-            await _run_one(task)
-            await asyncio.sleep(float(config.WNACG_THROTTLE_SECONDS))
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.exception(f"📖 wnacg worker 轮询异常：{e}")
-            await asyncio.sleep(10.0)
+    """常驻循环（SerialTaskWorker 框架实例；保留函数名兼容 app.py）。"""
+    await _WORKER.run()
 
 
 async def _run_one(task):
@@ -327,6 +305,8 @@ async def _run_one(task):
         except Exception:
             pass
     except asyncio.CancelledError:
+        # 取消放回由 SerialTaskWorker 框架统一接管（2026-10-26 迁移）；
+        # 本地半份 zip 下轮重下（requests 直写，无断点续传，代价可接受）。
         raise
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
@@ -354,8 +334,45 @@ async def _run_one(task):
 
 
 def release_inflight():
-    """优雅停机：在途任务放回 PENDING。"""
-    pass   # 单任务同步短事务，租约 15 分钟自愈即可
+    """优雅停机：在途任务放回 PENDING（框架兜底——取消路径已先放过）。"""
+    return _WORKER.release_inflight()
+
+
+# ── SerialTaskWorker 框架接线（2026-10-26 缺陷一迁移）──
+from .task_worker import SerialTaskWorker   # noqa: E402
+
+
+class _WnacgWorker(SerialTaskWorker):
+    name = "📖 wnacg"
+
+    def __init__(self):
+        super().__init__()
+        # config 现读（import 期零副作用；测试 patch 可生效）
+        self.poll_seconds = 5.0
+        self.idle_sleep = float(getattr(config, "WNACG_THROTTLE_SECONDS",
+                                        10.0))
+
+    def claim(self):
+        return runtime_db.claim_next_wnacg_task()
+
+    async def process(self, task):
+        await _run_one(task)
+
+    def release(self, task):
+        return runtime_db.release_wnacg_task(task["aid"])
+
+    def recover_startup(self):
+        runtime_db.recover_expired_wnacg_tasks()
+
+    def paused(self):
+        return _PAUSED["paused"]
+
+    def startup_banner(self):
+        return (f"📖 wnacg worker 已启动（串行一次一本，"
+                f"节流 {self.idle_sleep}s，落 {config.WNACG_REMOTE_DIR}）")
+
+
+_WORKER = _WnacgWorker()
 
 
 # ============================================================

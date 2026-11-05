@@ -17,6 +17,7 @@ import time
 from telethon import TelegramClient, events
 from telethon.network.connection import ConnectionTcpFull, ConnectionTcpObfuscated
 
+from .spawn import spawn
 from . import state
 from . import api_server
 from . import netio
@@ -33,8 +34,12 @@ from . import runtime_db
 from . import sql_templates
 from . import cmd_templates
 from . import extract_worker
+from . import config
 from . import wnacg
 from . import asmr_dl
+from . import bili_dl
+from . import x_dl as x_dl_mod
+from . import pixiv_dl as pixiv_dl_mod
 from . import cmdq
 from . import health
 from . import pawchive
@@ -740,7 +745,7 @@ async def new_message_handler(event):
         ):
             _payload = _relay_text[len(api_server.APP_RELAY_MARKER):].strip()
             if _payload:
-                asyncio.create_task(api_server.handle_app_relay(_payload))
+                spawn(api_server.handle_app_relay(_payload), "App relay")
             return
 
         # 只处理 Saved Messages（"me"）与白名单 chat
@@ -792,7 +797,8 @@ async def new_message_handler(event):
         # 链接解析只在 Saved Messages 生效（白名单 chat 仅下载媒体）。
         # ========================================================
         if is_me:
-            douyin_urls = platform.extract_douyin_urls(text)
+            douyin_urls = (platform.extract_douyin_urls(text)
+                           if config.AUTOROUTE_DOUYIN else [])
             instagram_urls = platform.extract_instagram_urls(text)
 
             # Telegram 可能把链接显示成 WebPage 预览（MessageMediaWebPage）。
@@ -823,11 +829,10 @@ async def new_message_handler(event):
                     f"🔎 检测到 {len(douyin_urls)} 个抖音链接、"
                     f"{len(instagram_urls)} 个 Instagram 链接"
                 )
-                asyncio.create_task(
+                spawn(
                     platform.relay_platform_links(
                         message, douyin_urls, instagram_urls
-                    )
-                )
+                    ), "平台链接转发")
                 return
 
             # 种子直链（.torrent 结尾）→ 转 115 离线（bot 对话同款；
@@ -858,15 +863,19 @@ async def new_message_handler(event):
                     except Exception as e:
                         logger.warning(f"🧲 离线结果通知失败：{e}")
 
-                asyncio.create_task(_torrent_job())
+                spawn(_torrent_job(), "种子离线任务")
                 return
 
-            # B站链接自动识别（2026-10-31 owner 定档）：直接发
-            # bilibili/b23 链接即按 /bili 处理，不必打前缀。必须在外链
-            # 台账**之前**拦——否则 B站链接会被登记成「待处理外链」。
+            # 站点链接自动识别（2026-10-31 B站定档；2026-11-05 配置化 +
+            # X 加入，config.AUTOROUTE_* 可关——关掉的回落外链台账）。
+            # 必须在外链台账**之前**拦——否则会被登记成「待处理外链」。
             from . import bili_dl
-            if bili_dl.looks_like_bili(text):
+            if config.AUTOROUTE_BILI and bili_dl.looks_like_bili(text):
                 reply = await bili_dl.auto_reply(text)
+                await event.reply(reply, link_preview=False)
+                return
+            if config.AUTOROUTE_X and x_dl_mod.looks_like_x(text):
+                reply = await x_dl_mod.auto_reply(text)
                 await event.reply(reply, link_preview=False)
                 return
 
@@ -896,7 +905,7 @@ async def new_message_handler(event):
                         except Exception as e:
                             logger.warning(f"t.me 回执回帖失败：{e}")
 
-                    asyncio.create_task(_tme_job())
+                    spawn(_tme_job(), "t.me 直下任务")
                     return
 
             # 非抖音/IG 的外链（MEGA/网盘等）→ 手动外链台账：登记（默认
@@ -947,7 +956,7 @@ async def new_message_handler(event):
         # 回原来源。来源禁转由 Worker 回退直下原消息；停机漏掉的由扫描
         # 生产者按 wl 游标补。
         if is_me:
-            asyncio.create_task(_enqueue_me(message))
+            spawn(_enqueue_me(message), "收藏夹媒体入队")
         else:
             # /dyu 在途目录戳：解析 bot（用户名含 douyin）回流的下一个
             # 视频盖作者目录章，落 <抖音>/<作者子目录>/ 而非默认 bot 文件夹
@@ -963,14 +972,14 @@ async def new_message_handler(event):
                         logger.info(
                             f"🎵 解析 bot 回流视频已盖目录戳：{source_override}")
                         if _aweme:
-                            asyncio.create_task(_settle_dyu_task(_aweme))
+                            spawn(_settle_dyu_task(_aweme), "/dyu 回流归位")
             except Exception:
                 pass
             # 白名单双通道（2026-09-13）：事件生产者只**记任务**，转发由
             # listener_worker 受控执行；停机漏掉的由 wl 扫描生产者按游标补。
-            asyncio.create_task(
+            spawn(
                 record_whitelist_media(message, event.chat_id,
-                                       source_override))
+                                       source_override), "白名单媒体记录")
 
     except Exception as e:
         logger.exception(f"❌ 消息处理异常：{e}")
@@ -1913,9 +1922,17 @@ async def main():
     cmdq_task = None
     health_monitor_task = None
     pawb_task = None
+    bili_task = None
+    x_task = None
+    pix_task = None
     if state.RUNTIME_DB_READY:
         wnacg_task = asyncio.create_task(wnacg.wnacg_worker_loop())
         asmr_task = asyncio.create_task(asmr_dl.asmr_worker_loop())
+        # bili 下载 worker（串行一次一条 → DB 队列，2026-11-05 迁移）
+        bili_task = asyncio.create_task(bili_dl.bili_worker_loop())
+        # X / Pixiv 下载 worker（同款 DB 队列，2026-11-05 迁移）
+        x_task = asyncio.create_task(x_dl_mod.x_worker_loop())
+        pix_task = asyncio.create_task(pixiv_dl_mod.pixiv_worker_loop())
         # 指令回放：启动时补离线指令 + 周期扫水位线（兜重连缺口）
         try:
             recovered_cmds = cmdq.recover_stale_running()
@@ -1980,22 +1997,16 @@ async def main():
                 "——重发同命令幂等续跑（已处理行自动跳过）")
     except Exception as e:
         logger.warning(f"📋 查重表执行中断标记读取失败：{e}")
+    # X/Pixiv 续跑（2026-11-05 队列统一）：不再有 RUNNING_MARK 内存标记——
+    # xn/xi_tasks 表的过期租约由 worker recover_startup 回 PENDING 自动续跑
     try:
-        from . import x_dl as _x_dl
-        _author = await _x_dl.resume_interrupted()
-        if _author:
+        from . import torrent_offline as _torrent_offline
+        _nwatch = await _torrent_offline.resume_offline_watchers()
+        if _nwatch:
             _recovery_notes.append(
-                f"X 下载续跑已启动：@{_author}（archive 幂等防重复）")
+                f"115 离线守望重建：{_nwatch} 个在途任务恢复完成通知")
     except Exception as e:
-        logger.warning(f"🐦 X 下载续跑失败（可手动 /x 重发）：{e}")
-    try:
-        from . import pixiv_dl as _pixiv_dl
-        _ptarget = await _pixiv_dl.resume_interrupted()
-        if _ptarget:
-            _recovery_notes.append(
-                f"Pixiv 下载续跑已启动：{_ptarget}（archive 幂等防重复）")
-    except Exception as e:
-        logger.warning(f"🎨 Pixiv 下载续跑失败（可手动 /pixiv 重发）：{e}")
+        logger.warning(f"🧲 离线守望重建失败：{e}")
     if _recovery_notes:
         logger.warning("🔄 重启恢复：" + "；".join(_recovery_notes))
         try:
@@ -2033,6 +2044,7 @@ async def main():
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
                   wl_scan_task, history_recheck_task, wnacg_task, asmr_task,
+                  bili_task, x_task, pix_task,
                   cmdq_task, health_monitor_task,
                   pawchive_worker_task, api_task,
                   extract_worker_task):
@@ -2041,6 +2053,7 @@ async def main():
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
                   wl_scan_task, history_recheck_task, wnacg_task, asmr_task,
+                  bili_task, x_task, pix_task,
                   cmdq_task, health_monitor_task,
                   pawchive_worker_task, api_task,
                   extract_worker_task):
@@ -2058,6 +2071,18 @@ async def main():
             wnacg.release_inflight()
         except Exception as e:
             logger.warning(f"📖 wnacg 在途任务释放失败：{e}")
+        try:
+            bili_dl.release_inflight()
+        except Exception as e:
+            logger.warning(f"📺 bili 在途任务释放失败：{e}")
+        try:
+            x_dl_mod.release_inflight()
+        except Exception as e:
+            logger.warning(f"🐦 x 在途任务释放失败：{e}")
+        try:
+            pixiv_dl_mod.release_inflight()
+        except Exception as e:
+            logger.warning(f"🎨 pixiv 在途任务释放失败：{e}")
         try:
             asmr_dl.release_inflight()
         except Exception as e:

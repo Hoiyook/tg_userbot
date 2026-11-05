@@ -40,15 +40,16 @@ def _read_history_file(path):
         return []
 
 
-def get_history_lines(n=None):
+def get_history_lines(n=None, kind=None):
     """读取最后 n 行渲染记录（n 为 None 时读全部），不存在返回空列表。
 
-    DB 在连 → download_history 表（渲染行与文件逐字符同格式，消费方
-    无感）；未连接 → 文件旧路径。
+    kind：渠道过滤（B站/X/iwara/Pixiv——按 kind 列精确匹配；媒体类传
+    None 拿全部）。DB 在连 → download_history 表（渲染行与文件逐字符
+    同格式，消费方无感）；未连接 → 文件旧路径。
     """
     if runtime_db.has_connection():
         try:
-            return runtime_db.history_lines(n)
+            return runtime_db.history_lines(n, kind=kind)
         except runtime_db.DbUnavailable as e:
             logger.warning(f"读取下载历史失败：{e}")
             return []

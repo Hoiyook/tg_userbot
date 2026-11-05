@@ -566,6 +566,64 @@ _SCHEMA = (
         updated_at   INTEGER NOT NULL
     )
     """,
+    # v22：X/Pixiv 作者下载队列（TaskDomain 域；key=作者/X 目标串）
+    """CREATE TABLE IF NOT EXISTS xn_tasks (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        target       TEXT NOT NULL UNIQUE,  -- @作者 / x.com 推文或作者页 URL
+        kind         TEXT,                  -- author/tweet（领取时判定）
+        label        TEXT,
+        status       TEXT NOT NULL,
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        next_retry_at INTEGER,
+        lease_until  INTEGER,
+        error        TEXT,
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL
+    )
+    """,
+    """CREATE TABLE IF NOT EXISTS xi_tasks (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        target       TEXT NOT NULL UNIQUE,  -- 画师名/用户ID/pixiv URL
+        kind         TEXT,
+        label        TEXT,
+        status       TEXT NOT NULL,
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        next_retry_at INTEGER,
+        lease_until  INTEGER,
+        error        TEXT,
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL
+    )
+    """,
+    # v21：B站串行下载队列（SerialTaskWorker 域；url 原始串判重——
+    # b23 短链与长链算两条，真实去重由 yt-dlp archive 兜底）
+    """CREATE TABLE IF NOT EXISTS bili_tasks (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        url          TEXT NOT NULL UNIQUE,  -- 提交的原始链接（延迟解析）
+        kind         TEXT,                  -- video/合集/系列（领到时解析回填）
+        label        TEXT,                  -- 展示名（解析后回填）
+        status       TEXT NOT NULL,         -- PENDING/PROCESSING/DONE/FAILED
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        next_retry_at INTEGER,
+        lease_until  INTEGER,
+        error        TEXT,
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL
+    )
+    """,
+    # v20：115 离线完成守望台账（2026-11-05 审计——守望 task 只存内存，
+    # 重启后磁力在 115 照下但永无人通知）
+    """CREATE TABLE IF NOT EXISTS offline_watch (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        info_hash    TEXT,                 -- 115 离线任务哈希（可空）
+        to_folder    TEXT NOT NULL,        -- 目标目录（守望轮询处）
+        label        TEXT,                 -- 通知展示名
+        known_names  TEXT,                 -- 提交时目录快照 JSON（判新增）
+        status       TEXT NOT NULL,        -- WATCHING / DONE
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL
+    )
+    """,
 )
 
 # SQLITE_BUSY / SQLITE_LOCKED 的典型文案（只用于判定是否值得重试）
@@ -945,6 +1003,16 @@ def migrate() -> int:
     if version < 19:
         # v18 → v19：新增 asmr_tasks（/asmr 音声下载任务，RJ 主键）。纯建表。
         logger.info("🗄 Runtime DB 迁移：v19（+ asmr_tasks 音声下载）")
+    if version < 20:
+        # v19 → v20：新增 offline_watch（115 离线完成守望台账）。纯建表。
+        logger.info("🗄 Runtime DB 迁移：v20（+ offline_watch 离线守望）")
+    if version < 21:
+        # v20 → v21：新增 bili_tasks（B站串行下载队列，TaskDomain 工厂域）。
+        # 纯建表。
+        logger.info("🗄 Runtime DB 迁移：v21（+ bili_tasks B站队列）")
+    if version < 22:
+        # v21 → v22：新增 xn_tasks / xi_tasks（X/Pixiv 下载队列）。纯建表。
+        logger.info("🗄 Runtime DB 迁移：v22（+ xn_tasks/xi_tasks X/Pixiv 队列）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -2142,26 +2210,36 @@ def creator_ids_by_name(creator_name):
     return _read(do, "查名字对应的创作者 id")
 
 
-def posts_for_backfill(creator_name=None, creator_id=None):
-    """某作者全部存量帖（回填用）：任何状态都要重拉详情对比。
+def posts_for_backfill(creator_name=None, creator_id=None,
+                       months=None):
+    """某作者存量帖（回填用）：任何状态都要重拉详情对比。
 
     creator_id 给定时按 id 精确（同名创作者防混，2026-10-21）；两者都空
-    返回空列表。"""
+    返回空列表。months 给定时只取 published 在最近 N 个月内的帖
+    （2026-11-03 owner：回填只回填最近 3 个月，不做全量扫描）；published
+    存站点发布日期（ISO 文本），空/解析不了的帖**保留**（宁多勿漏）。"""
 
     def do(conn):
+        since = None
+        if months:
+            import datetime as _dt
+            d = _dt.date.today() - _dt.timedelta(days=int(months) * 31)
+            since = d.isoformat()
         if creator_id is not None:
-            rows = _execute(
-                conn, "SELECT id, post_id, creator_id, service, status, "
-                "creator_name FROM pawchive_posts "
-                "WHERE creator_id = ? ORDER BY id DESC",
-                (str(creator_id),)).fetchall()
+            sql = ("SELECT id, post_id, creator_id, service, status, "
+                   "creator_name FROM pawchive_posts WHERE creator_id = ?")
+            args = [str(creator_id)]
         else:
-            rows = _execute(
-                conn, "SELECT id, post_id, creator_id, service, status, "
-                "creator_name FROM pawchive_posts "
-                "WHERE creator_name = ? COLLATE NOCASE "
-                "ORDER BY id DESC",
-                (str(creator_name or "").strip(),)).fetchall()
+            sql = ("SELECT id, post_id, creator_id, service, status, "
+                   "creator_name FROM pawchive_posts "
+                   "WHERE creator_name = ? COLLATE NOCASE")
+            args = [str(creator_name or "").strip()]
+        if since:
+            sql += (" AND (published >= ? OR published IS NULL "
+                    "OR published = '')")
+            args.append(since)
+        sql += " ORDER BY id DESC"
+        rows = _execute(conn, sql, args).fetchall()
         return [{"id": r[0], "post_id": r[1], "creator_id": r[2],
                  "service": r[3], "status": r[4], "creator_name": r[5]}
                 for r in rows]
@@ -3344,10 +3422,18 @@ def history_append_record(record):
         "下载历史入库")
 
 
-def history_lines(n=None):
+def history_lines(n=None, kind=None):
     """渲染行列表（get_history_lines 的 DB 等价）：n=None 全量按 id 升序；
-    n=尾部 n 条（升序，与文件 tail 语义一致）。"""
+    n=尾部 n 条（升序，与文件 tail 语义一致）；kind 给定时只取该类
+    （2026-11-05 owner：最近完成按渠道分类——B站/X/iwara/Pixiv）。"""
     def read(conn):
+        if kind:
+            rows = list(reversed(_execute(
+                conn, "SELECT ts, kind, filename, size_text, source, raw "
+                "FROM download_history WHERE kind=? "
+                "ORDER BY id DESC LIMIT ?",
+                (str(kind), int(n or 20))).fetchall()))
+            return [_history_row_to_line(r) for r in rows]
         if n is None:
             rows = _execute(
                 conn, "SELECT ts, kind, filename, size_text, source, raw "
@@ -4381,3 +4467,319 @@ def list_backfill_creators():
                 for r in rows]
 
     return _read(do, "列已扫作者")
+
+
+# ============================================================
+# offline_watch（115 离线完成守望，v20）
+# ============================================================
+OFFLINE_WATCHING = "WATCHING"
+OFFLINE_DONE = "DONE"
+
+
+def add_offline_watch(to_folder, label, known_names, info_hash=None):
+    """登记一个在途守望（watch 任务随内存死，行即真相源）。返回行 id。"""
+    import json as _json
+    import time as _t
+    now = int(_t.time())
+
+    def do(conn):
+        cur = _execute(
+            conn, "INSERT INTO offline_watch(info_hash, to_folder, label, "
+            "known_names, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ((info_hash or "").lower() or None, to_folder, label or "",
+             _json.dumps(sorted(known_names or []), ensure_ascii=False),
+             OFFLINE_WATCHING, now, now))
+        return cur.lastrowid
+
+    return _write(do, "登记离线守望")
+
+
+def list_offline_watching():
+    """全部 WATCHING 行（启动重建用）；顺带清 7 天前的 DONE 行。"""
+    import json as _json
+    import time as _t
+
+    def do(conn):
+        cutoff = int(_t.time()) - 7 * 86400
+        _execute(conn, "DELETE FROM offline_watch WHERE status = ? "
+                 "AND updated_at < ?", (OFFLINE_DONE, cutoff))
+        rows = _execute(
+            conn, "SELECT id, info_hash, to_folder, label, known_names "
+            "FROM offline_watch WHERE status = ? ORDER BY id",
+            (OFFLINE_WATCHING,)).fetchall()
+        return [{"id": r["id"], "info_hash": r["info_hash"],
+                 "to_folder": r["to_folder"], "label": r["label"],
+                 "known_names": set(_json.loads(r["known_names"] or "[]"))}
+                for r in rows]
+
+    return _read(do, "列出在途离线守望")
+
+
+def mark_offline_done(watch_id):
+    """守望已发出完成/超时通知 → 置 DONE。"""
+    import time as _t
+
+    def do(conn):
+        _execute(conn, "UPDATE offline_watch SET status = ?, updated_at = ? "
+                 "WHERE id = ?",
+                 (OFFLINE_DONE, int(_t.time()), watch_id))
+
+    _write(do, "离线守望完结")
+
+
+# ============================================================
+# 通用串行任务域工厂（2026-11-05 审计：wnacg/asmr 两域 10 函数 95% 同构
+# 的教训——新域一律走工厂生成，不再复制粘贴；wnacg/asmr 现存函数保留）
+# ============================================================
+class TaskDomain:
+    """SQLite 串行任务域（PENDING→PROCESSING→DONE/FAILED，租约+退避）。
+
+    wnacg 域函数的参数化泛化——语义与其逐字一致（2026-10-26 实战定稿版：
+    乐观锁领取 / 失败退避重投 N 次上限 / 租约过期自愈 / 优雅停机放回）。
+
+    表结构约定（迁移里建）：
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      <key>  <类型> NOT NULL UNIQUE,          -- 业务键（bili=url）
+      <payload 列...>,                        -- 域私有列
+      status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+      next_retry_at INTEGER, lease_until INTEGER, error TEXT,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+
+    key 值一律按 TEXT 绑定（url/author 类业务键）；领取 FIFO（id ASC），
+    列表最近在前（id DESC）。行映射用 dict(row)（列全集，无域私有裁剪）。
+    """
+
+    def __init__(self, table, key, what, emoji=""):
+        self.table = table
+        self.key = key
+        self.what = what          # 写事务描述（"bili 任务"）
+        self.emoji = emoji        # release 日志前缀
+        self.PENDING = "PENDING"
+        self.PROCESSING = "PROCESSING"
+        self.DONE = "DONE"
+        self.FAILED = "FAILED"
+
+    # ── 写路径 ──
+    def enqueue(self, key, now=None, **payload):
+        """登记任务（key 判重，已存在任何状态 → False）。payload 只收
+        表里存在的列（调用方多给列名会 sqlite 报错——故意 fail-fast）。"""
+        now = _now(now)
+        cols = list(payload.keys())
+        vals = [str(key)] + list(payload.values())
+        collist = ", ".join([self.key] + cols)
+        ph = ", ".join("?" * (1 + len(cols)))
+
+        def do(conn):
+            cur = _execute(
+                conn, f"INSERT OR IGNORE INTO {self.table} "
+                f"({collist}, status, created_at, updated_at) "
+                f"VALUES ({ph}, ?, ?, ?)",
+                (*vals, self.PENDING, now, now))
+            return bool(cur.rowcount)
+
+        return _write(do, f"登记 {self.what}")
+
+    def update(self, key, now=None, **cols):
+        """回填 payload 列（如 bili 领到后把解析出的 kind/label 落地）。"""
+        now = _now(now)
+        sets = ", ".join(f"{c}=?" for c in cols)
+
+        def do(conn):
+            _execute(conn, f"UPDATE {self.table} SET {sets}, updated_at=? "
+                     f"WHERE {self.key}=?",
+                     (*cols.values(), now, str(key)))
+
+        _write(do, f"回填 {self.what}")
+
+    def claim_next(self, now=None, lease_seconds=900):
+        """领一条到期 PENDING → PROCESSING（乐观锁）；没有返回 None。"""
+        now = _now(now)
+
+        def do(conn):
+            row = _execute(
+                conn, f"SELECT id FROM {self.table} WHERE status=? AND "
+                "(next_retry_at IS NULL OR next_retry_at<=?) "
+                "ORDER BY id LIMIT 1", (self.PENDING, now)).fetchone()
+            if row is None:
+                return None
+            cur = _execute(
+                conn, f"UPDATE {self.table} SET status=?, lease_until=?, "
+                "updated_at=? WHERE id=? AND status=?",
+                (self.PROCESSING, now + int(lease_seconds), now,
+                 row["id"], self.PENDING))
+            if not cur.rowcount:
+                return None
+            got = _execute(conn, f"SELECT * FROM {self.table} WHERE id=?",
+                           (row["id"],)).fetchone()
+            return dict(got)
+
+        return _write(do, f"领取 {self.what}")
+
+    def complete(self, key, now=None, **cols):
+        sets = ", ".join(f"{c}=?" for c in cols)
+
+        def do(conn):
+            extra = f", {sets}" if cols else ""
+            _execute(conn, f"UPDATE {self.table} SET status=?, "
+                     f"lease_until=NULL, error=NULL, updated_at=?{extra} "
+                     f"WHERE {self.key}=?",
+                     (self.DONE, _now(now), *cols.values(), str(key)))
+
+        _write(do, f"完成 {self.what}")
+
+    def fail(self, key, error, max_attempts=5, delay_seconds=None, now=None):
+        """失败分流：未到上限 → 退避重投；到上限 → FAILED（手动 retry）。
+
+        退避（2026-11-05 统一）：delay_seconds 缺省走指数退避
+        base × 2^(attempts-1)（与 queue._backoff_delay 同式，base=60s 封顶
+        30min）——wnacg/asmr 旧函数传固定 300s 的行为保持不变。"""
+        from . import config as _cfg
+        now = _now(now)
+
+        def do(conn):
+            row = _execute(conn, f"SELECT attempts FROM {self.table} "
+                           f"WHERE {self.key}=?", (str(key),)).fetchone()
+            attempts = (int(row["attempts"]) + 1) if row else 1
+            if attempts >= int(max_attempts):
+                _execute(conn, f"UPDATE {self.table} SET status=?, "
+                         "attempts=?, error=?, lease_until=NULL, "
+                         f"updated_at=? WHERE {self.key}=?",
+                         (self.FAILED, attempts, str(error)[:500], now,
+                          str(key)))
+                return self.FAILED
+            if delay_seconds is None:
+                base = int(getattr(_cfg, "AUTO_RETRY_BASE_DELAY", 60))
+                cap = int(getattr(_cfg, "AUTO_RETRY_MAX_DELAY", 1800))
+                delay = min(base * (2 ** max(0, attempts - 1)), cap)
+            else:
+                delay = int(delay_seconds)
+            _execute(conn, f"UPDATE {self.table} SET status=?, attempts=?, "
+                     "error=?, next_retry_at=?, lease_until=NULL, "
+                     f"updated_at=? WHERE {self.key}=?",
+                     (self.PENDING, attempts, str(error)[:500],
+                      now + delay, now, str(key)))
+            return self.PENDING
+
+        return _write(do, f"失败 {self.what}")
+
+    def retry(self, key=None, now=None):
+        """FAILED → PENDING（key=None 重投全部）。返回重投条数。"""
+        now = _now(now)
+
+        def do(conn):
+            if key is None:
+                cur = _execute(conn, f"UPDATE {self.table} SET status=?, "
+                               "attempts=0, next_retry_at=NULL, "
+                               "lease_until=NULL, updated_at=? WHERE status=?",
+                               (self.PENDING, now, self.FAILED))
+            else:
+                cur = _execute(conn, f"UPDATE {self.table} SET status=?, "
+                               "attempts=0, next_retry_at=NULL, "
+                               "lease_until=NULL, updated_at=? WHERE "
+                               f"{self.key}=? AND status=?",
+                               (self.PENDING, now, str(key), self.FAILED))
+            return cur.rowcount
+
+        return _write(do, f"重投 {self.what}")
+
+    def release(self, key, now=None):
+        """PROCESSING → PENDING（优雅停机取消在途，不等租约）。"""
+        def do(conn):
+            cur = _execute(
+                conn, f"UPDATE {self.table} SET status=?, lease_until=NULL, "
+                f"updated_at=? WHERE {self.key}=? AND status=?",
+                (self.PENDING, _now(now), str(key), self.PROCESSING))
+            return bool(cur.rowcount)
+
+        ok = _write(do, f"释放 {self.what}")
+        if ok:
+            logger.info(f"{self.emoji} {self.what}已放回待处理（停机取消）")
+        return ok
+
+    def recover_expired(self, now=None):
+        """租约过期的 PROCESSING → PENDING（崩溃自愈）。"""
+        now = _now(now)
+
+        def do(conn):
+            cur = _execute(conn, f"UPDATE {self.table} SET status=?, "
+                           "lease_until=NULL, updated_at=? "
+                           "WHERE status=? AND lease_until IS NOT NULL "
+                           "AND lease_until<?",
+                           (self.PENDING, now, self.PROCESSING, now))
+            return cur.rowcount
+
+        return _write(do, f"恢复过期 {self.what}")
+
+    def delete(self, rid):
+        """按行 id 移除（用户键可能是长 URL，/del 用短 id 顺手）。"""
+        def do(conn):
+            _execute(conn, f"DELETE FROM {self.table} WHERE id=?",
+                     (int(rid),))
+
+        _write(do, f"移除 {self.what}")
+
+    def retry_by_id(self, rid, now=None):
+        """按行 id 重投（同 delete：UI 用短 id）。返回条数。"""
+        now = _now(now)
+
+        def do(conn):
+            cur = _execute(conn, f"UPDATE {self.table} SET status=?, "
+                           "attempts=0, next_retry_at=NULL, lease_until=NULL, "
+                           "updated_at=? WHERE id=? AND status=?",
+                           (self.PENDING, now, int(rid), self.FAILED))
+            return cur.rowcount
+
+        return _write(do, f"重投 {self.what}")
+
+    # ── 读路径 ──
+    def list(self, status=None, limit=30):
+        def do(conn):
+            if status:
+                rows = _execute(
+                    conn, f"SELECT * FROM {self.table} WHERE status=? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (str(status), int(limit))).fetchall()
+            else:
+                rows = _execute(
+                    conn, f"SELECT * FROM {self.table} "
+                    "ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+            return [dict(r) for r in rows]
+
+        return _read(do, f"列 {self.what}")
+
+    def get(self, key):
+        row = _read(lambda c: _execute(
+            c, f"SELECT * FROM {self.table} WHERE {self.key}=?",
+            (str(key),)).fetchone(), f"查 {self.what}")
+        return dict(row) if row is not None else None
+
+    def count_since(self, status, since_ts, now=None):
+        """某状态且 updated_at >= since_ts 的行数（台账「今日完成」用）。"""
+        def do(conn):
+            row = _execute(conn, f"SELECT COUNT(*) AS n FROM {self.table} "
+                           "WHERE status=? AND updated_at>=?",
+                           (str(status), int(since_ts))).fetchone()
+            return int(row["n"])
+
+        return _read(do, f"计数 {self.what}（时间过滤）")
+
+    def count(self, status=None):
+        def do(conn):
+            if status:
+                row = _execute(conn, f"SELECT COUNT(*) AS n FROM {self.table} "
+                               "WHERE status=?", (str(status),)).fetchone()
+            else:
+                row = _execute(conn, f"SELECT COUNT(*) AS n FROM "
+                               f"{self.table}").fetchone()
+            return int(row["n"])
+
+        return _read(do, f"计数 {self.what}")
+
+
+BILI_TASKS = TaskDomain(table="bili_tasks", key="url",
+                        what="bili 任务", emoji="📺")
+XN_TASKS = TaskDomain(table="xn_tasks", key="target",
+                      what="x 任务", emoji="🐦")
+XI_TASKS = TaskDomain(table="xi_tasks", key="target",
+                      what="pixiv 任务", emoji="🎨")

@@ -28,7 +28,17 @@ from .log import logger
 from .naming import compute_url_filename, sanitize_filename
 
 _f2 = {"loaded": False, "ok": False, "reason": ""}
-_ENUM_LOCK = asyncio.Lock()   # 同时只允许一个 /dyu 枚举在跑
+_ENUM_LOCK = None   # /dyu 枚举互斥锁——运行期惰性创建（import 期
+                    # 无事件循环，3.9 的 Lock() 会抓主线程 loop；测试
+                    # IsolatedAsyncioTestCase 跑完后清主线程 loop，此后
+                    # 再 import 本模块就炸。2026-10-29 实测）
+
+
+def _enum_lock():
+    global _ENUM_LOCK
+    if _ENUM_LOCK is None:
+        _ENUM_LOCK = asyncio.Lock()
+    return _ENUM_LOCK
 
 
 def load_f2():
@@ -908,12 +918,18 @@ async def get_sec_user_id(url):
     return sec_uid
 
 
+def enum_busy() -> bool:
+    """/dyu 枚举是否在跑（命令层先查再 spawn——run_dyu 的忙拒绝返回值
+    曾被裸 create_task 丢弃，2026-11-05 审计修复）。"""
+    return _enum_lock().locked()
+
+
 async def run_dyu(url, subdir_raw, since=None, original_only=True):
     """后台编排：枚举 → 逐条判重入队 → 汇总通知。返回给命令层的文案由
     command_reply 同步部分给出；本函数只发异步通知。"""
-    if _ENUM_LOCK.locked():
+    if _enum_lock().locked():
         return "⏳ 已有一个 /dyu 枚举在进行中，稍后再发。"
-    async with _ENUM_LOCK:
+    async with _enum_lock():
         try:
             # 先保鲜 cookie（msToken 几小时过期，陈旧值是 403 主因）
             await refresh_cookie_from_browser()

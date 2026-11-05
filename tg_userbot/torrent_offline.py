@@ -47,13 +47,32 @@ def _dir_names(path):
 
 
 async def spawn_completion_watcher(to_folder, known_names, label="",
-                                   timeout_secs=None):
+                                   timeout_secs=None, info_hash=None):
     """离线完成守望：轮询目标目录，发现新增文件即 notify（用户要求：
     离线完成要有反馈）。超时则提示仍可能离线中。后台任务，强引用。"""
     timeout = float(timeout_secs or config.OFFLINE_WATCH_TIMEOUT_SECONDS)
     poll = float(getattr(config, "OFFLINE_WATCH_POLL_SECONDS", 30))
 
     async def _run():
+        # 持久化（2026-11-05 审计）：守望 task 只存内存，重启即丢通知承诺；
+        # 行即真相源，完结（通知发出）置 DONE
+        from . import runtime_db
+        watch_id = None
+        try:
+            watch_id = runtime_db.add_offline_watch(
+                to_folder, label, known_names, info_hash)
+        except Exception as e:
+            logger.warning(f"🧲 离线守望登记失败（不影响本次守望）：{e}")
+        try:
+            await _run_watch()
+        finally:
+            if watch_id is not None:
+                try:
+                    runtime_db.mark_offline_done(watch_id)
+                except Exception:
+                    pass
+
+    async def _run_watch():
         before = set(known_names or [])
         waited = 0.0
         while waited < timeout:
@@ -78,11 +97,29 @@ async def spawn_completion_watcher(to_folder, known_names, label="",
                 except Exception as e:
                     logger.warning(f"🧲 离线完成通知失败：{e}")
                 return
+        verdict = ""
+        if info_hash:
+            try:
+                st = await asyncio.to_thread(offline_status, info_hash,
+                                             to_folder or DEFAULT_TO)
+            except Exception as e:
+                logger.warning(f"🧲 离线状态查询失败：{e}")
+                st = None
+            if st is None:
+                verdict = ("❌ 任务不在 115 离线队列中——提交很可能被拒"
+                           "（内容审核/链接无效），不会再来新文件了")
+            elif st[0] == "已完成":
+                verdict = ("⚠️ 任务标记完成但目标目录未见新文件——"
+                           "去 115 云下载目录核对落点")
+            else:
+                verdict = f"⏳ 任务确认仍在队列：{st[0]}（{st[1]:.0f}%）"
+        if not verdict:
+            verdict = ("任务可能仍在离线中（冷门资源无 peer 会久挂），"
+                       "可稍后在 115 云下载目录确认")
         try:
             await notify.notify_user(
                 f"⏳ 离线 {int(timeout/60)} 分钟未见新文件（{label}）——"
-                "任务可能仍在离线中（冷门资源无 peer 会久挂），"
-                "可稍后在 115 云下载目录确认。")
+                f"{verdict}")
         except Exception:
             pass
 
@@ -92,12 +129,46 @@ async def spawn_completion_watcher(to_folder, known_names, label="",
     return t
 
 
+_OFFLINE_STATUS_ZH = {1: "排队中", 2: "已完成", 3: "下载中"}
+
+
+def offline_status(info_hash, sample_path=None):
+    sample_path = sample_path or DEFAULT_TO
+    """按 infoHash 查 115 离线任务的真实状态（2026-11-01 P2）。
+
+    返回 (状态中文, 完成百分比) 或 None（任务不在队列——提交被拒/被
+    清理/从未入列，正是 2026-10-31 App 端「提交成功但不入列」的实锤
+    探测手段）。阻塞 gRPC，调用方放线程。"""
+    import re as _re
+    from . import cd2_api
+    from .cd2_proto import clouddrive_pb2 as pb
+    f = cd2_api.find_remote(sample_path)
+    if f is None:
+        return None
+    m = _re.match(r"\{(\w+)-(\d+)\}", str(getattr(f, "id", "") or ""))
+    if not m:
+        return None
+    stub, md = cd2_api._md()
+    ih = (info_hash or "").lower()
+    for page in (1, 2, 3):
+        r = stub.ListAllOfflineFiles(pb.OfflineFileListAllRequest(
+            cloudName=m.group(1), cloudAccountId=m.group(2), page=page),
+            metadata=md, timeout=30)
+        for t in r.offlineFiles:
+            if (t.infoHash or "").lower() == ih:
+                st = _OFFLINE_STATUS_ZH.get(t.status, f"未知状态{t.status}")
+                return st, float(t.percendDone or 0)
+        if len(r.offlineFiles) < 30:
+            break
+    return None
+
+
 def snapshot_dir(to_folder):
     """目录快照（提交前抓，供守望比对新增）。同步阻塞，调用方放线程。"""
     return _dir_names(to_folder)
 
 
-def spawn_watch(to_folder, label="", known_names=None):
+def spawn_watch(to_folder, label="", known_names=None, info_hash=None):
     """提交成功后启动完成守望（sync 入口，内部建任务）。
 
     2026-09-29 修复：原来直接 ``return spawn_completion_watcher(...)``——
@@ -107,12 +178,33 @@ def spawn_watch(to_folder, label="", known_names=None):
     async def _run():
         known = known_names if known_names is not None else set(
             await asyncio.to_thread(_dir_names, to_folder) or [])
-        await spawn_completion_watcher(to_folder, known, label=label)
+        await spawn_completion_watcher(to_folder, known, label=label,
+                                       info_hash=info_hash)
 
     t = asyncio.ensure_future(_run())
     _OFFLINE_WATCH_TASKS.add(t)
     t.add_done_callback(_OFFLINE_WATCH_TASKS.discard)
     return t
+
+
+async def resume_offline_watchers():
+    """启动重建（2026-11-05 审计止血）：WATCHING 行逐个重新拉起守望。
+
+    known_names 用登记时的快照——重启期间落的新文件会被当「新增」正常
+    通知，不丢承诺。返回恢复条数。"""
+    from . import runtime_db
+    try:
+        rows = runtime_db.list_offline_watching()
+    except Exception as e:
+        logger.warning(f"🧲 离线守望重建读取失败：{e}")
+        return 0
+    for r in rows:
+        await spawn_completion_watcher(
+            r["to_folder"], r["known_names"], label=r["label"],
+            info_hash=r["info_hash"])
+    if rows:
+        logger.warning(f"🧲 离线守望重建：{len(rows)} 个在途任务恢复完成通知")
+    return len(rows)
 
 
 DEFAULT_TO = "/115open/云下载"
@@ -191,7 +283,7 @@ async def handle_torrent_url(url, to_folder=None):
         if "10008" in (err or "") or "已存在" in (err or ""):
             # 已在列表 ≠ 已完成：照样挂守望，完成后通知（否则重发链接
             # 永远拿不到完成反馈）
-            spawn_watch(to_folder or DEFAULT_TO, label=name)
+            spawn_watch(to_folder or DEFAULT_TO, label=name, info_hash=ih)
             return "🧲 该种子已在 115 离线列表中（完成后会通知你）"
         return f"🧲 离线提交被拒绝：{err}"
     lines = ["🧲 种子已转为 115 离线任务", f"名称：{name}"]
@@ -199,7 +291,7 @@ async def handle_torrent_url(url, to_folder=None):
         lines.append(f"内容 {format_size(info['size'])}｜"
                      f"{'⚠️ 私有种子' if info['private'] else '公开种子'}")
     lines.append(f"CD2 离线拉取到 {to_folder or DEFAULT_TO}（完成后会通知你）")
-    spawn_watch(to_folder or DEFAULT_TO, label=name)
+    spawn_watch(to_folder or DEFAULT_TO, label=name, info_hash=ih)
     from .text import fit_4096
     return fit_4096("\n".join(lines))
 
@@ -221,7 +313,7 @@ async def handle_torrent_bytes(data, to_folder=None):
     if not ok:
         if "10008" in (err or "") or "已存在" in (err or ""):
             # 已在列表 ≠ 已完成：照样挂守望（同 handle_torrent_url）
-            spawn_watch(to_folder or DEFAULT_TO, label=info["name"])
+            spawn_watch(to_folder or DEFAULT_TO, label=info["name"], info_hash=info.get("infohash"))
             return "🧲 该种子已在 115 离线列表中（完成后会通知你）"
         return f"🧲 离线提交被拒绝：{err}"
     lines = ["🧲 种子已转为 115 离线任务", f"名称：{info['name']}",
@@ -229,6 +321,6 @@ async def handle_torrent_bytes(data, to_folder=None):
              f"{'⚠️ 私有种子' if info['private'] else '公开种子'}",
              "CD2 离线拉取到 /115open/云下载",
              "完成后会通知你（默认守望 30 分钟）"]
-    spawn_watch(to_folder or DEFAULT_TO, label=info["name"])
+    spawn_watch(to_folder or DEFAULT_TO, label=info["name"], info_hash=info.get("infohash"))
     from .text import fit_4096
     return fit_4096("\n".join(lines))

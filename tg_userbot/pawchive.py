@@ -324,21 +324,36 @@ def _backfill_pool():
     return _BACKFILL_POOL
 
 
-async def backfill_author(name):
-    """回填一个作者的全部存量帖。返回回执文案（完成后 notify）。
+async def backfill_author(name, months=None):
+    """回填一个作者的存量帖。返回回执文案（完成后 notify）。
+
+    months：只回填最近 N 个月发布的帖（owner 2026-11-03：默认 3，
+    不做全量扫描；None = 不限）。调用方覆盖：
+      * 定期轮巡/待办自动执行 → 默认 3 个月
+      * /paw backfill <作者> → 默认 3 个月
+      * （/paw_plan 不受此限制——扫描的 since 参数自己管）
 
     同名防混（2026-10-21）：按名字命中多个 creator_id 时拒绝并列出各自
     帖量，要求 名字#id 或纯数字 id 定向；不再默默把两个号混着回填。"""
     label = str(name or "").strip()
     if not label:
         return f"{TEXT_PREFIX}\n用法：/paw backfill <作者名|名字#id|数字id>"
+    if months is None:
+        months = PAWB_MONTHS_LIMIT   # 函数内解析（默认参数在定义时求值，
+                                     # 常量定义在文件后部会 NameError）
     if state.PAW_SCAN_RUNNING is not None:
+        # 撞锁 → 自动排队（单待办位）：记下作者，锁释放后自动执行
+        pending, displaced = enqueue_plan_pending(label)
+        tip = (f"\n⚠️ 原待办「{displaced}」被本次覆盖（单待办位）"
+               if displaced and displaced != pending else "")
         return (f"{TEXT_PREFIX}\n⏳ 已有扫描/回填在进行"
-                f"（{state.PAW_SCAN_RUNNING}），稍后再试")
+                f"（{state.PAW_SCAN_RUNNING}）\n"
+                f"📌 已排队：扫描结束后自动执行「{pending}」的回填{tip}")
     name_part, id_part = parse_creator_ref(label)
     try:
         rows = runtime_db.posts_for_backfill(
-            creator_name=name_part or None, creator_id=id_part)
+            creator_name=name_part or None, creator_id=id_part,
+            months=months)
     except runtime_db.DbUnavailable as e:
         return f"{TEXT_PREFIX}\n❌ Runtime DB 不可用：{e}"
     if not rows:
@@ -355,7 +370,8 @@ async def backfill_author(name):
         return (f"{TEXT_PREFIX}\n⚠️ 「{name_part}」名下有 {len(by_id)} 个"
                 f"创作者（共 {len(rows)} 帖），请定向回填：\n{breakdown}\n"
                 "用法：/paw_backfill 名字#id 或 /paw_backfill 数字id")
-    state.PAW_SCAN_RUNNING = f"回填 {rows[0]['creator_name']}"
+    scope_txt = f"最近 {months} 个月" if months else "全部存量"
+    state.PAW_SCAN_RUNNING = f"回填 {rows[0]['creator_name']}（{scope_txt}）"
     state.PAW_SCAN_PROGRESS = {
         "started": time.monotonic(), "stage": "回填详情", "detail": "0/0"}
 
@@ -435,6 +451,7 @@ async def backfill_author(name):
         finally:
             state.PAW_SCAN_RUNNING = None
             state.PAW_SCAN_PROGRESS = {}
+            await _kick_plan_pending()
         try:
             await _notify(summary)
         except Exception as e:
@@ -463,6 +480,8 @@ async def backfill_author(name):
 PAWB_STATE_FILE = "pawb_state.json"
 PAWB_ROUND_HOURS = 72            # 全量作者一轮的周期
 PAWB_MAX_AUTHORS_PER_ROUND = 3   # 单轮最多处理作者数（每轮只啃一点）
+PAWB_MONTHS_LIMIT = 3            # 回填只回填最近 N 个月（owner 2026-11-03：
+                                 # 不做全量扫描；None = 不限）
 PAWB_POST_GAP = 2.5              # 帖间节流（与手动 backfill 同款）
 
 
@@ -477,6 +496,82 @@ def _load_pawb_state():
             return _j.load(f)
     except (OSError, ValueError):
         return {"cursor": 0, "last_round": 0}
+
+
+
+
+_PLAN_PENDING_FILE = os.path.join(config.RUNTIME_DIR, "paw_plan_pending.json")
+
+
+def _load_plan_pending() -> str:
+    """启动恢复待办位（2026-11-05 审计：排队在内存态曾因重启蒸发——
+    bili 侧实测 4 条排队全丢后，同款教训在此补齐）。"""
+    try:
+        with open(_PLAN_PENDING_FILE, "r", encoding="utf-8") as f:
+            return str(json.load(f) or "").strip()
+    except Exception:
+        return ""
+
+
+def _save_plan_pending(name):
+    try:
+        tmp = _PLAN_PENDING_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(name, f, ensure_ascii=False)
+        os.replace(tmp, _PLAN_PENDING_FILE)
+    except Exception as e:
+        logger.warning(f"🐾 pawchive 待办位落盘失败：{e}")
+
+
+def enqueue_plan_pending(name):
+    """撞锁时把 /paw_plan 作者记入单待办位（后写覆盖先写，被覆盖者
+    由调用方在回执里提示）。持久化到 runtime/paw_plan_pending.json，
+    重启不丢。返回 (生效名, 被覆盖名)。"""
+    name = str(name or "").strip()
+    displaced = getattr(state, "PAW_PLAN_PENDING", "") or ""
+    state.PAW_PLAN_PENDING = name
+    _save_plan_pending(name)
+    return name, displaced
+
+
+state.PAW_PLAN_PENDING = _load_plan_pending()   # 启动恢复（重启不丢）
+
+
+def take_plan_pending() -> str:
+    """取走待办作者（取后清空并落盘；无则空串）。"""
+    name = getattr(state, "PAW_PLAN_PENDING", "") or ""
+    state.PAW_PLAN_PENDING = ""
+    _save_plan_pending("")
+    return name
+
+
+async def _kick_plan_pending():
+    """锁释放点钩子：待办位有 /paw_plan 作者 → 自动启动（单待办位，
+    后写覆盖先写；再撞锁会再次入位，不会丢）。复用 /paw_plan 真实链路：
+    resolve_creators 解析（禁联网走旧缓存）→ start_scan。"""
+    name = take_plan_pending()
+    if not name:
+        return
+    logger.info(f"🐾 待办 /paw_plan 自动执行：{name}")
+    try:
+        import asyncio as _a
+        res = await _a.to_thread(resolve_creators, name, False)
+        kind = res.get("kind")
+        if kind == "exact":
+            creator, _note = pick_favorited_creator(res["hits"])
+            if creator is None:
+                creator = res["hits"][0]   # 重名自动取第一个（无法交互确认）
+        elif kind in ("id", "fuzzy"):
+            creator = res["hits"][0]
+        else:
+            creator = None
+        if creator is not None:
+            start_scan(creator)
+            return
+        # 解析不出：按文本回填兜底（backfill_author 自带防混校验）
+        await backfill_author(name)
+    except Exception as e:
+        logger.exception(f"🐾 待办自动回填失败：{e}")
 
 
 def _save_pawb_state(st):
@@ -494,6 +589,93 @@ def list_scanned_creators():
         return runtime_db.list_backfill_creators()
     except runtime_db.DbUnavailable:
         return []
+
+
+# 回填执行历史（2026-11-02）：每轮结束追加一条 JSONL（单行 append 纪律，
+# 读时裁剪）。字段：ts/author_count/summary/cursor——app「回填执行情况」
+# 与 /paw schedule 的姊妹视图。
+PAWB_HISTORY_FILE = os.path.join(config.PAWCHIVE_DATA_DIR, "pawb_history.jsonl")
+PAWB_HISTORY_MAX = 200
+
+
+def log_backfill_round(author_count, summary, cursor):
+    """一轮定期回填结束 → 追加执行记录（失败只告警，绝不影响回填）。"""
+    try:
+        os.makedirs(config.PAWCHIVE_DATA_DIR, exist_ok=True)
+        entry = {"ts": time.time(), "author_count": int(author_count),
+                 "summary": str(summary or "")[:400],
+                 "cursor": int(cursor or 0)}
+        with open(PAWB_HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"🐾 回填执行记录落盘失败：{e}")
+
+
+def read_backfill_history(n=20) -> list:
+    """回填执行历史（新→旧，裁到最近 n 条）。"""
+    try:
+        with open(PAWB_HISTORY_FILE, encoding="utf-8") as f:
+            lines = f.readlines()
+    except (OSError, ValueError):
+        return []
+    items = []
+    for ln in lines[-PAWB_HISTORY_MAX:][-n:]:
+        try:
+            items.append(json.loads(ln))
+        except ValueError:
+            continue
+    return list(reversed(items))
+
+
+def backfill_status_overview() -> dict:
+    """当前回填状态 + 历史 + 计划（app 三段式数据源，一次取全）。
+
+    current：轮巡状态（游标/循环起点/上次运行）；next_batch：按计划序
+    取即将回填的作者（前 PAWB_MAX_AUTHORS_PER_ROUND 个）。"""
+    import math
+    creators = list_scanned_creators()
+    st = _load_pawb_state()
+    cursor = int(st.get("cursor", 0)) % max(len(creators), 1)
+    started = float(st.get("loop_started", 0) or 0)
+    per = int(PAWB_MAX_AUTHORS_PER_ROUND)
+    wake_h = 6
+    now = time.time()
+    next_batch = []
+    if creators:
+        for i in range(min(per, len(creators))):
+            c = creators[(cursor + i) % len(creators)]
+            wake_idx = i // per
+            eta = (started or now) + (wake_idx + 1) * wake_h * 3600
+            next_batch.append({
+                "name": c.get("creator_name") or "",
+                "posts": int(c.get("posts") or 0),
+                "eta": time.strftime("%m-%d %H:%M", time.localtime(eta)),
+                "overdue": eta < now,
+            })
+    hist = read_backfill_history(50)
+    last_run = hist[0] if hist else None
+    last_run_at = (time.strftime("%m-%d %H:%M", time.localtime(last_run["ts"]))
+                   if last_run else "")
+    # 顺延判定：首批预计已逾期，且最近 6h 内没有实际执行记录
+    # （被让位/重启顺延了——如实报告，而不是干巴巴「已逾期」）
+    deferred = bool(next_batch and next_batch[0].get("overdue")
+                    and not (last_run and last_run.get("ts", 0) > now - 6 * 3600))
+    return {
+        "current": {
+            "cursor": cursor,
+            "total_creators": len(creators),
+            "loop_started": time.strftime(
+                "%m-%d %H:%M", time.localtime(started)) if started else "",
+            "full_round_h": math.ceil(len(creators) / per) * wake_h
+                            if creators else 0,
+            "per_round": per,
+            "wake_hours": wake_h,
+            "last_run_at": last_run_at,
+            "deferred": deferred,
+        },
+        "next_batch": next_batch,
+        "history": hist,
+    }
 
 
 async def backfill_round(start_index=0):
@@ -582,9 +764,14 @@ async def backfill_loop():
             _save_pawb_state(st)
     except Exception:
         pass
+    first_wake = True
     try:
         while True:
-            await asyncio.sleep(6 * 3600)
+            # 重启快醒（2026-11-03）：首次醒只等 5 分钟——重启不该把 6h
+            # 的醒次往后推（此前重启一次吞掉一个醒次，看板「已逾期」的
+            # 根因之一）；后续醒次仍每 6h
+            await asyncio.sleep(300 if first_wake else 6 * 3600)
+            first_wake = False
             try:
                 st = _load_pawb_state()
                 n_creators = len(list_scanned_creators())
@@ -594,6 +781,7 @@ async def backfill_loop():
                 # 38 作者 → 约 2.2 天转完一圈
                 result = await backfill_round(st.get("cursor", 0))
                 done, text, next_cursor = result
+                log_backfill_round(done, text, next_cursor)
                 if done:
                     st.update({"cursor": next_cursor})
                     _save_pawb_state(st)
@@ -1187,8 +1375,12 @@ def _creator_label(creator):
 async def start_scan(creator, scope="notfaved", since=None):
     """后台扫描一个创作者并落库；立即返回，结果经 notify 汇报。"""
     if state.PAW_SCAN_RUNNING is not None:
-        return (f"⏳ 已有扫描在进行（{state.PAW_SCAN_RUNNING}），"
-                "等它结束再发起（/paw status 看进度）")
+        label = _creator_label(creator)
+        pending, displaced = enqueue_plan_pending(label)
+        tip = (f"\n⚠️ 原待办「{displaced}」被本次覆盖（单待办位）"
+               if displaced and displaced != pending else "")
+        return (f"⏳ 已有扫描在进行（{state.PAW_SCAN_RUNNING}）\n"
+                f"📌 已排队：结束后自动执行「{label}」{tip}")
     state.PAW_SCAN_RUNNING = _creator_label(creator)
     state.PAW_SCAN_PROGRESS = {
         "started": time.monotonic(), "stage": "准备中", "detail": ""}
@@ -1286,6 +1478,7 @@ async def _scan_and_notify(creator, scope, since=None):
     finally:
         state.PAW_SCAN_RUNNING = None
         state.PAW_SCAN_PROGRESS = {}
+        await _kick_plan_pending()
 
 
 _FILE_STATUS_MARK = {
@@ -2389,6 +2582,20 @@ async def command_reply(event, cmd_text):
         await event.reply(author_progress_text(arg), link_preview=False)
         return
     if action == "backfill":
+        # /paw_backfill on|off|status（无参/status）= deferred 补扫的开关与
+        # 状态——与「按作者名回填」（backfill_author）是两件事。/paw_backfill
+        # 被 _PAW_CMD_RE 抢先路由到这里（commands.py 的独立分支轮不到），
+        # 所以子命令语义必须在此区分：特殊词走补扫，其余按作者名回填
+        a = (arg or "").strip().lower()
+        if a in ("status", "状态"):
+            await event.reply(backfill_status_text(), link_preview=False)
+            return
+        if a in ("on", "开", "启动"):
+            await event.reply(backfill_start(), link_preview=False)
+            return
+        if a in ("off", "停", "停止"):
+            await event.reply(backfill_stop(), link_preview=False)
+            return
         await event.reply(await backfill_author(arg), link_preview=False)
         return
     if action == "schedule":
@@ -2500,8 +2707,15 @@ def encode_pick(index):
 
 async def _reply_plan(event, arg):
     if state.PAW_SCAN_RUNNING is not None:
+        # 撞锁 → 自动排队：把参数记下，锁释放后按 /paw_plan 真实链路执行
+        name = (arg or "").strip()
+        pending, displaced = enqueue_plan_pending(name)
+        tip = (f"\n⚠️ 原待办「{displaced}」被本次覆盖（单待办位）"
+               if displaced and displaced != pending else "")
+        name = pending
         await event.reply(
-            f"{TEXT_PREFIX}\n⏳ 已有扫描在进行（{state.PAW_SCAN_RUNNING}）",
+            f"{TEXT_PREFIX}\n⏳ 已有扫描在进行（{state.PAW_SCAN_RUNNING}）\n"
+            f"📌 已排队：结束后自动执行「{name}」",
             link_preview=False)
         return
     await ack_stale_creators(
