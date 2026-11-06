@@ -572,6 +572,16 @@ async def dispatch_link_text(text: str) -> dict:
         reply = await bili_dl.auto_reply(text)
         return {"ok": True, "routed": "bili", "message": reply}
 
+    # X/Twitter 链接 → X 队列（2026-11-05 owner：分享即下载不落台账；
+    # 2026-11-06 补看板粘贴框入口——此前只挂了 Telegram 两路由，改一处
+    # 漏一处的现行犯）
+    from . import x_dl as _x_dl
+    if _x_dl.looks_like_x(text):
+        reply = await _x_dl.auto_reply(text)
+        _u = manual_links.extract_urls(text) or [None]
+        _log_paste(text, _u[0], "x", None)
+        return {"ok": True, "routed": "x", "message": reply}
+
     # t.me 帖子链接 → bot 自己的客户端拉原帖入队（收藏夹同款路径）
     from . import tme as _tme
     _tme_urls = _tme.extract_tme_post_urls(text)
@@ -795,12 +805,18 @@ async def handle_queues(request):
             rows = getattr(runtime_db, fn)(limit=200)
             from collections import Counter
             counts = Counter(r["status"] for r in rows)
+            # items 只放真正待办/在途的条目（2026-11-05 owner 反馈：
+            # 历史 DONE/FAILED 的标题混进卡片里看着像「正在进行中」）
+            active = [r for r in rows
+                      if r["status"] in ("PENDING", "PROCESSING")]
             out.append({"name": name, "emoji": emoji,
                         "pending": counts.get("PENDING", 0),
                         "running": counts.get("PROCESSING", 0),
                         "failed": counts.get("FAILED", 0),
-                        "items": [str(r.get("title") or r.get("aid") or r.get("rj"))[:36]
-                                  for r in rows[:5]]})
+                        "items": [str(r.get("title") or r.get("aid")
+                                      or r.get("rj"))[:36].replace(
+                                      "&#124;", "|")
+                                  for r in active[:5]]})
         except Exception as e:
             out.append({"name": name, "emoji": emoji, "error": str(e)[:80]})
 

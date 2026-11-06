@@ -469,7 +469,7 @@ class PasswordHintTest(unittest.TestCase):
         z = make_encrypted_zip(self.root)
         action, msg = extract_dir.process_archive(z)
         self.assertEqual(action, "fail")
-        self.assertIn("找不到密码", msg)
+        self.assertIn("都解不开", msg)
         self.assertTrue(z.exists())
 
     def test_hint_file_password_used(self):
@@ -591,14 +591,21 @@ class PasswordCandidatesChainTest(unittest.TestCase):
         z.write_bytes(b"")
         (self.root / "密码zxc.txt").write_text("提示密码", encoding="utf-8")
         cands = extract_dir.password_candidates(str(z), extra="目录名密码")
-        self.assertEqual(cands, ["目录名密码", "Fil3nam3", "zxc", "提示密码"])
+        # 前 4 个按序：extra/文件名#/提示stem/提示内容；尾部新加的
+        # 「所在目录名」候选（2026-11-06 c291dGhwbHVz 源）单独断言
+        self.assertEqual(cands[:4],
+                         ["目录名密码", "Fil3nam3", "zxc", "提示密码"])
+        self.assertEqual(cands[-1],
+                         os.path.basename(str(self.root)))
 
     def test_dedup_preserves_order(self):
         z = self.root / "包#same.zip"
         z.write_bytes(b"")
         (self.root / "密码same.txt").write_text("same", encoding="utf-8")
         cands = extract_dir.password_candidates(str(z), extra="same")
-        self.assertEqual(cands, ["same"])
+        self.assertEqual(cands[0], "same")
+        self.assertEqual(cands[-1], self.root.name)   # 目录名候选居尾
+        self.assertEqual(len(cands), len(set(cands)))  # 全程去重
 
     def test_115x_dir_name_wins_over_others(self):
         # /115x 场景：目录名密码（Telegram@XXX）与文件名/提示文件并存

@@ -365,10 +365,15 @@ class _XWorker(DomainWorker):
         is_tweet = "/status/" in (gurl or "")
         self.domain.update(raw, kind="tweet" if is_tweet else "author",
                            label=label)
+        # dest 作者名：推文从 URL 提取真作者（不能拿 URL 当作者名——
+        # 2026-11-06 实测落盘成 X/https:/x.com/... 怪目录）
+        m = _TWEET_URL_RE.search(gurl or "")
+        dest_author = m.group(1) if m else key
         _X_RUNNING = {"author": label, "started": time.time(), "done": 0}
         try:
             self.inner_task = asyncio.ensure_future(
-                asyncio.to_thread(run_author, key, url=gurl, label=label))
+                asyncio.to_thread(run_author, dest_author, url=gurl,
+                                  label=label))
             try:
                 n, note = await self.inner_task
             except asyncio.CancelledError:

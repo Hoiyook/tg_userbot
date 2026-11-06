@@ -294,6 +294,10 @@ async def _run_one(task):
         _CURRENT.update({"aid": aid, "title": title, "stage": "下载/上传"})
         result = await _process_task(task)
         runtime_db.complete_wnacg_task(aid, size_bytes=result["size"])
+        from .history import append_history
+        append_history(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} | wnacg | "
+            f"{title} | {format_size(result['size'])} | 来源：wnacg下载")
         logger.info(f"📖 [aid {aid}] 完成：{title}（{format_size(result['size'])}）"
                     "→ 已入解压管线")
         try:

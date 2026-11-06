@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# 数据目录钉住（2026-11-06 实测：restart 从无该变量的 shell 启动会把
+# runtime DB/下载目录回落到 ~/tg_downloader/ 旁库——看板与台账全失明）
+export TG_SAVE_FOLDER="${TG_SAVE_FOLDER:-/Volumes/V1}"
 # TG Userbot 一键启停：优雅停机（SIGTERM）+ 启动。
 #
 #   ./run.sh start      启动（已在跑就跳过，不重复拉）
@@ -208,6 +211,19 @@ do_stop() {
     fi
 }
 
+# 启动期输出轮转（2026-10-29）：userbot.out 只追加、曾累积到 549MB——
+# 超阈值时改名 .1（仅保留一份，下次轮转覆盖旧 .1）。内容 95% 是 telethon
+# 连接噪音，无保留价值；真正要查的日志在 download.log（已按天轮转）。
+rotate_out_file() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    local size
+    size=$(stat -f %z "$f" 2>/dev/null || echo 0)
+    if [ "$size" -gt 52428800 ]; then
+        mv -f "$f" "$f.1"
+    fi
+}
+
 purge_pycache() {
     # 清理 Python 字节码缓存（2026-09-16 事故根治）：并行编辑/git 操作曾让
     # ~/Library/Caches/com.apple.python 下的 .pyc 失效校验错乱，进程加载
@@ -220,6 +236,11 @@ purge_pycache() {
 
 do_start() {
     local value
+    # Runtime DB 位置（2026-11-01）：默认放内置盘 ~/tg_downloader/——
+    # 外置卷（V1）被 CD2 大量上传占满 I/O 时，同卷 SQLite 查询会把整个
+    # 事件循环磨到冻结（实测 API/看板/Telegram 全部无响应数分钟）。
+    # 可用环境变量 TG_RUNTIME_DB 覆盖。
+    export TG_RUNTIME_DB="${TG_RUNTIME_DB:-$HOME/tg_downloader/tg_userbot.db}"
     if [ -n "${TG_PROXY:-}" ]; then
         echo "▶ 代理来源：环境变量 TG_PROXY"
     else
@@ -236,6 +257,7 @@ do_start() {
         echo "ℹ️  userbot 已在运行（PID $(userbot_pids | pids_text))，跳过"
     else
         purge_pycache
+        rotate_out_file "$RUNTIME_DIR/userbot.out"
         nohup "$PY" "$USERBOT_SCRIPT" >>"$RUNTIME_DIR/userbot.out" 2>&1 &
         disown 2>/dev/null || true
         sleep 2
@@ -255,6 +277,7 @@ do_start() {
     else
         # TG_CHROME_HEADLESS=0：Agent 的专用 Chrome 以有头模式运行（owner
         # 指令 2026-10-04——验证码页/收割页面直接可见可操作）
+        rotate_out_file "$RUNTIME_DIR/chrome_agent.out"
         nohup env TG_CHROME_HEADLESS=0 "$PY" -m "$AGENT_MODULE" \
             >>"$RUNTIME_DIR/chrome_agent.out" 2>&1 &
         disown 2>/dev/null || true

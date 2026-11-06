@@ -18,6 +18,17 @@ from telethon import TelegramClient, events
 from telethon.network.connection import ConnectionTcpFull, ConnectionTcpObfuscated
 
 from .spawn import spawn
+
+
+async def _notify_replay_loop(interval=600.0):
+    """积压通知重发循环（notify.replay_failed_once 每 10 分钟一轮）。"""
+    from . import notify
+    while True:
+        try:
+            await notify.replay_failed_once()
+        except Exception as e:
+            logger.warning(f"通知重发异常（下轮继续）：{e}")
+        await asyncio.sleep(interval)
 from . import state
 from . import api_server
 from . import netio
@@ -39,6 +50,7 @@ from . import wnacg
 from . import asmr_dl
 from . import bili_dl
 from . import x_dl as x_dl_mod
+from . import pd_dl
 from . import pixiv_dl as pixiv_dl_mod
 from . import cmdq
 from . import health
@@ -1925,6 +1937,8 @@ async def main():
     bili_task = None
     x_task = None
     pix_task = None
+    pd_watch_task = None
+    notify_replay_task = None
     if state.RUNTIME_DB_READY:
         wnacg_task = asyncio.create_task(wnacg.wnacg_worker_loop())
         asmr_task = asyncio.create_task(asmr_dl.asmr_worker_loop())
@@ -1933,6 +1947,11 @@ async def main():
         # X / Pixiv 下载 worker（同款 DB 队列，2026-11-05 迁移）
         x_task = asyncio.create_task(x_dl_mod.x_worker_loop())
         pix_task = asyncio.create_task(pixiv_dl_mod.pixiv_worker_loop())
+        # pixeldrain 完成观察器（.ok 落地 → 通知 + 台账，2026-11-06 补盲）
+        pd_watch_task = asyncio.create_task(
+            pd_dl.completion_watch_loop())
+        # 通知重发循环（断连窗口积压的完成/失败通知，每 10 分钟补发）
+        notify_replay_task = asyncio.create_task(_notify_replay_loop())
         # 指令回放：启动时补离线指令 + 周期扫水位线（兜重连缺口）
         try:
             recovered_cmds = cmdq.recover_stale_running()
@@ -2044,7 +2063,8 @@ async def main():
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
                   wl_scan_task, history_recheck_task, wnacg_task, asmr_task,
-                  bili_task, x_task, pix_task,
+                  bili_task, x_task, pix_task, pd_watch_task,
+                  notify_replay_task,
                   cmdq_task, health_monitor_task,
                   pawchive_worker_task, api_task,
                   extract_worker_task):
@@ -2053,7 +2073,8 @@ async def main():
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
                   reporter_task, listener_task, listener_worker_task,
                   wl_scan_task, history_recheck_task, wnacg_task, asmr_task,
-                  bili_task, x_task, pix_task,
+                  bili_task, x_task, pix_task, pd_watch_task,
+                  notify_replay_task,
                   cmdq_task, health_monitor_task,
                   pawchive_worker_task, api_task,
                   extract_worker_task):

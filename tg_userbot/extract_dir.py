@@ -32,7 +32,7 @@ from .log import logger
 IN_PROGRESS_SUFFIXES = (".part", ".crdownload", ".download", ".tmp",
                         ".opdownload")
 
-SUBPROCESS_TIMEOUT_DEFAULT = 3600    # 单包硬顶 1 小时
+SUBPROCESS_TIMEOUT_DEFAULT = 14400   # 单包硬顶 4 小时（36GB 分卷实测需要）
 
 # 压缩包后缀 → 处理器；同名目录 = 去掉这些后缀后的名字
 ARCHIVE_SUFFIXES = (".zip", ".rar", ".7z", ".tar.gz", ".tgz", ".tar.bz2",
@@ -193,6 +193,13 @@ def password_candidates(archive_path, extra=None) -> list:
                 _add(m.group(1) if m else line[:64])
     except Exception as e:
         logger.debug(f"密码候选收集失败：{e}")
+    # ⑤ 所在目录名（2026-11-06 c291dGhwbHVz 实测：byqn/MMD 两个大包的
+    # 密码都是目录名——来源方打包时用密码当目录名的约定）
+    try:
+        _add(os.path.basename(os.path.dirname(
+            os.path.abspath(archive_path))))
+    except Exception:
+        pass
     return out
 
 
@@ -347,6 +354,56 @@ def process_archive(path, dry: bool = False,
         return ("done",
                 f"✅ 解出 {n} 个文件{pwd_note} → {dest_dir.name}/"
                 + (f"（已删除 {removed} 个分卷）" if removed > 1 else ""))
+
+    # .7z 单卷：**7z 工具优先**（加密 7z bsdtar/libarchive 不支持——
+    # rar 分支同款结论；无密码先试 → 候选循环，目录名是候选之一）
+    if low.endswith(".7z"):
+        tool = find_7z_tool()
+        if not tool:
+            return "fail", ("未找到 7z 工具（brew install p7zip）——"
+                            "保留原包")
+        if dry:
+            return "dry", f"将解压（7z）→ {dest_dir.name}/"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        candidates = password_candidates(path)
+        tries = [None] + candidates
+        last_err = ""
+        pwd_used = False
+        for pwd in tries:
+            cmd = [tool, "x", "-y", f"-o{dest_dir}", str(path)]
+            if pwd:
+                cmd.insert(2, f"-p{pwd}")
+            try:
+                r = subprocess.run(
+                    cmd, capture_output=True, stdin=subprocess.DEVNULL,
+                    timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return "fail", f"解压超时（>{timeout}s）——保留原包"
+            except Exception as e:
+                return "fail", f"解压异常: {type(e).__name__}: {e}"
+            if r.returncode == 0:
+                pwd_used = pwd
+                break
+            last_err = (r.stderr or r.stdout or b"").decode(
+                "utf-8", "ignore").strip()
+        if pwd_used is False:
+            if dest_dir.is_dir() and not any(os.scandir(dest_dir)):
+                dest_dir.rmdir()
+            hint = "、".join(c[:16] for c in candidates) or "无候选"
+            return "fail", (f"7z 解压失败（密码候选试过：{hint}）"
+                            f"——保留原包（{last_err[:100]}）")
+        n = sum(1 for _ in os.scandir(dest_dir))
+        if n <= 0:
+            return "fail", "解压完成但 0 个文件——保留原包待人工检查"
+        pwd_note = f"（用密码 {pwd_used[:16]}）" if pwd_used else ""
+        # 产物可能又是压缩包（双层压缩：外层分卷解出加密内层）——
+        # extract_directory 下轮自动接力（幂等跳过已解的）
+        inner = [f for f in os.listdir(dest_dir)
+                 if f.lower().endswith((".7z", ".rar", ".zip"))]
+        note2 = (f"；⚠️ 产物含内层压缩包 {inner[0]}（需再跑一轮 /extract "
+                 f"解它）" if inner else "")
+        return ("done",
+                f"✅ 解出 {n} 个文件{pwd_note} → {dest_dir.name}/{note2}")
 
     if dry:
         return "dry", f"将解压 → {dest_dir.name}/"

@@ -1347,3 +1347,36 @@ class QueuesAggregateTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue("error" in q or "pending" in q)
         finally:
             await client.close()
+
+
+class EnqueueXRouteTest(unittest.IsolatedAsyncioTestCase):
+    """/api/enqueue 的 X 分流（2026-11-06 补——看板粘贴框此前漏 X
+    落外链台账；与收藏夹/bot 路由同语义）。"""
+
+    async def test_x_link_routes_to_x_queue(self):
+        from tg_userbot import runtime_db
+        self._td = tempfile.mkdtemp(dir=_TMP)
+        self._saved_conn = runtime_db._CONN
+        runtime_db._CONN = None
+        runtime_db.init_db(os.path.join(self._td, "tg.db"))
+        self.addCleanup(lambda: (
+            runtime_db.close_db(),
+            setattr(runtime_db, "_CONN", self._saved_conn),
+            shutil.rmtree(self._td, ignore_errors=True),
+        ))
+        client = make_client()
+        await client.start_server()
+        try:
+            resp = await client.post(
+                "/api/enqueue",
+                data=json.dumps({"text": "https://x.com/DaymanDraws/status/2118073958474158364"}),
+            )
+            data = await resp.json()
+            self.assertTrue(data["ok"])
+            self.assertEqual(data["routed"], "x")
+            self.assertIn("已入队", data["message"])
+            row = runtime_db.XN_TASKS.get(
+                "https://x.com/DaymanDraws/status/2118073958474158364")
+            self.assertIsNotNone(row)
+        finally:
+            await client.close()

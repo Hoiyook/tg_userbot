@@ -20,6 +20,9 @@ Chrome 结果、汇报事件）统一改到控制面板对话，收藏夹只剩�
 因为断线的 `future.cancel()` 把 `CancelledError` 冒出去，正在下载的任务会
 被误判成「被真取消」而留在队列里——通知不该有这种权力。失败只记日志。
 """
+import os
+import json
+import time
 from . import netio
 from . import state
 from .config import NOTIFY_TIMEOUT_SECONDS
@@ -51,11 +54,83 @@ async def notify_user(text, link_preview=False, buttons=None):
 
     client = state.client
     if client is None:
-        return False
+        return _queue_failed(text)
     sent = await netio.shielded(
         lambda: client.send_message("me", text, link_preview=link_preview,
                                     buttons=buttons),
         NOTIFY_TIMEOUT_SECONDS,
         "发送通知（收藏夹）",
     )
-    return sent is not None
+    if sent is None:
+        return _queue_failed(text)
+    return True
+
+
+# ── 失败通知持久化重发（2026-11-06 梳理补盲）────────────────
+# 断连窗口的完成/失败通知此前永久丢失（82 处调用大多 except: pass）。
+# 现统一落到 runtime/failed_notify.jsonl（单行 append 纪律），主循环
+# 每隔一段重发一次（成功即移除）。调用方零改动——notify_user 返回前
+# 内部兜底。
+_FAILED_FILE = None
+
+
+def _failed_path():
+    global _FAILED_FILE
+    if _FAILED_FILE is None:
+        from . import config
+        _FAILED_FILE = os.path.join(config.RUNTIME_DIR,
+                                    "failed_notify.jsonl")
+    return _FAILED_FILE
+
+
+def _queue_failed(text):
+    """通知两侧都没发出去 → 追加落盘等重发（append 失败也只记日志）。"""
+    try:
+        with open(_failed_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": time.time(), "text": text},
+                               ensure_ascii=False) + "\n")
+        logger.warning("📤 通知发送失败，已入重发队列 "
+                       f"（当前 {sum(1 for _ in open(_failed_path()))} 条）")
+    except Exception as e:
+        logger.warning(f"通知落盘也失败（彻底丢弃）：{e}")
+    return False
+
+
+async def replay_failed_once():
+    """重发一轮积压通知（主循环定时调；成功一条删一条）。返回重发数。"""
+    path = _failed_path()
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return 0
+    if not lines:
+        return 0
+    kept, sent = [], 0
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        ok = False
+        if _bot_can_send():
+            r = await netio.shielded(
+                lambda t=item["text"]: state.bot_client.send_message(
+                    state.MY_ID, t), NOTIFY_TIMEOUT_SECONDS,
+                "重发通知（控制面板）")
+            ok = r is not None
+        if not ok and state.client is not None:
+            r = await netio.shielded(
+                lambda t=item["text"]: state.client.send_message(
+                    "me", t), NOTIFY_TIMEOUT_SECONDS,
+                "重发通知（收藏夹）")
+            ok = r is not None
+        if ok:
+            sent += 1
+        else:
+            kept.append(line)
+    if kept != lines:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(kept) + ("\n" if kept else ""))
+    if sent:
+        logger.info(f"📤 补发积压通知 {sent} 条")
+    return sent
