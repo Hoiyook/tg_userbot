@@ -271,6 +271,17 @@ class AutoRouteTest(_DbTestCase):
             "看这个 https://x.com/a/status/9 超强"))
         self.assertFalse(x_dl.looks_like_x("纯文本 https://b23.tv/x"))
 
+    def test_mediaviewer_url_normalized(self):
+        """实测事故（2026-11-05）：x.com 分享常是 mediaViewer 带一串 query
+        ——归一后键干净（query 全剥），gallery-dl 拿干净的 status 直链。"""
+        url = ("https://x.com/Jann4q/status/2117908501628588111/mediaViewer"
+               "?mode=profile&currentTweet=2117908501628588111"
+               "&currentTweetUser=Jann4q")
+        key, gurl, label, err = x_dl.normalize_target(url)
+        self.assertIsNone(err)
+        self.assertEqual(key, "https://x.com/Jann4q/status/2117908501628588111")
+        self.assertEqual(gurl, key)
+
     def test_auto_reply_extracts_url(self):
         """文本+链接混合形态：抽 URL 入队（键=归一 URL，不是整段文本）。"""
         out = asyncio.run(x_dl.auto_reply(

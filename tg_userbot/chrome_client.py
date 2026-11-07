@@ -925,14 +925,17 @@ async def notify_pending_results():
             continue
         try:
             await send_owner_message(rec.get("chat_id"), result_text(task))
-            if ("iwara" in str(rec.get("url") or "").lower()
-                    and task.get("status") == "SUCCESS"):
+            # 台账全覆盖（2026-11-07 梳理）：SUCCESS 均记录——
+            # iwara 用专 kind；其余 chrome 下载（普通网页媒体）记 chrome
+            if task.get("status") == "SUCCESS":
                 from .history import append_history
                 from datetime import datetime as _dt
+                is_iwara = "iwara" in str(rec.get("url") or "").lower()
+                kind = "iwara" if is_iwara else "chrome"
                 append_history(
-                    f"{_dt.now().strftime('%Y-%m-%d %H:%M:%S')} | iwara | "
+                    f"{_dt.now().strftime('%Y-%m-%d %H:%M:%S')} | {kind} | "
                     f"{task.get('filename') or str(rec.get('url'))[:60]} | - | "
-                    "来源：iwara（Chrome）")
+                    f"来源：{'iwara（Chrome）' if is_iwara else 'Chrome下载'}")
 
             mark_notified(task["task_id"],
                           outcome=task.get("status"),

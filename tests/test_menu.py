@@ -24,6 +24,8 @@ from tg_userbot import shell, upload as upload_mod  # noqa: E402
 
 # 按钮属性兼容垫片（unittest discover 不加载 conftest.py——Telethon 1.45 起
 # 回调数据挪进 .type.data，这里补回顶层 .data/.url 让既有断言保持原样）
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import conftest as _btn_shim  # noqa: F401
 
 
@@ -168,6 +170,49 @@ class LiveMenuHeaderTest(unittest.TestCase):
         self.old = (state.ACTIVE_DOWNLOADS, state.QUEUE)
         state.ACTIVE_DOWNLOADS = {}
         state.QUEUE = {"tasks": [], "retry": []}
+        # 今日成功数走 LOG_FILE（download.log 关键词估算）——全量跑时真实
+        # 日志有当日记录，必须指到空临时文件（2026-11-07 修跨测试污染）
+        from tg_userbot import config as _cfg
+        from tg_userbot import stats as _stats
+        from tg_userbot import runtime_db as _rt
+        import tempfile as _tf
+        # ① 今日成功数三数据源全隔离：日志（config+stats 双命名空间）、
+        #    DB 连接（discover 全量下前面测试遗留的连接会让
+        #    iter_history_lines 走 DB 分支读到真实库当日记录）、历史文件
+        self._old_log = _cfg.LOG_FILE
+        empty = os.path.join(_tf.mkdtemp(dir=_TMP), "empty.log")
+        _cfg.LOG_FILE = empty
+        _stats.LOG_FILE = empty
+        self._old_conn = _rt._CONN
+        self._old_reg_file = getattr(_rt, "REG", None) or             os.path.join(os.path.expanduser("~"), ".pd_jobs.json")
+        try:
+            _rt.close_db()
+        except Exception:
+            pass
+        _rt._CONN = None
+        # ② 历史文件路径（DB 断开后的回落读它）
+        self._old_hist = _cfg.DOWNLOAD_HISTORY_FILE
+        from tg_userbot import history as _history
+        self._old_hist_mod = _history.DOWNLOAD_HISTORY_FILE
+        _cfg.DOWNLOAD_HISTORY_FILE = os.path.join(
+            _tf.mkdtemp(dir=_TMP), "empty_history.txt")
+        _history.DOWNLOAD_HISTORY_FILE = _cfg.DOWNLOAD_HISTORY_FILE
+        self.addCleanup(self._restore_paths)
+
+    def _restore_paths(self):
+        from tg_userbot import config as _cfg
+        from tg_userbot import stats as _stats
+        from tg_userbot import runtime_db as _rt
+        from tg_userbot import history as _history
+        _cfg.LOG_FILE = self._old_log
+        _stats.LOG_FILE = self._old_log
+        _cfg.DOWNLOAD_HISTORY_FILE = self._old_hist
+        _history.DOWNLOAD_HISTORY_FILE = self._old_hist_mod
+        try:
+            _rt.close_db()
+        except Exception:
+            pass
+        _rt._CONN = self._old_conn
 
     def tearDown(self):
         state.ACTIVE_DOWNLOADS, state.QUEUE = self.old

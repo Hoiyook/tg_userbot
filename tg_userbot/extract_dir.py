@@ -245,19 +245,36 @@ def process_archive(path, dry: bool = False,
         if dry:
             return "dry", f"将解压分卷（7z）→ {dest_dir.name}/"
         dest_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            r = subprocess.run(
-                [tool, "x", "-y", f"-o{dest_dir}", str(path)],
-                capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return "fail", f"解压超时（>{timeout}s）——保留分卷"
-        except Exception as e:
-            return "fail", f"解压异常: {type(e).__name__}: {e}"
-        if r.returncode != 0:
-            err = (r.stderr or r.stdout or b"").decode("utf-8", "ignore").strip()
+        # 密码候选循环（2026-11-06 MMD 实测：外层分卷也加密；目录名
+        # c291dGhwbHVz 就是密码——候选链目录名源命中）
+        candidates = password_candidates(str(path))
+        tries = [None] + candidates
+        last_err = ""
+        pwd_used = False
+        for pwd in tries:
+            cmd = [tool, "x", "-y", f"-o{dest_dir}", str(path)]
+            if pwd:
+                cmd.insert(2, f"-p{pwd}")
+            try:
+                r = subprocess.run(
+                    cmd, capture_output=True, stdin=subprocess.DEVNULL,
+                    timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return "fail", f"解压超时（>{timeout}s）——保留分卷"
+            except Exception as e:
+                return "fail", f"解压异常: {type(e).__name__}: {e}"
+            if r.returncode == 0:
+                pwd_used = pwd
+                break
+            last_err = (r.stderr or r.stdout or b"").decode(
+                "utf-8", "ignore").strip()
+        if pwd_used is False:
             if dest_dir.is_dir() and not any(os.scandir(dest_dir)):
                 dest_dir.rmdir()
-            return "fail", f"7z 解压失败: {err[:160]}"
+            hint = "、".join(c[:16] for c in candidates) or "无候选"
+            return "fail", (f"分卷 7z 解压失败（密码候选试过：{hint}）"
+                            f"——保留分卷（{last_err[:120]}）")
+        err_note = last_err  # 部分卷解压时的非致命告警
         n = sum(1 for _ in os.scandir(dest_dir))
         if n <= 0:
             return "fail", "解压完成但 0 个文件——保留分卷待人工检查"
@@ -273,8 +290,9 @@ def process_archive(path, dry: bool = False,
                         removed += 1
                     except OSError as e:
                         logger.warning(f"分卷删除失败 {fn}：{e}")
+        pwd_note = f"（用密码 {pwd_used[:16]}）" if pwd_used else ""
         return ("done",
-                f"✅ 分卷解出 {n} 个文件 → {dest_dir.name}/"
+                f"✅ 分卷解出 {n} 个文件{pwd_note} → {dest_dir.name}/"
                 f"（已删除 {removed} 个分卷）")
 
     # rar：**一律 7z 工具优先**（2026-11-05 byqn 实测——bsdtar/libarchive

@@ -151,6 +151,7 @@
 <header>
   <span class="dot" id="dot"></span>
   <h1>TG Userbot</h1>
+  <span id="ver" style="font-size:11px;color:var(--tx3)"></span>
   <span class="badge" id="uptime">–</span>
 </header>
 <div class="wrap">
@@ -199,6 +200,16 @@
 
   <!-- ── 队列 ─────────────────────────── -->
   <section class="page" id="p-queue">
+    <h2>🗜 目录解压</h2>
+    <div class="card">
+      <div class="note" id="exDirs">列目录中…</div>
+      <div class="chips" style="margin-top:8px">
+        <span class="chip" onclick="extractDry()">🔍 预览 (dry)</span>
+        <span class="chip" onclick="extractRun()">🗜 执行解压</span>
+        <span class="chip" onclick="loadExtractState()">📊 状态</span>
+      </div>
+      <div class="note" id="exState" style="margin-top:6px"></div>
+    </div>
     <h2>全部队列</h2>
     <div id="queuesAll" class="card"><div class="note">读取中…</div></div>
     <h2>下载队列</h2>
@@ -278,6 +289,9 @@
     </div>
     <div class="card">
       <h3>🛰 iwara</h3><div id="hist-iwara"></div>
+    </div>
+    <div class="card">
+      <h3>🌐 Chrome</h3><div id="hist-chrome"></div>
     </div>
   </section>
 
@@ -454,8 +468,13 @@ async function refresh() {
     const s = d.stats || {};
     document.getElementById("conn").textContent =
       "已连接 · " + (d.save_folder||"") + " · 并发 " + (d.concurrency??"–")
-      + " · 磁盘余 " + fmtGB(d.disk_free_gb);
+      + " · 磁盘余 " + fmtGB(d.disk_free_gb) + (d.rate || "");
     document.getElementById("dot").className = "dot";
+    if (!document.getElementById("ver").textContent)
+      api("/api/version").then(v => {
+        if (v.ok) document.getElementById("ver").textContent =
+          "v" + v.version;
+      }).catch(() => {});
     document.getElementById("uptime").textContent =
       "已运行 " + Math.floor((d.uptime_s||0)/3600) + "h"
       + Math.floor(((d.uptime_s||0)%3600)/60) + "m";
@@ -632,7 +651,8 @@ async function loadHistory() {
   const targets = [["hist-media", null, "还没有媒体下载记录"],
                    ["hist-bili", "B站", "还没有 B站 下载记录"],
                    ["hist-x", "X", "还没有 X 下载记录"],
-                   ["hist-iwara", "iwara", "还没有 iwara 下载记录"]];
+                   ["hist-iwara", "iwara", "还没有 iwara 下载记录"],
+                   ["hist-chrome", "chrome", "还没有 Chrome 下载记录"]];
   await Promise.all(targets.map(async ([elId, kind, empty]) => {
     const el = document.getElementById(elId);
     try {
@@ -672,8 +692,8 @@ async function loadLinks() {
     document.getElementById("linksP").innerHTML = head + (d.pending||[]).map(p =>
       '<div class="qrow"><div class="info"><div class="nm wrap">' + esc(p.url) +
       '</div><div class="dt">' + esc(p.note || p.host || "") + ' · #' + p.id +
-      '</div></div><button class="ghost mini" onclick="doneLink(' + p.id +
-      ')">✅ 完成</button></div>').join("")
+      '</div></div><button class="ghost mini" onclick="doneLink(' +
+      parseInt(p.id, 10) + ')">✅ 完成</button></div>').join("")
       || '<div class="note">没有待人工处理的链接 🎉</div>';
   } catch (e) {
     document.getElementById("linksP").innerHTML = '<div class="note">❌ ' + esc(String(e)) + '</div>';
@@ -794,7 +814,9 @@ async function loadCmds() {
     document.getElementById("cmdGroups").innerHTML = d.groups.map(g =>
       '<h3>' + esc(g.name) + '</h3><div class="card">' +
       g.items.map(it =>
-        '<div class="crow" onclick="useCmd(\'' + it.cmd + '\')">' +
+        '<div class="crow" onclick="useCmd(\'' +
+        esc(String(it.cmd).replace(/\\/g, "\\\\").replace(/'/g, "\\'")) +
+        '\')">' +
         '<span class="ccmd">' + esc(it.cmd) + '</span>' +
         '<span class="cdesc">' + esc(it.desc) + '</span></div>').join("") +
       '</div>').join("");
@@ -870,6 +892,55 @@ async function runCmdDirect(cmd) {
 // 轮询退避（2026-11-05 审计）：fetch 失败（后端重启/网络抖动）时把主
 // 轮询间隔翻倍（上限 30s），成功即恢复 2s——避免慢/挂时请求堆积
 let _pollMs = 2000;
+// ── 目录解压卡（2026-11-07）──────────────────
+let _exTarget = "";
+async function loadExtractDirs() {
+  try {
+    const d = await api("/api/extract/dirs");
+    const el = document.getElementById("exDirs");
+    if (!d.ok) { el.innerHTML = "❌ " + esc(d.error); return; }
+    const hidden = (d.dirs[0] && d.dirs[0]._hidden) || 0;
+    const dirs = d.dirs.filter(x => !x._hidden);
+    el.innerHTML = "点选目录（压缩包数，? = 目录忙）：" + dirs.map(x =>
+      '<span class="chip mini ' + (_exTarget === d.base + "/" + x.name ?
+        "on" : "") + '" onclick="pickExDir(\'' +
+        esc(d.base + "/" + x.name).replace(/'/g, "\\'") + '\')">' +
+        esc(x.name) + ' (' + (x.archives < 0 ? "?" : x.archives) +
+        ')</span>').join(" ") +
+      (hidden ? '<span class="note">（另有 ' + hidden + ' 个系统隐藏目录已略）</span>' : "");
+  } catch (e) {
+    document.getElementById("exDirs").textContent = "❌ " + e;
+  }
+}
+function pickExDir(p) {
+  _exTarget = p;
+  loadExtractDirs();
+}
+async function extractDry() { await extractGo(true); }
+async function extractRun() { await extractGo(false); }
+async function extractGo(dry) {
+  if (!_exTarget) { showResult(false, "先点选一个目录", false); return; }
+  const d = await api("/api/extract/run", {method: "POST",
+    body: JSON.stringify({target: _exTarget, dry})});
+  showResult(!!d.ok, d.ok ? "已启动（结果看「状态」或 Telegram 通知）"
+                          : d.error, !d.ok);
+  loadExtractState();
+}
+async function loadExtractState() {
+  try {
+    const d = await api("/api/extract/state");
+    const el = document.getElementById("exState");
+    if (d.running) { el.textContent = "⏳ 解压中…（" +
+      (d.last || "首轮") + "）"; }
+    else {
+      const last = (d.rounds || []).slice(-1)[0];
+      el.textContent = d.last ? ("最近：" + d.last + "（" +
+        (last ? last.ts + " " + (last.dry ? "dry" : "") : "") + "）")
+        : "空闲";
+    }
+  } catch (e) { /* 静默 */ }
+}
+
 async function loadQueuesAll() {
   try {
     const d = await api("/api/queues");
@@ -886,20 +957,45 @@ async function loadQueuesAll() {
       if (q.failed) bits.push("失败 " + q.failed);
       const stat = bits.length ? bits.join(" · ") : "空闲";
       const items = (q.items || []).map(x => esc(x)).join("、");
+      // 渠道操作 chips（cmd 已存在的指令——app 与 Telegram 同一入口）
+      let ops = "";
+      const nm = q.name || "";
+      if (nm === "B站") ops =
+        '<span class="chip mini" onclick="runCmdDirect(\'/bili stop\')">⏹ 停止</span>' +
+        '<span class="chip mini" onclick="runCmdDirect(\'/bili retry all\')">↻ 重试</span>';
+      else if (nm === "wnacg 漫画") ops =
+        '<span class="chip mini" onclick="runCmdDirect(\'/wnacg stop\')">⏸ 暂停</span>' +
+        '<span class="chip mini" onclick="runCmdDirect(\'/wnacg start\')">▶️ 恢复</span>' +
+        '<span class="chip mini" onclick="runCmdDirect(\'/wnacg retry all\')">↻ 重试</span>';
+      else if (nm === "asmr 音声") ops =
+        '<span class="chip mini" onclick="runCmdDirect(\'/asmr stop\')">⏸ 暂停</span>' +
+        '<span class="chip mini" onclick="runCmdDirect(\'/asmr start\')">▶️ 恢复</span>' +
+        '<span class="chip mini" onclick="runCmdDirect(\'/asmr retry all\')">↻ 重试</span>';
+      else if (nm === "pixeldrain") ops =
+        '<span class="chip mini" onclick="runCmdDirect(\'/pd\')">📊 任务</span>';
       return '<div class="qrow"><div class="info"><div class="nm">' +
         esc(q.emoji + " " + q.name) + '</div><div class="dt">' +
         esc(stat) + (items ? "｜" + items : "") +
-        '</div></div></div>';
+        '</div><div class="chips" style="margin-top:4px">' + ops + '</div></div></div>';
     }).join("");
   } catch (e) { /* 主循环退避已处理 */ }
 }
 async function _refreshLoop() {
   try { await refresh(); _pollMs = 2000; }
   catch (e) { _pollMs = Math.min(_pollMs * 2, 30000); }
+  // 次级任务并轨（随主循环带退避——后端不可达时不再各自狂打）
+  for (const job of [loadQueuesAll, loadExtractState, loadChrome,
+                     loadBackup, loadPastes, loadLinks, loadHistory,
+                     loadPawSchedule, loadPawBackfill, loadPD, loadCmds]) {
+    try { await job(); } catch (e) { /* 主轮询已计退避 */ }
+  }
   setTimeout(_refreshLoop, _pollMs);
 }
 setInterval(loadQueuesAll, 5000);
+setInterval(loadExtractState, 8000);
 loadQueuesAll();
+loadExtractDirs();
+loadExtractState();
 
 // ── 应用内刷新（2026-11-05 owner：点按钮/下拉屏都不跳浏览器）──
 // refreshAll 把页面所有数据 loader 跑一遍（纯 fetch，无导航——

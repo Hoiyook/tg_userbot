@@ -34,6 +34,8 @@ from . import state
 from . import stats
 from . import history
 from . import notify
+from . import manual_links
+from .spawn import spawn
 from . import platform
 from .log import logger
 
@@ -463,6 +465,7 @@ def build_status() -> dict:
         "ok": True,
         "uptime_s": int(time.time() - _STARTED_AT),
         "save_folder": config.DOWNLOAD_DIR,
+        "rate": _recent_rate(),
         "db_ready": bool(state.RUNTIME_DB_READY),
         "concurrency": state.DOWNLOAD_CONCURRENCY,
         "toggles": {
@@ -610,6 +613,156 @@ async def handle_dashboard(request):
     # 否则「后端改了 UI、手机还显示旧版」会变成玄学问题
     return web.Response(text=html, content_type="text/html", charset="utf-8",
                         headers={"Cache-Control": "no-store"})
+
+
+_EXTRACT_STATE = {"running": False, "rounds": [], "last": "", "started": 0}
+
+
+async def handle_extract_dirs(request):
+    """解压卡：列出 V1 一级目录（含子目录计数与压缩包数量）。"""
+    from . import config as _cfg
+    base = _cfg.DOWNLOAD_DIR
+    out = []
+    try:
+        hidden = 0
+        for name in sorted(os.listdir(base)):
+            full = os.path.join(base, name)
+            if not os.path.isdir(full):
+                continue
+            if name.startswith("."):
+                hidden += 1   # 系统目录（.DocumentRevisions 等）不进列表
+                continue
+            # 轻量：只数直接子文件里的压缩包（全树 walk 在解压 I/O 打满
+            # 时会把 bot 卡死在 readdir——2026-11-07 实测），>99 显示 99+
+            n_arch = 0
+            try:
+                for f in os.listdir(full):
+                    if f.lower().endswith(
+                            (".zip", ".rar", ".7z", ".tar.gz", ".tgz",
+                             ".tar")):
+                        n_arch += 1
+                        if n_arch > 99:
+                            break
+            except OSError:
+                n_arch = -1   # 目录扫不动（I/O 忙）→ -1 显示「?」
+            out.append({"name": name, "archives": n_arch})
+        out.insert(0, {"_hidden": hidden})
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)[:80]}, 500)
+    return _json({"ok": True, "base": base, "dirs": out})
+
+
+def _extract_run_blocking(target):
+    """同步跑一轮解压并记录（后台线程执行）。"""
+    from . import extract_dir
+    _EXTRACT_STATE["running"] = True
+    try:
+        lines, st = extract_dir.extract_directory(target)
+        _EXTRACT_STATE["rounds"].append(
+            {"target": target, "st": st, "lines": lines[-40:],
+             "ts": time.strftime("%m-%d %H:%M")})
+        _EXTRACT_STATE["last"] = (
+            f"成功 {st['done']} | 失败 {st['fail']} | 跳过 {st['skip']}")
+    except Exception as e:
+        _EXTRACT_STATE["last"] = f"异常: {e}"
+    finally:
+        _EXTRACT_STATE["running"] = False
+
+
+async def handle_extract_run(request):
+    """解压卡：对选定目录启动一轮解压（串行防重入，dry 可选）。"""
+    global _EXTRACT_STATE
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    target = str(b.get("target") or "").strip()
+    dry = bool(b.get("dry"))
+    from . import config as _cfg
+    base = os.path.realpath(_cfg.DOWNLOAD_DIR)
+    real = os.path.realpath(target) if target else ""
+    if not real.startswith(base + os.sep) and real != base:
+        return _json({"ok": False,
+                      "error": f"目录必须在 {base} 下"}, 400)
+    if not os.path.isdir(real):
+        return _json({"ok": False, "error": "目录不存在"}, 400)
+    if _EXTRACT_STATE["running"]:
+        return _json({"ok": False,
+                      "error": "已有一轮解压在跑（看状态卡）"}, 409)
+    _EXTRACT_STATE["running"] = True
+    _EXTRACT_STATE["started"] = time.time()
+    spawn(lambda: _extract_run_blocking_dry(real, dry), "看板解压")
+    return _json({"ok": True, "message":
+                  "已启动" + ("（dry 预览）" if dry else "")})
+
+
+def _extract_run_blocking_dry(target, dry):
+    from . import extract_dir
+    try:
+        lines, st = extract_dir.extract_directory(target, dry=dry)
+        _EXTRACT_STATE["rounds"].append(
+            {"target": target, "st": st, "lines": lines[-40:],
+             "ts": time.strftime("%m-%d %H:%M"), "dry": dry})
+        _EXTRACT_STATE["last"] = (
+            f"成功 {st['done']} | 失败 {st['fail']} | 跳过 {st['skip']}")
+    except Exception as e:
+        _EXTRACT_STATE["last"] = f"异常: {e}"
+    finally:
+        _EXTRACT_STATE["running"] = False
+
+
+async def handle_extract_state(request):
+    """解压卡：当前状态 + 最近轮次结果。"""
+    s = dict(_EXTRACT_STATE)
+    s["running"] = bool(_EXTRACT_STATE["running"])
+    s["ok"] = True
+    return _json(s)
+
+
+async def handle_version(request):
+    """看板/后端版本一致性核对（SW 缓存错版本时肉眼可判）。"""
+    import subprocess
+    ver = "v2.24"
+    try:
+        d = subprocess.run(
+            ["git", "describe", "--tags", "--always"],
+            capture_output=True, text=True, timeout=5,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if d.returncode == 0:
+            ver += " (" + d.stdout.strip()[:12] + ")"
+    except Exception:
+        pass
+    return _json({"ok": True, "version": ver})
+
+
+def _recent_rate(window_s=60):
+    """近 N 秒成功字节速率（task_events SUCCESS 差分）→ MB/s 字符串。"""
+    try:
+        import time as _t
+        import json as _json
+        from . import config as _cfg
+        now = _t.time()
+        total = 0
+        path = os.path.join(_cfg.RUNTIME_DIR, "task_events.jsonl")
+        if not os.path.exists(path):
+            return ""
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    e = _json.loads(line)
+                except Exception:
+                    continue
+                if e.get("event") != "SUCCESS":
+                    continue
+                ts = e.get("ts") or 0
+                if now - ts <= window_s:
+                    total += int(e.get("bytes") or 0)
+        if total <= 0:
+            return ""
+        mbps = total / window_s / 1024 / 1024
+        return f" | {mbps:.1f} MB/s" if mbps >= 0.1 else ""
+    except Exception:
+        return ""
 
 
 async def handle_status(request):
@@ -1147,6 +1300,10 @@ def make_app() -> web.Application:
     app.add_routes([
         web.get("/", handle_dashboard),
         web.get("/api/status", handle_status),
+        web.get("/api/version", handle_version),
+        web.get("/api/extract/dirs", handle_extract_dirs),
+        web.post("/api/extract/run", handle_extract_run),
+        web.get("/api/extract/state", handle_extract_state),
         web.get("/api/stats", handle_stats),
         web.get("/api/queues", handle_queues),
         web.get("/api/find", handle_find),
