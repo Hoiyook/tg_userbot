@@ -196,6 +196,15 @@
 
     <div class="note">与 bot 菜单、/queue、/stats 同一套状态（单一真相源）；
       通知仍走 Telegram 控制面板，这里不再重复推送。</div>
+
+    <h2>🔗 粘贴链接入队</h2>
+    <div class="card">
+      <div class="row">
+        <input type="text" id="u" placeholder="抖音 / B站 / 种子 / 任意链接">
+        <button onclick="submit()">入队</button>
+      </div>
+      <div class="fb" id="fb">与往收藏夹发这条消息同语义：本地解析优先，失败自动转解析 bot / 外链台账。</div>
+    </div>
   </section>
 
   <!-- ── 队列 ─────────────────────────── -->
@@ -248,6 +257,19 @@
     <div class="card">
       <h3>🌐 Chrome</h3><div id="hist-chrome"></div>
     </div>
+
+    <h2>🕘 粘贴历史（含处理状态）</h2>
+    <div class="chips">
+      <span class="chip" onclick="loadPastes()">🔄 刷新</span>
+      <span class="chip" onclick="runCmdDirect('/cmdhis')">📜 完整历史</span>
+    </div>
+    <div id="pastes"><div class="note">加载中…</div></div>
+
+    <h2>👤 待人工处理链接（/links 同一台账）</h2>
+    <div class="chips">
+      <span class="chip" onclick="loadLinks()">🔄 刷新</span>
+    </div>
+    <div id="linksP"><div class="note">加载中…</div></div>
   </section>
 
   <!-- ── 回填计划 ──────────────────────── -->
@@ -574,22 +596,10 @@ async function submit() {
 document.getElementById("u").addEventListener("keydown",
   e => { if (e.key === "Enter") submit(); });
 
-async function doFind() {
-  const q = document.getElementById("fq").value.trim();
-  if (q.length < 2) { setFb("fqfb", false, "关键字至少 2 个字符"); return; }
-  setFb("fqfb", null, "查询中…");
-  try {
-    const d = await api("/api/find?q=" + encodeURIComponent(q));
-    setFb("fqfb", d.ok, d.ok ? "" : "❌ " + (d.error || ""));
-    showLong("fout", d.ok ? d.text : (d.error || "无结果"));
-  } catch (e) { setFb("fqfb", false, "❌ " + e); }
-}
 function showLong(preId, text) {
   const el = document.getElementById(preId);
   el.style.display = "block"; el.textContent = text || "（空）";
 }
-document.getElementById("fq").addEventListener("keydown",
-  e => { if (e.key === "Enter") doFind(); });
 
 async function loadChrome() {
   try {
@@ -847,7 +857,6 @@ document.querySelectorAll("nav div").forEach(t => t.onclick = () => {
   if (t.dataset.p === "p-queue") document.getElementById("bdg-queue").style.display = "none";
   if (t.dataset.p === "p-files") fsLoad(fsPath || "/Volumes/V1");
   else refresh();   // 切页即刷新徽标状态
-  if (t.dataset.p === "p-find") { loadPastes(); loadLinks(); }
   if (t.dataset.p === "p-cmds") loadCmds();
   if (t.dataset.p === "p-pd") loadPD();
   if (t.dataset.p === "p-paw") loadPawSchedule();
@@ -1215,7 +1224,6 @@ async function _refreshLoop() {
 setInterval(loadQueuesAll, 5000);
 setInterval(loadExtractState, 8000);
 loadQueuesAll();
-loadExtractDirs();
 loadExtractState();
 
 // ── 应用内刷新（2026-11-05 owner：点按钮/下拉屏都不跳浏览器）──

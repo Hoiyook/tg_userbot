@@ -12,8 +12,8 @@ android {
         applicationId = "local.nagram.shell"
         minSdk = 29
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.4"
     }
 
     // 本机 NDK 27.0.12077973 缺 toolchains/llvm/prebuilt（strip 失败）；

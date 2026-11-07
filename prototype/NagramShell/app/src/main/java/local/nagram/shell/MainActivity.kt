@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -112,7 +113,11 @@ fun App() {
                 )
             }
         }
-        Row(Modifier.fillMaxWidth().background(Color(0xFF1A2230))) {
+        // navigationBarsPadding：三键导航的返回/主屏/最近任务键叠在屏幕
+        // 最底部——不垫高的话底栏页签被系统键挡住点不到（2026-11-08
+        // 模拟器实测：点「脚本」页签全打在最近任务键上）
+        Row(Modifier.fillMaxWidth().background(Color(0xFF1A2230))
+                .navigationBarsPadding()) {
             TabItem("🌐 面板", tab == "panel", Modifier.weight(1f)) {
                 tab = "panel"
             }

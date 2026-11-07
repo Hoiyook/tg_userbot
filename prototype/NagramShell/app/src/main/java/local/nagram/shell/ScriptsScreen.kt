@@ -93,8 +93,8 @@ private fun placeholdersOf(args: List<String>): List<String> =
 private fun substitute(arg: String, values: Map<String, String>): String =
     PLACEHOLDER.replace(arg) { m -> values[m.groupValues[1]] ?: m.groupValues[0] }
 
-private fun runInTermux(ctx: Context, script: Script,
-                        argValues: Map<String, String>) {
+/** 原始命令发射（权限检查 + RUN_COMMAND）；脚本运行与文件管理卡共用。 */
+private fun runRaw(ctx: Context, program: String, args: Array<String>) {
     val granted = androidx.core.content.ContextCompat.checkSelfPermission(
         ctx, PERM_RUN_COMMAND
     ) == android.content.pm.PackageManager.PERMISSION_GRANTED
@@ -107,10 +107,9 @@ private fun runInTermux(ctx: Context, script: Script,
         }
         return
     }
-    val args = script.args.map { substitute(it, argValues) }.toTypedArray()
     val intent = Intent("com.termux.RUN_COMMAND").apply {
         setClassName("com.termux", "com.termux.app.RunCommandService")
-        putExtra("com.termux.RUN_COMMAND_PATH", script.program)
+        putExtra("com.termux.RUN_COMMAND_PATH", program)
         putExtra("com.termux.RUN_COMMAND_ARGUMENTS", args)
         putExtra("com.termux.RUN_COMMAND_WORKDIR", TERMUX_HOME)
         putExtra("com.termux.RUN_COMMAND_RUN_IN_TERM", true)
@@ -127,6 +126,20 @@ private fun runInTermux(ctx: Context, script: Script,
     }
 }
 
+private fun runInTermux(ctx: Context, script: Script,
+                        argValues: Map<String, String>) {
+    val args = script.args.map { substitute(it, argValues) }.toTypedArray()
+    runRaw(ctx, script.program, args)
+}
+
+private fun runCardCmd(ctx: Context, body: String) {
+    val out = "/sdcard/Download/scriptrunner_out.txt"
+    val wrapped = "{ $body ; } > \"$out\" 2>&1; " +
+        "echo '── 完成 ──' >> \"$out\"; " +
+        "termux-open \"$out\""
+    runRaw(ctx, "$TERMUX_PREFIX/bin/bash", arrayOf("-c", wrapped))
+}
+
 @Composable
 fun ScriptsScreen() {
     val ctx = LocalContext.current
@@ -134,6 +147,10 @@ fun ScriptsScreen() {
     var editing by remember { mutableStateOf<Script?>(null) }
     var editingIndex by remember { mutableIntStateOf(-1) }
     var running by remember { mutableStateOf<Script?>(null) }
+    // 文件管理卡状态（composable 顶层——删除确认对话框在 Column 外）
+    var srcPath by remember { mutableStateOf("/sdcard/Download/") }
+    var delName by remember { mutableStateOf("") }
+    var pendingDel by remember { mutableStateOf<String?>(null) }
 
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text("🛠 脚本", color = Color(0xFFE8EDF4),
@@ -182,6 +199,88 @@ fun ScriptsScreen() {
             editing = Script("", "$TERMUX_PREFIX/bin/python3", listOf())
             editingIndex = -1
         }, modifier = Modifier.fillMaxWidth()) { Text("+ 添加脚本") }
+
+        // ── 📂 Termux 脚本文件管理（自 ScriptRunner 移植）──────────
+        // 普通 app 无权直接写 Termux 私有目录——复制/删除/查看全部
+        // 发 RUN_COMMAND 让 Termux 自己执行（结果在 Termux 窗口可见）
+        Spacer(Modifier.height(16.dp))
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(14.dp)) {
+                Text("📂 Termux 脚本文件管理",
+                     color = Color(0xFFE8EDF4),
+                     style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "复制/删除 Termux home（~/）里的脚本文件；" +
+                        "操作经 Termux 执行，结果看 Termux 窗口",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF8FA1BD),
+                )
+                Spacer(Modifier.height(8.dp))
+                Button(onClick = {
+                    runCardCmd(ctx,
+                        "echo '[1] allow-external 配置行（有 = 正常）：'; " +
+                        "grep -n allow-external \"\$HOME/.termux/termux.properties\" 2>&1; " +
+                        "echo '[2] Termux 版本：'; echo \"\$TERMUX_VERSION\"; " +
+                        "echo '[3] 重载设置：'; termux-reload-settings 2>&1 " +
+                        "&& echo '已重载'; echo '── 诊断完成，截这段给我 ──'")
+                }, modifier = Modifier.fillMaxWidth()) {
+                    Text("🔍 诊断 Termux（配置/版本/重载）")
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = srcPath, onValueChange = { srcPath = it },
+                    label = { Text("脚本文件路径（源）") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = {
+                        runCardCmd(ctx,
+                            "cp \"$srcPath\" \"\$HOME/\" 2>&1 " +
+                            "&& echo \"✅ 已复制：\$(basename \"$srcPath\")\"")
+                    }) { Text("📋 复制到 Termux") }
+                    OutlinedButton(onClick = {
+                        runCardCmd(ctx,
+                            "/data/data/com.termux/files/usr/bin/ls -la " +
+                            "\$HOME 2>&1")
+                    }) { Text("📜 查看 home 文件") }
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = delName, onValueChange = { delName = it },
+                        label = { Text("home 里的文件名") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Button(onClick = {
+                        if (delName.isNotBlank())
+                            pendingDel = delName.trim()
+                    }) { Text("🗑 删除") }
+                }
+            }
+        }
+    }
+
+    // ── 删除确认 ──
+    pendingDel?.let { name ->
+        AlertDialog(
+            onDismissRequest = { pendingDel = null },
+            title = { Text("删除确认") },
+            text = { Text("确定删除 Termux home 里的「$name」？此操作不可恢复。") },
+            confirmButton = {
+                Button(onClick = {
+                    runRaw(ctx, "$TERMUX_PREFIX/bin/bash", arrayOf(
+                        "-c", "rm ~/\"$name\" && echo \"✅ 已删除 $name\""))
+                    pendingDel = null
+                }) { Text("删除") }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { pendingDel = null }) { Text("取消") }
+            },
+        )
     }
 
     running?.let { s ->
