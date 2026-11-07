@@ -695,12 +695,22 @@ async def backfill_round(start_index=0):
     summaries = []
     for c in todo:
         if state.PAW_SCAN_RUNNING is not None:
-            summaries.append(f"⏸ 让位人工扫描（{state.PAW_SCAN_RUNNING}）")
+            # 措辞修正（2026-11-07）：原「让位人工扫描」让用户误以为
+            # 是自己触发的扫描——实际让位对象常是**上一轮派发的回填
+            # 后台任务**（标签同为「回填 X（最近 3 个月）」）
+            summaries.append(f"⏸ 让位进行中任务（{state.PAW_SCAN_RUNNING}）")
             break
         out = await backfill_author(f"{c['creator_name']}#{c['creator_id']}")
         done += 1
         # backfill_author 返回回执文案；摘要取首行
         summaries.append(out.strip().splitlines()[0][:60])
+        # 等本作者的后台 _run 真正完成再判下一个（2026-11-07 吞吐修复：
+        # author1 刚派发后台、author2 立即让位——每轮实际只处理 1 个，
+        # 比设计的 3 个慢 3 倍）。上限 4h 防单作者卡死整轮
+        for _ in range(240):
+            if state.PAW_SCAN_RUNNING is None:
+                break
+            await asyncio.sleep(60)
         await asyncio.sleep(10)   # 作者间隔
     next_cursor = (start_index + done) % max(len(creators), 1)
     return done, "\n".join(summaries), next_cursor

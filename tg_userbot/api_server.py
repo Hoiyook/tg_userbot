@@ -678,12 +678,10 @@ async def handle_extract_run(request):
         b = {}
     target = str(b.get("target") or "").strip()
     dry = bool(b.get("dry"))
-    from . import config as _cfg
-    base = os.path.realpath(_cfg.DOWNLOAD_DIR)
-    real = os.path.realpath(target) if target else ""
-    if not real.startswith(base + os.sep) and real != base:
+    real = _fs_safe(target)
+    if real is None:
         return _json({"ok": False,
-                      "error": f"目录必须在 {base} 下"}, 400)
+                      "error": "目录必须在数据盘内"}, 400)
     if not os.path.isdir(real):
         return _json({"ok": False, "error": "目录不存在"}, 400)
     if _EXTRACT_STATE["running"]:
@@ -724,6 +722,164 @@ async def handle_extract_state(request):
     s["running"] = bool(_EXTRACT_STATE["running"])
     s["ok"] = True
     return _json(s)
+
+
+# ── 文件管理器（数据盘 V1；所有操作 realpath 限定在 DATA_ROOT 下）──
+def _fs_safe(p):
+    """路径规范化并限定在数据盘内；越界返回 None。"""
+    from . import config as _cfg
+    base = os.path.realpath(_cfg.DATA_ROOT)
+    real = os.path.realpath(str(p or ""))
+    if real == base or real.startswith(base + os.sep):
+        return real
+    return None
+
+
+_FS_OP = {"running": False, "msg": "", "error": ""}
+
+
+def _fs_paste_blocking(action, srcs, dest):
+    """粘贴执行体（后台线程）：同盘 move=瞬时改名；copy 大文件长任务。"""
+    import shutil
+    _FS_OP.update(running=True, msg="", error="")
+    try:
+        for src in srcs:
+            name = os.path.basename(src.rstrip("/"))
+            dst = os.path.join(dest, name)
+            n = 1
+            while os.path.exists(dst):
+                stem, ext = os.path.splitext(name)
+                dst = os.path.join(dest, f"{stem} ({n}){ext}")
+                n += 1
+            _FS_OP["msg"] = f"{'移动' if action == 'move' else '复制'} {name}"
+            if action == "move":
+                shutil.move(src, dst)
+            elif os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+        _FS_OP["msg"] = "完成"
+    except Exception as e:
+        _FS_OP["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        _FS_OP["running"] = False
+
+
+async def handle_fs_list(request):
+    from . import config as _cfg
+    real = _fs_safe(request.query.get("path", _cfg.DATA_ROOT))
+    if real is None:
+        return _json({"ok": False, "error": "路径必须在数据盘内"}, 400)
+    if not os.path.isdir(real):
+        return _json({"ok": False, "error": "目录不存在"}, 400)
+    base = os.path.realpath(_cfg.DATA_ROOT)
+    items = []
+    try:
+        for name in sorted(os.listdir(real)):
+            if name.startswith("."):
+                continue   # 隐藏文件不进列表（.DS_Store 等噪声）
+            full = os.path.join(real, name)
+            try:
+                st = os.stat(full)
+                items.append({"name": name,
+                              "is_dir": os.path.isdir(full),
+                              "size": 0 if os.path.isdir(full)
+                                      else st.st_size,
+                              "mtime": int(st.st_mtime)})
+            except OSError:
+                continue
+    except OSError as e:
+        return _json({"ok": False, "error": str(e)[:80]}, 500)
+    items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+    return _json({"ok": True, "path": real,
+                  "parent": os.path.dirname(real) if real != base else "",
+                  "items": items})
+
+
+async def handle_fs_rename(request):
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    real = _fs_safe(b.get("path"))
+    new_name = str(b.get("new_name") or "").strip()
+    if real is None or not new_name or "/" in new_name:
+        return _json({"ok": False, "error": "参数非法（路径越界或新名含 /）"},
+                     400)
+    dst = os.path.join(os.path.dirname(real), new_name)
+    if os.path.exists(dst):
+        return _json({"ok": False, "error": "同名目标已存在"}, 400)
+    try:
+        os.rename(real, dst)
+    except OSError as e:
+        return _json({"ok": False, "error": str(e)[:100]}, 500)
+    return _json({"ok": True, "path": dst})
+
+
+async def handle_fs_delete(request):
+    import shutil
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    n = err = 0
+    for p in (b.get("paths") or []):
+        real = _fs_safe(p)
+        if real is None or real == os.path.realpath(
+                __import__("tg_userbot.config", fromlist=["DATA_ROOT"])
+                .DATA_ROOT):
+            err = err or "路径越界"
+            continue
+        try:
+            if os.path.isdir(real):
+                shutil.rmtree(real)
+            else:
+                os.remove(real)
+            n += 1
+        except OSError as e:
+            err = str(e)[:100]
+    return _json({"ok": n > 0 and not err, "deleted": n,
+                  "error": err or ""})
+
+
+async def handle_fs_paste(request):
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    dest = _fs_safe(b.get("dest"))
+    srcs = [s for s in (_fs_safe(x) for x in (b.get("srcs") or [])) if s]
+    action = "move" if b.get("move") else "copy"
+    if dest is None or not srcs:
+        return _json({"ok": False, "error": "参数非法（越界/无源）"}, 400)
+    if _FS_OP["running"]:
+        return _json({"ok": False, "error": "上一个粘贴任务还在跑"}, 409)
+    spawn(asyncio.to_thread(_fs_paste_blocking, action, srcs, dest),
+          "文件粘贴")
+    return _json({"ok": True, "message":
+                  f"{'移动' if action == 'move' else '复制'} "
+                  f"{len(srcs)} 项已启动"})
+
+
+async def handle_fs_extract(request):
+    """文件管理器解压：V1 内任意目录（复用解压卡的状态与管线）。"""
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    real = _fs_safe(b.get("target"))
+    if real is None or not os.path.isdir(real):
+        return _json({"ok": False, "error": "目录不存在或越界"}, 400)
+    if _EXTRACT_STATE["running"]:
+        return _json({"ok": False, "error": "已有一轮解压在跑"}, 409)
+    _EXTRACT_STATE["running"] = True
+    spawn(asyncio.to_thread(_extract_run_blocking_dry, real, False),
+          "文件管理器解压")
+    return _json({"ok": True, "message": "解压已启动（状态看解压卡）"})
+
+
+async def handle_fs_op(request):
+    return _json({"ok": True, **_FS_OP})
 
 
 async def handle_version(request):
@@ -1311,6 +1467,12 @@ def make_app() -> web.Application:
         web.get("/api/extract/dirs", handle_extract_dirs),
         web.post("/api/extract/run", handle_extract_run),
         web.get("/api/extract/state", handle_extract_state),
+        web.get("/api/fs/list", handle_fs_list),
+        web.post("/api/fs/rename", handle_fs_rename),
+        web.post("/api/fs/delete", handle_fs_delete),
+        web.post("/api/fs/paste", handle_fs_paste),
+        web.post("/api/fs/extract", handle_fs_extract),
+        web.get("/api/fs/op", handle_fs_op),
         web.get("/api/stats", handle_stats),
         web.get("/api/queues", handle_queues),
         web.get("/api/find", handle_find),

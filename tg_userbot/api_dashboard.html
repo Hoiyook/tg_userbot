@@ -349,6 +349,26 @@
       高危指令（/sh 任意命令、/sql、/restart、/up、/paw_cookie）刻意不开放。</div>
   </section>
 
+  <!-- ── 文件管理器 ─────────────────────── -->
+  <section class="page" id="p-files">
+    <h2>📁 文件管理器</h2>
+    <div class="card">
+      <div class="note" id="fsCrumb" style="word-break:break-all"></div>
+      <div class="chips" style="margin-top:6px">
+        <span class="chip mini" onclick="fsUp()">⬆ 上级</span>
+        <span class="chip mini" onclick="fsRefresh()">🔄 刷新</span>
+        <span class="chip mini" onclick="fsPaste(false)">📋 粘贴</span>
+        <span class="chip mini" onclick="fsPaste(true)">✂ 移动</span>
+        <span class="chip mini" onclick="fsSelAll()">☑ 全选</span>
+        <span class="chip mini" onclick="fsExtractSel()">🗜 解压选中</span>
+      </div>
+      <div class="note" id="fsOp" style="margin-top:4px"></div>
+    </div>
+    <div class="card" id="fsList">加载中…</div>
+    <div class="note">点目录名进入；勾选后可 粘贴/移动/解压；
+      ✎ 重命名、🗑 删除在行尾。所有操作限定数据盘内。</div>
+  </section>
+
   <!-- ── 设置 ─────────────────────────── -->
   <section class="page" id="p-set">
     <h2>下载</h2>
@@ -396,6 +416,7 @@
 <nav>
   <div class="on" data-p="p-home"><span class="e">📊</span>总览</div>
   <div data-p="p-queue"><span class="bdg" id="bdg-queue"></span><span class="e">📥</span>队列</div>
+  <div data-p="p-files"><span class="e">📁</span>文件</div>
   <div data-p="p-find"><span class="e">🔍</span>发现</div>
   <div data-p="p-ledger"><span class="e">📈</span>台账</div>
   <div data-p="p-paw"><span class="e">🐾</span>回填</div>
@@ -431,6 +452,13 @@ function esc(s){
   return (s || "").replace(/[&<>"]/g, c =>
     ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function fmtMB(n){ return n == null ? "–" : (n/1048576).toFixed(1)+" MB"; }
+function fmtSize(n){
+  if (n == null) return "–";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n/1024).toFixed(1) + " KB";
+  if (n < 1073741824) return (n/1048576).toFixed(1) + " MB";
+  return (n/1073741824).toFixed(2) + " GB";
+}
 function fmtGB(n){ return n == null ? "–" : n+" GB"; }
 
 async function api(path, opts) {
@@ -854,6 +882,7 @@ document.querySelectorAll("nav div").forEach(t => t.onclick = () => {
   if (t.dataset.p === "p-queue") loadChrome();
   if (t.dataset.p === "p-paw") loadPawBackfill();
   if (t.dataset.p === "p-queue") document.getElementById("bdg-queue").style.display = "none";
+  if (t.dataset.p === "p-files") fsLoad(fsPath || "/Volumes/V1");
   else refresh();   // 切页即刷新徽标状态
   if (t.dataset.p === "p-find") { loadPastes(); loadLinks(); }
   if (t.dataset.p === "p-cmds") loadCmds();
@@ -892,47 +921,180 @@ async function runCmdDirect(cmd) {
 // 轮询退避（2026-11-05 审计）：fetch 失败（后端重启/网络抖动）时把主
 // 轮询间隔翻倍（上限 30s），成功即恢复 2s——避免慢/挂时请求堆积
 let _pollMs = 2000;
+// ── 文件管理器（2026-11-07）──────────────────
+let fsPath = "";
+let fsItems = [];
+let fsSel = new Set();
+let fsClip = null;   // {paths: [], move: bool}
+let fsOpTimer = null;
+
+function _fsCrumbRender() {
+  const el = document.getElementById("fsCrumb");
+  const parts = fsPath.replace("/Volumes/V1", "").split("/").filter(Boolean);
+  let html = '<span class="chip mini on" onclick="fsLoad(\'/Volumes/V1\')">V1</span>';
+  let acc = "/Volumes/V1";
+  parts.forEach(seg => {
+    acc += "/" + seg;
+    html += ' / <span class="chip mini" onclick="fsLoad(\'' +
+      esc(acc).replace(/'/g, "\\'") + '\')">' + esc(seg) + '</span>';
+  });
+  el.innerHTML = html;
+}
+
+async function fsLoad(p) {
+  try {
+    const d = await api("/api/fs/list?path=" + encodeURIComponent(p || "/Volumes/V1"));
+    if (!d.ok) { document.getElementById("fsList").innerHTML =
+      '<div class="note">❌ ' + esc(d.error) + '</div>'; return; }
+    fsPath = d.path; fsItems = d.items || []; fsSel.clear();
+    _fsCrumbRender();
+    const rows = fsItems.map((x, i) =>
+      '<div class="qrow"><label style="display:flex;align-items:center;gap:8px;flex:1;min-width:0">' +
+      '<input type="checkbox" ' + (fsSel.has(x.name) ? "checked" : "") +
+      ' onchange="fsToggle(' + i + ', this.checked)">' +
+      '<span style="cursor:' + (x.is_dir ? "pointer" : "default") +
+      '" onclick="' + (x.is_dir ? "fsEnter(" + i + ")" : "void 0") + '">' +
+      (x.is_dir ? "📁 " : "📄 ") + esc(x.name) + '</span></label>' +
+      '<span class="dt" style="white-space:nowrap">' +
+      (x.is_dir ? "" : fmtSize(x.size) + " · ") +
+      new Date(x.mtime * 1000).toLocaleDateString("zh-CN") + '</span>' +
+      '<span class="chips">' +
+      (x.name.toLowerCase().match(/\.(zip|rar|7z|tar)$/) ?
+        '<span class="chip mini" onclick="fsExtract(' + i + ')">🗜</span>' : "") +
+      '<span class="chip mini" onclick="fsRename(' + i + ')">✎</span>' +
+      '<span class="chip mini" onclick="fsDelete(' + i + ')">🗑</span>' +
+      '</span></div>').join("");
+    document.getElementById("fsList").innerHTML =
+      rows || '<div class="note">空目录</div>';
+  } catch (e) {
+    document.getElementById("fsList").innerHTML = "❌ " + esc(String(e));
+  }
+}
+
+function fsRefresh() { fsLoad(fsPath); }
+function fsUp() { api("/api/fs/list?path=" + encodeURIComponent(fsPath))
+  .then(d => { if (d.parent) fsLoad(d.parent); }).catch(() => {}); }
+function fsEnter(i) { const x = fsItems[i]; if (x && x.is_dir)
+  fsLoad(fsPath + "/" + x.name); }
+function fsToggle(i, on) {
+  const name = fsItems[i].name;
+  if (on) fsSel.add(name); else fsSel.delete(name);
+}
+function fsSelAll() { fsItems.forEach(x => fsSel.add(x.name)); fsLoad(fsPath); }
+
+function fsRename(i) {
+  const x = fsItems[i];
+  const nn = prompt("重命名：", x.name);
+  if (!nn || nn === x.name) return;
+  api("/api/fs/rename", {method: "POST", body: JSON.stringify(
+    {path: fsPath + "/" + x.name, new_name: nn})})
+    .then(d => { if (!d.ok) alert("❌ " + d.error); fsRefresh(); })
+    .catch(e => alert("❌ " + e));
+}
+
+function fsDelete(i) {
+  const x = fsItems[i];
+  if (!confirm("删除 " + (x.is_dir ? "目录" : "文件") + "「" + x.name +
+      "」？" + (x.is_dir ? "\n目录会连同全部内容一起删除！" : ""))) return;
+  api("/api/fs/delete", {method: "POST", body: JSON.stringify(
+    {paths: [fsPath + "/" + x.name]})})
+    .then(d => { if (!d.ok) alert("❌ " + d.error); fsRefresh(); })
+    .catch(e => alert("❌ " + e));
+}
+
+function fsCopySel(move) {
+  const srcs = [...fsSel].map(n => fsPath + "/" + n);
+  if (!srcs.length) { alert("先勾选要操作的条目"); return; }
+  fsClip = {paths: srcs, move};
+  showResult(true, "已" + (move ? "剪切" : "复制") + " " + srcs.length +
+    " 项——进入目标目录后点 粘贴", false);
+}
+function fsPaste(moveOverride) {
+  if (!fsClip) { alert("剪贴板为空——先勾选并复制/剪切"); return; }
+  const move = moveOverride !== undefined && moveOverride !== null
+    ? moveOverride : fsClip.move;
+  if (!confirm((move ? "移动" : "复制") + " " + fsClip.paths.length +
+      " 项到当前目录？")) return;
+  api("/api/fs/paste", {method: "POST", body: JSON.stringify(
+    {dest: fsPath, srcs: fsClip.paths, move})})
+    .then(d => {
+      if (!d.ok) { alert("❌ " + d.error); return; }
+      fsClip = null;
+      fsOpPoll();
+    }).catch(e => alert("❌ " + e));
+}
+
+function fsExtract(i) {
+  const x = fsItems[i];
+  if (!confirm("解压目录「" + x.name + "」里的压缩包？（成功才删原包）")) return;
+  api("/api/fs/extract", {method: "POST", body: JSON.stringify(
+    {target: fsPath + "/" + x.name})})
+    .then(d => { showResult(!!d.ok, d.ok ? d.message : d.error, !d.ok); })
+    .catch(e => alert("❌ " + e));
+}
+
+function fsOpPoll() {
+  if (fsOpTimer) clearInterval(fsOpTimer);
+  fsOpTimer = setInterval(async () => {
+    try {
+      const d = await api("/api/fs/op");
+      const el = document.getElementById("fsOp");
+      if (d.running) { el.textContent = "⏳ " + (d.msg || "执行中…"); return; }
+      clearInterval(fsOpTimer); fsOpTimer = null;
+      if (d.error) el.textContent = "❌ " + d.error;
+      else if (d.msg) el.textContent = "✅ " + d.msg;
+      fsRefresh();
+    } catch (e) { /* 静默 */ }
+  }, 2000);
+}
+
 // ── 目录解压卡（2026-11-07）──────────────────
 let _exTarget = "";
+let _exDirs = [];      // {name, archives}
+let _exBase = "";
+let _exShowAll = false;
+
 async function loadExtractDirs() {
   try {
     const d = await api("/api/extract/dirs");
-    const el = document.getElementById("exDirs");
-    if (!d.ok) { el.innerHTML = "❌ " + esc(d.error); return; }
-    const hidden = (d.dirs[0] && d.dirs[0]._hidden) || 0;
-    // 按包数降序；默认只显示有压缩包的目录（53 个全平铺实测太乱），
-    // 其余收进「显示全部」切换
-    const dirs = d.dirs.filter(x => !x._hidden && x.archives > 0)
-      .sort((a, b) => b.archives - a.archives);
-    const rest = d.dirs.filter(x => !x._hidden && x.archives <= 0);
-    window._exAllDirs = d.dirs.filter(x => !x._hidden);
-    const chip = x =>
-      '<span class="chip mini ' + (_exTarget === d.base + "/" + x.name ?
-        "on" : "") + '" onclick="pickExDir(\'' +
-        esc(d.base + "/" + x.name).replace(/'/g, "\\'") + '\')">' +
-        esc(x.name) + ' (' + (x.archives < 0 ? "?" : x.archives) +
-        ')</span>';
-    let html = dirs.length
-      ? dirs.map(chip).join(" ")
-      : '<span class="note">一级目录里没有压缩包（有的话会按数量排前）</span>';
-    if (rest.length)
-      html += '<span class="chip mini" onclick="' +
-        'document.getElementById("exRest").style.display=' +
-        '(document.getElementById("exRest").style.display==="none"?' +
-        '"inline-block":"none")">…另有 ' + rest.length + ' 个空目录</span>' +
-        '<span id="exRest" style="display:none">' +
-        rest.map(chip).join(" ") + '</span>';
-    if (hidden)
-      html += '<span class="note">（' + hidden + ' 个系统隐藏目录已略）</span>';
-    el.innerHTML = html;
+    _exDirs = (d.dirs || []).filter(x => !x._hidden);
+    _exBase = d.base || "";
+    renderExDirs();
   } catch (e) {
     document.getElementById("exDirs").textContent = "❌ " + e;
   }
 }
-function pickExDir(p) {
-  _exTarget = p;
-  loadExtractDirs();
+
+function renderExDirs() {
+  // 按包数降序；默认只显示有压缩包的目录（全部平铺实测不可用），
+  // 空目录收进「另有 N 个」切换。chip 用**索引**传参——零引号嵌套
+  const el = document.getElementById("exDirs");
+  const sorted = _exDirs.slice().sort((a, b) => b.archives - a.archives);
+  const withA = sorted.filter(x => x.archives > 0);
+  const empty = sorted.filter(x => x.archives <= 0);
+  const shown = _exShowAll ? sorted : withA;
+  const chip = x =>
+    '<span class="chip mini ' + (_exTarget === _exBase + "/" + x.name ?
+      "on" : "") + '" onclick="pickExDir(' + _exDirs.indexOf(x) + ')">' +
+      esc(x.name) + ' (' + (x.archives < 0 ? "?" : x.archives) + ')</span>';
+  let html = shown.length
+    ? shown.map(chip).join(" ")
+    : '<span class="note">一级目录里没有压缩包</span>';
+  if (!_exShowAll && empty.length)
+    html += '<span class="chip mini" onclick="toggleExAll()">…另有 ' +
+      empty.length + ' 个目录</span>';
+  if (_exShowAll && empty.length)
+    html += '<span class="chip mini" onclick="toggleExAll()">⬆ 收起空目录</span>';
+  el.innerHTML = html;
 }
+
+function toggleExAll() { _exShowAll = !_exShowAll; renderExDirs(); }
+
+function pickExDir(idx) {
+  _exTarget = _exBase + "/" + _exDirs[idx].name;
+  renderExDirs();
+}
+
 async function extractDry() { await extractGo(true); }
 async function extractRun() { await extractGo(false); }
 async function extractGo(dry) {

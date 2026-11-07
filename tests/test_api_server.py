@@ -1380,3 +1380,88 @@ class EnqueueXRouteTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(row)
         finally:
             await client.close()
+
+
+class FileManagerTest(unittest.IsolatedAsyncioTestCase):
+    """/api/fs/*：数据盘护栏 + 列表/重命名/粘贴。"""
+
+    runtime_db = runtime_db_mod   # 类属性（setUp 里实例重绑也走它）
+
+    def setUp(self):
+        from tg_userbot import runtime_db as _rt
+        self._td = tempfile.mkdtemp(dir=_TMP)
+        self._saved_conn = _rt._CONN
+        _rt._CONN = None
+        _rt.init_db(os.path.join(self._td, "tg.db"))
+        runtime_db = _rt
+        self._old_root = config.DATA_ROOT
+        config.DATA_ROOT = os.path.join(self._td, "v1")
+        os.makedirs(config.DATA_ROOT)
+        os.makedirs(os.path.join(config.DATA_ROOT, "sub"))
+        with open(os.path.join(config.DATA_ROOT, "sub", "a.txt"), "w") as f:
+            f.write("hello")
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        rt = self.runtime_db
+        try:
+            rt.close_db()
+        except Exception:
+            pass
+        rt._CONN = self._saved_conn
+        config.DATA_ROOT = self._old_root
+        shutil.rmtree(self._td, ignore_errors=True)
+
+    async def test_list_and_rename(self):
+        client = make_client()
+        await client.start_server()
+        try:
+            r = await client.get("/api/fs/list?path=" +
+                                 config.DATA_ROOT.replace("\\", "/"))
+            d = await r.json()
+            self.assertTrue(d["ok"])
+            names = [x["name"] for x in d["items"]]
+            self.assertIn("sub", names)
+            # 重命名
+            r2 = await client.post("/api/fs/rename", data=json.dumps(
+                {"path": config.DATA_ROOT + "/sub/a.txt",
+                 "new_name": "b.txt"}))
+            self.assertTrue((await r2.json())["ok"])
+            self.assertTrue(os.path.exists(
+                os.path.join(config.DATA_ROOT, "sub", "b.txt")))
+        finally:
+            await client.close()
+
+    async def test_traversal_rejected(self):
+        client = make_client()
+        await client.start_server()
+        try:
+            r = await client.get(
+                "/api/fs/list?path=/etc")
+            d = await r.json()
+            self.assertFalse(d["ok"])
+            r2 = await client.post("/api/fs/rename", data=json.dumps(
+                {"path": "/etc/hosts", "new_name": "x"}))
+            self.assertFalse((await r2.json())["ok"])
+        finally:
+            await client.close()
+
+    async def test_paste_copy_in_disk(self):
+        client = make_client()
+        await client.start_server()
+        try:
+            r = await client.post("/api/fs/paste", data=json.dumps(
+                {"dest": config.DATA_ROOT,
+                 "srcs": [config.DATA_ROOT + "/sub/a.txt"],
+                 "move": False}))
+            d = await r.json()
+            self.assertTrue(d["ok"], d)
+            for _ in range(30):
+                if not json.loads((await (
+                        await client.get("/api/fs/op")).text()))["running"]:
+                    break
+                await asyncio.sleep(0.1)
+            self.assertTrue(os.path.exists(
+                os.path.join(config.DATA_ROOT, "a.txt")))
+        finally:
+            await client.close()
