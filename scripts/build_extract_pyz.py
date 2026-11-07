@@ -27,6 +27,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PKG = os.path.join(ROOT, "tg_userbot")
 OUT = os.path.join(ROOT, "dist", "extract.pyz")
 
+# 包版本：每次出包手动 +1（手机排查「跑的是哪版」全靠运行首行横幅——
+# 2026-11-07 Alicexi 排障实测：旧包覆盖失败连跑三轮同款报错）。
+#   1 初版（zip+bsdtar）
+#   2 魔数嗅探（伪装 .zip 按 rar/7z 签名分流）
+#   3 SFX 深扫描（前 4MB 搜内嵌签名）+ 7z 成功删原包
+VERSION = "3"
+
 # extract_util 引用的守卫常量：内置默认（与项目 config.py 现值一致），
 # 环境变量 EXTRACT_* 可覆盖（手机上想放宽守卫时不用改脚本）
 CONFIG_STUB = '''"""薄版 config（zipapp 垫片）：只提供 extract_util 用到的守卫常量。
@@ -67,10 +74,12 @@ if not logger.handlers:
 MAIN_STUB = '''"""extract.pyz 入口：/extract 命令的同款语义（递归解压目录）。"""
 import sys
 
+from _extract_pkg.version import VERSION
 from _extract_pkg.extract_dir import extract_directory
 
 
 def main(argv):
+    print(f"extract.pyz v{VERSION}")   # 排障横幅：一眼确认手机跑的哪版
     arg = " ".join(a for a in argv if not a.startswith("--"))
     dry = "--dry" in argv
     timeout = 3600
@@ -98,6 +107,7 @@ def main():
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("__main__.py", MAIN_STUB)
+        z.writestr("_extract_pkg/version.py", f'VERSION = "{VERSION}"\n')
         z.writestr("_extract_pkg/__init__.py", "")
         # 源模块逐字复制（单一真相源）
         for name in ("extract_dir.py", "extract_util.py"):

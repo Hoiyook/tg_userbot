@@ -618,54 +618,6 @@ async def handle_dashboard(request):
 _EXTRACT_STATE = {"running": False, "rounds": [], "last": "", "started": 0}
 
 
-async def handle_extract_dirs(request):
-    """解压卡：列出 V1 一级目录（含子目录计数与压缩包数量）。"""
-    from . import config as _cfg
-    base = _cfg.DOWNLOAD_DIR
-    out = []
-    try:
-        hidden = 0
-        for name in sorted(os.listdir(base)):
-            full = os.path.join(base, name)
-            if not os.path.isdir(full):
-                continue
-            if name.startswith("."):
-                hidden += 1   # 系统目录（.DocumentRevisions 等）不进列表
-                continue
-            # 有界遍历（深度 2、上限 800 项——全树 walk 在解压 I/O 打满
-            # 时会把 bot 卡死在 readdir，2026-11-07 实测）：统计文件总数
-            # 与压缩包数。MEGA 这类「目录里是 mp4 不是压缩包」的显示
-            # (N 文件) 而不是误导性的 (0)
-            n_files = n_arch = 0
-            scanned = 0
-            capped = False
-            try:
-                for _dp, _dn, fns in os.walk(full):
-                    for f in fns:
-                        scanned += 1
-                        if scanned > 800:
-                            capped = True
-                            break
-                        low = f.lower()
-                        n_files += 1
-                        if low.endswith((".zip", ".rar", ".7z", ".tar.gz",
-                                         ".tgz", ".tar")):
-                            n_arch += 1
-                    if capped:
-                        break
-                    if len(_dn) and _dp.count(os.sep) - full.count(os.sep) >= 2:
-                        _dn[:] = []   # 深度 2 截断
-            except OSError:
-                pass
-            if capped:
-                n_files = -1   # 目录太大没扫完 → 显示「?」
-            out.append({"name": name, "files": n_files, "archives": n_arch})
-        out.insert(0, {"_hidden": hidden})
-    except Exception as e:
-        return _json({"ok": False, "error": str(e)[:80]}, 500)
-    return _json({"ok": True, "base": base, "dirs": out})
-
-
 def _extract_run_blocking(target):
     """同步跑一轮解压并记录（后台线程执行）。"""
     from . import extract_dir
@@ -681,38 +633,6 @@ def _extract_run_blocking(target):
         _EXTRACT_STATE["last"] = f"异常: {e}"
     finally:
         _EXTRACT_STATE["running"] = False
-
-
-async def handle_extract_run(request):
-    """解压卡：对选定目录启动一轮解压（串行防重入，dry 可选）。"""
-    global _EXTRACT_STATE
-    try:
-        b = await request.json()
-    except Exception:
-        b = {}
-    target = str(b.get("target") or "").strip()
-    dry = bool(b.get("dry"))
-    real = _fs_safe(target)
-    if real is None:
-        return _json({"ok": False,
-                      "error": "目录必须在数据盘内"}, 400)
-    if not os.path.isdir(real):
-        return _json({"ok": False, "error": "目录不存在"}, 400)
-    if _EXTRACT_STATE["running"]:
-        return _json({"ok": False,
-                      "error": "已有一轮解压在跑（看状态卡）"}, 409)
-    _EXTRACT_STATE["running"] = True
-    _EXTRACT_STATE["started"] = time.time()
-    try:
-        # spawn 需要协程（同步 lambda 会让 create_task TypeError——
-        # running 卡死在 True，2026-11-07 实测）
-        spawn(asyncio.to_thread(_extract_run_blocking_dry, real, dry),
-              "看板解压")
-    except Exception as e:
-        _EXTRACT_STATE["running"] = False
-        return _json({"ok": False, "error": f"启动失败: {e}"}, 500)
-    return _json({"ok": True, "message":
-                  "已启动" + ("（dry 预览）" if dry else "")})
 
 
 def _extract_run_targets(targets, dry=False):
@@ -1647,8 +1567,6 @@ def make_app() -> web.Application:
         web.get("/api/version", handle_version),
         web.get("/api/batch", handle_batch),
         web.get("/api/sse", handle_sse),
-        web.get("/api/extract/dirs", handle_extract_dirs),
-        web.post("/api/extract/run", handle_extract_run),
         web.get("/api/extract/state", handle_extract_state),
         web.get("/api/fs/list", handle_fs_list),
         web.post("/api/fs/rename", handle_fs_rename),
