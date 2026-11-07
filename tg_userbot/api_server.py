@@ -691,7 +691,14 @@ async def handle_extract_run(request):
                       "error": "已有一轮解压在跑（看状态卡）"}, 409)
     _EXTRACT_STATE["running"] = True
     _EXTRACT_STATE["started"] = time.time()
-    spawn(lambda: _extract_run_blocking_dry(real, dry), "看板解压")
+    try:
+        # spawn 需要协程（同步 lambda 会让 create_task TypeError——
+        # running 卡死在 True，2026-11-07 实测）
+        spawn(asyncio.to_thread(_extract_run_blocking_dry, real, dry),
+              "看板解压")
+    except Exception as e:
+        _EXTRACT_STATE["running"] = False
+        return _json({"ok": False, "error": f"启动失败: {e}"}, 500)
     return _json({"ok": True, "message":
                   "已启动" + ("（dry 预览）" if dry else "")})
 

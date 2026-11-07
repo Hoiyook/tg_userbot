@@ -900,14 +900,31 @@ async function loadExtractDirs() {
     const el = document.getElementById("exDirs");
     if (!d.ok) { el.innerHTML = "❌ " + esc(d.error); return; }
     const hidden = (d.dirs[0] && d.dirs[0]._hidden) || 0;
-    const dirs = d.dirs.filter(x => !x._hidden);
-    el.innerHTML = "点选目录（压缩包数，? = 目录忙）：" + dirs.map(x =>
+    // 按包数降序；默认只显示有压缩包的目录（53 个全平铺实测太乱），
+    // 其余收进「显示全部」切换
+    const dirs = d.dirs.filter(x => !x._hidden && x.archives > 0)
+      .sort((a, b) => b.archives - a.archives);
+    const rest = d.dirs.filter(x => !x._hidden && x.archives <= 0);
+    window._exAllDirs = d.dirs.filter(x => !x._hidden);
+    const chip = x =>
       '<span class="chip mini ' + (_exTarget === d.base + "/" + x.name ?
         "on" : "") + '" onclick="pickExDir(\'' +
         esc(d.base + "/" + x.name).replace(/'/g, "\\'") + '\')">' +
         esc(x.name) + ' (' + (x.archives < 0 ? "?" : x.archives) +
-        ')</span>').join(" ") +
-      (hidden ? '<span class="note">（另有 ' + hidden + ' 个系统隐藏目录已略）</span>' : "");
+        ')</span>';
+    let html = dirs.length
+      ? dirs.map(chip).join(" ")
+      : '<span class="note">一级目录里没有压缩包（有的话会按数量排前）</span>';
+    if (rest.length)
+      html += '<span class="chip mini" onclick="' +
+        'document.getElementById("exRest").style.display=' +
+        '(document.getElementById("exRest").style.display==="none"?' +
+        '"inline-block":"none")">…另有 ' + rest.length + ' 个空目录</span>' +
+        '<span id="exRest" style="display:none">' +
+        rest.map(chip).join(" ") + '</span>';
+    if (hidden)
+      html += '<span class="note">（' + hidden + ' 个系统隐藏目录已略）</span>';
+    el.innerHTML = html;
   } catch (e) {
     document.getElementById("exDirs").textContent = "❌ " + e;
   }
