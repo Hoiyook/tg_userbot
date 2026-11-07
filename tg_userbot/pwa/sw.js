@@ -4,7 +4,7 @@
  *       ③ /api/* 一律网络优先、绝不缓存（数据必须实时）。
  * 更新策略：版本号变更 + skipWaiting + clients.claim，重开即新版。
  */
-const CACHE = "nagram-dash-v3";   // v2：应用内刷新 + 下拉刷新 + 新图标
+const CACHE = "nagram-dash-v4";   // v4：发现页签恢复（找文件移除）+ 粘贴框回归\n//   v3：应用内刷新 + 下拉刷新 + 新图标
 
 self.addEventListener("install", (e) => self.skipWaiting());
 
