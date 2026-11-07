@@ -27,6 +27,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Button
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -57,13 +59,30 @@ import kotlinx.coroutines.withContext
  * （?token= 引导一次进 localStorage），同源免 CORS；改 UI 不用发 APK。
  * 打开 app 时顺带补投离线暂存的分享。
  */
+// ── 白色主题设计令牌（2026-11-08 重设计）──────────────────
+// M3 默认 baseline 是重紫色调（旧版按钮全紫、黑底蓝字显闷）——换
+// 本项目看板网页同款蓝做主色，整体白底灰字。
+internal val BgApp = Color(0xFFF6F8FB)      // app 背景：冷灰白
+internal val CardWhite = Color(0xFFFFFFFF)  // 卡片/底栏纯白
+internal val Hairline = Color(0xFFE6EAF0)   // 描边/细分隔线
+internal val Brand = Color(0xFF2563EB)      // 主色（看板网页同款蓝）
+internal val BrandSoft = Color(0xFFEAF1FE)  // 主色淡底（选中页签药丸）
+internal val InkStrong = Color(0xFF0F172A)  // 主文字
+internal val InkMut = Color(0xFF64748B)     // 次要文字
+internal val Danger = Color(0xFFDC2626)     // 危险操作（删除）
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize(),
-                        color = Color(0xFF10151C)) {
+            MaterialTheme(
+                colorScheme = lightColorScheme(
+                    primary = Brand,
+                    background = BgApp,
+                    surface = CardWhite,
+                ),
+            ) {
+                Surface(modifier = Modifier.fillMaxSize(), color = BgApp) {
                     App()
                 }
             }
@@ -97,7 +116,7 @@ fun App() {
     }
 
     // 已配置：面板 / 脚本 双页签（2026-11-07 合并 ScriptRunner）
-    Column(Modifier.fillMaxSize().background(Color(0xFF10151C))) {
+    Column(Modifier.fillMaxSize().background(BgApp)) {
         Box(Modifier.weight(1f)) {
             when {
                 tab == "scripts" -> ScriptsScreen()
@@ -116,8 +135,10 @@ fun App() {
         // navigationBarsPadding：三键导航的返回/主屏/最近任务键叠在屏幕
         // 最底部——不垫高的话底栏页签被系统键挡住点不到（2026-11-08
         // 模拟器实测：点「脚本」页签全打在最近任务键上）
-        Row(Modifier.fillMaxWidth().background(Color(0xFF1A2230))
-                .navigationBarsPadding()) {
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Hairline))
+        Row(Modifier.fillMaxWidth().background(CardWhite)
+                .navigationBarsPadding()
+                .padding(vertical = 6.dp)) {
             TabItem("🌐 面板", tab == "panel", Modifier.weight(1f)) {
                 tab = "panel"
             }
@@ -131,17 +152,22 @@ fun App() {
 @Composable
 fun TabItem(label: String, selected: Boolean, modifier: Modifier,
             onClick: () -> Unit) {
-    Column(modifier
-        .clickable(onClick = onClick)
-        .padding(vertical = 10.dp),
-        horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(label, color = if (selected) Color(0xFF5B8CFF)
-             else Color(0xFF8FA1BD), fontSize = 14.sp)
-        Spacer(Modifier.height(2.dp))
-        Box(Modifier
-            .size(width = 36.dp, height = 3.dp)
-            .background(if (selected) Color(0xFF5B8CFF) else Color.Transparent,
-                RoundedCornerShape(2.dp)))
+    // 药丸式页签：选中 = 淡蓝底胶囊 + 主色半粗字；未选中 = 灰字
+    Box(modifier.clickable(onClick = onClick),
+        contentAlignment = Alignment.Center) {
+        Row(
+            Modifier
+                .padding(horizontal = 16.dp, vertical = 4.dp)
+                .background(if (selected) BrandSoft else Color.Transparent,
+                    RoundedCornerShape(50))
+                .padding(horizontal = 18.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(label, fontSize = 14.sp,
+                 fontWeight = if (selected) FontWeight.SemiBold
+                              else FontWeight.Normal,
+                 color = if (selected) Brand else InkMut)
+        }
     }
 }
 
@@ -153,31 +179,33 @@ fun TelegramOnlyScreen(onEdit: () -> Unit, spoolNote: String) {
             .padding(24.dp),
         verticalArrangement = Arrangement.Center,
     ) {
-        Text("✅ 分享直达已就绪", color = Color(0xFFE8EDF4), fontSize = 26.sp)
+        Text("✅ 分享直达已就绪", color = InkStrong, fontSize = 26.sp,
+             fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(14.dp))
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Color(0xFF1A2230), RoundedCornerShape(12.dp))
+                .background(CardWhite, RoundedCornerShape(14.dp))
+                .border(1.dp, Hairline, RoundedCornerShape(14.dp))
                 .padding(16.dp),
         ) {
             Text(
                 "用法：任意 app 里点「分享」→ 选「存到下载器」→ 提示已通过"
                         + " Telegram 转交即可，进度与结果看 Telegram 控制面板"
                         + "（📲 分享直达通知 + bot 菜单）",
-                color = Color(0xFFB9C8DA), fontSize = 14.sp, lineHeight = 20.sp,
+                color = InkMut, fontSize = 14.sp, lineHeight = 20.sp,
             )
         }
         if (spoolNote.isNotEmpty()) {
             Spacer(Modifier.height(12.dp))
-            Text(spoolNote, color = Color(0xFFFBBF24), fontSize = 14.sp)
+            Text(spoolNote, color = Color(0xFFB45309), fontSize = 14.sp)
         }
         Spacer(Modifier.height(20.dp))
         Text(
             "看板仪表盘需要「服务器直连」地址：家里同一 WiFi 时在 ⚙ 里填"
                     + " http://<Mac的IP>:8765（token 见 tg_secrets.json api 段）；"
                     + "填了以后打开 app 就是实时仪表盘",
-            color = Color(0xFF8FA3BB), fontSize = 13.sp, lineHeight = 19.sp,
+            color = InkMut, fontSize = 13.sp, lineHeight = 19.sp,
         )
         Spacer(Modifier.height(24.dp))
         OutlinedButton(onClick = onEdit, modifier = Modifier.fillMaxWidth()) {
@@ -198,59 +226,58 @@ fun ConfigScreen(onSaved: () -> Unit, onCancel: (() -> Unit)?) {
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .background(BgApp)
             .verticalScroll(rememberScrollState())
-            .padding(24.dp),
-        verticalArrangement = Arrangement.Center,
+            .padding(20.dp),
     ) {
-        Text("配置下载器", color = Color(0xFFE8EDF4), fontSize = 24.sp)
-        Spacer(Modifier.height(8.dp))
-        Text(
-            "① Telegram 中转（推荐，选填）：分享走 Bot API，任何网络都能用，"
-                    + "不与代理冲突。bot token 找管理 bot 的 @BotFather 看；"
-                    + "数字 ID 向 @userinfobot 发消息可查",
-            color = Color(0xFF8FA3BB), fontSize = 13.sp,
-        )
+        Spacer(Modifier.height(28.dp))
+        Text("🧰 个人工具箱", color = InkStrong, fontSize = 26.sp,
+             fontWeight = FontWeight.Bold)
+        Text("连接你的下载控制台", color = InkMut, fontSize = 14.sp)
+        Spacer(Modifier.height(20.dp))
+
+        ConfigCard("① Telegram 中转 · 推荐",
+            "分享走 Bot API，任何网络都能用，不与代理冲突。" +
+                "bot token 找管理 bot 的 @BotFather 看；" +
+                "数字 ID 向 @userinfobot 发消息可查") {
+            OutlinedTextField(
+                value = botToken,
+                onValueChange = { botToken = it },
+                label = { Text("Bot Token（选填，如 123456:ABC-xxx）") },
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+            )
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(
+                value = chatId,
+                onValueChange = { chatId = it },
+                label = { Text("你的数字 ID（选填，如 5452449426）") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+            )
+        }
         Spacer(Modifier.height(12.dp))
-        OutlinedTextField(
-            value = botToken,
-            onValueChange = { botToken = it },
-            label = { Text("Bot Token（选填，如 123456:ABC-xxx）") },
-            visualTransformation = PasswordVisualTransformation(),
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-        )
-        Spacer(Modifier.height(10.dp))
-        OutlinedTextField(
-            value = chatId,
-            onValueChange = { chatId = it },
-            label = { Text("你的数字 ID（选填，如 5452449426）") },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-        )
-        Spacer(Modifier.height(16.dp))
-        Text(
-            "② 服务器直连（选填）：家里同一 WiFi 时看板更快；"
-                    + "token 见 tg_secrets.json 的 api 段",
-            color = Color(0xFF8FA3BB), fontSize = 13.sp,
-        )
-        Spacer(Modifier.height(12.dp))
-        OutlinedTextField(
-            value = url,
-            onValueChange = { url = it },
-            label = { Text("服务器地址（选填，如 http://192.168.31.161:8765）") },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-        )
-        Spacer(Modifier.height(10.dp))
-        OutlinedTextField(
-            value = token,
-            onValueChange = { token = it },
-            label = { Text("API 访问令牌（选填）") },
-            visualTransformation = PasswordVisualTransformation(),
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-        )
-        Spacer(Modifier.height(18.dp))
+        ConfigCard("② 服务器直连 · 选填",
+            "家里同一 WiFi 时看板更快；token 见 tg_secrets.json 的 api 段") {
+            OutlinedTextField(
+                value = url,
+                onValueChange = { url = it },
+                label = { Text("服务器地址（如 http://192.168.31.161:8765）") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+            )
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(
+                value = token,
+                onValueChange = { token = it },
+                label = { Text("API 访问令牌（选填）") },
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+            )
+        }
+        Spacer(Modifier.height(20.dp))
         Button(
             onClick = {
                 if (botToken.isBlank() && !url.trim().startsWith("http")) {
@@ -260,18 +287,40 @@ fun ConfigScreen(onSaved: () -> Unit, onCancel: (() -> Unit)?) {
                 Prefs.save(ctx, url, token, botToken, chatId)
                 onSaved()
             },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+            shape = RoundedCornerShape(12.dp),
         ) { Text("保存并打开控制台", fontSize = 16.sp) }
         if (note.isNotEmpty()) {
             Spacer(Modifier.height(8.dp))
-            Text(note, color = Color(0xFFF87171), fontSize = 13.sp)
+            Text(note, color = Danger, fontSize = 13.sp)
         }
         if (onCancel != null) {
             Spacer(Modifier.height(6.dp))
             TextButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) {
-                Text("返回看板")
+                Text("返回看板", color = InkMut)
             }
         }
+        Spacer(Modifier.height(28.dp))
+    }
+}
+
+/** 白底描边配置分区卡：标题 + 说明 + 字段内容。 */
+@Composable
+private fun ConfigCard(title: String, desc: String,
+                       content: @Composable () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(CardWhite, RoundedCornerShape(16.dp))
+            .border(1.dp, Hairline, RoundedCornerShape(16.dp))
+            .padding(16.dp),
+    ) {
+        Text(title, color = InkStrong, fontSize = 15.sp,
+             fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(4.dp))
+        Text(desc, color = InkMut, fontSize = 12.sp)
+        Spacer(Modifier.height(12.dp))
+        content()
     }
 }
 

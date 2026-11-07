@@ -1076,6 +1076,20 @@ async function fsExtract(i) {
   showResult(!!d.ok, d.ok ? d.message : d.error, !d.ok);
 }
 
+async function fsExtractSel() {
+  const names = [...fsSel];
+  if (!names.length) {
+    fsModal({title: "提示", body: "先勾选要解压的条目（目录或压缩包均可）"});
+    return;
+  }
+  if (!await fsModal({title: "解压确认",
+      body: "解压 " + names.length + " 个选中目标里的压缩包？（成功才删原包）",
+      okText: "解压"})) return;
+  const d = await api("/api/fs/extract", {method: "POST", body: JSON.stringify(
+    {targets: names.map(n => fsPath + "/" + n)})});
+  showResult(!!d.ok, d.ok ? d.message : d.error, !d.ok);
+}
+
 async function fsMkdir() {
   const name = await fsModal({title: "新建文件夹（当前目录内）",
                               input: "", okText: "创建"});
@@ -1111,8 +1125,7 @@ function fsOpPoll() {
   }, 2000);
 }
 
-// ── 目录解压卡（2026-11-07）──────────────────// ── 目录解压卡（2026-11-07）──────────────────
-// 目录解压卡已移除（2026-11-07）：解压入口统一到 📁 文件页签
+// ── 目录解压卡已移除（2026-11-07）：解压入口统一到 📁 文件页签
 let _exDirs = [];   // 兼容遗留引用（loadExtractState 不再使用）
 
 

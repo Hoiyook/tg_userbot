@@ -3,14 +3,18 @@ package local.nagram.shell
 import android.content.Context
 import android.content.Intent
 import android.widget.Toast
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.json.JSONArray
@@ -152,27 +156,31 @@ fun ScriptsScreen() {
     var delName by remember { mutableStateOf("") }
     var pendingDel by remember { mutableStateOf<String?>(null) }
 
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Text("🛠 脚本", color = Color(0xFFE8EDF4),
-             fontSize = 20.sp)
+    Column(Modifier.fillMaxSize().background(BgApp).padding(16.dp)) {
+        Text("🛠 脚本", color = InkStrong, fontSize = 22.sp,
+             fontWeight = FontWeight.Bold)
         Text("点脚本运行（输出在 Termux 窗口）。前置：Termux 设 " +
             "allow-external-apps=true",
-            style = MaterialTheme.typography.bodySmall,
-            color = Color(0xFF8FA1BD))
+            style = MaterialTheme.typography.bodySmall, color = InkMut)
         Spacer(Modifier.height(12.dp))
 
         LazyColumn(Modifier.weight(1f),
                    verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(scripts.size) { i ->
                 val s = scripts[i]
-                Card(Modifier.fillMaxWidth()) {
+                Card(
+                    Modifier.fillMaxWidth()
+                        .border(1.dp, Hairline, RoundedCornerShape(14.dp)),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = CardWhite),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                ) {
                     Column(Modifier.padding(14.dp)) {
-                        Text(s.name, color = Color(0xFFE8EDF4),
-                             fontSize = 16.sp)
+                        Text(s.name, color = InkStrong, fontSize = 16.sp,
+                             fontWeight = FontWeight.SemiBold)
                         Text(s.program.substringAfterLast('/') +
                             " " + s.args.joinToString(" "),
-                            color = Color(0xFF8FA1BD), fontSize = 12.sp,
-                            maxLines = 2)
+                            color = InkMut, fontSize = 12.sp, maxLines = 2)
                         Row(Modifier.padding(top = 8.dp),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(onClick = {
@@ -183,11 +191,11 @@ fun ScriptsScreen() {
                             OutlinedButton(onClick = {
                                 editing = s; editingIndex = i }) {
                                 Text("编辑") }
-                            OutlinedButton(onClick = {
+                            TextButton(onClick = {
                                 scripts = scripts.toMutableList()
                                     .apply { removeAt(i) }
                                 saveScripts(ctx, scripts)
-                            }) { Text("删除") }
+                            }) { Text("删除", color = Danger) }
                         }
                     }
                 }
@@ -195,25 +203,30 @@ fun ScriptsScreen() {
         }
 
         Spacer(Modifier.height(12.dp))
-        Button(onClick = {
+        OutlinedButton(onClick = {
             editing = Script("", "$TERMUX_PREFIX/bin/python3", listOf())
             editingIndex = -1
-        }, modifier = Modifier.fillMaxWidth()) { Text("+ 添加脚本") }
+        }, modifier = Modifier.fillMaxWidth()) { Text("＋ 添加脚本") }
 
         // ── 📂 Termux 脚本文件管理（自 ScriptRunner 移植）──────────
         // 普通 app 无权直接写 Termux 私有目录——复制/删除/查看全部
         // 发 RUN_COMMAND 让 Termux 自己执行（结果在 Termux 窗口可见）
         Spacer(Modifier.height(16.dp))
-        Card(Modifier.fillMaxWidth()) {
+        Card(
+            Modifier.fillMaxWidth()
+                .border(1.dp, Hairline, RoundedCornerShape(14.dp)),
+            shape = RoundedCornerShape(14.dp),
+            colors = CardDefaults.cardColors(containerColor = CardWhite),
+            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        ) {
             Column(Modifier.padding(14.dp)) {
-                Text("📂 Termux 脚本文件管理",
-                     color = Color(0xFFE8EDF4),
-                     style = MaterialTheme.typography.titleMedium)
+                Text("📂 Termux 脚本文件管理", color = InkStrong,
+                     style = MaterialTheme.typography.titleMedium,
+                     fontWeight = FontWeight.SemiBold)
                 Text(
                     "复制/删除 Termux home（~/）里的脚本文件；" +
                         "操作经 Termux 执行，结果看 Termux 窗口",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF8FA1BD),
+                    style = MaterialTheme.typography.bodySmall, color = InkMut,
                 )
                 Spacer(Modifier.height(8.dp))
                 Button(onClick = {
@@ -255,10 +268,14 @@ fun ScriptsScreen() {
                         singleLine = true,
                         modifier = Modifier.weight(1f),
                     )
-                    Button(onClick = {
-                        if (delName.isNotBlank())
-                            pendingDel = delName.trim()
-                    }) { Text("🗑 删除") }
+                    Button(
+                        onClick = {
+                            if (delName.isNotBlank())
+                                pendingDel = delName.trim()
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Danger),
+                    ) { Text("🗑 删除") }
                 }
             }
         }
@@ -271,11 +288,14 @@ fun ScriptsScreen() {
             title = { Text("删除确认") },
             text = { Text("确定删除 Termux home 里的「$name」？此操作不可恢复。") },
             confirmButton = {
-                Button(onClick = {
-                    runRaw(ctx, "$TERMUX_PREFIX/bin/bash", arrayOf(
-                        "-c", "rm ~/\"$name\" && echo \"✅ 已删除 $name\""))
-                    pendingDel = null
-                }) { Text("删除") }
+                Button(
+                    onClick = {
+                        runRaw(ctx, "$TERMUX_PREFIX/bin/bash", arrayOf(
+                            "-c", "rm ~/\"$name\" && echo \"✅ 已删除 $name\""))
+                        pendingDel = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Danger),
+                ) { Text("删除") }
             },
             dismissButton = {
                 OutlinedButton(onClick = { pendingDel = null }) { Text("取消") }
