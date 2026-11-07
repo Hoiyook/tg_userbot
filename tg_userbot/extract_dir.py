@@ -236,11 +236,38 @@ def process_archive(path, dry: bool = False,
 
     low = name.lower()
 
+    # 魔数嗅探（2026-11-07 Alicexi 实测）：站点/网盘会把加密 rar 改名
+    # .zip，甚至套 SFX 自解压头（实测 rar5 数据前挂 460288 字节 stub，
+    # 7z 报 Offset=460288）——扩展名和开头字节都不可信。rar/7z 签名
+    # → 强制走下方 7z 工具分支（7z 按内容开包，天然吃 SFX）。
+    try:
+        with open(path, "rb") as f:
+            magic = f.read(8)
+    except OSError:
+        magic = b""
+    if magic.startswith(b"Rar!"):                  # rar4/rar5 同签名
+        low = name.lower() + ".rar"                # 唯一作用：命中 .rar 分支
+    elif magic.startswith(b"7z\xbc\xaf\x27\x1c"):
+        low = name.lower() + ".7z"
+    elif low.endswith(".zip") and not magic.startswith(b"PK"):
+        # 伪装 .zip 且开头非 PK：前 4MB 搜内嵌签名（SFX stub 典型几十~
+        # 几百 KB）；真 zip 不进这条，零额外开销
+        head = b""
+        try:
+            with open(path, "rb") as f:
+                head = f.read(4 * 1024 * 1024)
+        except OSError:
+            pass
+        if b"Rar!\x1a\x07" in head:
+            low = name.lower() + ".rar"
+        elif b"7z\xbc\xaf\x27\x1c" in head:
+            low = name.lower() + ".7z"
+
     # 7z 分卷：需要 p7zip/7z 工具（bsdtar 不支持分卷）；首卷入口
     if is_split_volume(name):
         tool = find_7z_tool()
         if not tool:
-            return "fail", ("未找到 7z 工具（brew install p7zip）——"
+            return "fail", ("未找到 7z 工具（brew/pkg install p7zip）——"
                             "保留分卷")
         if dry:
             return "dry", f"将解压分卷（7z）→ {dest_dir.name}/"
@@ -315,8 +342,8 @@ def process_archive(path, dry: bool = False,
             if dest_dir.is_dir() and not any(os.scandir(dest_dir)):
                 dest_dir.rmdir()
             if status == "password":
-                return ("fail", "加密 rar 且未装 7z 工具（brew install "
-                        "p7zip）——保留原包")
+                return ("fail", "加密 rar 且未装 7z 工具（brew/pkg "
+                        "install p7zip）——保留原包")
             return "fail", str(detail) or "解压失败"
         if dry:
             return "dry", f"将解压（7z）→ {dest_dir.name}/"
@@ -378,7 +405,7 @@ def process_archive(path, dry: bool = False,
     if low.endswith(".7z"):
         tool = find_7z_tool()
         if not tool:
-            return "fail", ("未找到 7z 工具（brew install p7zip）——"
+            return "fail", ("未找到 7z 工具（brew/pkg install p7zip）——"
                             "保留原包")
         if dry:
             return "dry", f"将解压（7z）→ {dest_dir.name}/"
@@ -413,6 +440,14 @@ def process_archive(path, dry: bool = False,
         n = sum(1 for _ in os.scandir(dest_dir))
         if n <= 0:
             return "fail", "解压完成但 0 个文件——保留原包待人工检查"
+        # 成功删原包（与 rar/zip 路同一「成功才删」纪律；2026-11-07 冒烟
+        # 实测伪装 7z 解出后原包残留——删包动作此前漏了）
+        gone = ""
+        try:
+            os.remove(path)
+            gone = "（压缩包已删除）"
+        except OSError as e:
+            logger.warning(f"🗜 7z 原包删除失败：{e}")
         pwd_note = f"（用密码 {pwd_used[:16]}）" if pwd_used else ""
         # 产物可能又是压缩包（双层压缩：外层分卷解出加密内层）——
         # extract_directory 下轮自动接力（幂等跳过已解的）
@@ -421,7 +456,8 @@ def process_archive(path, dry: bool = False,
         note2 = (f"；⚠️ 产物含内层压缩包 {inner[0]}（需再跑一轮 /extract "
                  f"解它）" if inner else "")
         return ("done",
-                f"✅ 解出 {n} 个文件{pwd_note} → {dest_dir.name}/{note2}")
+                f"✅ 解出 {n} 个文件{pwd_note} → {dest_dir.name}/{gone}"
+                f"{note2}")
 
     if dry:
         return "dry", f"将解压 → {dest_dir.name}/"

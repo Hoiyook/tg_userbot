@@ -632,20 +632,34 @@ async def handle_extract_dirs(request):
             if name.startswith("."):
                 hidden += 1   # 系统目录（.DocumentRevisions 等）不进列表
                 continue
-            # 轻量：只数直接子文件里的压缩包（全树 walk 在解压 I/O 打满
-            # 时会把 bot 卡死在 readdir——2026-11-07 实测），>99 显示 99+
-            n_arch = 0
+            # 有界遍历（深度 2、上限 800 项——全树 walk 在解压 I/O 打满
+            # 时会把 bot 卡死在 readdir，2026-11-07 实测）：统计文件总数
+            # 与压缩包数。MEGA 这类「目录里是 mp4 不是压缩包」的显示
+            # (N 文件) 而不是误导性的 (0)
+            n_files = n_arch = 0
+            scanned = 0
+            capped = False
             try:
-                for f in os.listdir(full):
-                    if f.lower().endswith(
-                            (".zip", ".rar", ".7z", ".tar.gz", ".tgz",
-                             ".tar")):
-                        n_arch += 1
-                        if n_arch > 99:
+                for _dp, _dn, fns in os.walk(full):
+                    for f in fns:
+                        scanned += 1
+                        if scanned > 800:
+                            capped = True
                             break
+                        low = f.lower()
+                        n_files += 1
+                        if low.endswith((".zip", ".rar", ".7z", ".tar.gz",
+                                         ".tgz", ".tar")):
+                            n_arch += 1
+                    if capped:
+                        break
+                    if len(_dn) and _dp.count(os.sep) - full.count(os.sep) >= 2:
+                        _dn[:] = []   # 深度 2 截断
             except OSError:
-                n_arch = -1   # 目录扫不动（I/O 忙）→ -1 显示「?」
-            out.append({"name": name, "archives": n_arch})
+                pass
+            if capped:
+                n_files = -1   # 目录太大没扫完 → 显示「?」
+            out.append({"name": name, "files": n_files, "archives": n_arch})
         out.insert(0, {"_hidden": hidden})
     except Exception as e:
         return _json({"ok": False, "error": str(e)[:80]}, 500)
@@ -701,15 +715,52 @@ async def handle_extract_run(request):
                   "已启动" + ("（dry 预览）" if dry else "")})
 
 
-def _extract_run_blocking_dry(target, dry):
+def _extract_run_targets(targets, dry=False):
+    """解压执行体：目录 → 整轮；单个压缩包文件 → 单包解压。
+
+    混合列表按序跑完（2026-11-07 补：此前只接受目录，用户解压单个
+    文件 2#123.zip 报「目录不存在或越界」）。"""
+    from pathlib import Path
     from . import extract_dir
+    _EXTRACT_STATE["running"] = True
     try:
-        lines, st = extract_dir.extract_directory(target, dry=dry)
+        all_lines = []
+        total = {"done": 0, "fail": 0, "skip": 0}
+        for t in targets:
+            real = _fs_safe(t)
+            if real is None:
+                continue
+            try:
+                if os.path.isdir(real):
+                    lines, st = extract_dir.extract_directory(
+                        real, dry=dry)
+                    all_lines += lines
+                    for k in total:
+                        total[k] += st[k]
+                elif os.path.isfile(real) and real.lower().endswith(
+                        (".zip", ".rar", ".7z", ".tar.gz", ".tgz", ".tar")):
+                    action, msg = extract_dir.process_archive(
+                        Path(real), dry=dry)
+                    all_lines.append(
+                        f"{action}: {os.path.basename(real)}  {msg}")
+                    key = {"done": "done", "fail": "fail",
+                           "skip": "skip"}.get(action, "skip")
+                    total[key] += 1
+                else:
+                    all_lines.append(f"skip: {os.path.basename(real)}"
+                                     "（不是压缩包也不是目录）")
+                    total["skip"] += 1
+            except Exception as e:
+                all_lines.append(f"fail: {os.path.basename(real)}  "
+                                 f"{type(e).__name__}: {e}")
+                total["fail"] += 1
         _EXTRACT_STATE["rounds"].append(
-            {"target": target, "st": st, "lines": lines[-40:],
+            {"target": ", ".join(os.path.basename(t) for t in targets)[:80],
+             "st": total, "lines": all_lines[-40:],
              "ts": time.strftime("%m-%d %H:%M"), "dry": dry})
         _EXTRACT_STATE["last"] = (
-            f"成功 {st['done']} | 失败 {st['fail']} | 跳过 {st['skip']}")
+            f"成功 {total['done']} | 失败 {total['fail']} | "
+            f"跳过 {total['skip']}")
     except Exception as e:
         _EXTRACT_STATE["last"] = f"异常: {e}"
     finally:
@@ -907,15 +958,20 @@ async def handle_fs_extract(request):
         b = await request.json()
     except Exception:
         b = {}
-    real = _fs_safe(b.get("target"))
-    if real is None or not os.path.isdir(real):
-        return _json({"ok": False, "error": "目录不存在或越界"}, 400)
+    targets = b.get("targets") or (
+        [b.get("target")] if b.get("target") else [])
+    safe = [t for t in (_fs_safe(x) for x in targets) if t]
+    if not safe:
+        return _json({"ok": False,
+                      "error": "目标不存在或越界（支持目录与压缩包文件）"},
+                     400)
     if _EXTRACT_STATE["running"]:
         return _json({"ok": False, "error": "已有一轮解压在跑"}, 409)
     _EXTRACT_STATE["running"] = True
-    spawn(asyncio.to_thread(_extract_run_blocking_dry, real, False),
+    spawn(asyncio.to_thread(_extract_run_targets, safe, False),
           "文件管理器解压")
-    return _json({"ok": True, "message": "解压已启动（状态看解压卡）"})
+    return _json({"ok": True, "message":
+                  f"解压已启动（{len(safe)} 个目标；状态看解压卡）"})
 
 
 async def handle_fs_op(request):
@@ -936,20 +992,8 @@ async def handle_batch(request):
     （含 query）。未知/出错的端点单独降级，不影响其它。"""
     from urllib.parse import urlparse, parse_qsl
     spec = request.query.get("paths", "")
-    out = {}
-    for p in [s for s in spec.split(",") if s][:24]:
-        u = urlparse(p)
-        handler = _BATCH_HANDLERS.get(u.path)
-        if handler is None:
-            out[p] = {"ok": False, "error": "unknown path"}
-            continue
-        q = dict(parse_qsl(u.query))
-        try:
-            resp = await handler(_FakeReq(q))
-            out[p] = json.loads(resp.text)
-        except Exception as e:
-            out[p] = {"ok": False, "error": str(e)[:80]}
-    return _json({"ok": True, "data": out})
+    paths = [s for s in spec.split(",") if s][:24]
+    return _json({"ok": True, "data": await _batch_data(paths)})
 
 
 _BATCH_HANDLERS = {
@@ -965,6 +1009,53 @@ _BATCH_HANDLERS = {
     "/api/links": lambda r: handle_links(r),
     "/api/commands": lambda r: handle_commands_registry(r),
 }
+
+
+_SSE_CLIENTS = set()
+
+
+async def handle_sse(request):
+    """SSE 推送流（2026-11-07 批2）：手机保持一条连接，服务器每 2s 推
+    全量 batch 数据——页面零轮询、准实时；连接断开自动清理。"""
+    resp = web.StreamResponse(
+        status=200,
+        headers={"Content-Type": "text/event-stream",
+                 "Cache-Control": "no-store",
+                 "Connection": "keep-alive"})
+    await resp.prepare(request)
+    _SSE_CLIENTS.add(resp)
+    try:
+        while True:
+            data = {"ok": True, "data": await _batch_data(
+                ["/api/status", "/api/queues", "/api/chrome", "/api/backup",
+                 "/api/pd/jobs", "/api/paw_backfill", "/api/paw_schedule",
+                 "/api/history?n=30", "/api/pastes?n=30", "/api/links",
+                 "/api/commands"])}
+            await resp.write(
+                f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
+            await asyncio.sleep(2)
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        _SSE_CLIENTS.discard(resp)
+    return resp
+
+
+async def _batch_data(paths):
+    from urllib.parse import urlparse, parse_qsl
+    out = {}
+    for p in paths:
+        u = urlparse(p)
+        handler = _BATCH_HANDLERS.get(u.path)
+        if handler is None:
+            continue
+        q = dict(parse_qsl(u.query))
+        try:
+            resp = await handler(_FakeReq(q))
+            out[p] = json.loads(resp.text)
+        except Exception as e:
+            out[p] = {"ok": False, "error": str(e)[:80]}
+    return out
 
 
 async def handle_version(request):
@@ -1555,6 +1646,7 @@ def make_app() -> web.Application:
         web.get("/api/status", handle_status),
         web.get("/api/version", handle_version),
         web.get("/api/batch", handle_batch),
+        web.get("/api/sse", handle_sse),
         web.get("/api/extract/dirs", handle_extract_dirs),
         web.post("/api/extract/run", handle_extract_run),
         web.get("/api/extract/state", handle_extract_state),

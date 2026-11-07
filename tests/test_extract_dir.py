@@ -23,6 +23,7 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import config   # noqa: E402
 from tg_userbot import extract_dir   # noqa: E402
+from tg_userbot import extract_util   # noqa: E402
 
 
 def make_zip(path, entries):
@@ -391,6 +392,145 @@ class RarMultipartTest(unittest.TestCase):
             action, msg = extract_dir.process_archive(z)
         self.assertEqual(action, "fail")
         self.assertTrue(z.exists())
+
+
+class MagicSniffTest(unittest.TestCase):
+    """扩展名与内容不符（2026-11-07 Alicexi 实测：站点把加密 rar 改名
+    .zip）——stdlib 报「File is not a zip file」→ bsdtar 探测报
+    「Encryption is not supported」终结，密码候选全不试（死路）。
+    分发前按魔数嗅探：rar/7z 签名 → 强制走 7z 工具分支。"""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(dir=_TMP))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _fake_7z_run(self, calls):
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            for a in cmd:   # 按 -o<dest> 造解压产物（过 0 文件守卫）
+                if str(a).startswith("-o"):
+                    d = Path(str(a)[2:])
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / "f.txt").write_text("x", encoding="utf-8")
+            class R:
+                returncode = 0
+                stderr = b""
+                stdout = b""
+            return R()
+        return fake_run
+
+    def test_rar_magic_named_zip_routes_to_7z(self):
+        z = self.root / "2026-11-6#Alicexi.zip"
+        z.write_bytes(b"Rar!" + b"\x00" * 32)   # 真 rar 魔数，扩展名骗人
+        (self.root / "密码pw123.txt").write_text("pw123", encoding="utf-8")
+        calls = []
+        with mock.patch.object(extract_dir, "find_7z_tool",
+                               return_value="/opt/homebrew/bin/7z"), \
+             mock.patch.object(extract_dir.subprocess, "run",
+                               self._fake_7z_run(calls)), \
+             mock.patch.object(extract_util, "extract_archive",
+                               side_effect=AssertionError("zip 死路被走到")):
+            action, msg = extract_dir.process_archive(z)
+        self.assertEqual(action, "done", msg)
+        self.assertEqual(len(calls), 1)          # 首试无密码即成功
+        self.assertFalse(any(str(a).startswith("-p") for a in calls[0]))
+
+    def test_7z_magic_named_zip_routes_to_7z(self):
+        z = self.root / "伪装.zip"
+        z.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 32)
+        calls = []
+        with mock.patch.object(extract_dir, "find_7z_tool",
+                               return_value="/opt/homebrew/bin/7z"), \
+             mock.patch.object(extract_dir.subprocess, "run",
+                               self._fake_7z_run(calls)), \
+             mock.patch.object(extract_util, "extract_archive",
+                               side_effect=AssertionError("zip 死路被走到")):
+            action, msg = extract_dir.process_archive(z)
+        self.assertEqual(action, "done", msg)
+
+    def test_7z_success_deletes_source(self):
+        # 单卷 7z（含伪装改名的）成功后删原包——与 rar/zip 路同一
+        # 「成功才删」纪律（2026-11-07 冒烟实测：伪装 7z 解出后原包残留）
+        z = self.root / "伪装.zip"
+        z.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 32)
+        with mock.patch.object(extract_dir, "find_7z_tool",
+                               return_value="/opt/homebrew/bin/7z"), \
+             mock.patch.object(extract_dir.subprocess, "run",
+                               self._fake_7z_run([])):
+            action, msg = extract_dir.process_archive(z)
+        self.assertEqual(action, "done")
+        self.assertFalse(z.exists(), "成功后原包应删除")
+        self.assertIn("已删除", msg)
+
+    def test_genuine_7z_success_deletes_source(self):
+        z = self.root / "包.7z"
+        z.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 32)
+        with mock.patch.object(extract_dir, "find_7z_tool",
+                               return_value="/opt/homebrew/bin/7z"), \
+             mock.patch.object(extract_dir.subprocess, "run",
+                               self._fake_7z_run([])):
+            action, msg = extract_dir.process_archive(z)
+        self.assertEqual(action, "done")
+        self.assertFalse(z.exists(), "成功后原包应删除")
+        self.assertIn("已删除", msg)
+
+    def test_sfx_rar_named_zip_routes_to_7z(self):
+        # SFX 自解压封装（2026-11-07 Alicexi 手机实测：rar5 数据前挂
+        # 460288 字节 stub，7z 报 Offset=460288）——真签名不在开头，
+        # 前 4MB 内搜到 rar/7z 签名也要命中
+        stub = b"MZ" + b"\x00" * 500          # 可执行头样貌
+        z = self.root / "sfx伪装.zip"
+        z.write_bytes(stub + b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+        calls = []
+        with mock.patch.object(extract_dir, "find_7z_tool",
+                               return_value="/opt/homebrew/bin/7z"), \
+             mock.patch.object(extract_dir.subprocess, "run",
+                               self._fake_7z_run(calls)), \
+             mock.patch.object(extract_util, "extract_archive",
+                               side_effect=AssertionError("zip 死路被走到")):
+            action, msg = extract_dir.process_archive(z)
+        self.assertEqual(action, "done", msg)
+
+    def test_sfx_7z_named_zip_routes_to_7z(self):
+        stub = b"MZ" + b"\x00" * 500
+        z = self.root / "sfx7z.zip"
+        z.write_bytes(stub + b"7z\xbc\xaf\x27\x1c" + b"\x00" * 32)
+        calls = []
+        with mock.patch.object(extract_dir, "find_7z_tool",
+                               return_value="/opt/homebrew/bin/7z"), \
+             mock.patch.object(extract_dir.subprocess, "run",
+                               self._fake_7z_run(calls)), \
+             mock.patch.object(extract_util, "extract_archive",
+                               side_effect=AssertionError("zip 死路被走到")):
+            action, msg = extract_dir.process_archive(z)
+        self.assertEqual(action, "done", msg)
+
+    def test_pk_zip_with_embedded_rar_sig_stays_zip(self):
+        # 真 zip 魔数（PK）即使体内嵌 rar 签名也绝不重定向——
+        # 深扫描只对「非 PK 开头的伪装 .zip」生效
+        z = self.root / "内嵌签名.zip"
+        z.write_bytes(b"PK\x03\x04" + b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+        with mock.patch.object(extract_dir, "find_7z_tool",
+                               return_value="/opt/homebrew/bin/7z"), \
+             mock.patch.object(extract_dir.subprocess, "run",
+                               side_effect=AssertionError("7z 分支被走到")), \
+             mock.patch.object(extract_util, "extract_archive",
+                               return_value=("failed", "stub", [])):
+            action, msg = extract_dir.process_archive(z)
+        self.assertEqual(action, "fail")   # 走了 zip 路（stub 返回 failed）
+
+    def test_real_zip_magic_unchanged(self):
+        # 真 zip 魔数（PK\x03\x04）不重定向——原 zip 路照走
+        z = self.root / "正常.zip"
+        make_zip(str(z), [("a.txt", b"hi")])
+        with mock.patch.object(extract_dir, "find_7z_tool",
+                               return_value="/opt/homebrew/bin/7z"), \
+             mock.patch.object(extract_dir.subprocess, "run",
+                               side_effect=AssertionError("7z 分支被走到")):
+            action, msg = extract_dir.process_archive(z)
+        self.assertEqual(action, "done", msg)
 
 
 class SplitVolumeTest(unittest.TestCase):

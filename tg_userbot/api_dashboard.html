@@ -200,16 +200,6 @@
 
   <!-- ── 队列 ─────────────────────────── -->
   <section class="page" id="p-queue">
-    <h2>🗜 目录解压</h2>
-    <div class="card">
-      <div class="note" id="exDirs">列目录中…</div>
-      <div class="chips" style="margin-top:8px">
-        <span class="chip" onclick="extractDry()">🔍 预览 (dry)</span>
-        <span class="chip" onclick="extractRun()">🗜 执行解压</span>
-        <span class="chip" onclick="loadExtractState()">📊 状态</span>
-      </div>
-      <div class="note" id="exState" style="margin-top:6px"></div>
-    </div>
     <h2>全部队列</h2>
     <div id="queuesAll" class="card"><div class="note">读取中…</div></div>
     <h2>下载队列</h2>
@@ -231,41 +221,6 @@
       </div>
       <div class="fb" id="ccfb"></div>
     </div>
-  </section>
-
-  <!-- ── 发现 ─────────────────────────── -->
-  <section class="page" id="p-find">
-    <h2>🔍 找文件（队列 / 日志 / 历史三源查询）</h2>
-    <div class="card">
-      <div class="row">
-        <input type="text" id="fq" placeholder="文件名 / caption 里的任意字段子串">
-        <button onclick="doFind()">查询</button>
-      </div>
-      <div class="fb" id="fqfb"></div>
-    </div>
-    <div class="out" id="fout" style="display:block"></div>
-
-    <h2>🔗 粘贴链接入队</h2>
-    <div class="card">
-      <div class="row">
-        <input type="text" id="u" placeholder="抖音 / B站 / 种子 / 任意链接">
-        <button onclick="submit()">入队</button>
-      </div>
-      <div class="fb" id="fb">与往收藏夹发这条消息同语义：本地解析优先，失败自动转解析 bot / 外链台账。</div>
-    </div>
-
-    <h2>🕘 粘贴历史（含处理状态）</h2>
-    <div class="chips">
-      <span class="chip" onclick="loadPastes()">🔄 刷新</span>
-      <span class="chip" onclick="runCmdDirect('/cmdhis')">📜 完整历史</span>
-    </div>
-    <div id="pastes"><div class="note">加载中…</div></div>
-
-    <h2>👤 待人工处理链接（/links 同一台账）</h2>
-    <div class="chips">
-      <span class="chip" onclick="loadLinks()">🔄 刷新</span>
-    </div>
-    <div id="linksP"><div class="note">加载中…</div></div>
   </section>
 
   <!-- ── 台账 ─────────────────────────── -->
@@ -367,6 +322,7 @@
       </div>
       <div class="note" id="fsClipState" style="margin-top:4px"></div>
       <div class="note" id="fsOp" style="margin-top:4px"></div>
+      <div class="note" id="exState" style="margin-top:4px"></div>
     </div>
     <div class="card" id="fsList">加载中…</div>
     <div class="note">点目录名进入；勾选后可 粘贴/移动/解压；
@@ -421,7 +377,7 @@
   <div class="on" data-p="p-home"><span class="e">📊</span>总览</div>
   <div data-p="p-queue"><span class="bdg" id="bdg-queue"></span><span class="e">📥</span>队列</div>
   <div data-p="p-files"><span class="e">📁</span>文件</div>
-  <div data-p="p-find"><span class="e">🔍</span>发现</div>
+
   <div data-p="p-ledger"><span class="e">📈</span>台账</div>
   <div data-p="p-paw"><span class="e">🐾</span>回填</div>
   <div data-p="p-pd"><span class="e">🛰</span>直链</div>
@@ -947,7 +903,8 @@ function fsModal(opts) {
       ? '<input id="fsModalIn" style="width:100%;box-sizing:border-box;' +
         'padding:10px;border:1px solid var(--line);border-radius:10px;' +
         'font-size:15px;background:var(--bg);color:var(--tx)" value="' +
-        esc(opts.inputVal || "") + '">'
+        esc(opts.input !== undefined ? (opts.inputVal || opts.input || "") :
+            (opts.inputVal || "")) + '">'
       : "";
     ov.innerHTML = '<div style="background:var(--card);border-radius:14px;' +
       'padding:18px;width:min(88vw,420px);font-size:15px;color:var(--tx)">' +
@@ -1106,7 +1063,7 @@ async function fsExtract(i) {
       body: "解压目录「" + x.name + "」里的压缩包？（成功才删原包）",
       okText: "解压"})) return;
   const d = await api("/api/fs/extract", {method: "POST", body: JSON.stringify(
-    {target: fsPath + "/" + x.name})});
+    {targets: [fsPath + "/" + x.name]})});
   showResult(!!d.ok, d.ok ? d.message : d.error, !d.ok);
 }
 
@@ -1146,58 +1103,18 @@ function fsOpPoll() {
 }
 
 // ── 目录解压卡（2026-11-07）──────────────────// ── 目录解压卡（2026-11-07）──────────────────
-let _exTarget = "";
-let _exDirs = [];      // {name, archives}
-let _exBase = "";
-let _exShowAll = false;
+// 目录解压卡已移除（2026-11-07）：解压入口统一到 📁 文件页签
+let _exDirs = [];   // 兼容遗留引用（loadExtractState 不再使用）
 
-async function loadExtractDirs() {
-  try {
-    const d = await api("/api/extract/dirs");
-    _exDirs = (d.dirs || []).filter(x => !x._hidden);
-    _exBase = d.base || "";
-    renderExDirs();
-  } catch (e) {
-    document.getElementById("exDirs").textContent = "❌ " + e;
-  }
-}
 
-function renderExDirs() {
-  // 按包数降序；默认只显示有压缩包的目录（全部平铺实测不可用），
-  // 空目录收进「另有 N 个」切换。chip 用**索引**传参——零引号嵌套
-  const el = document.getElementById("exDirs");
-  const sorted = _exDirs.slice().sort((a, b) => b.archives - a.archives);
-  const withA = sorted.filter(x => x.archives > 0);
-  const empty = sorted.filter(x => x.archives <= 0);
-  const shown = _exShowAll ? sorted : withA;
-  const chip = x =>
-    '<span class="chip mini ' + (_exTarget === _exBase + "/" + x.name ?
-      "on" : "") + '" onclick="pickExDir(' + _exDirs.indexOf(x) + ')">' +
-      esc(x.name) + ' (' + (x.archives < 0 ? "?" : x.archives) + ')</span>';
-  let html = shown.length
-    ? shown.map(chip).join(" ")
-    : '<span class="note">一级目录里没有压缩包</span>';
-  if (!_exShowAll && empty.length)
-    html += '<span class="chip mini" onclick="toggleExAll()">…另有 ' +
-      empty.length + ' 个目录</span>';
-  if (_exShowAll && empty.length)
-    html += '<span class="chip mini" onclick="toggleExAll()">⬆ 收起空目录</span>';
-  el.innerHTML = html;
-}
 
-function toggleExAll() { _exShowAll = !_exShowAll; renderExDirs(); }
-
-function pickExDir(idx) {
-  _exTarget = _exBase + "/" + _exDirs[idx].name;
-  renderExDirs();
-}
 
 async function extractDry() { await extractGo(true); }
 async function extractRun() { await extractGo(false); }
 async function extractGo(dry) {
   if (!_exTarget) { showResult(false, "先点选一个目录", false); return; }
   const d = await api("/api/extract/run", {method: "POST",
-    body: JSON.stringify({target: _exTarget, dry})});
+    body: JSON.stringify({targets: [_exTarget], dry})});
   showResult(!!d.ok, d.ok ? "已启动（结果看「状态」或 Telegram 通知）"
                           : d.error, !d.ok);
   loadExtractState();
@@ -1206,14 +1123,11 @@ async function loadExtractState() {
   try {
     const d = await api("/api/extract/state");
     const el = document.getElementById("exState");
+    if (!el) return;
     if (d.running) { el.textContent = "⏳ 解压中…（" +
       (d.last || "首轮") + "）"; }
-    else {
-      const last = (d.rounds || []).slice(-1)[0];
-      el.textContent = d.last ? ("最近：" + d.last + "（" +
-        (last ? last.ts + " " + (last.dry ? "dry" : "") : "") + "）")
-        : "空闲";
-    }
+    else if (d.last) { el.textContent = "🗜 最近解压：" + d.last; }
+    else { el.textContent = ""; }
   } catch (e) { /* 静默 */ }
 }
 
@@ -1256,26 +1170,46 @@ async function loadQueuesAll() {
     }).join("");
   } catch (e) { /* 主循环退避已处理 */ }
 }
-async function _refreshLoop() {
-  // 一次 RTT 带回全部数据（12 个串行请求 → 1 个，手机经 ts.net 从
-  // 1-2.4s/轮 降到 ≈1×RTT）
-  _BATCH = {};
+function _applyBatch(data) {
+  _BATCH = data || {};
+  return refresh();
+}
+
+function _startSSE() {
+  // SSE 推送（2026-11-07）：服务器每 2s 推全量数据，页面零轮询。
+  // EventSource 自带断线重连——onerror 期间由 batch 轮询兜底
   try {
-    const paths = ["/api/status", "/api/queues", "/api/chrome",
-      "/api/backup", "/api/pd/jobs", "/api/paw_backfill",
-      "/api/paw_schedule", "/api/history?n=30", "/api/pastes?n=30",
-      "/api/links", "/api/commands"];
-    const d = await api("/api/batch?paths=" + encodeURIComponent(paths.join(",")));
-    if (d.ok) _BATCH = d.data;
-    await refresh(); _pollMs = 2000;
-  } catch (e) { _BATCH = {}; _pollMs = Math.min(_pollMs * 2, 30000); }
-  // 各 loader 优先读本轮 batch 缓存，未命中的自行 fetch
-  for (const job of [loadQueuesAll, loadExtractState, loadChrome,
-                     loadBackup, loadPastes, loadLinks, loadHistory,
-                     loadPawSchedule, loadPawBackfill, loadPD, loadCmds]) {
-    try { await job(); } catch (e) { /* 主轮询已计退避 */ }
+    const es = new EventSource("/api/sse" +
+      (TOK() ? "?token=" + encodeURIComponent(TOK()) : ""));
+    es.onmessage = ev => {
+      const d = JSON.parse(ev.data);
+      if (d.ok) { _BATCH = d.data; refresh(); }
+    };
+    es.onerror = () => { /* EventSource 自动重连；主轮询退避兜底 */ };
+    return es;
+  } catch (e) { return null; }
+}
+
+async function _refreshLoop() {
+  // batch 轮询兜底（SSE 未建/断开时接管；SSE 在跑时本循环空转）
+  if (!window._sseOK) {
+    _BATCH = {};
+    try {
+      const paths = ["/api/status", "/api/queues", "/api/chrome",
+        "/api/backup", "/api/pd/jobs", "/api/paw_backfill",
+        "/api/paw_schedule", "/api/history?n=30", "/api/pastes?n=30",
+        "/api/links", "/api/commands"];
+      const d = await api("/api/batch?paths=" +
+        encodeURIComponent(paths.join(",")));
+      if (d.ok) { _BATCH = d.data; await refresh(); _pollMs = 2000; }
+      else { _pollMs = Math.min(_pollMs * 2, 30000); }
+    } catch (e) { _BATCH = {}; _pollMs = Math.min(_pollMs * 2, 30000); }
+    for (const job of [loadQueuesAll, loadExtractState, loadChrome,
+                       loadBackup, loadPastes, loadLinks, loadHistory,
+                       loadPawSchedule, loadPawBackfill, loadPD, loadCmds]) {
+      try { await job(); } catch (e) { /* 主轮询已计退避 */ }
+    }
   }
-  _BATCH = {};
   setTimeout(_refreshLoop, _pollMs);
 }
 setInterval(loadQueuesAll, 5000);
@@ -1349,6 +1283,8 @@ async function refreshAll() {
   }, {passive: true});
 })();
 _refreshLoop();
+window._sse = _startSSE();
+if (window._sse) window._sse.onopen = () => { window._sseOK = true; };
 setInterval(loadBackup, 60000);
 setInterval(loadChrome, 5000);
 refresh();
