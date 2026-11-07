@@ -29,17 +29,29 @@ data class Script(
     val args: List<String>,
 )
 
+private val OUT_FILE = "/sdcard/Download/scriptrunner_out.txt"
+
+private val EXTRACT_DRY_BODY =
+    "out=\$OUT_FILE; " +
+    "if [ -f \"\$HOME/extract.pyz\" ]; then " +
+    "python3 \"\$HOME/extract.pyz\" \"\$1\" --dry > \"\$out\" 2>&1; " +
+    "else echo \"❌ extract.pyz 不在 Termux home——先在 文件管理卡片" +
+    "点「复制到 Termux」（源 /sdcard/Download/extract.pyz）\" > \"\$out\"; fi; " +
+    "termux-open \"\$out\""
+
+private val EXTRACT_RUN_BODY =
+    "out=\$OUT_FILE; " +
+    "if [ -f \"\$HOME/extract.pyz\" ]; then " +
+    "python3 \"\$HOME/extract.pyz\" \"\$1\" > \"\$out\" 2>&1; " +
+    "else echo \"❌ extract.pyz 不在 Termux home——先在 文件管理卡片" +
+    "点「复制到 Termux」（源 /sdcard/Download/extract.pyz）\" > \"\$out\"; fi; " +
+    "termux-open \"\$out\""
+
 private fun defaultScripts() = listOf(
     Script("🗜 解压·预览 (dry)", "$TERMUX_PREFIX/bin/bash",
-        listOf("-c", "python3 \"\$HOME/extract.pyz\" \"\$1\" --dry " +
-            "> /sdcard/Download/scriptrunner_out.txt 2>&1; " +
-            "termux-open \"/sdcard/Download/scriptrunner_out.txt\"", "_",
-            "{要解压的目录}")),
+        listOf("-c", EXTRACT_DRY_BODY, "_", "{要解压的目录}")),
     Script("🗜 解压·执行", "$TERMUX_PREFIX/bin/bash",
-        listOf("-c", "python3 \"\$HOME/extract.pyz\" \"\$1\" " +
-            "> /sdcard/Download/scriptrunner_out.txt 2>&1; " +
-            "termux-open \"/sdcard/Download/scriptrunner_out.txt\"", "_",
-            "{要解压的目录}")),
+        listOf("-c", EXTRACT_RUN_BODY, "_", "{要解压的目录}")),
     Script("⚙️ 自定义命令行", "$TERMUX_PREFIX/bin/bash",
         listOf("-c", "{完整命令行，如 python3 ~/x.py 参数1}")),
 )
