@@ -356,12 +356,16 @@
       <div class="note" id="fsCrumb" style="word-break:break-all"></div>
       <div class="chips" style="margin-top:6px">
         <span class="chip mini" onclick="fsUp()">⬆ 上级</span>
-        <span class="chip mini" onclick="fsRefresh()">🔄 刷新</span>
-        <span class="chip mini" onclick="fsPaste(false)">📋 粘贴</span>
-        <span class="chip mini" onclick="fsPaste(true)">✂ 移动</span>
+        <span class="chip mini" onclick="fsRefresh()">🔄</span>
         <span class="chip mini" onclick="fsSelAll()">☑ 全选</span>
+        <span class="chip mini" onclick="fsCopySel(false)">📋 复制选中</span>
+        <span class="chip mini" onclick="fsCopySel(true)">✂ 剪切选中</span>
+        <span class="chip mini" onclick="fsPasteClip()">📥 粘贴到此处</span>
         <span class="chip mini" onclick="fsExtractSel()">🗜 解压选中</span>
+        <span class="chip mini" onclick="fsMkdir()">📁 新建文件夹</span>
+        <span class="chip mini" onclick="fsTouch()">📄 新建文件</span>
       </div>
+      <div class="note" id="fsClipState" style="margin-top:4px"></div>
       <div class="note" id="fsOp" style="margin-top:4px"></div>
     </div>
     <div class="card" id="fsList">加载中…</div>
@@ -461,7 +465,10 @@ function fmtSize(n){
 }
 function fmtGB(n){ return n == null ? "–" : n+" GB"; }
 
+let _BATCH = {};   // 本轮 batch 数据（_refreshLoop 预取，周期结束清空）
 async function api(path, opts) {
+  if ((!opts || !opts.method || opts.method === "GET") && _BATCH[path])
+    return _BATCH[path];
   const r = await fetch(path, Object.assign({headers: H()}, opts||{}));
   if (r.status === 401) {
     const t = prompt("访问令牌：");
@@ -921,15 +928,52 @@ async function runCmdDirect(cmd) {
 // 轮询退避（2026-11-05 审计）：fetch 失败（后端重启/网络抖动）时把主
 // 轮询间隔翻倍（上限 30s），成功即恢复 2s——避免慢/挂时请求堆积
 let _pollMs = 2000;
-// ── 文件管理器（2026-11-07）──────────────────
+// ── 文件管理器（2026-11-07；2026-11-08 重写交互层）──────────
+// iOS PWA standalone 下 prompt()/confirm() 被静默吞掉（实测：重命名
+// 无反应）——全部改用页内模态框；全选不再经 fsLoad（会清空选择）
 let fsPath = "";
 let fsItems = [];
 let fsSel = new Set();
 let fsClip = null;   // {paths: [], move: bool}
 let fsOpTimer = null;
 
+function fsModal(opts) {
+  // opts: {title, body?, input?, inputVal?, okText?} → Promise(值/true/null)
+  return new Promise(resolve => {
+    const ov = document.createElement("div");
+    ov.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.55);" +
+      "z-index:9998;display:flex;align-items:center;justify-content:center";
+    const inpHtml = opts.input !== undefined
+      ? '<input id="fsModalIn" style="width:100%;box-sizing:border-box;' +
+        'padding:10px;border:1px solid var(--line);border-radius:10px;' +
+        'font-size:15px;background:var(--bg);color:var(--tx)" value="' +
+        esc(opts.inputVal || "") + '">'
+      : "";
+    ov.innerHTML = '<div style="background:var(--card);border-radius:14px;' +
+      'padding:18px;width:min(88vw,420px);font-size:15px;color:var(--tx)">' +
+      '<div style="font-weight:700;margin-bottom:10px">' + esc(opts.title) +
+      '</div>' + (opts.body ? '<div style="margin-bottom:10px;' +
+      'line-height:1.5;word-break:break-all">' + esc(opts.body) + '</div>' : "") +
+      inpHtml + '<div style="display:flex;gap:10px;margin-top:14px">' +
+      '<button class="ghost" style="flex:1" id="fsModalCancel">取消</button>' +
+      '<button style="flex:1" id="fsModalOk">' + esc(opts.okText || "确定") +
+      '</button></div></div>';
+    document.body.appendChild(ov);
+    const done = v => { ov.remove(); resolve(v); };
+    ov.querySelector("#fsModalCancel").onclick = () => done(null);
+    ov.querySelector("#fsModalOk").onclick = () => done(
+      opts.input !== undefined
+        ? (ov.querySelector("#fsModalIn").value.trim() || null) : true);
+    if (opts.input !== undefined) {
+      const inp = ov.querySelector("#fsModalIn");
+      inp.focus(); inp.select();
+      inp.onkeydown = e => { if (e.key === "Enter")
+        done(inp.value.trim() || null); };
+    }
+  });
+}
+
 function _fsCrumbRender() {
-  const el = document.getElementById("fsCrumb");
   const parts = fsPath.replace("/Volumes/V1", "").split("/").filter(Boolean);
   let html = '<span class="chip mini on" onclick="fsLoad(\'/Volumes/V1\')">V1</span>';
   let acc = "/Volumes/V1";
@@ -938,34 +982,50 @@ function _fsCrumbRender() {
     html += ' / <span class="chip mini" onclick="fsLoad(\'' +
       esc(acc).replace(/'/g, "\\'") + '\')">' + esc(seg) + '</span>';
   });
-  el.innerHTML = html;
+  document.getElementById("fsCrumb").innerHTML = html;
+}
+
+function _fsClipRender() {
+  const el = document.getElementById("fsClipState");
+  if (!el) return;
+  if (!fsClip) { el.textContent =
+    "剪贴板：空（勾选 → 复制/剪切 → 进入目标目录 → 粘贴）"; return; }
+  el.textContent = "📌 剪贴板：" + fsClip.paths.length + " 项（" +
+    (fsClip.move ? "剪切" : "复制") + "）——进入目标目录后点「粘贴到此处」";
+}
+
+function fsRender() {
+  const rows = fsItems.map((x, i) =>
+    '<div class="qrow"><label style="display:flex;align-items:center;' +
+    'gap:8px;flex:1;min-width:0">' +
+    '<input type="checkbox" ' + (fsSel.has(x.name) ? "checked" : "") +
+    ' onchange="fsToggle(' + i + ', this.checked)">' +
+    '<span style="cursor:' + (x.is_dir ? "pointer" : "default") +
+    '" onclick="' + (x.is_dir ? "fsEnter(" + i + ")" : "void 0") + '">' +
+    (x.is_dir ? "📁 " : "📄 ") + esc(x.name) + '</span></label>' +
+    '<span class="dt" style="white-space:nowrap">' +
+    (x.is_dir ? "" : fmtSize(x.size) + " · ") +
+    new Date(x.mtime * 1000).toLocaleDateString("zh-CN") + '</span>' +
+    '<span class="chips">' +
+    (x.name.toLowerCase().match(/\.(zip|rar|7z|tar)$/) ?
+      '<span class="chip mini" onclick="fsExtract(' + i + ')">🗜</span>' : "") +
+    '<span class="chip mini" onclick="fsRename(' + i + ')">✎</span>' +
+    '<span class="chip mini" onclick="fsDelete(' + i + ')">🗑</span>' +
+    '</span></div>').join("");
+  document.getElementById("fsList").innerHTML =
+    rows || '<div class="note">空目录</div>';
+  _fsCrumbRender();
+  _fsClipRender();
 }
 
 async function fsLoad(p) {
   try {
-    const d = await api("/api/fs/list?path=" + encodeURIComponent(p || "/Volumes/V1"));
+    const d = await api("/api/fs/list?path=" +
+      encodeURIComponent(p || "/Volumes/V1"));
     if (!d.ok) { document.getElementById("fsList").innerHTML =
       '<div class="note">❌ ' + esc(d.error) + '</div>'; return; }
     fsPath = d.path; fsItems = d.items || []; fsSel.clear();
-    _fsCrumbRender();
-    const rows = fsItems.map((x, i) =>
-      '<div class="qrow"><label style="display:flex;align-items:center;gap:8px;flex:1;min-width:0">' +
-      '<input type="checkbox" ' + (fsSel.has(x.name) ? "checked" : "") +
-      ' onchange="fsToggle(' + i + ', this.checked)">' +
-      '<span style="cursor:' + (x.is_dir ? "pointer" : "default") +
-      '" onclick="' + (x.is_dir ? "fsEnter(" + i + ")" : "void 0") + '">' +
-      (x.is_dir ? "📁 " : "📄 ") + esc(x.name) + '</span></label>' +
-      '<span class="dt" style="white-space:nowrap">' +
-      (x.is_dir ? "" : fmtSize(x.size) + " · ") +
-      new Date(x.mtime * 1000).toLocaleDateString("zh-CN") + '</span>' +
-      '<span class="chips">' +
-      (x.name.toLowerCase().match(/\.(zip|rar|7z|tar)$/) ?
-        '<span class="chip mini" onclick="fsExtract(' + i + ')">🗜</span>' : "") +
-      '<span class="chip mini" onclick="fsRename(' + i + ')">✎</span>' +
-      '<span class="chip mini" onclick="fsDelete(' + i + ')">🗑</span>' +
-      '</span></div>').join("");
-    document.getElementById("fsList").innerHTML =
-      rows || '<div class="note">空目录</div>';
+    fsRender();
   } catch (e) {
     document.getElementById("fsList").innerHTML = "❌ " + esc(String(e));
   }
@@ -980,57 +1040,94 @@ function fsToggle(i, on) {
   const name = fsItems[i].name;
   if (on) fsSel.add(name); else fsSel.delete(name);
 }
-function fsSelAll() { fsItems.forEach(x => fsSel.add(x.name)); fsLoad(fsPath); }
-
-function fsRename(i) {
-  const x = fsItems[i];
-  const nn = prompt("重命名：", x.name);
-  if (!nn || nn === x.name) return;
-  api("/api/fs/rename", {method: "POST", body: JSON.stringify(
-    {path: fsPath + "/" + x.name, new_name: nn})})
-    .then(d => { if (!d.ok) alert("❌ " + d.error); fsRefresh(); })
-    .catch(e => alert("❌ " + e));
+function fsSelAll() {
+  // 直接改选择 + 重渲染（不经 fsLoad——那会清空选择，全选曾因此失效）
+  fsItems.forEach(x => fsSel.add(x.name));
+  fsRender();
 }
 
-function fsDelete(i) {
+async function fsRename(i) {
   const x = fsItems[i];
-  if (!confirm("删除 " + (x.is_dir ? "目录" : "文件") + "「" + x.name +
-      "」？" + (x.is_dir ? "\n目录会连同全部内容一起删除！" : ""))) return;
-  api("/api/fs/delete", {method: "POST", body: JSON.stringify(
-    {paths: [fsPath + "/" + x.name]})})
-    .then(d => { if (!d.ok) alert("❌ " + d.error); fsRefresh(); })
-    .catch(e => alert("❌ " + e));
+  const nn = await fsModal({title: "重命名", input: x.name, okText: "重命名"});
+  if (!nn || nn === x.name) return;
+  const d = await api("/api/fs/rename", {method: "POST", body: JSON.stringify(
+    {path: fsPath + "/" + x.name, new_name: nn})});
+  if (!d.ok) await fsModal({title: "❌ 重命名失败", body: d.error});
+  fsRefresh();
+}
+
+async function fsDelete(i) {
+  const x = fsItems[i];
+  if (!await fsModal({title: "删除确认",
+      body: "删除 " + (x.is_dir ? "目录" : "文件") + "「" + x.name + "」？" +
+        (x.is_dir ? "\n目录会连同全部内容一起删除！" : ""),
+      okText: "删除"})) return;
+  const d = await api("/api/fs/delete", {method: "POST", body: JSON.stringify(
+    {paths: [fsPath + "/" + x.name]})});
+  if (!d.ok) await fsModal({title: "❌ 删除失败", body: d.error});
+  fsRefresh();
 }
 
 function fsCopySel(move) {
   const srcs = [...fsSel].map(n => fsPath + "/" + n);
-  if (!srcs.length) { alert("先勾选要操作的条目"); return; }
+  if (!srcs.length) {
+    fsModal({title: "提示", body: "先勾选要操作的条目"}); return;
+  }
   fsClip = {paths: srcs, move};
-  showResult(true, "已" + (move ? "剪切" : "复制") + " " + srcs.length +
-    " 项——进入目标目录后点 粘贴", false);
-}
-function fsPaste(moveOverride) {
-  if (!fsClip) { alert("剪贴板为空——先勾选并复制/剪切"); return; }
-  const move = moveOverride !== undefined && moveOverride !== null
-    ? moveOverride : fsClip.move;
-  if (!confirm((move ? "移动" : "复制") + " " + fsClip.paths.length +
-      " 项到当前目录？")) return;
-  api("/api/fs/paste", {method: "POST", body: JSON.stringify(
-    {dest: fsPath, srcs: fsClip.paths, move})})
-    .then(d => {
-      if (!d.ok) { alert("❌ " + d.error); return; }
-      fsClip = null;
-      fsOpPoll();
-    }).catch(e => alert("❌ " + e));
+  _fsClipRender();
+  fsModal({title: move ? "✂ 已剪切" : "📋 已复制",
+           body: srcs.length + " 项——进入目标目录后点「粘贴到此处」",
+           okText: "好"});
 }
 
-function fsExtract(i) {
+async function fsPasteClip() {
+  if (!fsClip) {
+    fsModal({title: "提示", body: "剪贴板为空——先勾选并复制/剪切"}); return;
+  }
+  if (fsClip.move && fsClip.paths.some(p => p.startsWith(fsPath + "/"))) {
+    if (!await fsModal({title: "注意",
+        body: "剪切源在当前目录内——移动等于原地改名/无操作，继续？",
+        okText: "继续"})) return;
+  }
+  if (!await fsModal({title: "粘贴确认",
+      body: (fsClip.move ? "移动" : "复制") + " " + fsClip.paths.length +
+        " 项到「" + fsPath + "」？", okText: "粘贴"})) return;
+  const d = await api("/api/fs/paste", {method: "POST", body: JSON.stringify(
+    {dest: fsPath, srcs: fsClip.paths, move: fsClip.move})});
+  if (!d.ok) { await fsModal({title: "❌ 粘贴失败", body: d.error}); return; }
+  fsClip = null;
+  _fsClipRender();
+  fsOpPoll();
+}
+
+async function fsExtract(i) {
   const x = fsItems[i];
-  if (!confirm("解压目录「" + x.name + "」里的压缩包？（成功才删原包）")) return;
-  api("/api/fs/extract", {method: "POST", body: JSON.stringify(
-    {target: fsPath + "/" + x.name})})
-    .then(d => { showResult(!!d.ok, d.ok ? d.message : d.error, !d.ok); })
-    .catch(e => alert("❌ " + e));
+  if (!await fsModal({title: "解压确认",
+      body: "解压目录「" + x.name + "」里的压缩包？（成功才删原包）",
+      okText: "解压"})) return;
+  const d = await api("/api/fs/extract", {method: "POST", body: JSON.stringify(
+    {target: fsPath + "/" + x.name})});
+  showResult(!!d.ok, d.ok ? d.message : d.error, !d.ok);
+}
+
+async function fsMkdir() {
+  const name = await fsModal({title: "新建文件夹（当前目录内）",
+                              input: "", okText: "创建"});
+  if (!name) return;
+  const d = await api("/api/fs/mkdir", {method: "POST", body: JSON.stringify(
+    {dest: fsPath, name})});
+  if (!d.ok) { await fsModal({title: "❌ 创建失败", body: d.error}); return; }
+  fsRefresh();
+}
+
+async function fsTouch() {
+  const name = await fsModal({title: "新建文件（当前目录内）",
+                              input: "", okText: "创建"});
+  if (!name) return;
+  const d = await api("/api/fs/touch", {method: "POST", body: JSON.stringify(
+    {dest: fsPath, name})});
+  if (!d.ok) { await fsModal({title: "❌ 创建失败", body: d.error}); return; }
+  fsRefresh();
 }
 
 function fsOpPoll() {
@@ -1048,7 +1145,7 @@ function fsOpPoll() {
   }, 2000);
 }
 
-// ── 目录解压卡（2026-11-07）──────────────────
+// ── 目录解压卡（2026-11-07）──────────────────// ── 目录解压卡（2026-11-07）──────────────────
 let _exTarget = "";
 let _exDirs = [];      // {name, archives}
 let _exBase = "";
@@ -1160,14 +1257,25 @@ async function loadQueuesAll() {
   } catch (e) { /* 主循环退避已处理 */ }
 }
 async function _refreshLoop() {
-  try { await refresh(); _pollMs = 2000; }
-  catch (e) { _pollMs = Math.min(_pollMs * 2, 30000); }
-  // 次级任务并轨（随主循环带退避——后端不可达时不再各自狂打）
+  // 一次 RTT 带回全部数据（12 个串行请求 → 1 个，手机经 ts.net 从
+  // 1-2.4s/轮 降到 ≈1×RTT）
+  _BATCH = {};
+  try {
+    const paths = ["/api/status", "/api/queues", "/api/chrome",
+      "/api/backup", "/api/pd/jobs", "/api/paw_backfill",
+      "/api/paw_schedule", "/api/history?n=30", "/api/pastes?n=30",
+      "/api/links", "/api/commands"];
+    const d = await api("/api/batch?paths=" + encodeURIComponent(paths.join(",")));
+    if (d.ok) _BATCH = d.data;
+    await refresh(); _pollMs = 2000;
+  } catch (e) { _BATCH = {}; _pollMs = Math.min(_pollMs * 2, 30000); }
+  // 各 loader 优先读本轮 batch 缓存，未命中的自行 fetch
   for (const job of [loadQueuesAll, loadExtractState, loadChrome,
                      loadBackup, loadPastes, loadLinks, loadHistory,
                      loadPawSchedule, loadPawBackfill, loadPD, loadCmds]) {
     try { await job(); } catch (e) { /* 主轮询已计退避 */ }
   }
+  _BATCH = {};
   setTimeout(_refreshLoop, _pollMs);
 }
 setInterval(loadQueuesAll, 5000);

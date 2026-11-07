@@ -1465,3 +1465,65 @@ class FileManagerTest(unittest.IsolatedAsyncioTestCase):
                 os.path.join(config.DATA_ROOT, "a.txt")))
         finally:
             await client.close()
+
+
+class FileManagerMkdirTouchTest(unittest.IsolatedAsyncioTestCase):
+    """fs/mkdir + fs/touch：创建/同名拒绝/越界拒绝。"""
+
+    runtime_db = runtime_db_mod
+
+    def setUp(self):
+        from tg_userbot import runtime_db as _rt
+        self._td = tempfile.mkdtemp(dir=_TMP)
+        self._saved_conn = _rt._CONN
+        _rt._CONN = None
+        _rt.init_db(os.path.join(self._td, "tg.db"))
+        runtime_db = _rt
+        self._old_root = config.DATA_ROOT
+        config.DATA_ROOT = os.path.join(self._td, "v1")
+        os.makedirs(config.DATA_ROOT)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        rt = self.runtime_db
+        try:
+            rt.close_db()
+        except Exception:
+            pass
+        rt._CONN = self._saved_conn
+        config.DATA_ROOT = self._old_root
+        shutil.rmtree(self._td, ignore_errors=True)
+
+    async def test_mkdir_and_touch(self):
+        client = make_client()
+        await client.start_server()
+        try:
+            r = await client.post("/api/fs/mkdir", data=json.dumps(
+                {"dest": config.DATA_ROOT, "name": "新目录"}))
+            self.assertTrue((await r.json())["ok"])
+            self.assertTrue(os.path.isdir(
+                os.path.join(config.DATA_ROOT, "新目录")))
+            r2 = await client.post("/api/fs/touch", data=json.dumps(
+                {"dest": config.DATA_ROOT, "name": "note.txt"}))
+            self.assertTrue((await r2.json())["ok"])
+            self.assertTrue(os.path.isfile(
+                os.path.join(config.DATA_ROOT, "note.txt")))
+            # 同名拒绝
+            r3 = await client.post("/api/fs/mkdir", data=json.dumps(
+                {"dest": config.DATA_ROOT, "name": "新目录"}))
+            self.assertFalse((await r3.json())["ok"])
+        finally:
+            await client.close()
+
+    async def test_traversal_and_dupe_rejected(self):
+        client = make_client()
+        await client.start_server()
+        try:
+            r = await client.post("/api/fs/mkdir", data=json.dumps(
+                {"dest": config.DATA_ROOT, "name": "../逃逸"}))
+            self.assertFalse((await r.json())["ok"])
+            r2 = await client.post("/api/fs/touch", data=json.dumps(
+                {"dest": "/etc", "name": "x"}))
+            self.assertFalse((await r2.json())["ok"])
+        finally:
+            await client.close()

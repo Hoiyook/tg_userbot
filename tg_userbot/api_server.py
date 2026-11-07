@@ -816,6 +816,46 @@ async def handle_fs_rename(request):
     return _json({"ok": True, "path": dst})
 
 
+async def handle_fs_mkdir(request):
+    """新建文件夹（数据盘内；同名拒绝）。"""
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    dest = _fs_safe(b.get("dest"))
+    name = str(b.get("name") or "").strip()
+    if dest is None or not name or "/" in name:
+        return _json({"ok": False, "error": "参数非法"}, 400)
+    dst = os.path.join(dest, name)
+    if os.path.exists(dst):
+        return _json({"ok": False, "error": "同名已存在"}, 400)
+    try:
+        os.makedirs(dst)
+    except OSError as e:
+        return _json({"ok": False, "error": str(e)[:100]}, 500)
+    return _json({"ok": True, "path": dst})
+
+
+async def handle_fs_touch(request):
+    """新建空文件（数据盘内；同名拒绝）。"""
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    dest = _fs_safe(b.get("dest"))
+    name = str(b.get("name") or "").strip()
+    if dest is None or not name or "/" in name:
+        return _json({"ok": False, "error": "参数非法"}, 400)
+    dst = os.path.join(dest, name)
+    if os.path.exists(dst):
+        return _json({"ok": False, "error": "同名已存在"}, 400)
+    try:
+        open(dst, "a", encoding="utf-8").close()
+    except OSError as e:
+        return _json({"ok": False, "error": str(e)[:100]}, 500)
+    return _json({"ok": True, "path": dst})
+
+
 async def handle_fs_delete(request):
     import shutil
     try:
@@ -882,6 +922,51 @@ async def handle_fs_op(request):
     return _json({"ok": True, **_FS_OP})
 
 
+class _FakeReq:
+    """batch 内部调 handler 的最小 request 替身（GET；只有 .query）。"""
+    def __init__(self, q):
+        self.query = q
+
+
+async def handle_batch(request):
+    """看板数据聚合端点：一次请求带回全部子页数据。
+
+    手机经 ts.net 每 RTT 50-200ms，看板一轮 12 个请求 = 1-2.4s 纯网络
+    等待——合并为 1 个请求后 ≈ 1×RTT。paths=逗号分隔的 GET 端点列表
+    （含 query）。未知/出错的端点单独降级，不影响其它。"""
+    from urllib.parse import urlparse, parse_qsl
+    spec = request.query.get("paths", "")
+    out = {}
+    for p in [s for s in spec.split(",") if s][:24]:
+        u = urlparse(p)
+        handler = _BATCH_HANDLERS.get(u.path)
+        if handler is None:
+            out[p] = {"ok": False, "error": "unknown path"}
+            continue
+        q = dict(parse_qsl(u.query))
+        try:
+            resp = await handler(_FakeReq(q))
+            out[p] = json.loads(resp.text)
+        except Exception as e:
+            out[p] = {"ok": False, "error": str(e)[:80]}
+    return _json({"ok": True, "data": out})
+
+
+_BATCH_HANDLERS = {
+    "/api/status": lambda r: handle_status(r),
+    "/api/queues": lambda r: handle_queues(r),
+    "/api/chrome": lambda r: handle_chrome(r),
+    "/api/backup": lambda r: handle_backup(r),
+    "/api/pd/jobs": lambda r: handle_pd_jobs(r),
+    "/api/paw_backfill": lambda r: handle_paw_backfill(r),
+    "/api/paw_schedule": lambda r: handle_paw_schedule(r),
+    "/api/history": lambda r: handle_history(r),
+    "/api/pastes": lambda r: handle_pastes(r),
+    "/api/links": lambda r: handle_links(r),
+    "/api/commands": lambda r: handle_commands_registry(r),
+}
+
+
 async def handle_version(request):
     """看板/后端版本一致性核对（SW 缓存错版本时肉眼可判）。"""
     import subprocess
@@ -909,8 +994,13 @@ def _recent_rate(window_s=60):
         path = os.path.join(_cfg.RUNTIME_DIR, "task_events.jsonl")
         if not os.path.exists(path):
             return ""
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
+        # 文件会涨到几十 MB——只读尾部 512KB（60s 窗口的事件必在其中）
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 524288))
+            tail = f.read().decode("utf-8", "replace")
+        for line in tail.splitlines():
                 try:
                     e = _json.loads(line)
                 except Exception:
@@ -1464,12 +1554,15 @@ def make_app() -> web.Application:
         web.get("/", handle_dashboard),
         web.get("/api/status", handle_status),
         web.get("/api/version", handle_version),
+        web.get("/api/batch", handle_batch),
         web.get("/api/extract/dirs", handle_extract_dirs),
         web.post("/api/extract/run", handle_extract_run),
         web.get("/api/extract/state", handle_extract_state),
         web.get("/api/fs/list", handle_fs_list),
         web.post("/api/fs/rename", handle_fs_rename),
         web.post("/api/fs/delete", handle_fs_delete),
+        web.post("/api/fs/mkdir", handle_fs_mkdir),
+        web.post("/api/fs/touch", handle_fs_touch),
         web.post("/api/fs/paste", handle_fs_paste),
         web.post("/api/fs/extract", handle_fs_extract),
         web.get("/api/fs/op", handle_fs_op),
