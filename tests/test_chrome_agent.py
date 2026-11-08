@@ -46,7 +46,7 @@ class ChromeConfigTest(unittest.TestCase):
 
     def test_retry_and_timeout_defaults(self):
         """最大重试 3 次、单次下载超时 1800 秒（规格 29/30）。"""
-        self.assertEqual(config.CHROME_DOWNLOAD_RETRIES, 3)
+        self.assertEqual(config.CHROME_DOWNLOAD_RETRIES, 10)  # 2026-10-31 owner 定档（前 5 固定 + 后 5 指数退避）
         self.assertEqual(config.CHROME_DOWNLOAD_TIMEOUT, 1800)
 
     def test_profile_dir_is_dedicated(self):
@@ -197,6 +197,48 @@ class StateMachineTest(unittest.TestCase):
         self.assertEqual(task["status"], "FAILED")
         self.assertEqual(task["attempts"], 3)  # 最终失败保留 attempts（规格 29）
         self.assertIsNotNone(task["finished_at"])
+
+    def test_backoff_first_five_fixed_then_exponential(self):
+        """2026-10-31 owner 定档：前 5 次固定 30s，第 6 次起指数退避
+        base×2^k（base=120s → 2/4/8/16 分钟），第 10 次耗尽 FAILED。"""
+        from datetime import datetime as _dt
+        base = 120
+        now = _dt(2026, 10, 31, 10, 0, 0)
+        task = _task()
+        waits = []
+        for i in range(1, 10):   # 第 1..9 次失败都还在重试档
+            chrome_agent.start_attempt(task)
+            self.assertEqual(task["attempts"], i)
+            chrome_agent.fail_attempt(task, "断连", retries=10,
+                                      wait_seconds=30, now=now,
+                                      backoff_base=base)
+            self.assertEqual(task["status"], "RETRY_WAIT")
+            from datetime import datetime as _d2
+            nxt = _d2.strptime(task["next_retry_at"], "%Y-%m-%d %H:%M:%S")
+            waits.append(int((nxt - now).total_seconds()))
+        # 前 5 次固定 30s；6..9 次退避 120/240/480/960s
+        self.assertEqual(waits[:5], [30, 30, 30, 30, 30])
+        self.assertEqual(waits[5:], [120, 240, 480, 960])
+        # 第 10 次失败 → FAILED 终态
+        chrome_agent.start_attempt(task)
+        chrome_agent.fail_attempt(task, "断连", retries=10,
+                                  wait_seconds=30, now=now,
+                                  backoff_base=base)
+        self.assertEqual(task["status"], "FAILED")
+
+    def test_backoff_zero_keeps_legacy_fixed_wait(self):
+        """backoff_base 缺省 0 = 旧行为（全程固定），既有调用方不破。"""
+        from datetime import datetime as _dt
+        now = _dt(2026, 10, 31, 10, 0, 0)
+        task = _task()
+        for _ in range(8):
+            chrome_agent.start_attempt(task)
+        chrome_agent.fail_attempt(task, "断连", retries=10,
+                                  wait_seconds=30, now=now)
+        self.assertEqual(task["status"], "RETRY_WAIT")
+        from datetime import datetime as _d2
+        nxt = _d2.strptime(task["next_retry_at"], "%Y-%m-%d %H:%M:%S")
+        self.assertEqual(int((nxt - now).total_seconds()), 30)
 
 
 class ClaimNextTest(unittest.TestCase):
@@ -1646,3 +1688,70 @@ class CancelProcessFlowTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProgressFileTest(unittest.TestCase):
+    """实时下载进度（chrome_progress.json）：节流落盘 + 清理。"""
+
+    def setUp(self):
+        chrome_agent._PROGRESS.clear()
+        chrome_agent._PROGRESS_FLUSH_AT = 0.0   # 节流时间戳也是模块态，一并隔离
+        try:
+            os.remove(config.CHROME_PROGRESS_FILE)
+        except OSError:
+            pass
+
+    def tearDown(self):
+        chrome_agent._PROGRESS.clear()
+        try:
+            os.remove(config.CHROME_PROGRESS_FILE)
+        except OSError:
+            pass
+
+    def test_note_writes_and_throttles(self):
+        t0 = 1000.0
+        self.assertTrue(chrome_agent.note_progress(
+            "g1", "f.bin",
+            {"receivedBytes": 100, "totalBytes": 400, "speed": 50},
+            task_id="T1", now=t0))
+        data = json.load(open(config.CHROME_PROGRESS_FILE, encoding="utf-8"))
+        self.assertEqual(data["items"][0]["received"], 100)
+        self.assertEqual(data["items"][0]["task_id"], "T1")
+        # 1s 节流窗口内：不落盘，文件仍是旧值
+        self.assertFalse(chrome_agent.note_progress(
+            "g1", "f.bin", {"receivedBytes": 200, "totalBytes": 400},
+            task_id="T1", now=t0 + 0.5))
+        data = json.load(open(config.CHROME_PROGRESS_FILE, encoding="utf-8"))
+        self.assertEqual(data["items"][0]["received"], 100)
+        # 窗口过后：落盘新值
+        self.assertTrue(chrome_agent.note_progress(
+            "g1", "f.bin", {"receivedBytes": 200, "totalBytes": 400},
+            task_id="T1", now=t0 + 1.5))
+        data = json.load(open(config.CHROME_PROGRESS_FILE, encoding="utf-8"))
+        self.assertEqual(data["items"][0]["received"], 200)
+
+    def test_missing_total_tolerated(self):
+        # 服务器无 Content-Length：total 缺失容忍为 None
+        self.assertTrue(chrome_agent.note_progress(
+            "g2", "f2.bin", {"receivedBytes": 55}, task_id="T2", now=10.0))
+        data = json.load(open(config.CHROME_PROGRESS_FILE, encoding="utf-8"))
+        self.assertIsNone(data["items"][0]["total"])
+
+    def test_clear_by_guid_and_full_reset(self):
+        chrome_agent.note_progress("g1", "f1", {"receivedBytes": 1},
+                                   task_id="T1", now=10.0)
+        chrome_agent.clear_progress(guid="g1")
+        data = json.load(open(config.CHROME_PROGRESS_FILE, encoding="utf-8"))
+        self.assertEqual(data["items"], [])
+        chrome_agent.note_progress("g2", "f2", {"receivedBytes": 2},
+                                   task_id="T2", now=11.0)
+        chrome_agent.clear_progress()   # 全清（Agent 启动重置同款）
+        data = json.load(open(config.CHROME_PROGRESS_FILE, encoding="utf-8"))
+        self.assertEqual(data["items"], [])
+
+    def test_note_without_total_keys(self):
+        # params 里连 receivedBytes 都没有（异常事件）也不炸
+        self.assertTrue(chrome_agent.note_progress(
+            "g3", "f3", {}, task_id="T3", now=20.0))
+        data = json.load(open(config.CHROME_PROGRESS_FILE, encoding="utf-8"))
+        self.assertIsNone(data["items"][0]["received"])

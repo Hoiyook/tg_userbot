@@ -1,7 +1,7 @@
-"""从本地浏览器 Cookie 数据库提取 douyin.com 域 cookie。
+"""从本地浏览器 Cookie 数据库提取指定域 cookie（默认 douyin.com）。
 
 用 f2 自带的 browser_cookie3 直接读浏览器的加密 Cookie 库——比手动
-DevTools 复制省事，且能拿到 HttpOnly 的 sessionid（document.cookie
+DevTools 复制省事，且能拿到 HttpOnly 的 sessionid/SESSDATA（document.cookie
 拿不到）。懒导入 + 线程执行：macOS 首次读 Chrome 会等钥匙串授权框，
 菜单侧必须用 run_in_executor 调用，不能阻塞事件循环。
 
@@ -20,11 +20,12 @@ def supported_browsers():
     return tuple(_BROWSER_LOADERS)
 
 
-def load_browser_cookie_string(browser):
-    """读指定浏览器的 douyin.com cookie，返回 (cookie_str, err)。
+def load_browser_cookie_string(browser, domain="douyin.com"):
+    """读指定浏览器的 domain 域 cookie，返回 (cookie_str, err)。
 
     err 非 None 时 cookie_str 为空串。调用方（bot 菜单/CLI）拿到非空
-    cookie 后交给 config.save_douyin_cookie 持久化 + 实时生效。
+    cookie 后交给对应 config.save_*_cookie 持久化 + 实时生效。
+    domain 默认 douyin.com（抖音链路保持原行为），B 站传 bilibili.com。
     """
     loader_name = _BROWSER_LOADERS.get((browser or "").strip().lower())
     if loader_name is None:
@@ -40,7 +41,7 @@ def load_browser_cookie_string(browser):
         )
 
     try:
-        jar = getattr(browser_cookie3, loader_name)(domain_name="douyin.com")
+        jar = getattr(browser_cookie3, loader_name)(domain_name=domain)
     except Exception as e:
         hint = ""
         if isinstance(e, PermissionError):
@@ -64,8 +65,8 @@ def load_browser_cookie_string(browser):
         parts.append(f"{c.name}={c.value}")
     if not parts:
         return "", (
-            f"{browser} 里没有 douyin.com 的 cookie"
-            "（请先在该浏览器登录 douyin.com）"
+            f"{browser} 里没有 {domain} 的 cookie"
+            f"（请先在该浏览器登录 {domain}）"
         )
 
     return "; ".join(parts), None

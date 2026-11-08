@@ -124,6 +124,33 @@ def tag_matches(text: str, tag: str) -> bool:
     ) is not None
 
 
+def media_member_ext(m) -> str:
+    """成员扩展名（小写带点）：文档取原始文件名后缀；photo 恒 .jpg；
+    无媒体/无名 → 空串（绝不误滤）。"""
+    try:
+        f = getattr(m, "file", None)
+        name = (getattr(f, "name", None) or "") if f else ""
+        if name:
+            ext = os.path.splitext(name)[1].lower()
+            if ext:
+                return ext
+        if getattr(m, "photo", None):
+            return ".jpg"
+    except Exception:
+        pass
+    return ""
+
+
+def filter_media_by_ext(media, exclude_exts):
+    """按规则扩展名黑名单滤成员。返回 (保留列表, 丢弃数)。"""
+    exts = {str(e).lower() for e in (exclude_exts or [])}
+    if not exts:
+        return list(media), 0
+    kept = [m for m in media
+            if media_member_ext(m) not in exts]
+    return kept, len(media) - len(kept)
+
+
 def matched_tags(text: str, tags) -> set:
     """文本命中的标签集合（供「多标签命中合并」用）。"""
     return {t for t in (tags or []) if tag_matches(text, t)}
@@ -271,6 +298,13 @@ def normalize_rule(rule) -> dict:
         "targets": targets,
         "download": bool(rule.get("download")),
     }
+    # 扩展名过滤（2026-10-27 定档：转发时丢弃指定类型的组成员；可空）
+    exts = rule.get("exclude_ext")
+    if exts:
+        norm_exts = sorted({(("." + str(e).strip().lstrip(".")).lower())
+                            for e in exts if str(e).strip()})
+        if norm_exts:
+            out["exclude_ext"] = norm_exts
     for field in ("source_name", "source_username"):
         if rule.get(field):
             out[field] = str(rule[field])
@@ -624,6 +658,41 @@ async def add_listener(rule) -> tuple:
     return True, f"{LISTEN_NOTIFY_PREFIX} 已添加规则：{_rule_oneline(rule)}"
 
 
+def set_rule_exclude_ext(arg) -> tuple:
+    """`/listen ext <序号> <.jpg,.png|clear>`——该规则的转发扩展名黑名单。
+
+    只影响**转发组成员**（命中帖里被丢弃的成员不转发）；评论跟进、
+    判重、历史回扫共用同一规则。空/清空 = 不过滤。
+    """
+    parts = str(arg or "").split()
+    if len(parts) < 2:
+        return False, (f"{LISTEN_NOTIFY_PREFIX} 用法："
+                       "/listen ext <序号> <.jpg,.png>（多个逗号分隔）\n"
+                       "　清空过滤：/listen ext <序号> clear\n"
+                       "　例：/listen ext 1 .jpg")
+    try:
+        pos = int(parts[0])
+    except ValueError:
+        return False, f"{LISTEN_NOTIFY_PREFIX}：规则序号无效"
+    if not 1 <= pos <= len(state.LISTEN_RULES):
+        return False, f"{LISTEN_NOTIFY_PREFIX}：序号超出范围（1-{len(state.LISTEN_RULES)}）"
+    rule = state.LISTEN_RULES[pos - 1]
+    spec = parts[1].lower()
+    if spec == "clear":
+        rule.pop("exclude_ext", None)
+        save_listen_config()
+        return True, (f"{LISTEN_NOTIFY_PREFIX} ✅ 规则 {pos}（{rule['tag']}）"
+                      "转发过滤已清空")
+    exts = sorted({("." + e.strip().lstrip(".")).lower()
+                   for e in spec.split(",") if e.strip().lstrip(".")})
+    if not exts:
+        return False, f"{LISTEN_NOTIFY_PREFIX}：扩展名列表为空"
+    rule["exclude_ext"] = exts
+    save_listen_config()
+    return True, (f"{LISTEN_NOTIFY_PREFIX} ✅ 规则 {pos}（{rule['tag']}）"
+                  f"转发将过滤：{' '.join(exts)}")
+
+
 def replace_listener(index, rule) -> tuple:
     """按序号替换规则（「✏️ 修改」保存时用）。chat_id 不变则不重init checkpoint。"""
     try:
@@ -920,11 +989,25 @@ async def _scan_chat(chat_id, rules):
                     )
                     break
                 result["matched"] += 1
+                # 扩展名过滤（2026-10-27）：命中规则的 exclude_ext 取并集，
+                # 丢弃的成员不进转发组；全组滤空则不建任务（评论跟进照常）
+                exts = set()
+                for rule in rules:
+                    if rule["tag"] in hits:
+                        exts |= set(rule.get("exclude_ext") or [])
+                fwd_media, dropped = filter_media_by_ext(media, exts)
+                if dropped:
+                    logger.info(f"🧹 {chat_id} #{anchor}：扩展名过滤丢弃 "
+                                f"{dropped} 个成员（{sorted(exts)}）")
                 # 评论继承频道原帖的 caption/日期：解析要走 1~2 次网络请求，
                 # 只在**真的命中标签**时才做（未命中的消息一分钱不花）。
                 origin = await resolve_origin_snapshot(media[0])
-                tasks.extend(_build_tasks(chat_id, media, keys, download,
-                                          text, anchor, origin))
+                if fwd_media:
+                    tasks.extend(_build_tasks(chat_id, fwd_media, keys,
+                                              download, text, anchor, origin))
+                else:
+                    logger.info(f"🧹 {chat_id} #{anchor}：整组被扩展名过滤"
+                                "，跳过建任务（评论跟进照常）")
                 logger.info(
                     f"🏷 标签监听命中：{chat_id} #{anchor} "
                     f"标签 {' '.join(sorted(hits))} → 建任务 {len(keys)} 条"
@@ -1435,10 +1518,21 @@ async def _history_scan_run(chat_id, tag, label):
                 if not tag_matches(text, tag):
                     continue
                 matched += 1
+                # 扩展名过滤：与实时扫描同规则（该 chat+tag 的 exclude_ext）
+                rule_exts = next(
+                    (r.get("exclude_ext") or []
+                     for r in (state.LISTEN_RULES or [])
+                     if r.get("source_chat_id") == chat_id
+                     and r.get("tag") == tag), [])
+                fwd_media, dropped = filter_media_by_ext(media, rule_exts)
+                if dropped:
+                    logger.info(f"🧹 {label} #{anchor}：扩展名过滤丢弃 "
+                                f"{dropped} 个成员")
                 origin = await resolve_origin_snapshot(media[0])
-                tasks.extend(_build_tasks(
-                    chat_id, media, {("saved_messages", None)}, True,
-                    text, anchor, origin))
+                if fwd_media:
+                    tasks.extend(_build_tasks(
+                        chat_id, fwd_media, {("saved_messages", None)}, True,
+                        text, anchor, origin))
                 _add_follow_from_scan(chat_id, anchor, text, origin, media[0],
                                       source_name=label)
                 logger.info(
@@ -1663,8 +1757,28 @@ def failed_tasks_text(limit=15):
         if err:
             lines.append(f"   原因：{err}")
     lines.append("")
-    lines.append("重试：/listen_retry <行id>")
+    lines.append("重试：/listen_retry <行id>｜删除：/listen_failed del <行id>"
+                 "（源已删的死任务建议删掉）")
     return "\n".join(lines)[:3900]
+
+
+def delete_failed_task(arg):
+    """/listen_failed del <行id>：删除失败任务（只许删 FAILED——
+    待处理/执行中的是活任务，误删丢转发）。"""
+    from . import runtime_db
+    parts = str(arg or "").split()
+    if len(parts) != 2 or parts[0].lower() != "del" or not parts[1].isdigit():
+        return (f"{LISTEN_NOTIFY_PREFIX}\n用法：/listen_failed del <行id>"
+                "（只删失败任务）")
+    try:
+        ok = runtime_db.delete_listener_task(int(parts[1]), failed_only=True)
+    except runtime_db.DbUnavailable as e:
+        return f"{LISTEN_NOTIFY_PREFIX}\n❌ Runtime DB 不可用：{e}"
+    if ok:
+        return (f"{LISTEN_NOTIFY_PREFIX} 🗑️ 失败任务 #{parts[1]} 已删除"
+                "（转忽略态，不再出现在失败列表）")
+    return (f"{LISTEN_NOTIFY_PREFIX}\n❌ #{parts[1]} 不存在或不是失败态"
+            "（活任务不可删）")
 
 
 def retry_failed_task(arg):
@@ -1703,6 +1817,8 @@ def view_text() -> str:
                 lines.append(f"   {' '.join(tgts)}")
             lines.append(
                 f"   ⬇️ 自动下载：{'开启' if rule.get('download') else '关闭'}")
+            if rule.get("exclude_ext"):
+                lines.append(f"   🧹 转发过滤：{' '.join(rule['exclude_ext'])}")
             lines.append("")
     if _HISTORY_PROGRESS:
         lines.append("历史回扫：")
@@ -1809,9 +1925,12 @@ def parse_listen_command(text):
     head, _, rest = body.partition(" ")
     head = head.strip().lstrip("_").lower()   # /listen_add（标准）兼容
     rest = rest.strip()
-    if head in ("on", "off", "scan", "list", "failed", "retry"):
+    if head in ("on", "off", "scan", "list"):
         return (head, None)
-    if head in ("add", "del", "interval", "edit", "history"):
+    # failed/retry 带参（/listen_retry <id>、/listen_failed del <id>）——
+    # 旧版把参数丢了，带 ID 重试实际不可用（2026-10-27 修）
+    if head in ("add", "del", "interval", "edit", "history", "ext",
+                "failed", "retry"):
         return (head, rest)
     return ("usage", head)
 
@@ -1824,6 +1943,7 @@ USAGE_TEXT = (
     "    例：/listen add @source #01musume me,@speedlearnnn on\n"
     "    目标可用 me（收藏夹）/ @用户名 / 数字 ID；省略则只转发收藏夹\n"
     "/listen del <序号> — 删除规则\n"
+    "/listen ext <序号> <.jpg,.png|clear> — 转发扩展名过滤（按规则）\n"
     "/listen interval <分钟> — 设置扫描周期\n"
     "/listen scan — 立即扫描一次\n"    "/listen history <聊天> <标签> — 整频道历史回扫该标签"
 )
@@ -1920,6 +2040,8 @@ async def command_reply(action, arg) -> str:
         return set_interval(arg)[1]
     if action == "del":
         return del_listener(arg)[1]
+    if action == "ext":
+        return set_rule_exclude_ext(arg)[1]
     if action == "add":
         return await _cmd_add(arg)
     if action == "scan":

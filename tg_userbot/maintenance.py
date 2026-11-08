@@ -12,8 +12,10 @@ from . import config
 from . import runtime_db
 from .log import logger
 
-BACKUP_KEEP = 7            # 备份滚动保留份数
+BACKUP_KEEP = 3            # 备份滚动保留份数（2026-10-29：7→3——
+                           # DB 日增量极小，3 份足够回滚，省 ~370MB）
 EVENTS_TRIM_MAX = 30000    # 与 TASK_EVENTS_MAX_EVENTS 同源（台账封顶）
+LISTENER_DONE_RETENTION_DAYS = 90   # 监听任务 SUCCESS/DISMISSED 保留天数
 
 
 def backup_db(out_dir, keep=BACKUP_KEEP, now=None):
@@ -81,3 +83,25 @@ def daily_maintenance():
             logger.info(f"🗄 事件流已裁剪 {removed} 条（封顶 {EVENTS_TRIM_MAX}）")
     except sqlite3.Error as e:
         logger.warning(f"🗄 事件流裁剪失败：{e}")
+    try:
+        # 监听任务 SUCCESS 终态 90 天清理（2026-10-29）：SUCCESS 行永久
+        # 留存是唯一无界的业务表；判重不依赖它（dedup_index 独立），删
+        # 旧成功行不影响任何功能。DISMISSED 同为终态一并清。FAILED 保留
+        # （是待办）。独立连接（同上，to_thread 线程不能复用业务连接）。
+        conn = sqlite3.connect(runtime_db.db_path(), timeout=10)
+        try:
+            cutoff = int(time.time()) - LISTENER_DONE_RETENTION_DAYS * 86400
+            cur = conn.execute(
+                "DELETE FROM listener_tasks WHERE status IN (?, ?) "
+                "AND completed_at IS NOT NULL AND completed_at < ?",
+                (runtime_db.STATUS_SUCCESS, runtime_db.STATUS_DISMISSED,
+                 cutoff))
+            conn.commit()
+            removed = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        finally:
+            conn.close()
+        if removed:
+            logger.info(f"🗄 监听任务终态清理 {removed} 条"
+                        f"（SUCCESS/DISMISSED 保留 {LISTENER_DONE_RETENTION_DAYS} 天）")
+    except sqlite3.Error as e:
+        logger.warning(f"🗄 监听任务终态清理失败：{e}")

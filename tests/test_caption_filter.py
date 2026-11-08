@@ -477,21 +477,21 @@ class NamingIntegrationTest(unittest.TestCase):
         m = self.fake("a.mp4", REAL_CAPTION)
         self.assertEqual(
             naming.compute_final_filename(m),
-            f"26-09-10 {REAL_EXPECTED} - a.mp4",
+            f"26-09-10 1 {REAL_EXPECTED} - a.mp4",
         )
 
     def test_cleaning_runs_before_sanitize_newline_fields(self):
         # sanitize 会把换行变成 '_'，那样 '期数' 就不再是字段起点
         m = self.fake("a.mp4", "作者：#腿玩年\n期数：bl11")
         self.assertEqual(
-            naming.compute_final_filename(m), "26-09-10 #腿玩年 bl11 - a.mp4"
+            naming.compute_final_filename(m), "26-09-10 1 #腿玩年 bl11 - a.mp4"
         )
 
     def test_cleaning_runs_before_sanitize_ascii_colon(self):
         # sanitize 会把 ASCII ':' 换成 '_'，那样 field:作者 永远匹配不上
         m = self.fake("a.mp4", "作者:张三")
         self.assertEqual(
-            naming.compute_final_filename(m), "26-09-10 张三 - a.mp4"
+            naming.compute_final_filename(m), "26-09-10 1 张三 - a.mp4"
         )
 
     def test_album_caption_override_is_cleaned(self):
@@ -500,13 +500,13 @@ class NamingIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(
             naming.compute_final_filename(m, caption=REAL_CAPTION),
-            f"26-09-10 {REAL_EXPECTED}.jpg",
+            f"26-09-10 1 {REAL_EXPECTED}.jpg",
         )
 
     def test_captionless_message_unchanged(self):
         m = self.fake("a.mp4")
         result = naming.compute_final_filename(m)
-        self.assertEqual(result, "26-09-10 a.mp4")
+        self.assertEqual(result, "26-09-10 1 a.mp4")
         self.assertNotIn("未命名文件", result)
 
     def test_caption_that_cleans_to_nothing_falls_back(self):
@@ -527,7 +527,7 @@ class NamingIntegrationTest(unittest.TestCase):
         self.assertLessEqual(
             len(result.encode("utf-8")), config.MAX_FILENAME_BYTES
         )
-        self.assertTrue(result.startswith("26-09-10 "))
+        self.assertTrue(result.startswith("26-09-10 1 "))
         self.assertTrue(result.endswith(" - a.mp4"))
 
     def test_get_caption_returns_cleaned_text(self):
@@ -544,13 +544,13 @@ class NamingIntegrationTest(unittest.TestCase):
     def test_new_rules_take_effect_without_restart(self):
         m = self.fake("a.mp4", "作者：#腿玩年 标签：#MMD")
         self.assertEqual(
-            naming.compute_final_filename(m), "26-09-10 #腿玩年 #MMD - a.mp4"
+            naming.compute_final_filename(m), "26-09-10 1 #腿玩年 #MMD - a.mp4"
         )
         with mock.patch.object(
             state, "CAPTION_FILTER_RULES", ["field:标签"]
         ):
             self.assertEqual(
-                naming.compute_final_filename(m), "26-09-10 作者：#腿玩年 #MMD - a.mp4"
+                naming.compute_final_filename(m), "26-09-10 1 作者：#腿玩年 #MMD - a.mp4"
             )
 
 

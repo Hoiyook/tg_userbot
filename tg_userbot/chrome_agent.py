@@ -39,6 +39,8 @@ from .config import (
     CHROME_PROXY_SERVER,
     CHROME_REQUESTS_FILE,
     CHROME_RETRY_WAIT_SECONDS,
+    CHROME_RETRY_BACKOFF_BASE_SECONDS,
+    CHROME_PROGRESS_FILE,
     CHROME_TASKS_FILE,
     CHROME_TASKS_KEEP_TERMINAL,
     LOG_RETENTION_DAYS,
@@ -288,9 +290,15 @@ def finish_success(task, filename, size_bytes, now=None):
     task["updated_at"] = _fmt(now)
 
 
-def fail_attempt(task, error, retries, wait_seconds, now=None):
+def fail_attempt(task, error, retries, wait_seconds, now=None,
+                 backoff_base=0):
     """本次尝试失败：未达上限 → RETRY_WAIT（含下次执行时间）；达上限 →
-    FAILED 终态（attempts/error 永久保留，规格 29）。"""
+    FAILED 终态（attempts/error 永久保留，规格 29）。
+
+    等待策略（2026-10-31 owner 定档）：前 5 次固定 wait_seconds；第 6 次
+    起指数退避 backoff_base×2^k（10 次档 = 2/4/8/16/32 分钟）——网络不稳
+    时前 5 次快速试、后 5 次跨抖动窗口。backoff_base=0（缺省）维持旧
+    「全程固定等待」行为（既有调用方/测试不破）。"""
     task["error"] = str(error)
     task["updated_at"] = _fmt(now)
     if int(task.get("attempts", 0)) >= int(retries):
@@ -298,8 +306,13 @@ def fail_attempt(task, error, retries, wait_seconds, now=None):
         task["finished_at"] = _fmt(now)
     else:
         task["status"] = "RETRY_WAIT"
+        attempts = int(task.get("attempts", 0))
+        if backoff_base and attempts > 5:
+            wait = backoff_base * (2 ** (attempts - 6))
+        else:
+            wait = wait_seconds
         base = now or datetime.now()
-        nxt = base + __import__("datetime").timedelta(seconds=wait_seconds)
+        nxt = base + __import__("datetime").timedelta(seconds=wait)
         task["next_retry_at"] = nxt.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -581,6 +594,66 @@ async def _finish_cancelled(cdp, guid, filename):
     return False, filename, None, CANCEL_REASON
 
 
+# ── 实时下载进度（2026-11-01）：chrome_progress.json（Agent 独占写，
+# chrome_client/API 只读）。串行 Agent 同一时刻最多一个在途下载，进度
+# 文件即「当前下载」单项。节流 1s 落盘——downloadProgress 事件很密，
+# 逐事件写盘会 churn 外置卷。
+
+
+_PROGRESS: dict = {}          # guid → 进度项
+_PROGRESS_FLUSH_AT = 0.0      # monotonic；节流窗口
+
+
+def _write_progress_file(items) -> None:
+    temp_path = CHROME_PROGRESS_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump({"updated_at": time.time(), "items": items},
+                  f, ensure_ascii=False)
+    os.replace(temp_path, CHROME_PROGRESS_FILE)
+
+
+def note_progress(guid, filename, params, task_id=None, now=None) -> bool:
+    """downloadProgress(inProgress) → 更新内存进度并按 1s 节流落盘。
+
+    返回本次是否真的落了盘。receivedBytes/totalBytes 缺失（服务器无
+    Content-Length）容忍为 None——UI 显示「只有已接收、无百分比」。"""
+    global _PROGRESS_FLUSH_AT
+    now = time.monotonic() if now is None else now
+    _PROGRESS[guid] = {
+        "task_id": task_id,
+        "guid": guid,
+        "filename": filename or "",
+        "received": params.get("receivedBytes"),
+        "total": params.get("totalBytes"),
+        "speed": params.get("speed"),
+    }
+    if now - _PROGRESS_FLUSH_AT < 1.0:
+        return False
+    _PROGRESS_FLUSH_AT = now
+    _write_progress_file(list(_PROGRESS.values()))
+    return True
+
+
+def clear_progress(guid=None, task_id=None) -> None:
+    """尝试结束（完成/取消/失败/断连）→ 清掉对应进度并立即落盘。
+
+    guid/task_id 都不给 = 全清（Agent 启动时重置用）。无变化且文件已
+    存在时不重写，避免无谓写盘。"""
+    global _PROGRESS_FLUSH_AT
+    before = len(_PROGRESS)
+    if guid is not None:
+        _PROGRESS.pop(guid, None)
+    if task_id is not None:
+        for g in [g for g, v in _PROGRESS.items()
+                  if v.get("task_id") == task_id]:
+            _PROGRESS.pop(g, None)
+    if guid is None and task_id is None:
+        _PROGRESS.clear()
+    if len(_PROGRESS) != before or not os.path.isfile(CHROME_PROGRESS_FILE):
+        _write_progress_file(list(_PROGRESS.values()))
+    _PROGRESS_FLUSH_AT = time.monotonic()
+
+
 async def run_download_attempt(cdp, url, download_dir, timeout,
                                cancel_event=None, task=None):
     """执行一次下载尝试（规格 22：完全由 CDP 事件判定，不 sleep 猜测）。
@@ -679,6 +752,16 @@ async def run_download_attempt(cdp, url, download_dir, timeout,
                 if guid is not None and params.get("guid") != guid:
                     continue  # 不是本任务的下载事件
                 state = params.get("state")
+                if state == "inProgress":
+                    if guid is None:
+                        # downloadWillBegin 未到（响应头前的早期事件）：无从
+                        # 归因到任务，不记——否则落一串全 None 的假进度
+                        continue
+                    # 实时进度（2026-11-01）：事件自带 received/total/speed，
+                    # 记下并节流落盘——chrome_progress.json 供 API/看板展示
+                    note_progress(guid, filename, params,
+                                  task_id=(task or {}).get("task_id"))
+                    continue
                 if state == "completed":
                     if not filename:
                         return False, None, None, "下载完成但文件名缺失"
@@ -689,6 +772,7 @@ async def run_download_attempt(cdp, url, download_dir, timeout,
                 if state == "canceled":
                     return False, filename, None, "浏览器取消下载"
     finally:
+        clear_progress(guid=guid, task_id=(task or {}).get("task_id"))
         if cancel_task is not None and not cancel_task.done():
             cancel_task.cancel()
         try:
@@ -1029,7 +1113,8 @@ async def _watch_cancel(cancel_path, task_id, cancel_event, poll):
 async def process_pending_tasks(cdp, tasks, tasks_path, download_dir,
                                 timeout, retries, wait_seconds,
                                 stop_event=None, cancel_path=None,
-                                cancel_poll=CANCEL_POLL_SECONDS):
+                                cancel_poll=CANCEL_POLL_SECONDS,
+                                backoff_base=0):
     """把当前可执行的任务按 FIFO 串行处理完（一次只跑一个，规格 23）。
 
     每次尝试前后都落盘：任何时刻进程死掉，chrome_tasks.json 都是最新事实。
@@ -1094,7 +1179,8 @@ async def process_pending_tasks(cdp, tasks, tasks_path, download_dir,
                 save_tasks(tasks, tasks_path)
                 logger.info(f"[T={trace}] 🛑 下载已取消（{CANCEL_REASON}）")
                 break  # 回到认领循环，继续下一个任务（§16）
-            fail_attempt(task, error, retries, wait_seconds)
+            fail_attempt(task, error, retries, wait_seconds,
+                         backoff_base=backoff_base)
             save_tasks(tasks, tasks_path)
             logger.warning(
                 f"[T={trace}] ❌ 下载失败（{task['status']}）：{error}")
@@ -1119,6 +1205,7 @@ def configure_agent_logging():
 async def agent_main():
     """Chrome Agent 进程入口（python -m tg_userbot.chrome_agent）。"""
     configure_agent_logging()
+    clear_progress()   # 启动重置：上一进程死亡遗留的进度不是活下载
     os.makedirs(CHROME_DOWNLOAD_DIR, exist_ok=True)
     os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
     stop = asyncio.Event()
@@ -1172,7 +1259,8 @@ async def agent_main():
                 client, tasks, CHROME_TASKS_FILE, CHROME_DOWNLOAD_DIR,
                 CHROME_DOWNLOAD_TIMEOUT, CHROME_DOWNLOAD_RETRIES,
                 CHROME_RETRY_WAIT_SECONDS, stop_event=stop,
-                cancel_path=CHROME_CANCEL_REQUESTS_FILE)
+                cancel_path=CHROME_CANCEL_REQUESTS_FILE,
+                backoff_base=CHROME_RETRY_BACKOFF_BASE_SECONDS)
             if stop.is_set():
                 break
             if trim_terminal_tasks(tasks, CHROME_TASKS_KEEP_TERMINAL):

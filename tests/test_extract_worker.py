@@ -6,6 +6,7 @@ COPY 幂等 / 解压 / UPLOAD 逐文件 / VERIFY 通过与失败 / 密码终结�
 
     .venv/bin/python -m unittest tests.test_extract_worker -v
 """
+import asyncio
 import atexit
 import os
 import shutil
@@ -274,6 +275,82 @@ class PreconditionTest(_Env):
         with mock.patch.object(config, "CLOUD_MOUNT_BASE",
                                "/nonexistent_mount"):
             self.assertFalse(ew._preconditions_ok())
+
+
+class FrameworkCancelTest(_Env):
+    """extract → SerialTaskWorker 框架迁移回归：取消在途经框架放回。"""
+
+    async def test_cancel_via_framework_releases_task(self):
+        size = self._put_remote_zip("d", "a.zip", {"f": b"x" * 50})
+        self._enqueue_one("d", "a.zip", size)
+        import threading
+        gate = threading.Event()
+
+        def blocking_copy(src, dst, progress=None, chunk=1 << 20,
+                          expected=None):
+            gate.wait(5)
+            return 0
+
+        w = ew._WORKER
+        try:
+            with mock.patch.object(ew, "_copy_file",
+                                   side_effect=blocking_copy):
+                runner = asyncio.ensure_future(w.run())
+                await asyncio.sleep(0.4)   # 领取+进拷贝
+                self.assertIsNotNone(w._current)
+                runner.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await runner
+        finally:
+            gate.set()
+        # 取消后 _current 已清——从 DB 断言入队的那条
+        row = runtime_db.list_extract_tasks()[0]
+        self.assertEqual(row["status"], "PENDING", row)
+        self.assertIsNone(row["lease_until"])
+        re_claimed = runtime_db.claim_next_extract_task()
+        self.assertIsNotNone(re_claimed, "立即可重领")
+
+
+class ShutdownReleaseTest(_Env):
+    """优雅停机取消在途任务：立即放回 PENDING——app.py 的 release_inflight
+    兜底在本协程 finally 清空 _CURRENT 之后才跑（读不到 task_id），若不在
+    取消分支自己放回，只能等租约过期 + 10 分钟恢复扫描（2026-10-25 实测
+    E43485 停机后白等 10 分钟才续跑）。"""
+
+    async def test_cancel_releases_task_to_pending(self):
+        import threading
+        size = self._put_remote_zip("d", "a.zip", {"f": b"x" * 100})
+        self._enqueue_one("d", "a.zip", size)
+        claimed = runtime_db.claim_next_extract_task()
+        self.assertIsNotNone(claimed)
+
+        gate = threading.Event()
+
+        def blocking_copy(src, dst, progress=None, chunk=1 << 20,
+                          expected=None):
+            gate.wait(5)      # 卡在拷贝中，模拟长阶段被停机打断
+            return 0
+
+        try:
+            with mock.patch.object(ew, "_copy_file",
+                                   side_effect=blocking_copy):
+                runner = asyncio.ensure_future(ew._process_task(claimed))
+                await asyncio.sleep(0.15)     # 进到拷贝阶段
+                self.assertEqual(ew._CURRENT.get("task_id"), claimed["id"])
+                runner.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await runner
+        finally:
+            gate.set()
+
+        after = runtime_db.get_extract_task(claimed["id"])
+        self.assertEqual(after["status"], "PENDING", after)
+        self.assertIsNone(after["lease_until"])
+        self.assertEqual(after["attempts"], 1)   # 释放不加尝试次数
+        # 立即可被重新领取（无需等租约过期/恢复扫描）
+        re_claimed = runtime_db.claim_next_extract_task()
+        self.assertEqual(re_claimed["id"], claimed["id"])
+        self.assertEqual(re_claimed["attempts"], 2)
 
 
 class RecoverLoopTest(_Env):

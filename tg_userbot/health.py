@@ -83,6 +83,18 @@ def render_now() -> str:
     except Exception:
         lines.append("📖 wnacg：？（模块未载入）")
 
+    # ③.5 asmr
+    try:
+        from . import asmr_dl
+        cur = dict(getattr(asmr_dl, "_CURRENT", {}) or {})
+        if cur.get("rj"):
+            lines.append(f"🎧 asmr：RJ{cur['rj']} {cur.get('stage') or ''}"
+                         f"｜{(cur.get('title') or '')[:28]}")
+        else:
+            lines.append("🎧 asmr：空闲")
+    except Exception:
+        lines.append("🎧 asmr：？（模块未载入）")
+
     # ④ 下载队列（主下载在途）
     try:
         actives = [v for v in (state.ACTIVE_DOWNLOADS or {}).values()]
@@ -117,11 +129,14 @@ def render_now() -> str:
 
     # ⑥ 卡死嫌疑 + 队列总量一行
     if snap:
-        exp = {k: snap[k]["expired"] for k in
-               ("extract", "pawchive", "listener", "wnacg")
-               if snap[k]["expired"]}
-        due = sum(snap[k]["due"] for k in
-                  ("extract", "pawchive", "listener", "wnacg"))
+        # asmr 键用 .get 兜底：假快照/旧库可能没有该队列（新键向后兼容）
+        _q = lambda k: snap.get(k) or {"expired": 0, "due": 0,
+                                       "recent_done": 0}
+        exp = {k: _q(k)["expired"] for k in
+               ("extract", "pawchive", "listener", "wnacg", "asmr")
+               if _q(k)["expired"]}
+        due = sum(_q(k)["due"] for k in
+                  ("extract", "pawchive", "listener", "wnacg", "asmr"))
         if exp:
             lines.append(f"⚠️ 租约过期（自愈中）：{exp}")
         lines.append(f"待办合计 {due}"
@@ -239,6 +254,7 @@ def render_health() -> str:
         ql("pawchive", "pawchive")
         ql("监听任务", "listener")
         ql("wnacg", "wnacg")
+        ql("asmr", "asmr")
         dc = snap["download"]["counts"]
         row("下载队列", True, " ".join(f"{s}={n}" for s, n in
             sorted(dc.items())) or "空")
@@ -262,17 +278,20 @@ def decide_stall_signals(snap, now=None):
     out = []
     if not snap:
         return out
-    queues = ("extract", "pawchive", "listener", "wnacg")
-    due = sum(snap[k]["due"] for k in queues)
-    completions = (sum(snap[k]["recent_done"] for k in queues)
+    queues = ("extract", "pawchive", "listener", "wnacg", "asmr")
+    # .get 兜底：假快照/旧库可能没有新队列键（向后兼容）
+    blk = lambda k: snap.get(k) or {}
+    due = sum(blk(k).get("due", 0) for k in queues)
+    completions = (sum(blk(k).get("recent_done", 0) for k in queues)
                    + snap.get("recent_dl_history", 0))
     if due > 0 and completions == 0:
-        detail = "｜".join(f"{k} due {snap[k]['due']}" for k in queues
-                           if snap[k]["due"])
+        detail = "｜".join(f"{k} due {blk(k)['due']}" for k in queues
+                          if blk(k).get("due"))
         out.append({"key": "stall", "text":
                     f"⚠️ 疑似卡死：有到期待办（{detail}）但近 30 分钟零完成。"
                     "发 /health 巡检、/now 看现场；必要时重启后 /cmdq 台账会补指令"})
-    exp = {k: snap[k]["expired"] for k in queues if snap[k]["expired"]}
+    exp = {k: blk(k).get("expired", 0) for k in queues
+           if blk(k).get("expired")}
     if exp:
         out.append({"key": "lease", "text":
                     f"⚠️ 租约过期 {exp}（recover 循环应自愈；反复出现=自愈失灵，"

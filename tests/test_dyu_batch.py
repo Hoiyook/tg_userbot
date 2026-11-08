@@ -6,6 +6,9 @@ queue 的 serial 串行门（一次一条，不并发）。
 
     .venv/bin/python -m unittest tests.test_dyu_batch -v
 """
+import os as _os, sys as _sys  # noqa: E402
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import conftest as _btn_shim  # noqa: F401,E402  按钮属性垫片（独立跑时补 .data/.url）
 import asyncio
 import atexit
 import os

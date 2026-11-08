@@ -139,6 +139,16 @@ def extract_archive(archive_path, dest=None, delete_source=False,
                     timeout=120, stdin=subprocess.DEVNULL)
             except subprocess.TimeoutExpired:
                 probe = None
+            except FileNotFoundError:
+                # 环境没装 bsdtar（2026-11-07 Termux ScriptRunner 实测）：
+                # 与主 bsdtar 路同语义，诚实 failed，别让异常穿透成
+                # 「未预期异常」中断整轮
+                return ("failed",
+                        "zip 容器不可解析（{0}）；bsdtar 未安装"
+                        "（Termux: pkg install libarchive；"
+                        "macOS 自带/Linux: apt install libarchive-tools）"
+                        "——源文件疑损坏或非标准格式".format(str(e)[:60]),
+                        [])
             if probe is not None and probe.returncode == 0:
                 logger.info(
                     f"🗜 stdlib 拒解析（{str(e)[:60]}），回落 bsdtar："

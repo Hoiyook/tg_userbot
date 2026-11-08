@@ -617,6 +617,8 @@ class DailyCookieNotifyOnlyOnRealInvalidTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(notify, "notify_user", fake_notify), \
              mock.patch.object(config, "PAWCHIVE_COOKIE", "sessionid=X"), \
              mock.patch.object(_insp, "run_inspection", lambda: None), \
+             mock.patch("tg_userbot.ops_report.daily_failed_push",
+                        new=mock.AsyncMock(return_value="skipped")), \
              mock.patch.object(app_mod.asyncio, "sleep", fake_sleep):
             task = asyncio.ensure_future(app_mod._maintenance_loop())
             with self.assertRaises(asyncio.CancelledError):
@@ -2827,8 +2829,12 @@ class ListenFailedViewTest(unittest.TestCase):
     def test_registered(self):
         for n in ("listen_failed", "listen_retry"):
             self.assertIn(n, config.REGISTERED_COMMAND_NAMES)
+        # failed/retry 自 2026-10-27 起带参（/listen_retry <id>、
+        # /listen_failed del <id>）——裸命令返回空串而非 None
         self.assertEqual(listener_mod.parse_listen_command("/listen_failed"),
-                         ("failed", None))
+                         ("failed", ""))
+        self.assertEqual(listener_mod.parse_listen_command("/listen_retry 7"),
+                         ("retry", "7"))
 
 
 class ListenerWizardStepTest(unittest.TestCase):
@@ -4434,7 +4440,9 @@ class MemoCommandTest(unittest.TestCase):
                      "stats": "stats", "cleanup": "botclean",
                      "wl_scan": "wl_scan", "cmd_templates": "cmdt",
                      "extract_worker": "115x", "douyin_batch": "dyu",
-                     "shell": "sh", "dup_scan": "115dup", "ops_report": "report", "inventory": "115inv"}
+                     "shell": "sh", "dup_scan": "115dup", "ops_report": "report", "inventory": "115inv",
+                     "x_dl": "x", "pixiv_dl": "pixiv", "asmr_dl": "asmr",
+                     "bili_dl": "bili", "pd_dl": "pd"}
         # /cd2check 写在 botclean 分支体内（共享 is_botclean_command 入口），
         # 其日志行会被 botclean 家族覆盖
         panel = {name for name, _ in b.BOT_COMMANDS}
@@ -4452,7 +4460,8 @@ class MemoCommandTest(unittest.TestCase):
         handled |= {name for name in panel
                     if any(name == f or name.startswith(f + "_")
                            for f in families)}
-        missing = panel - handled - {"help", "start", "paw"}
+        missing = panel - handled - {"help", "start", "paw",
+                                        "pdst", "pdclean"}
         # paw 家族在 pawchive.command_reply 分发、help/start 有专门分支
         self.assertEqual(missing, set(),
                          f"面板命令无 dispatch: {sorted(missing)}")

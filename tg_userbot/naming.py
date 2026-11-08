@@ -392,8 +392,9 @@ def compute_final_filename(message, caption=None, label=None, max_bytes=None,
                            date_override=None) -> str:
     """根据消息计算最终落盘文件名（download_file 与队列展示共用）。
 
-    规则：文件名开头加原消息日期前缀（'YY-MM-DD '，见 date_prefix）；有
-    caption 用 caption 拼接原名；无意义文件名（未命名/UUID）用 caption 或
+    规则：文件名开头加原消息日期前缀（'YY-MM-DD '，见 date_prefix）与消息
+    ID 段（'<id> '，不同帖唯一——同 caption 多帖不再同名互覆，2026-10-30）；
+    有 caption 用 caption 拼接原名；无意义文件名（未命名/UUID）用 caption 或
     媒体类型_时间戳 兜底；原名缺后缀时按 MIME 推断。唯一例外：纯兜底名
     媒体类型_时间戳 已含消息日期，不再前缀以免冗余。
 
@@ -426,6 +427,12 @@ def compute_final_filename(message, caption=None, label=None, max_bytes=None,
         original_filename += extension
 
     prefix = date_prefix(message, date_override)
+    # 消息 ID 段（2026-10-30）：日期前缀后插 '<id> '——同 caption 多帖
+    # （如「原图在评论区」类帖子评论区多图同名）曾靠覆盖旧同名副本存活，
+    # 被覆盖的旧版进 115 回收站看似"文件被删"。ID 唯一 → 不同帖必不同名。
+    # 合法 int 才拼（测试的 Mock 假消息无 id，自动省略保持旧格式）。
+    mid = getattr(message, "id", None)
+    mid_piece = f"{mid} " if isinstance(mid, int) and mid > 0 else ""
     meaningful = not is_meaningless_filename(original_filename)
     # 无意义文件名时的扩展名：原名带出的优先，否则按 MIME 推断的
     m_ext = os.path.splitext(original_filename)[1] or extension or ""
@@ -435,8 +442,8 @@ def compute_final_filename(message, caption=None, label=None, max_bytes=None,
 
         def assemble(text_block):
             if text_block:
-                return prefix + text_block + " - " + base
-            return prefix + base
+                return prefix + mid_piece + text_block + " - " + base
+            return prefix + mid_piece + base
     else:
         if message.voice:
             kind = "voice"
@@ -451,7 +458,7 @@ def compute_final_filename(message, caption=None, label=None, max_bytes=None,
 
         def assemble(text_block):
             if text_block:
-                return prefix + text_block + m_ext
+                return prefix + mid_piece + text_block + m_ext
             # 兜底名已含 媒体类型_时间戳（同为消息日期），不再前缀
             return generate_fallback_filename(
                 message, kind, date_override) + m_ext
@@ -460,11 +467,11 @@ def compute_final_filename(message, caption=None, label=None, max_bytes=None,
     if max_bytes is None:
         return assemble(text_block)
 
-    # ---- 字节预算版：先算「文字段」可用预算，保 日期前缀+文件名/后缀 ----
+    # ---- 字节预算版：先算「文字段」可用预算，保 日期前缀+ID+文件名/后缀 ----
     if meaningful:
-        overhead = len((prefix + " - " + base).encode("utf-8"))
+        overhead = len((prefix + mid_piece + " - " + base).encode("utf-8"))
     else:
-        overhead = len((prefix + m_ext).encode("utf-8"))
+        overhead = len((prefix + mid_piece + m_ext).encode("utf-8"))
     allowed_text = max_bytes - overhead
     if allowed_text > 0:
         return assemble(_fit_text_parts(label_piece, caption, allowed_text))

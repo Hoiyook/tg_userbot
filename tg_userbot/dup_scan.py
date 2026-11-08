@@ -108,6 +108,19 @@ def _split_path(path):
     return (d or "/", name)
 
 
+def recover_stale_runs():
+    """启动清理：进程重启遗留的 running run → failed。返回清理条数。"""
+    from . import runtime_db
+    try:
+        return runtime_db.dup_recover_stale_runs()
+    except runtime_db.DbUnavailable as e:
+        logger.warning(f"查重遗留 run 启动清理失败（下次开档会自动废）：{e}")
+        return 0
+    except Exception as e:
+        logger.warning(f"查重遗留 run 启动清理异常：{e}")
+        return 0
+
+
 def scan_and_save(root="/115open", deadline_s=None):
     """全盘扫描 → 分组 → 落库（阻塞；命令层用 to_thread 跑）。
 
@@ -379,17 +392,25 @@ def _render_report_csv(rows):
     import io
     buf = io.StringIO()
     w = csv.writer(buf)
+    # 末两列是人工审表的填写槽（/115dup apply 的输入）：新目录=移动、
+    # 新文件名=重命名，留空=不动；deleted 改 1=删该份（回收站）
     w.writerow(["group_id", "sha1", "size_mb", "directory", "filename",
-                "write_time", "deleted"])
+                "write_time", "deleted", "新目录", "新文件名"])
     for gid, size, members in rows:
         for m in members:
             directory, name = _split_path(m["path"])
             w.writerow([gid, m["sha1"], _mb_num(size), directory, name,
-                        _fmt_dt(m["write_time"]), m["deleted"]])
+                        _fmt_dt(m["write_time"]), m["deleted"], "", ""])
     return buf.getvalue()
 
 
-def export_report(target_dir=REPORT_DIR_DEFAULT, run=None,
+def dated_report_dir(base=REPORT_DIR_DEFAULT):
+    """报告按日期子目录归档（2026-10-24 用户要求：不平铺）。"""
+    import time as _time
+    return f"{base}/{_time.strftime('%Y-%m-%d')}"
+
+
+def export_report(target_dir=None, run=None,
                   mem_groups=None, mem_stats=None, mem_root=None):
     """渲染 TXT+CSV → 本地存档 → 写 CD2 挂载（=上传 115）→ gRPC 对账。
 
@@ -401,6 +422,7 @@ def export_report(target_dir=REPORT_DIR_DEFAULT, run=None,
     import time as _time
     from . import runtime_db
     from . import cd2_api
+    target_dir = target_dir or dated_report_dir()
     out = {"ok": False, "remote_dir": str(target_dir), "files": [],
            "local_dir": None, "note": ""}
     if run is None and mem_groups is None:
@@ -427,10 +449,12 @@ def export_report(target_dir=REPORT_DIR_DEFAULT, run=None,
     local_dir = os.path.join(config.RUNTIME_DIR, "dup_reports")
     try:
         os.makedirs(local_dir, exist_ok=True)
+        # utf-8-sig 带 BOM：查重 CSV 要给人用 Excel 审表编辑（/115dup
+        # apply 回导），双击打开不乱码（与 ops_report 同款，2026-10-24）
         for ext, content in (("txt", _render_report_text(root, stats, rows)),
                              ("csv", _render_report_csv(rows))):
             path = os.path.join(local_dir, f"{stem}.{ext}")
-            with open(path, "w", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8-sig") as f:
                 f.write(content)
             out["files"].append(path)
         out["local_dir"] = local_dir
@@ -464,7 +488,8 @@ def _export_note(res):
 def is_dup_command(cmd_text):
     head = str(cmd_text or "").split()[0] if str(cmd_text or "").strip() else ""
     return head.lower() in ("/115dup", "/115dup_scan", "/115dup_list",
-                            "/115dup_show", "/115dup_del", "/115dup_report")
+                            "/115dup_show", "/115dup_del", "/115dup_report",
+                            "/115dup_apply")
 
 
 def parse_dup_command(cmd_text):
@@ -482,7 +507,7 @@ def parse_dup_command(cmd_text):
             return "list", {"page": 1}
         sub = parts[1].lower()
     elif head in ("/115dup_scan", "/115dup_list", "/115dup_show",
-                  "/115dup_del", "/115dup_report"):
+                  "/115dup_del", "/115dup_report", "/115dup_apply"):
         sub = head.rsplit("_", 1)[1]
         parts = ["", ""] + parts[1:]
     else:
@@ -498,8 +523,22 @@ def parse_dup_command(cmd_text):
                 root, path_seen = tok, True
         return "scan", {"root": root, "minutes": minutes}
     if sub == "report":
-        return "report", {"dir": (parts[2] if len(parts) > 2
-                                  else REPORT_DIR_DEFAULT)}
+        return "report", {"dir": (parts[2] if len(parts) > 2 else None)}
+    if sub == "apply":
+        # /115dup apply <csv路径> [确认] [全组]——路径可能含空格，按
+        # 「非标志 token 拼接」还原
+        confirmed = allow_full = False
+        path_toks = []
+        for t in parts[2:]:
+            tl = t.lower()
+            if tl in ("确认", "confirm", "yes"):
+                confirmed = True
+            elif tl in ("全组", "full", "all"):
+                allow_full = True
+            else:
+                path_toks.append(t)
+        return "apply", {"csv": " ".join(path_toks), "confirmed": confirmed,
+                         "allow_full_group": allow_full}
     if sub == "list":
         page = 1
         if len(parts) > 2:
@@ -536,7 +575,10 @@ USAGE = ("🧹 /115dup —— 115 查重（SHA1 判据，走 CD2 不读文件内
          "/115dup show <组号> —— 组内明细（文件名/目录/写入时间）\n"
          "/115dup del <组号> [keep=oldest|newest] [确认] —— 预览/删除\n"
          "/115dup report [115目录] —— 重出报告传 115"
-         "（默认 /115open/userBot报告）\n"
+         "（默认 /115open/userBot报告/日期/）\n"
+         "/115dup apply <csv> [确认] [全组] —— 执行人工审过的报告 CSV\n"
+         "　表格里：deleted=1 删该份（回收站）；新目录列=移动；"
+         "新文件名列=重命名\n"
          "　例：/115dup scan /115open/视频 20\n"
          "　保留策略默认 keep=oldest（留最早写入那份）；确认后进回收站")
 
@@ -631,6 +673,9 @@ async def command_reply(cmd_text):
                                        args["confirmed"])
     if action == "report":
         return await asyncio.to_thread(_report_text, args["dir"])
+    if action == "apply":
+        from . import ops_apply
+        return await ops_apply.command_reply(cmd_text)
     return USAGE
 
 

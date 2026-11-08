@@ -503,8 +503,10 @@ def format_retry_text(queue, page=1):
                             "（打开收藏夹按日期可找到）\n")
             except (TypeError, ValueError):
                 pass
-        base = (f"{i}. {_queue_record_display(r)}"
-                f"（已尝试 {r.get('attempts', 0)} 次）")
+        base = f"{i}. {_queue_record_display(r)}"
+        # 「已尝试 N 次」必须与 URL 分行：TG 会把「URL（已尝试…）」整行
+        # 自动链接化，点击落到错误目标（2026-10-29 用户实测）
+        base += f"\n   ↻ 已尝试 {r.get('attempts', 0)} 次"
         return f"{base}\n{link}" if link else base
 
     return _paged_lines(

@@ -117,6 +117,20 @@ class DbLifecycleTest(_DbCase):
         self.assertEqual(runtime_db.get_wnacg_task(300)["status"],
                          runtime_db.WNACG_PENDING)
 
+    def test_release_back_to_pending(self):
+        """优雅停机取消在途：立即放回 PENDING（不等 15 分钟租约）。"""
+        runtime_db.enqueue_wnacg_task(400)
+        runtime_db.claim_next_wnacg_task()
+        self.assertTrue(runtime_db.release_wnacg_task(400))
+        after = runtime_db.get_wnacg_task(400)
+        self.assertEqual(after["status"], runtime_db.WNACG_PENDING)
+        self.assertIsNone(after["lease_until"])
+        # 释放后立即可重新领取
+        again = runtime_db.claim_next_wnacg_task()
+        self.assertEqual(again["aid"], 400)
+        # 重复释放/释放非在途 → False（幂等不误伤）
+        self.assertFalse(runtime_db.release_wnacg_task(999))
+
 
 class CommandTest(_DbCase):
     def test_enqueue_by_url(self):
@@ -282,3 +296,48 @@ class WorkerFlowTest(_DbCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkerFrameworkTest(_DbCase):
+    """wnacg → SerialTaskWorker 迁移回归：取消在途 → 框架放回 PENDING。"""
+
+    def test_cancel_via_framework_releases_task(self):
+        import asyncio
+        from tg_userbot import wnacg
+        runtime_db.enqueue_wnacg_task(500, "标题")
+
+        async def drive():
+            # Event 必须在 run 的同一个 loop 里建（跨 loop 会把 wait 变
+            # RuntimeError，被框架当业务异常吞掉——首版测试就踩的这坑）
+            gate = asyncio.Event()
+
+            async def slow(task):
+                await gate.wait()
+
+            w = wnacg._WnacgWorker()
+            claimed = {"n": 0}
+
+            def real_claim():
+                claimed["n"] += 1
+                return (runtime_db.claim_next_wnacg_task()
+                        if claimed["n"] == 1 else None)
+
+            w.claim = real_claim
+            w.process = slow
+            with mock.patch.object(wnacg.logger, "info"):
+                runner = asyncio.ensure_future(w.run())
+                await asyncio.sleep(0.05)
+                self.assertIsNotNone(w._current, "应已在途")
+                runner.cancel()
+                try:
+                    await runner
+                except asyncio.CancelledError:
+                    pass
+        asyncio.run(drive())
+        after = runtime_db.get_wnacg_task(500)
+        self.assertEqual(after["status"], runtime_db.WNACG_PENDING,
+                         "框架取消路径必须把在途放回待处理")
+        self.assertIsNone(after["lease_until"])
+        # 立即可重领（不等租约）
+        again = runtime_db.claim_next_wnacg_task()
+        self.assertEqual(again["aid"], 500)

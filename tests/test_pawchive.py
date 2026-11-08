@@ -943,3 +943,37 @@ class BackfillScheduleTest(unittest.TestCase):
                          ("schedule", None))
         self.assertEqual(paw.parse_paw_command("/paw schedule"),
                          ("schedule", None))
+
+
+class PlanPendingTest(unittest.TestCase):
+    """撞锁自动排队：入位/取走。"""
+
+    def setUp(self):
+        self._saved = pawchive.state.PAW_PLAN_PENDING
+        pawchive.state.PAW_PLAN_PENDING = ""
+
+    def tearDown(self):
+        pawchive.state.PAW_PLAN_PENDING = self._saved
+
+    def test_backfill_collision_enqueues(self):
+        from tg_userbot import state
+        with mock.patch.object(state, "PAW_SCAN_RUNNING", "回填 别人"), \
+             mock.patch.object(pawchive.runtime_db, "posts_for_backfill",
+                               return_value=[{"id": 1, "post_id": 9,
+                                              "creator_id": 7,
+                                              "service": "fanbox",
+                                              "status": "COMPLETED",
+                                              "creator_name": "作者A"}]), \
+             mock.patch.object(pawchive, "parse_creator_ref",
+                               return_value=("作者A", 7)), \
+             mock.patch.object(pawchive.asyncio, "create_task") as ct:
+            import asyncio
+            out = asyncio.run(pawchive.backfill_author("作者A"))
+        self.assertIn("已排队", out)
+        self.assertIn("作者A", pawchive.state.PAW_PLAN_PENDING)
+        ct.assert_not_called()   # 撞锁时不该启动后台任务
+
+    def test_take_clears(self):
+        pawchive.enqueue_plan_pending("作者B")
+        self.assertEqual(pawchive.take_plan_pending(), "作者B")
+        self.assertEqual(pawchive.take_plan_pending(), "")

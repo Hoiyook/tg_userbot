@@ -492,7 +492,7 @@ class ParseReportTest(unittest.TestCase):
 
     def test_report_forms(self):
         self.assertEqual(dup_scan.parse_dup_command("/115dup report"),
-                         ("report", {"dir": dup_scan.REPORT_DIR_DEFAULT}))
+                         ("report", {"dir": None}))   # None=按日期子目录
         self.assertEqual(
             dup_scan.parse_dup_command("/115dup_report /115open/X"),
             ("report", {"dir": "/115open/X"}))
@@ -554,7 +554,8 @@ class ReportRenderTest(_ExportBase):
         table = list(csv.reader(io.StringIO(dup_scan._render_report_csv(rows))))
         self.assertEqual(table[0],
                          ["group_id", "sha1", "size_mb", "directory",
-                          "filename", "write_time", "deleted"])
+                          "filename", "write_time", "deleted", "新目录",
+                          "新文件名"])
         # 3（组1）+ 2（组2）+ 表头 = 6 行
         self.assertEqual(len(table), 6)
         # 目录与文件名分列；时间格式化；size 为 MB 数值
@@ -593,13 +594,16 @@ class ExportReportTest(_ExportBase):
         self.assertTrue(res["ok"], res["note"])
         names = sorted(os.path.basename(p) for p in res["files"])
         self.assertEqual([n.rsplit(".", 1)[1] for n in names], ["csv", "txt"])
-        mount_out = os.listdir(os.path.join(self.mount_base, "userBot报告"))
-        self.assertEqual(len(mount_out), 2)
+        mount_files = [f for _r, _d, fs in os.walk(
+            os.path.join(self.mount_base, "userBot报告")) for f in fs]
+        self.assertEqual(len(mount_files), 2)   # 日期子目录下
         for p in res["files"]:
+            import time as _tt
             self.assertEqual(
                 os.path.getsize(p),
                 os.path.getsize(os.path.join(
-                    self.mount_base, "userBot报告", os.path.basename(p))))
+                    self.mount_base, "userBot报告",
+                    _tt.strftime("%Y-%m-%d"), os.path.basename(p))))
 
     def test_verify_fail_keeps_local_and_reports_note(self):
         with mock.patch.object(cd2_api, "find_remote", return_value=None):
@@ -847,8 +851,9 @@ class BackgroundResilienceRegressionTest(_ExportBase):
         self.assertEqual(run["status"], "done")
         self.assertEqual(run["dup_groups"], 1)
         # 报告真落了双份（本地 + 挂载），gRPC 对账语义由 find 桩保证
-        mount_out = os.listdir(os.path.join(self.mount_base, "userBot报告"))
-        self.assertEqual(len(mount_out), 2)
+        mount_files = [f for _r, _d, fs in os.walk(
+            os.path.join(self.mount_base, "userBot报告")) for f in fs]
+        self.assertEqual(len(mount_files), 2)
         # 收尾清理：强引用集与防重入标志都归位
         self.assertEqual(dup_scan._SCAN_TASKS, set())
         self.assertEqual(dup_scan._SCAN_RUNNING, {})
@@ -856,3 +861,16 @@ class BackgroundResilienceRegressionTest(_ExportBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecoverStaleRunsTest(_DbTestCase):
+    """启动清理：重启遗留的 running run → failed（list 不再误导）。"""
+
+    def test_recover_marks_stale_running_failed(self):
+        runtime_db.dup_start_run("/115open")
+        self.assertEqual(dup_scan.recover_stale_runs(), 1)
+        run = runtime_db.dup_latest_run()
+        self.assertEqual(run["status"], "failed")
+        self.assertIn("重启中断", run["error"])
+        self.assertEqual(dup_scan.recover_stale_runs(), 0)   # 幂等
+        self.assertIsNotNone(run["finished_at"])

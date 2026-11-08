@@ -73,8 +73,7 @@ def _backoff_delay(attempts):
 
 def request_stop():
     """请求 worker 停止（/115x stop）；返回是否确有任务在跑。"""
-    _STOP["requested"] = True
-    return bool(_CURRENT.get("task_id"))
+    return _WORKER.request_stop()
 
 
 # 当前在途任务（/115x stop 回执与状态视图用）
@@ -185,44 +184,17 @@ async def _process_task(task):
                               os.path.splitext(name)[1].lower())
 
     async def _copy_with_watchdog(src_path, dst_path, expected):
-        """带无进度看门狗的拷贝：FUSE 挂载冻结时 read 会永久阻塞（无异常
-        不超时），实测两个 1GB 任务卡同一字节 12 小时。每 CHECK 周期查
-        一次目标增长，COPY_STALL 内无增长 → 抛错走重试（底层线程可能仍
-        阻塞在 read 上，但 worker 不再被拖死）。"""
-        check = float(getattr(
-            config, "EXTRACT_COPY_CHECK_SECONDS", 60))
-        copied = asyncio.ensure_future(asyncio.to_thread(
-            _copy_file, src_path, dst_path,
-            expected=expected))
-        stall = 0.0
-        last = -1
-        logged = 0
-        while True:
-            try:
-                return await asyncio.wait_for(
-                    asyncio.shield(copied), timeout=check)
-            except asyncio.TimeoutError:
-                cur = os.path.getsize(dst_path) \
-                    if os.path.exists(dst_path) else 0
-                if cur != last:
-                    # 对比「上次已记录」水位：60s 内增量常不足 256MB，
-                    # 对比上次轮询会永远够不到阈值（进度全程静默）
-                    if cur - logged >= 256 * 1024 * 1024:
-                        logger.info(
-                            f"🗜 [E{tid}] 拷贝进度：{cur} / {expected} 字节")
-                        logged = cur
-                    last = cur
-                    stall = 0.0
-                else:
-                    stall += check
-                if stall >= float(getattr(
-                        config, "EXTRACT_COPY_STALL_SECONDS", 900)):
-                    copied.cancel()
-                    raise TimeoutError(
-                        f"拷贝无进度超过 {int(stall)}s（挂载冻结），转重试")
-            except asyncio.CancelledError:
-                copied.cancel()
-                raise
+        """共享看门狗拷贝的薄包装（task_worker.copy_with_watchdog）：
+        FUSE 冻结时 read 永久阻塞线程（实测卡 12 小时），无进展超限
+        抛错转重试。原内联实现 2026-10-26 泛化进框架供 asmr 等复用。"""
+        from .task_worker import copy_with_watchdog
+        return await copy_with_watchdog(
+            src_path, dst_path, expected,
+            check=float(getattr(
+                config, "EXTRACT_COPY_CHECK_SECONDS", 60)),
+            stall=float(getattr(
+                config, "EXTRACT_COPY_STALL_SECONDS", 900)),
+            copy_fn=_copy_file, label=f"🗜 E{tid}")
 
     try:
         # ── ① COPY（幂等：副本已存在且尺寸一致 → 跳过） ──
@@ -247,21 +219,35 @@ async def _process_task(task):
         status, detail, files = await asyncio.to_thread(
             extract_archive, local_arch, content_dir, False)
         if status == "password":
-            # 目录名密码尝试（owner 指令 2026-10-09）：压缩包所在最后一层
-            # 目录名做密码，只试一次（如 /云下载/Telegram@XXX 下的包用
-            # Telegram@XXX 做密码）
-            dir_pwd = os.path.basename(mount_dir.rstrip("/"))
-            logger.info(f"🗜 [E{tid}] 需密码，尝试目录名密码（{dir_pwd}）")
-            status, detail, files = await asyncio.to_thread(
-                extract_archive, local_arch, content_dir, False, dir_pwd)
-            if status != "extracted":
+            # 密码候选链（2026-11-03 扩展）：目录名（既有规则，最先）→
+            # 压缩包文件名 # 段 → 密码提示文件（文件名 stem/内容）。
+            # 全部走 extract_archive 的 bsdtar 路（libarchive 支持
+            # ZipCrypto/AES）。逐个尝试，第一个解开的获胜。
+            from .extract_dir import password_candidates
+            candidates = password_candidates(local_arch, extra=os.path.basename(
+                mount_dir.rstrip("/")))
+            if not candidates:
+                candidates = [os.path.basename(mount_dir.rstrip("/"))]
+            logger.info(f"🗜 [E{tid}] 需密码，候选 {len(candidates)} 个："
+                        f"{[c[:12] for c in candidates]}")
+            tried = []
+            for cand in candidates:
+                logger.info(f"🗜 [E{tid}] 尝试密码「{cand[:16]}」")
+                status, detail, files = await asyncio.to_thread(
+                    extract_archive, local_arch, content_dir, False, cand)
+                if status == "extracted":
+                    break
+                tried.append(cand)
+            else:
                 runtime_db.mark_extract_password(
-                    tid, f"需密码（目录名 {dir_pwd} 尝试失败）：{detail}")
+                    tid, f"需密码（尝试 {len(tried)} 个候选均失败："
+                    f"{'、'.join(c[:16] for c in tried)}）")
                 shutil_rmtree(staging)
                 try:
                     await notify.notify_user(
                         f"🗜 115 解压跳过（需密码）\n\n{name}\n"
-                        f"已尝试目录名「{dir_pwd}」做密码仍失败。\n"
+                        f"已尝试 {len(tried)} 个密码候选"
+                        f"（目录名/文件名#段/密码提示文件）仍失败。\n"
                         "已跳过；下次扫描该目录时会自动再试。")
                 except Exception:
                     pass
@@ -325,6 +311,18 @@ async def _process_task(task):
     except Exception as e:
         logger.exception(f"🗜 [E{tid}] 处理异常：{e}")
         await _fail(tid, f"{type(e).__name__}: {e}")
+    except asyncio.CancelledError:
+        # 优雅停机被取消：立即放回 PENDING。app.py 的 release_inflight
+        # 兜底在本协程 finally 清空 _CURRENT 之后才跑，读不到 task_id，
+        # 任务只能等租约过期 + 恢复扫描（最长 15+10 分钟）——2026-10-25
+        # 实测 E43485 停机后白等 10 分钟才续跑。staging 保留，断点续用。
+        try:
+            runtime_db.release_extract_task(tid)
+            logger.info(f"🗜 [E{tid}] 停机取消：已放回 PENDING，"
+                        "续跑时跳过已完成阶段")
+        except Exception as e:
+            logger.warning(f"🗜 [E{tid}] 放回 PENDING 失败（转租约自愈）：{e}")
+        raise
     finally:
         _CURRENT.update({"task_id": None, "label": None, "stage": None})
 
@@ -482,42 +480,12 @@ async def _tick():
 
 
 async def extract_worker_loop():
-    """常驻循环：串行处理，任何一轮异常都吞掉记日志，永不退出。"""
-    logger.info(
-        "🗜 115 解压 worker 已启动（串行一次一包，退避重试上限 "
-        f"{config.EXTRACT_MAX_ATTEMPTS}，staging {config.EXTRACT_STAGING_ROOT}）")
-    load_watch_dirs()
-    if _WATCH_DIRS["dirs"]:
-        logger.info(f"🗜 watch 已登记 {len(_WATCH_DIRS['dirs'])} 个目录，"
-                    "每小时自动扫描")
-    watch_task = asyncio.ensure_future(_watch_loop())
-    _WATCH_TASKS.add(watch_task)
-    watch_task.add_done_callback(_WATCH_TASKS.discard)
-    recover_task = asyncio.ensure_future(_recover_loop())
-    _WATCH_TASKS.add(recover_task)
-    recover_task.add_done_callback(_WATCH_TASKS.discard)
-    # 崩溃自愈：上次进程遗留的过期 PROCESSING → PENDING
-    try:
-        runtime_db.recover_expired_extract_tasks()
-    except Exception as e:
-        logger.warning(f"🗜 115 解压任务租约恢复失败：{e}")
-    while not _STOP["requested"]:
-        try:
-            if _PAUSED["paused"]:
-                await asyncio.sleep(float(getattr(
-                    config, "EXTRACT_POLL_SECONDS", 2.0)))
-                continue
-            await _tick()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.exception(f"🗜 115 解压 worker 轮询异常：{e}")
-        await asyncio.sleep(float(getattr(config, "EXTRACT_POLL_SECONDS",
-                                          2.0)))
+    """常驻循环（SerialTaskWorker 框架实例；保留函数名兼容 app.py）。"""
+    await _WORKER.run()
 
 
 def release_inflight():
-    """把在途任务放回 PENDING（优雅停机，不等租约到期）。staging 保留。"""
+    """把在途任务放回 PENDING（框架兜底；staging 保留）。"""
     tid = _CURRENT.get("task_id")
     if tid is None:
         return False
@@ -526,6 +494,75 @@ def release_inflight():
     except runtime_db.DbUnavailable as e:
         logger.warning(f"🗜 在途解压任务释放失败（租约到期后自愈）：{e}")
         return False
+
+
+# ── SerialTaskWorker 框架接线（2026-10-26 缺陷一迁移）──
+from .task_worker import SerialTaskWorker   # noqa: E402
+
+
+class _ExtractWorker(SerialTaskWorker):
+    """115 解压 worker：claim 前 Environment 检查 + 处理期租约续期。
+
+    取消放回由框架统一接管；_process_task 内 2026-10-25 加的取消分支
+    保留（幂等，双保险——直接调 _process_task 的路径仍受保护）。
+    """
+    name = "🗜 115 解压"
+
+    def __init__(self):
+        super().__init__()
+        # config 现读（import 期零副作用；测试 patch 可生效）
+        self.poll_seconds = float(getattr(config, "EXTRACT_POLL_SECONDS",
+                                          2.0))
+
+    def request_stop(self):
+        # 同时置旧 _STOP：_watch_loop 仍读它（每小时扫描循环的停止位）
+        _STOP["requested"] = True
+        return super().request_stop()
+
+    def claim(self):
+        if not state.RUNTIME_DB_READY or not _preconditions_ok():
+            return None
+        return runtime_db.claim_next_extract_task()
+
+    async def process(self, task):
+        renamer = asyncio.ensure_future(_renew_loop(task["id"]))
+        try:
+            await _process_task(task)
+        finally:
+            renamer.cancel()
+            try:
+                await renamer
+            except asyncio.CancelledError:
+                pass
+
+    def release(self, task):
+        return runtime_db.release_extract_task(task["id"])
+
+    def recover_startup(self):
+        runtime_db.recover_expired_extract_tasks()
+
+    def extras_start(self):
+        load_watch_dirs()
+        if _WATCH_DIRS["dirs"]:
+            logger.info(f"🗜 watch 已登记 {len(_WATCH_DIRS['dirs'])} 个目录，"
+                        "每小时自动扫描")
+        watch_task = asyncio.ensure_future(_watch_loop())
+        _WATCH_TASKS.add(watch_task)
+        watch_task.add_done_callback(_WATCH_TASKS.discard)
+        recover_task = asyncio.ensure_future(_recover_loop())
+        _WATCH_TASKS.add(recover_task)
+        recover_task.add_done_callback(_WATCH_TASKS.discard)
+
+    def paused(self):
+        return _PAUSED["paused"]
+
+    def startup_banner(self):
+        return (f"🗜 115 解压 worker 已启动（串行一次一包，退避重试上限 "
+                f"{config.EXTRACT_MAX_ATTEMPTS}，"
+                f"staging {config.EXTRACT_STAGING_ROOT}）")
+
+
+_WORKER = _ExtractWorker()
 
 
 # ============================================================

@@ -222,7 +222,8 @@ async def process_gallery(gid, token, author=None):
             cd2_api.add_offline_download, magnet, where)
         if not ok and "10008" not in (err or "") and "已存在" not in (err or ""):
             return f"{TEXT_PREFIX} ❌ 离线提交被拒：{err}"
-        torrent_offline.spawn_watch(where, label=name or f"ehentai_{gid}")
+        torrent_offline.spawn_watch(where, label=name or f"ehentai_{gid}",
+                                    info_hash=ih)
         return (f"{TEXT_PREFIX} 🧲 已走种子（最优 {seeds} seeds）\n"
                 f"名称：{(name or f'ehentai_{gid}')[:60]}\n"
                 f"→ 115 离线拉取到 {where}（完成后会通知你）")

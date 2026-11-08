@@ -110,3 +110,52 @@ async def resolve_best_download_url(cdp, video_id, target_id, timeout=40):
         raise RuntimeError(f"iwara UI 复刻失败：{info['error']}")
     return (info["url"], info.get("title") or "", info.get("quality") or "",
             info.get("author") or "", info.get("date") or "")
+
+
+# ============================================================
+# URL 判重（2026-10-26 用户定档：只有成功过的才拦截，失败重发不拦）
+# ============================================================
+def find_previous_success(video_id, requests_path=None, tasks_path=None):
+    """该 iwara 视频是否**成功**下载过。命中返回请求记录 dict，否则 None。
+
+    数据源两层：① 请求台账的 outcome=SUCCESS（上线后的持久记录，台账
+    只进不出永不过期）；② 任务窗口内 status=SUCCESS 的兜底（上线前的
+    历史成功，窗口 200 条内仍可命中）。FAILED/CANCELLED 一律不拦——
+    失败重发正是期望行为。"""
+    from . import chrome_agent, chrome_client
+    from . import config as _cfg
+    requests_path = requests_path or chrome_client.CHROME_REQUESTS_FILE
+    tasks_path = tasks_path or chrome_client.CHROME_TASKS_FILE
+    success_ids = set()
+    try:
+        for t in chrome_agent.load_tasks(tasks_path):
+            if t.get("status") == "SUCCESS":
+                success_ids.add(t.get("task_id"))
+    except Exception:
+        pass
+    try:
+        reqs = chrome_client.load_requests(requests_path)
+    except Exception:
+        return None
+    for rec in reqs:
+        if extract_iwara_video_id(rec.get("url") or "") != video_id:
+            continue
+        if rec.get("outcome") == "SUCCESS":
+            return rec
+        if rec.get("outcome"):          # FAILED/CANCELLED 明确不拦
+            continue
+        if rec.get("task_id") in success_ids:
+            return rec                  # 上线前的老成功（窗口内兜底）
+    return None
+
+
+def duplicate_text(rec):
+    """判重命中回执。"""
+    when = rec.get("notified_at") or rec.get("created_at") or ""
+    fname = rec.get("filename") or ""
+    lines = ["⏭️ 该 iwara 视频已成功下载过，已拦截重复下载",
+             f"首次成功：{when}"]
+    if fname:
+        lines.append(f"当时文件：{fname}")
+    lines.append("确要重新下载可显式发：/chrome <视频链接>")
+    return "\n".join(lines)

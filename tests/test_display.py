@@ -42,7 +42,7 @@ class ComputeFinalFilenameTest(unittest.TestCase):
     def test_caption_prepended_to_name(self):
         message = fake_message("a.mp4", caption="标题")
         self.assertEqual(
-            naming.compute_final_filename(message), "标题 - a.mp4"
+            naming.compute_final_filename(message), "1 标题 - a.mp4"
         )
 
     def test_meaningless_uuid_name_with_caption(self):
@@ -50,7 +50,7 @@ class ComputeFinalFilenameTest(unittest.TestCase):
             "c80d0ff8-4fdb-4762-8b97-800612217e4c.mp4", caption="标题"
         )
         self.assertEqual(
-            naming.compute_final_filename(message), "标题.mp4"
+            naming.compute_final_filename(message), "1 标题.mp4"
         )
 
     def test_meaningless_name_without_caption_falls_back(self):
@@ -62,7 +62,7 @@ class ComputeFinalFilenameTest(unittest.TestCase):
         message = fake_message("葉瞬光_Handjob_Uncensored_CC.mp4")
         self.assertEqual(
             naming.compute_final_filename(message),
-            "葉瞬光_Handjob_Uncensored_CC.mp4",
+            "1 葉瞬光_Handjob_Uncensored_CC.mp4",
         )
 
     def test_missing_extension_inferred_from_video(self):
@@ -70,7 +70,7 @@ class ComputeFinalFilenameTest(unittest.TestCase):
         message.video = True
         message.file.mime_type = "video/mp4"
         result = naming.compute_final_filename(message)
-        self.assertEqual(result, "video_no_ext.mp4")
+        self.assertEqual(result, "1 video_no_ext.mp4")
 
 
 class DatePrefixNamingTest(unittest.TestCase):
@@ -86,20 +86,20 @@ class DatePrefixNamingTest(unittest.TestCase):
     def test_date_prefix_on_caption_name(self):
         message = self._msg("a.mp4", caption="标题")
         self.assertEqual(
-            naming.compute_final_filename(message), "26-09-05 标题 - a.mp4"
+            naming.compute_final_filename(message), "26-09-05 1 标题 - a.mp4"
         )
 
     def test_date_prefix_on_plain_name(self):
         message = self._msg("葉瞬光_Handjob_Uncensored_CC.mp4")
         self.assertEqual(
             naming.compute_final_filename(message),
-            "26-09-05 葉瞬光_Handjob_Uncensored_CC.mp4",
+            "26-09-05 1 葉瞬光_Handjob_Uncensored_CC.mp4",
         )
 
     def test_date_prefix_on_uuid_with_caption(self):
         message = self._msg("c80d0ff8-4fdb-4762-8b97-800612217e4c.mp4", caption="标题")
         self.assertEqual(
-            naming.compute_final_filename(message), "26-09-05 标题.mp4"
+            naming.compute_final_filename(message), "26-09-05 1 标题.mp4"
         )
 
     def test_fallback_timestamp_not_prefixed(self):
@@ -111,7 +111,42 @@ class DatePrefixNamingTest(unittest.TestCase):
 
     def test_no_date_means_no_prefix(self):
         message = fake_message("a.mp4", caption="标题")  # date=None
-        self.assertEqual(naming.compute_final_filename(message), "标题 - a.mp4")
+        self.assertEqual(naming.compute_final_filename(message), "1 标题 - a.mp4")
+
+
+class MsgIdNamingTest(unittest.TestCase):
+    """文件名消息 ID 段（2026-10-30）：日期前缀后插 '<id> '。
+
+    同 caption 多帖（如「原图在评论区」类帖子的评论区多图同名）曾靠同名
+    互覆存活——被覆盖的旧版进 115 回收站，看似"文件被删"。消息 ID 全局
+    唯一 → 不同帖必不同名；无合法 id（如旧测试的 Mock）自动省略退旧格式。
+    """
+
+    D = datetime(2026, 9, 5, 14, 30, 25)
+
+    def _msg(self, msg_id):
+        m = fake_message("3.png", caption="原图在评论区 #壁纸 #美图")
+        m.id = msg_id
+        m.date = self.D
+        return m
+
+    def test_id_inserted_after_date_prefix(self):
+        self.assertEqual(
+            naming.compute_final_filename(self._msg(59231)),
+            "26-09-05 59231 原图在评论区 #壁纸 #美图 - 3.png",
+        )
+
+    def test_different_ids_same_caption_dont_collide(self):
+        a = naming.compute_final_filename(self._msg(59231))
+        b = naming.compute_final_filename(self._msg(60001))
+        self.assertNotEqual(a, b)
+        self.assertIn("60001", b)
+
+    def test_invalid_id_omitted(self):
+        self.assertEqual(
+            naming.compute_final_filename(self._msg(0)),
+            "26-09-05 原图在评论区 #壁纸 #美图 - 3.png",
+        )
 
 
 class ForwardedOriginalDateTest(unittest.TestCase):
@@ -143,7 +178,7 @@ class ForwardedOriginalDateTest(unittest.TestCase):
         expected_prefix = fwd_date.astimezone().strftime("%y-%m-%d ")
         self.assertEqual(
             naming.compute_final_filename(message),
-            f"{expected_prefix}标题 - a.mp4",
+            f"{expected_prefix}1 标题 - a.mp4",
         )
 
     def test_forward_without_fwd_from_keeps_message_date(self):
@@ -153,7 +188,7 @@ class ForwardedOriginalDateTest(unittest.TestCase):
             msg_date=datetime(2026, 9, 6, 12, 0, 0),
         )
         self.assertEqual(
-            naming.compute_final_filename(message), "26-09-06 标题 - a.mp4"
+            naming.compute_final_filename(message), "26-09-06 1 标题 - a.mp4"
         )
 
     def test_aware_message_date_rendered_in_local_tz(self):
@@ -167,7 +202,7 @@ class ForwardedOriginalDateTest(unittest.TestCase):
         ).astimezone().strftime("%y-%m-%d ")
         self.assertEqual(
             naming.compute_final_filename(message),
-            f"{expected}标题 - a.mp4",
+            f"{expected}1 标题 - a.mp4",
         )
 
 
@@ -188,7 +223,7 @@ class CaptionOverrideNamingTest(unittest.TestCase):
         m.photo = True
         m.date = self.D
         result = naming.compute_final_filename(m, caption="作者：#Furatto 绝区零")
-        self.assertEqual(result, "26-09-05 #Furatto 绝区零.jpg")
+        self.assertEqual(result, "26-09-05 1 #Furatto 绝区零.jpg")
 
     def test_captionless_photo_with_real_name_keeps_name(self):
         # 无文字但原名有意义（如 IMG_1234.jpg）→ 说明拼在原名前
@@ -196,7 +231,7 @@ class CaptionOverrideNamingTest(unittest.TestCase):
         m.photo = True
         m.date = self.D
         result = naming.compute_final_filename(m, caption="作者：#Furatto")
-        self.assertEqual(result, "26-09-05 #Furatto - IMG_1234.jpg")
+        self.assertEqual(result, "26-09-05 1 #Furatto - IMG_1234.jpg")
 
     def test_no_caption_no_override_falls_back_to_timestamp(self):
         # 继承说明读不到、消息也无文字 → 仍回 媒体类型_时间戳 兜底
@@ -212,7 +247,7 @@ class CaptionOverrideNamingTest(unittest.TestCase):
         m.date = self.D
         self.assertEqual(
             naming.compute_final_filename(m, caption=None),
-            "26-09-05 标题 - a.mp4",
+            "26-09-05 1 标题 - a.mp4",
         )
 
 
@@ -231,14 +266,14 @@ class LabelNamingTest(unittest.TestCase):
         m = self._msg("a.mp4", caption="标题")
         self.assertEqual(
             naming.compute_final_filename(m, label="自存"),
-            "26-09-06 #自存 标题 - a.mp4",
+            "26-09-06 1 #自存 标题 - a.mp4",
         )
 
     def test_label_alone_with_no_caption(self):
         m = self._msg("a.mp4")
         self.assertEqual(
             naming.compute_final_filename(m, label="自存"),
-            "26-09-06 #自存 - a.mp4",
+            "26-09-06 1 #自存 - a.mp4",
         )
 
     def test_label_on_meaningless_uuid_caption(self):
@@ -246,7 +281,7 @@ class LabelNamingTest(unittest.TestCase):
         m = self._msg("c80d0ff8-4fdb-4762-8b97-800612217e4c.mp4", caption="标题")
         self.assertEqual(
             naming.compute_final_filename(m, label="自存"),
-            "26-09-06 #自存 标题.mp4",
+            "26-09-06 1 #自存 标题.mp4",
         )
 
     def test_label_rescues_meaningless_name_from_fallback(self):
@@ -254,7 +289,7 @@ class LabelNamingTest(unittest.TestCase):
         m = self._msg("c80d0ff8-4fdb-4762-8b97-800612217e4c.mp4")
         self.assertEqual(
             naming.compute_final_filename(m, label="自存"),
-            "26-09-06 #自存.mp4",
+            "26-09-06 1 #自存.mp4",
         )
 
     def test_label_user_pretyped_hash_not_doubled(self):
@@ -262,14 +297,14 @@ class LabelNamingTest(unittest.TestCase):
         m = self._msg("a.mp4", caption="标题")
         self.assertEqual(
             naming.compute_final_filename(m, label="#自存"),
-            "26-09-06 #自存 标题 - a.mp4",
+            "26-09-06 1 #自存 标题 - a.mp4",
         )
 
     def test_label_only_hash_is_ignored(self):
         m = self._msg("a.mp4", caption="标题")
         self.assertEqual(
             naming.compute_final_filename(m, label="#"),
-            "26-09-06 标题 - a.mp4",
+            "26-09-06 1 标题 - a.mp4",
         )
 
     def test_label_none_unchanged(self):
@@ -277,7 +312,7 @@ class LabelNamingTest(unittest.TestCase):
         m = self._msg("a.mp4", caption="标题")
         self.assertEqual(
             naming.compute_final_filename(m, caption=None),
-            "26-09-06 标题 - a.mp4",
+            "26-09-06 1 标题 - a.mp4",
         )
 
 
@@ -305,7 +340,7 @@ class LabelBudgetTrimTest(unittest.TestCase):
         result = naming.compute_final_filename(
             m, label="自存", max_bytes=config.MAX_FILENAME_BYTES
         )
-        self.assertEqual(result, "26-09-06 #自存 标题 - a.mp4")
+        self.assertEqual(result, "26-09-06 1 #自存 标题 - a.mp4")
 
     def test_trims_caption_even_before_truncating_label_only_when_forced(self):
         # 标注 + 极长 caption：标注整条保留，caption 被裁到放不下为止
@@ -316,7 +351,7 @@ class LabelBudgetTrimTest(unittest.TestCase):
         )
         self.assertLessEqual(len(result.encode("utf-8")), config.MAX_FILENAME_BYTES)
         self.assertTrue(result.endswith("- a.mp4"))
-        self.assertTrue(result.startswith("26-09-06 #自存 "))
+        self.assertTrue(result.startswith("26-09-06 1 #自存 "))
         self.assertNotEqual(result, "26-09-06 #自存 " + "汉" * 80 + " - a.mp4")
 
     def test_filename_truncated_only_as_last_resort(self):
@@ -338,7 +373,7 @@ class LabelBudgetTrimTest(unittest.TestCase):
         m.date = self.D
         result = naming.compute_final_filename(m, label="自存", max_bytes=None)
         self.assertIn("汉" * 80, result)
-        self.assertTrue(result.startswith("26-09-06 #自存 "))
+        self.assertTrue(result.startswith("26-09-06 1 #自存 "))
 
     def test_label_piece_helper(self):
         self.assertEqual(naming._label_piece(None), "")

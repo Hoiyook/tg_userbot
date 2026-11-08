@@ -66,9 +66,11 @@ def _channel_title(msg):
     return getattr(chat, "title", None) or None
 
 
-async def handle_tme_url(url, fetcher=None, enqueue=None):
+async def handle_tme_url(url, fetcher=None, enqueue=None, on_enqueued=None):
     """处理一条 t.me 帖子链接：拉原帖 → 相册展开 → 逐条入队。
 
+    on_enqueued(msg)：每条成功入队后回调（App 粘贴历史用它收集
+    (chat_id, msg_id) 做状态回查）。
     返回回执文本（给收藏夹回复 / App 粘贴回执共用）。绝不抛异常——
     任何失败都收口成 ❌ 文案。
     """
@@ -125,6 +127,11 @@ async def handle_tme_url(url, fetcher=None, enqueue=None):
     for m in group:
         try:
             await enqueue(m)
+            if on_enqueued is not None:
+                try:
+                    on_enqueued(m)
+                except Exception as e:
+                    logger.debug(f"on_enqueued 回调失败：{e}")
             done += 1
         except Exception as e:
             logger.exception(f"t.me 入队失败 msg={getattr(m, 'id', '?')}：{e}")

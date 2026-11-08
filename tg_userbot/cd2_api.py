@@ -25,6 +25,13 @@ import os
 # 并需要显式开启 fork 支持——必须在 import grpc 之前设置这两个环境变量
 os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+# macOS 15.4+ 已知崩溃（2026-11-04 定位）：gRPC 默认的 c-ares 解析器在后台线程
+# 初始化时调 dns_configuration_copy()，其内部 os_log 懒加载撞上 libxpc 的
+# strict-close 断言 → EXC_BREAKPOINT(SIGTRAP)，进程秒死（48 份崩溃报告同一签名，
+# 见 crash 报告 Python-*.ips）。目标固定是 127.0.0.1:19798（IP 直连，无需 DNS），
+# 切 native 解析器（getaddrinfo 路径）完全绕开 c-ares，功能无损。
+# 顺带被所有子进程继承——uv 里由 python 父进程拉起的 python 子进程同样受益。
+os.environ.setdefault("GRPC_DNS_RESOLVER", "native")
 
 from . import config
 from .log import logger
@@ -588,20 +595,69 @@ def rename_remote(path, new_name, expected_size=None):
     return True, ""
 
 
-def read_remote_text(path):
+def read_remote_text(path, timeout=5.0):
     """读远端文本文件（经挂载；utf-8-sig → utf-8 → gbk 三路兜底——
-    Excel 存 CSV 的编码坑）。返回文本或 None。"""
+    Excel 存 CSV 的编码坑）。返回文本或 None。
+
+    FUSE 冻结时 open/read 都会无限卡死线程（v13 实测），to_thread 又
+    不可取消——open+read **整体**放进 future 限时执行；超时后
+    shutdown(wait=False) 弃线程返回 None。绝不能用 with 块：
+    Executor.__exit__ 是 shutdown(wait=True)，会等卡死线程结束，
+    等于没有超时（2026-10-25 评审实测抓出）。被弃线程在挂载恢复后
+    自行退出；若一直冻着，进程退出由 run.sh 的 30s 强杀兜底。"""
     from .extract_worker import mount_of
     mp = mount_of(str(path))
     if mp is None or not os.path.exists(mp):
         return None
-    raw = open(mp, "rb").read()
+    import concurrent.futures
+
+    def _read_all():
+        with open(mp, "rb") as f:
+            return f.read()
+
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        raw = ex.submit(_read_all).result(float(timeout))
+    except concurrent.futures.TimeoutError:
+        logger.warning(f"_cd2 挂载读取超时（可能冻结）：{path}")
+        return None
+    finally:
+        ex.shutdown(wait=False)
     for enc in ("utf-8-sig", "utf-8", "gbk"):
         try:
             return raw.decode(enc)
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", errors="replace")
+
+
+def list_dir_index(remote_dir):
+    """列一个远端目录 → {文件名: (size, sha1大写)}；失败返回 None。
+
+    ops_apply 批量执行用：一次目录列表替代 N 次逐文件 find_remote
+    （后者每次都可能触发 CD2 的父目录回源刷新——实测单行分钟级）。
+    """
+    from .cd2_proto import clouddrive_pb2 as pb
+    stub, md = _md()
+    try:
+        entries = []
+        for reply in stub.GetSubFiles(
+                pb.ListSubFileRequest(path=str(remote_dir)),
+                metadata=md, timeout=120):
+            entries.extend(reply.subFiles)
+    except Exception as e:
+        logger.warning(f"_cd2 目录索引失败 {remote_dir}：{type(e).__name__}: {e}")
+        return None
+    out = {}
+    for f in entries:
+        if f.isDirectory:
+            continue
+        hashes = getattr(f, "fileHashes", None)
+        sha1 = ""
+        if hashes is not None:
+            sha1 = str(hashes.get(HASH_KEY_SHA1) or "").upper()
+        out[f.name] = (int(f.size), sha1)
+    return out
 
 
 def space_text():

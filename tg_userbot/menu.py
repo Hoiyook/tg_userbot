@@ -205,6 +205,7 @@ def settings_menu_buttons():
         [Button.inline("🧵 并发", encode_menu_data("thread")),
          Button.inline("🛡 去重", encode_menu_data("dedup"))],
         [Button.inline("🍪 Cookie", encode_menu_data("cookie")),
+         Button.inline("🌐 B站Cookie", encode_menu_data("bili_cookie")),
          Button.inline("🧹 Caption", encode_menu_data("capf"))],
         [Button.inline("☁️ CD2", encode_menu_data("cd2_menu")),
          Button.inline("📐 SQL模板", encode_menu_data("sqlt"))],
@@ -475,6 +476,43 @@ def cookie_menu_buttons():
         [Button.inline("🌐 Chrome", encode_menu_data("cookie_imp", "chrome")),
          Button.inline("🌐 Edge", encode_menu_data("cookie_imp", "edge")),
          Button.inline("🌐 Firefox", encode_menu_data("cookie_imp", "firefox"))],
+        [Button.inline("⬅️ 设置", encode_menu_data("settings")),
+         Button.inline("🏠 首页", encode_menu_data("home"))],
+    ]
+
+
+def bili_cookie_status_text():
+    """【🌐 B站Cookie】按钮的状态视图（动态读内存值，实时）。"""
+    cookie = getattr(config, "BILIBILI_COOKIE", "") or ""
+    if not cookie:
+        return (
+            "🌐 B站 Cookie\n\n"
+            "状态：未配置\n"
+            "（/bili 仍可用，游客画质最高 480P；登录 1080P，"
+            "大会员解锁 1080P60/4K/HDR/杜比/8K）\n"
+            "配置：✏️ 粘贴整段 cookie，或点 🌐 浏览器按钮自动提取"
+            "（先在浏览器登录 bilibili.com）"
+        )
+    sess = ("含登录态 SESSDATA ✅" if "sessdata=" in cookie.lower()
+            else "⚠️ 未检测到 SESSDATA（可能非登录态）")
+    return (
+        "🌐 B站 Cookie\n\n"
+        f"状态：已配置（{len(cookie)} 字符，{sess}）\n"
+        f"片段：{config.mask_douyin_cookie(cookie)}\n"
+        "来源：tg_secrets.json（更新后实时生效）\n"
+        "用途：/bili 命令下载（画质档位由账号决定）"
+    )
+
+
+def bili_cookie_menu_buttons():
+    return [
+        [Button.inline("✏️ 更新", encode_menu_data("bili_cookie_set")),
+         Button.inline("🗑 清除", encode_menu_data("bili_cookie_clear"))],
+        [Button.inline("🌐 Chrome",
+                       encode_menu_data("bili_cookie_imp", "chrome")),
+         Button.inline("🌐 Edge", encode_menu_data("bili_cookie_imp", "edge")),
+         Button.inline("🌐 Firefox",
+                       encode_menu_data("bili_cookie_imp", "firefox"))],
         [Button.inline("⬅️ 设置", encode_menu_data("settings")),
          Button.inline("🏠 首页", encode_menu_data("home"))],
     ]

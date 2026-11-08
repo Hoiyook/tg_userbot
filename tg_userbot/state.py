@@ -41,6 +41,8 @@ PROCESSING_DOUYIN_IDS = set()
 
 # bot 菜单「🍪 抖音Cookie」的等待输入标记：monotonic 时间戳，超过即窗口关闭
 COOKIE_INPUT_UNTIL = 0.0
+# bot 菜单「🌐 B站Cookie」的等待输入标记（与抖音同款互斥机制，见 open_input_window）
+BILI_COOKIE_INPUT_UNTIL = 0.0
 FIND_INPUT_UNTIL = 0.0
 # bot 菜单「🧹 Caption 清洗」的等待输入标记 + 这次输入当什么用：
 # "add" = 下一条文本是一条规则，"del" = 规则编号，"test" = 要试清洗的原文。
@@ -162,6 +164,7 @@ PAW_INPUT_STEP = ""            # search | cookie
 PAW_SEARCH_CANDIDATES = {}
 # 正在进行的 /paw plan 扫描的创作者摘要（None = 空闲）；/paw status 只读展示。
 PAW_SCAN_RUNNING = None
+PAW_PLAN_PENDING = ""   # /paw_plan 撞锁待办（单待办位，后写覆盖先写）
 # 扫描实时进度 {"started": monotonic, "stage": str, "detail": str}：
 # 分页拉取/收藏对比/入库各阶段更新（进度回调跑在线程池，只做字典赋值）；
 # /paw status 与 🐾 进度面板只读展示，扫描结束整字典清空。

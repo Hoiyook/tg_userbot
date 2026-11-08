@@ -195,3 +195,71 @@ class TasksAndOfflineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadRemoteTextTest(unittest.TestCase):
+    """read_remote_text：三编码兜底 + 挂载冻结限时返回（P1 修复回归——
+    旧实现 with 块退出会等卡死线程，超时形同虚设）。"""
+
+    def _read_via_mount(self, data, filename="a.csv", timeout=5.0):
+        import tempfile
+        d = tempfile.mkdtemp(dir=_TMP)
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        p = os.path.join(d, filename)
+        mode = "wb" if isinstance(data, bytes) else "w"
+        with open(p, mode, encoding=None if mode == "wb" else "utf-8") as f:
+            f.write(data)
+        with mock.patch("tg_userbot.extract_worker.mount_of",
+                        return_value=p):
+            return cd2_api.read_remote_text(f"/115open/x/{filename}",
+                                            timeout=timeout)
+
+    def test_success_decodes_bom_and_gbk(self):
+        self.assertEqual(
+            self._read_via_mount(b"\xef\xbb\xbfcol1,col2"), "col1,col2")
+        self.assertEqual(
+            self._read_via_mount("中文测试".encode("gbk"), "b.csv"),
+            "中文测试")
+
+    def test_frozen_mount_times_out_without_blocking_caller(self):
+        """挂载冻结（读永久阻塞）——限时必须快速返回 None，调用方不被
+        拖死。写端线程先 open 持有（与 open(rb) 配对但永不写 → read 挂起
+        模拟冻结），清理时写一字节放行，让非 daemon 的池线程能在解释器
+        退出前结束——否则 threading._shutdown 会把整个测试进程挂死。"""
+        import tempfile
+        import threading
+        import time as _time
+        d = tempfile.mkdtemp(dir=_TMP)
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        fifo = os.path.join(d, "frozen.csv")
+        os.mkfifo(fifo)
+
+        opened = threading.Event()
+        release = threading.Event()
+
+        def _holder():
+            fh = open(fifo, "wb")     # 与 worker 的 open(rb) 配对
+            opened.set()
+            release.wait(5)           # 持有写端不写 → read() 冻结
+            try:
+                fh.write(b"\x01")
+                fh.close()            # 放行：worker 的 read 返回
+            except OSError:
+                pass
+
+        # 写端 open(wb) 会阻塞等读端——配对发生在 read_remote_text 的
+        # worker open(rb) 时，无需（也不能）在此等待
+        threading.Thread(target=_holder, daemon=True).start()
+
+        with mock.patch("tg_userbot.extract_worker.mount_of",
+                        return_value=fifo):
+            t0 = _time.monotonic()
+            out = cd2_api.read_remote_text("/115open/x/frozen.csv",
+                                           timeout=0.3)
+        elapsed = _time.monotonic() - t0
+        self.assertIsNone(out)
+        self.assertTrue(opened.wait(2), "fifo 配对没发生（读写端没碰上）")
+        self.assertLess(elapsed, 0.9,
+                        f"超时后调用方又被拖了 {elapsed:.1f}s——"
+                        "shutdown(wait=False) 没生效")
+        release.set()

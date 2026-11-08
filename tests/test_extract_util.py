@@ -352,3 +352,34 @@ class CorruptZipTest(unittest.TestCase):
         self.assertEqual(status, "failed", detail)
         self.assertIn("疑损坏", detail)
         self.assertEqual(files, [])
+
+    def test_no_bsdtar_degrades_gracefully_not_crash(self):
+        """环境无 bsdtar（2026-11-07 Termux ScriptRunner 实测）：
+        stdlib 拒解析的 zip 探测回落时 FileNotFoundError 未被捕，
+        一路穿透成「未预期异常」。应与主 bsdtar 路（:172）同语义——
+        诚实 failed + 指引安装，原包保留，单包失败不中断整轮。"""
+        arch = os.path.join(self.dir, "坏无工具.zip")
+        _make_zip(arch, {"a.txt": b"hello"})
+        with open(arch, "rb") as f:
+            raw = bytearray(f.read())
+        cd = raw.find(self.CD_SIG)
+        eocd = raw.rfind(self.EOCD_SIG)
+        for i in range(cd, eocd):
+            raw[i] = (raw[i] * 7 + 13) & 0xFF
+        with open(arch, "wb") as f:
+            f.write(bytes(raw))
+
+        real_run = subprocess.run
+
+        def no_bsdtar_run(cmd, *a, **kw):
+            if cmd and cmd[0] == "bsdtar":
+                raise FileNotFoundError(
+                    "[Errno 2] No such file or directory: 'bsdtar'")
+            return real_run(cmd, *a, **kw)
+
+        import unittest.mock as mock
+        with mock.patch("subprocess.run", side_effect=no_bsdtar_run):
+            status, detail, files = extract_util.extract_archive(arch)
+        self.assertEqual(status, "failed", detail)
+        self.assertIn("bsdtar", detail)
+        self.assertEqual(files, [])

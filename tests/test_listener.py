@@ -1241,3 +1241,56 @@ class HistoryRecheckTest(unittest.TestCase):
         out = _a.run(run())
         self.assertEqual(out, [], "running 让位不重复 spawn")
         self.assertEqual(spawned, [])
+
+
+class FailedTaskDeleteTest(unittest.TestCase):
+    """失败任务删除（2026-10-27）：只许删 FAILED；顺带回归 parse 带
+    参（旧版把 /listen_retry 的 ID 丢了，带 ID 重试实际不可用）。"""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="listen_del_", dir="/tmp")
+        import tg_userbot.config as _cfg
+        self._p = mock.patch.object(
+            _cfg, "RUNTIME_DB_FILE", os.path.join(self.dir, "t.db"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        from tg_userbot import runtime_db
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        self.runtime_db = runtime_db
+        ins = runtime_db.enqueue_listener_tasks(
+            -100, [{"message_id": 1, "target_type": "saved_messages",
+                    "payload": {"member_ids": [1]}}])
+        self.tid = ins[0]
+        runtime_db.fail_listener_task(self.tid, "源消息不可读", now=0)
+
+    def test_parse_carries_args(self):
+        self.assertEqual(listener.parse_listen_command("/listen_retry 7"),
+                         ("retry", "7"))
+        self.assertEqual(listener.parse_listen_command("/listen_failed del 3"),
+                         ("failed", "del 3"))
+        self.assertEqual(listener.parse_listen_command("/listen_failed"),
+                         ("failed", ""))
+
+    def test_delete_failed_only(self):
+        msg = listener.delete_failed_task(f"del {self.tid}")
+        self.assertIn("已删除", msg)
+        after = self.runtime_db.get_listener_task(self.tid)
+        self.assertEqual(after["status"],
+                         self.runtime_db.STATUS_DISMISSED,
+                         "物理删除会断 task_events 外键——转忽略态")
+
+    def test_delete_refuses_pending(self):
+        # 造一条 PENDING：先 retry 回去再尝试删 → 拒绝
+        self.runtime_db.retry_listener_task(self.tid,
+                                            next_retry_at=0)
+        msg = listener.delete_failed_task(f"del {self.tid}")
+        self.assertIn("不是失败态", msg)
+
+    def test_usage_and_missing(self):
+        self.assertIn("用法", listener.delete_failed_task("del"))
+        self.assertIn("用法", listener.delete_failed_task("clear 1"))
+        self.assertIn("不存在或不是失败态",
+                      listener.delete_failed_task("del 99999"))

@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -1045,3 +1046,37 @@ class OpenVisibleTest(unittest.TestCase):
         self.assertEqual(args[0], "open")
         self.assertIn("Google Chrome", args)
         self.assertIn("https://mega.nz/file/a#K", args)
+
+
+class ReadProgressTest(unittest.TestCase):
+    """chrome_progress.json 读取：缺失/过期/新鲜 三态。"""
+
+    def setUp(self):
+        try:
+            os.remove(chrome_client.CHROME_PROGRESS_FILE)
+        except OSError:
+            pass
+
+    def tearDown(self):
+        try:
+            os.remove(chrome_client.CHROME_PROGRESS_FILE)
+        except OSError:
+            pass
+
+    def _write(self, updated_at):
+        with open(chrome_client.CHROME_PROGRESS_FILE, "w",
+                  encoding="utf-8") as f:
+            json.dump({"updated_at": updated_at,
+                       "items": [{"received": 100, "total": 400}]}, f)
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(chrome_client.read_progress())
+
+    def test_stale_returns_none(self):
+        self._write(time.time() - 300)
+        self.assertIsNone(chrome_client.read_progress())
+
+    def test_fresh_returns_items(self):
+        self._write(time.time() - 5)
+        d = chrome_client.read_progress()
+        self.assertEqual(d["items"][0]["received"], 100)

@@ -59,7 +59,7 @@ class TestSpawnWatch(unittest.IsolatedAsyncioTestCase):
     async def test_watch_scheduled_and_runs(self):
         calls = []
 
-        async def fake_watcher(to_folder, known, label=""):
+        async def fake_watcher(to_folder, known, label="", info_hash=None):
             calls.append((to_folder, set(known or []), label))
 
         def fake_dir_names(path):
@@ -81,7 +81,7 @@ class TestSpawnWatch(unittest.IsolatedAsyncioTestCase):
     async def test_known_names_bypasses_snapshot(self):
         calls = []
 
-        async def fake_watcher(to_folder, known, label=""):
+        async def fake_watcher(to_folder, known, label="", info_hash=None):
             calls.append(set(known or []))
 
         with mock.patch.object(torrent_offline, "_dir_names",
