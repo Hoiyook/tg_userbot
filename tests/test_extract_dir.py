@@ -374,6 +374,111 @@ class RarMultipartTest(unittest.TestCase):
         self.assertEqual(action, "done")
         ea.assert_called_once()   # 走了 extract_util 回落
 
+    def test_rar_unsupported_method_switches_to_unrar(self):
+        """7z 全候选报 Unsupported Method（WinRAR7 新格式）→ 自动转
+        unrar 同候选链（2026-11-09 Gilberta 实测场景）。"""
+        z = self.root / "新格式.rar"
+        z.write_bytes(b"rar5-bytes")
+        (self.root / "密码pw7.txt").write_text("pw7", encoding="utf-8")
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            if "7z" in cmd[0]:
+                class R7:
+                    returncode = 2
+                    stderr = b"ERROR: Unsupported Method : a.mkv"
+                    stdout = b""
+                return R7()
+            # unrar 路：无密码失败（Incorrect password）、带密码成功
+            if not any(str(a).startswith("-p") for a in cmd):
+                class RP:
+                    returncode = 3
+                    stderr = b"Incorrect password for a.mkv"
+                    stdout = b""
+                return RP()
+            # unrar 路：cmd[-1] 是 dest 目录
+            d = Path(cmd[-1])
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "a.mkv").write_bytes(b"x" * 10)
+            class RU:
+                returncode = 0
+                stderr = b""
+                stdout = b""
+            return RU()
+
+        with mock.patch.object(extract_dir, "find_7z_tool",
+                               return_value="/opt/homebrew/bin/7z"), \
+             mock.patch.object(extract_dir, "find_unrar_tool",
+                               return_value="/opt/homebrew/bin/unrar"), \
+             mock.patch.object(extract_dir.subprocess, "run", fake_run):
+            action, msg = extract_dir.process_archive(z)
+        self.assertEqual(action, "done")
+        engines = ["unrar" if "unrar" in c[0] else "7z" for c in calls]
+        self.assertIn("unrar", engines)
+        self.assertEqual(engines[-1], "unrar")
+        # unrar 用上了密码候选（pw7 出现在 -p 参数）
+        self.assertTrue(any(c.startswith("-p") and "pw7" in c
+                            for c in calls[-1]))
+
+    def test_rar_unsupported_method_no_unrar_cleans_and_guides(self):
+        """unrar 未装：失败并清理 0 字节残骸 + 文案指引安装（今日现场）。"""
+        z = self.root / "新格式2.rar"
+        z.write_bytes(b"rar5-bytes")
+        dest = self.root / "新格式2"
+
+        def fake_run(cmd, **kw):
+            # 模拟 7z 失败也留 0 字节条目框架
+            for a in cmd:
+                if str(a).startswith("-o"):
+                    d = Path(str(a)[2:])
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / "a.mkv").write_bytes(b"")
+            class R:
+                returncode = 2
+                stderr = b"ERROR: Unsupported Method : a.mkv"
+                stdout = b""
+            return R()
+
+        with mock.patch.object(extract_dir, "find_7z_tool",
+                               return_value="/opt/homebrew/bin/7z"), \
+             mock.patch.object(extract_dir, "find_unrar_tool",
+                               return_value=""), \
+             mock.patch.object(extract_dir.subprocess, "run", fake_run):
+            action, msg = extract_dir.process_archive(z)
+        self.assertEqual(action, "fail")
+        self.assertIn("WinRAR 7", msg)
+        self.assertIn("unrar", msg)
+        self.assertFalse(dest.exists())   # 残骸已清
+
+    def test_rar_zero_byte_success_guarded(self):
+        """引擎 exit 0 但产物全 0 字节（静默失败）→ fail + 残骸清理。"""
+        z = self.root / "全零.rar"
+        z.write_bytes(b"rar-bytes")
+        dest = self.root / "全零"
+
+        def fake_run(cmd, **kw):
+            for a in cmd:
+                if str(a).startswith("-o"):
+                    d = Path(str(a)[2:])
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / "a.mkv").write_bytes(b"")   # 全 0
+            class R:
+                returncode = 0
+                stderr = b""
+                stdout = b""
+            return R()
+
+        with mock.patch.object(extract_dir, "find_7z_tool",
+                               return_value="/opt/homebrew/bin/7z"), \
+             mock.patch.object(extract_dir, "find_unrar_tool",
+                               return_value=""), \
+             mock.patch.object(extract_dir.subprocess, "run", fake_run):
+            action, msg = extract_dir.process_archive(z)
+        self.assertEqual(action, "fail")
+        self.assertIn("0 字节", msg)
+        self.assertFalse(dest.exists())
+
     def test_rar_encrypted_no_7z_reports_tool_hint(self):
         z = make_encrypted_zip(self.root, "密.rar")   # 借加密 zip 夹具不行——
         # rar 加密探测在 7z 里，mock 7z 永远失败即可

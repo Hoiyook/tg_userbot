@@ -66,6 +66,36 @@ def find_7z_tool() -> str:
     return ""
 
 
+def find_unrar_tool() -> str:
+    """RarLab 官方 unrar 路径，无则返回空串。
+
+    2026-11-09 Gilberta 实测：WinRAR 7 打的新格式 rar（RAR5 签名 +
+    大字典/新压缩算法，如 m3:25）——p7zip 17.05 报 Unsupported Method
+    且**留下 0 字节条目框架**，macOS bsdtar 同样解不动；官方 unrar 7.x
+    全格式通吃。brew 的 rar cask 已被 Gatekeeper 禁用，装法：
+    rarlab.com/download.htm 下 rarmacos-arm64 包解出 unrar 放进 PATH。
+    """
+    for cand in ("/opt/homebrew/bin/unrar", "/usr/local/bin/unrar",
+                 "unrar"):
+        if shutil.which(cand):
+            return cand
+    return ""
+
+
+def _dir_files_bytes(d) -> tuple:
+    """目录内 (文件数, 字节总量)——解压产物「全 0 字节静默失败」守卫用。"""
+    n = 0
+    total = 0
+    for dp, _dn, fns in os.walk(d):
+        for fn in fns:
+            n += 1
+            try:
+                total += os.path.getsize(os.path.join(dp, fn))
+            except OSError:
+                pass
+    return n, total
+
+
 def archive_stem(name: str) -> str:
     """压缩包文件名 → 同名目录名（foo.tar.gz → foo，foo.zip → foo）。
 
@@ -215,7 +245,8 @@ def find_password(path) -> str:
 
 
 def process_archive(path, dry: bool = False,
-                    timeout: int = SUBPROCESS_TIMEOUT_DEFAULT) -> tuple:
+                    timeout: int = SUBPROCESS_TIMEOUT_DEFAULT,
+                    extra_pwd=None) -> tuple:
     """处理单个压缩包。返回 (动作, 说明)。
 
     动作: "done" 已解压并删除 / "skip" 跳过（已存在等） / "fail" 失败保留
@@ -274,7 +305,7 @@ def process_archive(path, dry: bool = False,
         dest_dir.mkdir(parents=True, exist_ok=True)
         # 密码候选循环（2026-11-06 MMD 实测：外层分卷也加密；目录名
         # c291dGhwbHVz 就是密码——候选链目录名源命中）
-        candidates = password_candidates(str(path))
+        candidates = password_candidates(str(path), extra=extra_pwd)
         tries = [None] + candidates
         last_err = ""
         pwd_used = False
@@ -296,15 +327,22 @@ def process_archive(path, dry: bool = False,
             last_err = (r.stderr or r.stdout or b"").decode(
                 "utf-8", "ignore").strip()
         if pwd_used is False:
-            if dest_dir.is_dir() and not any(os.scandir(dest_dir)):
-                dest_dir.rmdir()
+            # 残骸清理（2026-11-09 Gilberta 实测：引擎失败也会留下 0 字节
+            # 条目框架，残留会冒充「解压出来了」误导排查；入口幂等守卫
+            # 保证走到这里时 dest_dir 是本轮新建/空起步，清之安全）
+            if dest_dir.is_dir():
+                shutil.rmtree(dest_dir, ignore_errors=True)
             hint = "、".join(c[:16] for c in candidates) or "无候选"
             return "fail", (f"分卷 7z 解压失败（密码候选试过：{hint}）"
                             f"——保留分卷（{last_err[:120]}）")
         err_note = last_err  # 部分卷解压时的非致命告警
-        n = sum(1 for _ in os.scandir(dest_dir))
-        if n <= 0:
-            return "fail", "解压完成但 0 个文件——保留分卷待人工检查"
+        n, total = _dir_files_bytes(dest_dir)
+        if n <= 0 or total <= 0:
+            if dest_dir.is_dir():
+                shutil.rmtree(dest_dir, ignore_errors=True)
+            return ("fail",
+                    "解压完成但 0 个文件/全 0 字节（引擎静默失败）"
+                    "——保留分卷待人工检查")
         # 成功：删除全部相关分卷（.001 ~ .NNN）
         import re as _re
         base_name = _re.sub(r"\.7z\.\d{3}$", "", name, flags=_re.IGNORECASE)
@@ -339,8 +377,8 @@ def process_archive(path, dry: bool = False,
             if status == "extracted":
                 return ("done", f"✅ 解出 {len(files)} 个文件 → "
                         f"{dest_dir.name}/（压缩包已删除）")
-            if dest_dir.is_dir() and not any(os.scandir(dest_dir)):
-                dest_dir.rmdir()
+            if dest_dir.is_dir():
+                shutil.rmtree(dest_dir, ignore_errors=True)
             if status == "password":
                 return ("fail", "加密 rar 且未装 7z 工具（brew/pkg "
                         "install p7zip）——保留原包")
@@ -348,8 +386,15 @@ def process_archive(path, dry: bool = False,
         if dry:
             return "dry", f"将解压（7z）→ {dest_dir.name}/"
         dest_dir.mkdir(parents=True, exist_ok=True)
-        candidates = password_candidates(path)
+        candidates = password_candidates(path, extra=extra_pwd)
         tries = [None] + candidates   # 先无密码（很多 rar 只是假加密提示）
+
+        # 2026-11-09 Gilberta 实测：WinRAR 7 新格式（RAR5 签名 + 大字典
+        # 新算法）7z 报 Unsupported Method 且留 0 字节框架；官方 unrar
+        # 全格式通吃 → 7z 全候选失败且报 Unsupported Method 时自动转
+        # unrar 再试同一候选链（unrar 未装则在失败文案里指引安装）
+        unrar = find_unrar_tool()
+
         last_err = ""
         pwd_used = False              # False=尚无成功；None=无密码成功（哨兵区分）
         for pwd in tries:
@@ -369,15 +414,49 @@ def process_archive(path, dry: bool = False,
                 break
             last_err = (r.stderr or r.stdout or b"").decode(
                 "utf-8", "ignore").strip()
+        if pwd_used is False and unrar and (
+                "unsupported method" in last_err.lower()):
+            for pwd in tries:
+                cmd = [unrar, "x", "-y", "-o+"]
+                if pwd:
+                    cmd.append(f"-p{pwd}")
+                cmd += [str(path), f"{dest_dir}/"]
+                try:
+                    r = subprocess.run(
+                        cmd, capture_output=True, stdin=subprocess.DEVNULL,
+                        timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    return "fail", f"unrar 解压超时（>{timeout}s）——保留原包"
+                except Exception as e:
+                    return "fail", f"unrar 解压异常: {type(e).__name__}: {e}"
+                if r.returncode == 0:
+                    pwd_used = pwd
+                    break
+                last_err = (r.stderr or r.stdout or b"").decode(
+                    "utf-8", "ignore").strip() or last_err
+                if "incorrect password" not in last_err.lower():
+                    break   # 非密码类错误（损坏等）换候选无意义
         if pwd_used is False:
-            if dest_dir.is_dir() and not any(os.scandir(dest_dir)):
-                dest_dir.rmdir()
+            # 残骸清理：引擎失败也可能留下 0 字节条目框架（Gilberta
+            # 实测），残留会冒充「解压出来了」误导排查
+            if dest_dir.is_dir():
+                shutil.rmtree(dest_dir, ignore_errors=True)
             hint = "、".join(c[:16] for c in candidates) or "无候选"
+            if "unsupported method" in last_err.lower():
+                how = ("已装 unrar 但解压仍失败" if unrar else
+                       "本机未装官方 unrar（rarlab.com 下 rarmacos 包，"
+                       "解出 unrar 放入 /opt/homebrew/bin）")
+                return "fail", (f"rar 为 WinRAR 7 新压缩格式，7z 不支持"
+                                f"（{how}；密码候选试过：{hint}）——保留原包")
             return "fail", (f"rar 解压失败（密码候选试过：{hint}）"
                             f"——保留原包（{last_err[:100]}）")
-        n = sum(1 for _ in os.scandir(dest_dir))
-        if n <= 0:
-            return "fail", "解压完成但 0 个文件——保留原包待人工检查"
+        n, total = _dir_files_bytes(dest_dir)
+        if n <= 0 or total <= 0:
+            if dest_dir.is_dir():
+                shutil.rmtree(dest_dir, ignore_errors=True)
+            return ("fail",
+                    "解压完成但 0 个文件/全 0 字节（引擎静默失败）"
+                    "——保留原包待人工检查")
         # 分卷 rar：成功删全部相关卷（.partN.rar 一起走）
         import re as _re
         base_no_part = _re.sub(r"\.part\d+\.rar$", "", name,
@@ -521,7 +600,9 @@ def extract_directory(root: str, dry: bool = False,
     n_done = n_fail = n_skip = 0
     for p in targets:
         try:
-            action, msg = process_archive(p, dry, timeout)
+            action, msg = process_archive(
+                p, dry, timeout, extra_pwd=os.path.basename(
+                    os.path.dirname(os.path.abspath(p))))
         except Exception as e:   # 单包失败绝不中断整轮
             action, msg = "fail", f"未预期异常: {type(e).__name__}: {e}"
         mark = {"done": "✅", "fail": "❌", "skip": "·", "dry": "🔍"}.get(

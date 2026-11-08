@@ -217,6 +217,9 @@ def extract_archive(archive_path, dest=None, delete_source=False,
                 stdin=subprocess.DEVNULL)
             if p.returncode != 0:
                 detail = p.stderr.decode("utf-8", "replace")[:120]
+                # 残骸清理：失败也会留条目框架（2026-11-09 Gilberta
+                # 实测 bsdtar 对 WinRAR7 新格式如此），防冒充解压结果
+                shutil.rmtree(staging, ignore_errors=True)
                 # 解压阶段才暴露的加密（探测能列、解密失败）
                 low = detail.lower()
                 if "passphrase" in low or "password" in low or \
@@ -225,6 +228,7 @@ def extract_archive(archive_path, dest=None, delete_source=False,
                 return "failed", detail or "bsdtar 解压失败", []
             os.replace(staging, dest)
         except subprocess.TimeoutExpired:
+            shutil.rmtree(staging, ignore_errors=True)
             return "failed", "bsdtar 解压超时", []
         except FileNotFoundError:
             return "failed", "bsdtar 不可用", []
@@ -235,9 +239,20 @@ def extract_archive(archive_path, dest=None, delete_source=False,
         for n in names:
             files.append(os.path.join(root, n))
     if not files:
+        shutil.rmtree(dest, ignore_errors=True)
         return ("failed",
                 "解压后目录为空（引擎零产物：源文件疑损坏、噪声目录，"
                 "或加密卷未解）", [])
+    # 全 0 字节守卫（2026-11-09 Gilberta 实测）：bsdtar 对不支持的
+    # RAR5 新格式会 exit 0 + 全 0 产物——目录非空不再等价于解压成功
+    total = sum(os.path.getsize(f) for f in files
+                if os.path.isfile(f))
+    if total <= 0:
+        shutil.rmtree(dest, ignore_errors=True)
+        return ("failed",
+                "解压产物全 0 字节（引擎静默失败：格式过新/损坏）"
+                "——建议安装 7z/unrar 后重试", [])
+
     if delete_source:
         try:
             os.remove(archive_path)

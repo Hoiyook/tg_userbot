@@ -661,7 +661,9 @@ def _extract_run_targets(targets, dry=False):
                 elif os.path.isfile(real) and real.lower().endswith(
                         (".zip", ".rar", ".7z", ".tar.gz", ".tgz", ".tar")):
                     action, msg = extract_dir.process_archive(
-                        Path(real), dry=dry)
+                        Path(real), dry=dry,
+                        extra_pwd=os.path.basename(
+                            os.path.dirname(real)))
                     all_lines.append(
                         f"{action}: {os.path.basename(real)}  {msg}")
                     key = {"done": "done", "fail": "fail",
