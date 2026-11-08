@@ -36,7 +36,7 @@ data class Script(
 private val OUT_FILE = "/sdcard/Download/scriptrunner_out.txt"
 
 private val EXTRACT_DRY_BODY =
-    "out=\$OUT_FILE; " +
+    "out=$OUT_FILE; " +
     "if [ -f \"\$HOME/extract.pyz\" ]; then " +
     "python3 \"\$HOME/extract.pyz\" \"\$1\" --dry > \"\$out\" 2>&1; " +
     "else echo \"❌ extract.pyz 不在 Termux home——先在 文件管理卡片" +
@@ -44,7 +44,7 @@ private val EXTRACT_DRY_BODY =
     "termux-open \"\$out\""
 
 private val EXTRACT_RUN_BODY =
-    "out=\$OUT_FILE; " +
+    "out=$OUT_FILE; " +
     "if [ -f \"\$HOME/extract.pyz\" ]; then " +
     "python3 \"\$HOME/extract.pyz\" \"\$1\" > \"\$out\" 2>&1; " +
     "else echo \"❌ extract.pyz 不在 Termux home——先在 文件管理卡片" +
@@ -66,15 +66,31 @@ private fun loadScripts(ctx: Context): MutableList<Script> {
         ?: return defaultScripts().toMutableList()
     return try {
         val arr = JSONArray(raw)
-        (0 until arr.length()).map { i ->
+        val list = (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             val args = mutableListOf<String>()
             val a = o.getJSONArray("args")
             for (j in 0 until a.length()) args.add(a.getString(j))
             Script(o.getString("name"), o.getString("program"), args)
         }.toMutableList()
+        migrateStaleDefaults(list)
+        list
     } catch (e: Exception) {
         defaultScripts().toMutableList()
+    }
+}
+
+/** 存量治愈：v1.2 保存的解压默认脚本没有 extract.pyz 存在检查，
+ *  且后续默认脚本随版本演进（out 文件/弹结果）——同名旧版就地升级，
+ *  用户自建脚本（名字不同）绝不碰。 */
+private fun migrateStaleDefaults(list: MutableList<Script>) {
+    val defaults = defaultScripts()
+    for (i in list.indices) {
+        val d = defaults.firstOrNull { it.name == list[i].name }
+            ?: continue
+        val body = list[i].args.firstOrNull { it.contains("extract.pyz") }
+        if (body == null || !body.contains("scriptrunner_out.txt"))
+            list[i] = d
     }
 }
 
