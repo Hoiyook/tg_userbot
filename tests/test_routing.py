@@ -7,6 +7,7 @@
 个服务入口」。各入口只保留自己的交付方式（回帖 / 面板发送 / JSON）。
 """
 import atexit
+import json
 import os
 import shutil
 import tempfile
@@ -219,7 +220,10 @@ class ExecuteTest(unittest.IsolatedAsyncioTestCase):
                 routing.tme, "handle_tme_url",
                 new=mock.AsyncMock(return_value="📥 已入队")) as handler:
             res = await routing.execute(d)
-            handler.assert_awaited_once_with(TME)
+            handler.assert_awaited_once()
+            self.assertEqual(handler.await_args.args[0], TME)
+            self.assertTrue(callable(
+                handler.await_args.kwargs.get("on_enqueued")))
         self.assertEqual(res.message, "📥 已入队")
 
     async def test_ledger_returns_buttons(self):
@@ -375,6 +379,56 @@ class AppSurfaceIwaraDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tme", captured["allow"])
         execute.assert_not_awaited()
         spawn.assert_called_once()
+
+
+class JournalRecordTest(unittest.IsolatedAsyncioTestCase):
+    """三入口统一日志：routing.execute 是唯一记录点。"""
+
+    async def test_execute_records_surface_kind_url_and_ref(self):
+        d = routing.Decision(kind="bili", text=f"标题 {BILI}", urls=(BILI,))
+        with mock.patch.object(routing.bili_dl, "auto_reply",
+                               new=mock.AsyncMock(return_value="ok")), \
+                mock.patch.object(routing.link_journal, "record") as rec:
+            await routing.execute(d, surface="bot")
+        rec.assert_called_once()
+        args, kwargs = rec.call_args
+        self.assertEqual(args[1], BILI)
+        self.assertEqual(args[2], "bili")
+        self.assertEqual(kwargs["surface"], "bot")
+
+    async def test_none_does_not_record(self):
+        with mock.patch.object(routing.link_journal, "record") as rec:
+            await routing.execute(routing.Decision(kind="none"),
+                                  surface="me")
+        rec.assert_not_called()
+
+    async def test_tme_collects_enqueued_pairs_as_ref(self):
+        class Msg:
+            chat_id = -1001
+            id = 42
+
+        async def fake(url, on_enqueued=None):
+            on_enqueued(Msg())
+            return "📥 已入队"
+
+        d = routing.Decision(kind="tme", urls=(TME,), extra={"label": ""})
+        with mock.patch.object(routing.tme, "handle_tme_url", new=fake), \
+                mock.patch.object(routing.link_journal, "record") as rec:
+            res = await routing.execute(d, surface="api")
+        self.assertEqual(json.loads(res.ref), [[-1001, 42]])
+        self.assertEqual(rec.call_args.kwargs["ref"], res.ref)
+
+    async def test_exception_still_records(self):
+        """失败也要留痕：日志里能看到 ❌，而不是整条提交消失。"""
+        d = routing.Decision(kind="iwara", urls=(IWARA,), extra={})
+        with mock.patch.object(
+                routing.chrome_client, "handle_chrome_command",
+                new=mock.AsyncMock(side_effect=RuntimeError("boom"))), \
+                mock.patch.object(routing.link_journal, "record") as rec:
+            with self.assertRaises(RuntimeError):
+                await routing.execute(d, event=object(), surface="me")
+        rec.assert_called_once()
+        self.assertIn("❌", rec.call_args.kwargs["message"])
 
 
 if __name__ == "__main__":

@@ -203,6 +203,8 @@
   <section class="page" id="p-queue">
     <h2>全部队列</h2>
     <div id="queuesAll" class="card"><div class="note">读取中…</div></div>
+    <h2>🔗 最近链接（全入口）</h2>
+    <div id="pastes-queue"><div class="note">加载中…</div></div>
     <h2>下载队列</h2>
     <div id="queue"></div>
     <h2>待重试</h2>
@@ -235,7 +237,7 @@
       <div class="fb" id="fb">与往收藏夹发这条消息同语义：本地解析优先，失败自动转解析 bot / 外链台账。</div>
     </div>
 
-    <h2>🕘 粘贴历史（含处理状态）</h2>
+    <h2>🔗 链接记录（全入口，含处理状态）</h2>
     <div class="chips">
       <span class="chip" onclick="loadPastes()">🔄 刷新</span>
       <span class="chip" onclick="runCmdDirect('/cmdhis')">📜 完整历史</span>
@@ -258,6 +260,8 @@
       <span class="chip" data-d="7" onclick="loadStats(7)">7 天</span>
     </div>
     <div class="out" id="ledger" style="display:block">加载中…</div>
+    <h2>🔗 最近链接（全入口）</h2>
+    <div id="pastes-ledger"><div class="note">加载中…</div></div>
     <h2>最近完成</h2>
     <div class="card">
       <h3>🎬 媒体（抖音/监听/收藏夹）</h3><div id="hist-media"></div>
@@ -554,6 +558,13 @@ async function refresh() {
       '</div></div><button class="ghost mini" onclick="retryOne(' + (idx+1) +
       ')">🔁</button></div>').join("")
       || '<div class="note">没有待重试任务 🎉</div>';
+    // 链接记录（全入口）：SSE/batch 里同一份数据，三处视图一起刷新
+    const pd = _BATCH["/api/submissions?n=30"];
+    if (pd && pd.items) {
+      _renderPastes(pd.items, "pastes", 30);
+      _renderPastes(pd.items, "pastes-queue", 10);
+      _renderPastes(pd.items, "pastes-ledger", 10);
+    }
     // 导航徽标：队列/待重试有货时提醒（本页可见时不标）
     const onQueuePage = document.getElementById("p-queue").classList.contains("on");
     const bq = document.getElementById("bdg-queue");
@@ -672,21 +683,35 @@ async function loadHistory() {
   }));
 }
 
+function _renderPastes(items, targetId, n) {
+  const el = document.getElementById(targetId);
+  if (!el) return;
+  const kc = k => k === "done" ? "t-done" : k === "bad" ? "t-retry"
+    : k === "run" ? "t-run" : k === "pending" ? "t-wait"
+    : k === "retry" ? "t-retry" : "t-wait";
+  const srcName = s => s === "me" ? "收藏夹" : s === "bot" ? "bot"
+    : s === "app" ? "App" : s === "api" ? "看板/PWA" : "看板";
+  el.innerHTML = (items || []).slice(0, n).map(p => {
+    const when = new Date(p.ts * 1000).toLocaleString("zh-CN", {hour12: false});
+    return '<div class="qrow"><div class="info"><div class="nm wrap">' +
+      esc(p.url || p.text || "") + '</div><div class="dt">' +
+      esc(srcName(p.surface)) + " · " + esc(p.routed || "") + " · " +
+      when + '</div></div><span class="tag ' + kc(p.kind) + '">' +
+      esc(p.status) + '</span></div>';
+  }).join("") || '<div class="note">还没有链接记录</div>';
+}
 async function loadPastes() {
   try {
-    const d = await api("/api/pastes?n=30");
-    const kc = k => k === "done" ? "t-done" : k === "bad" ? "t-retry"
-      : k === "run" ? "t-run" : k === "pending" ? "t-wait"
-      : k === "retry" ? "t-retry" : "t-wait";
-    document.getElementById("pastes").innerHTML = (d.items||[]).map(p => {
-      const when = new Date(p.ts * 1000).toLocaleString("zh-CN", {hour12: false});
-      return '<div class="qrow"><div class="info"><div class="nm wrap">' +
-        esc(p.url || p.text || "") + '</div><div class="dt">' +
-        esc(p.routed || "") + " · " + when + '</div></div>' +
-        '<span class="tag ' + kc(p.kind) + '">' + esc(p.status) + '</span></div>';
-    }).join("") || '<div class="note">还没有粘贴记录</div>';
+    const d = await api("/api/submissions?n=30");
+    const items = d.items || [];
+    _renderPastes(items, "pastes", 30);
+    _renderPastes(items, "pastes-queue", 10);
+    _renderPastes(items, "pastes-ledger", 10);
   } catch (e) {
-    document.getElementById("pastes").innerHTML = '<div class="note">❌ ' + esc(String(e)) + '</div>';
+    for (const id of ["pastes", "pastes-queue", "pastes-ledger"]) {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = '<div class="note">❌ ' + esc(String(e)) + '</div>';
+    }
   }
 }
 async function loadLinks() {
@@ -1224,7 +1249,7 @@ async function _refreshLoop() {
     try {
       const paths = ["/api/status", "/api/queues", "/api/chrome",
         "/api/backup", "/api/pd/jobs", "/api/paw_backfill",
-        "/api/paw_schedule", "/api/history?n=30", "/api/pastes?n=30",
+        "/api/paw_schedule", "/api/history?n=30", "/api/submissions?n=30",
         "/api/links", "/api/commands"];
       const d = await api("/api/batch?paths=" +
         encodeURIComponent(paths.join(",")));

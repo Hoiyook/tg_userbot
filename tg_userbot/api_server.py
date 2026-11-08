@@ -33,6 +33,7 @@ from . import config
 from . import state
 from . import stats
 from . import history
+from . import link_journal
 from . import notify
 from . import routing
 from .spawn import spawn
@@ -116,7 +117,7 @@ async def _rate_limit_middleware(request, handler):
 # 纪律，读时裁剪到上限）；状态回查按路由去向各查真相源（下载任务=事件流、
 # iwara/Chrome=chrome_tasks、台账=runtime_db），查询失败不影响返回。
 
-_PASTE_LOG_FILE = os.path.join(config.RUNTIME_DIR, "paste_log.jsonl")
+_PASTE_LOG_FILE = link_journal.PATH
 
 # ── PWA 静态资产（2026-11-02）────────────────────────────
 # manifest / SW / 图标 / 分享接收页必须**免鉴权可取**——PWA 安装与系统
@@ -124,32 +125,17 @@ _PASTE_LOG_FILE = os.path.join(config.RUNTIME_DIR, "paste_log.jsonl")
 _PWA_DIR = Path(__file__).with_name("pwa")
 _PWA_PUBLIC_PATHS = ("/manifest.json", "/sw.js", "/share",
                      "/icons/icon-192.png", "/icons/icon-512.png")
-_PASTE_LOG_MAX = 500
+_PASTE_LOG_MAX = link_journal.MAX_ENTRIES
 
 
-def _log_paste(text, url, routed, ref=None) -> None:
-    try:
-        entry = {"ts": time.time(), "text": str(text or "")[:200],
-                 "url": url, "routed": routed, "ref": ref}
-        with open(_PASTE_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as e:
-        logger.warning(f"粘贴记录落盘失败：{e}")
+def _log_paste(text, url, routed, ref=None, **kwargs) -> None:
+    """兼容旧调用：实际写 link_journal（全入口统一日志）。"""
+    link_journal.record(text, url, routed, ref=ref,
+                        path=_PASTE_LOG_FILE, **kwargs)
 
 
 def _read_paste_log(n=50) -> list:
-    try:
-        with open(_PASTE_LOG_FILE, encoding="utf-8") as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        return []
-    items = []
-    for line in lines[-_PASTE_LOG_MAX:][-n:]:
-        try:
-            items.append(json.loads(line))
-        except ValueError:
-            continue
-    return list(reversed(items))    # 新→旧
+    return link_journal.read(n, path=_PASTE_LOG_FILE)
 
 
 _CHROME_STATUS_VIEW = {
@@ -187,8 +173,14 @@ def _task_domain_status(row, label_key=None):
 
 
 def _paste_status(p):
-    """回查一条粘贴记录的当前处理状态（尽力而为，查询失败不炸）。"""
+    """回查一条链接记录的当前处理状态（尽力而为，查询失败不炸）。"""
     routed, ref, url = p.get("routed"), p.get("ref"), p.get("url")
+    # 统一日志里的失败/说明回执：任何类型都能先显示明确结果
+    msg = str(p.get("message") or "")
+    if msg.startswith("❌"):
+        return msg.strip(), "bad"
+    if msg.startswith("ℹ️"):
+        return msg.strip(), "info"
     try:
         if routed == "tme":
             # ref = JSON [[chat_id, msg_id], …]（v2.16 起写入）——
@@ -290,6 +282,16 @@ def _paste_status(p):
                     fname = hit.get("filename") or ""
                     return ("✅ 已处理（重复拦截）"
                             + (f" · {fname}" if fname else ""), "done")
+        if routed == "torrent":
+            # 115 离线任务的精确进度在 CD2 侧（需 info_hash）；这里至少把
+            # 提交结果如实显示，不再回落「已受理」
+            msg = str(p.get("message") or "")
+            first = msg.splitlines()[0].strip() if msg else ""
+            if any(k in msg for k in ("失败", "拒绝", "错误")):
+                return first[:100] or "❌ 种子提交失败", "bad"
+            if first:
+                return first[:100], "wait"
+            return "🧲 已提交 115 离线（完成会通知）", "wait"
         if routed == "bili" and url:
             # B站任务在 bili_tasks（TaskDomain）；粘贴记录的 url 就是业务键
             from . import bili_dl, runtime_db
@@ -393,7 +395,8 @@ async def handle_app_relay(text: str) -> None:
     """
     try:
         result = await asyncio.wait_for(
-            dispatch_link_text(text), timeout=_DISPATCH_TIMEOUT_SECONDS)
+            dispatch_link_text(text, surface="app"),
+            timeout=_DISPATCH_TIMEOUT_SECONDS)
     except Exception as e:
         logger.exception(f"🛰 app 中转入队失败：{e}")
         try:
@@ -567,12 +570,12 @@ def build_status() -> dict:
     }
 
 
-async def dispatch_link_text(text: str) -> dict:
+async def dispatch_link_text(text: str, surface: str = "api") -> dict:
     """把一段含链接的文本按平台分流——语义与「往收藏夹发这条消息」一致。
 
     分流顺序与每路参数构造的唯一实现在 ``routing``（收藏夹 / bot 对话 /
-    看板三入口共用）；本函数只做 API 特有的交付：JSON 回执、粘贴历史，
-    以及种子任务的结果通知。
+    看板三入口共用）；本函数只做 API 特有的交付：JSON 回执与种子任务
+    结果通知。链接日志由 ``routing.execute`` 统一写（surface 标明入口）。
     """
     text = str(text or "").strip()
     decision = routing.classify(text, allow=routing.SURFACE_API,
@@ -582,7 +585,7 @@ async def dispatch_link_text(text: str) -> dict:
                 "message": "没有识别到可处理的链接"}
 
     event = _HeadlessEvent() if decision.kind == "iwara" else None
-    res = await routing.execute(decision, event=event)
+    res = await routing.execute(decision, event=event, surface=surface)
     kind = res.kind
     message = res.message
 
@@ -597,7 +600,6 @@ async def dispatch_link_text(text: str) -> dict:
         except Exception as e:
             logger.warning(f"API 种子离线结果通知失败：{e}")
 
-    _log_paste(text, (res.urls or (None,))[0], kind, res.ref)
     return {"ok": True, "routed": kind, "message": message}
 
 
@@ -925,6 +927,7 @@ _BATCH_HANDLERS = {
     "/api/paw_schedule": lambda r: handle_paw_schedule(r),
     "/api/history": lambda r: handle_history(r),
     "/api/pastes": lambda r: handle_pastes(r),
+    "/api/submissions": lambda r: handle_pastes(r),
     "/api/links": lambda r: handle_links(r),
     "/api/commands": lambda r: handle_commands_registry(r),
 }
@@ -948,7 +951,7 @@ async def handle_sse(request):
             data = {"ok": True, "data": await _batch_data(
                 ["/api/status", "/api/queues", "/api/chrome", "/api/backup",
                  "/api/pd/jobs", "/api/paw_backfill", "/api/paw_schedule",
-                 "/api/history?n=30", "/api/pastes?n=30", "/api/links",
+                 "/api/history?n=30", "/api/submissions?n=30", "/api/links",
                  "/api/commands"])}
             await resp.write(
                 f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
@@ -1586,6 +1589,7 @@ def make_app() -> web.Application:
         web.get("/icons/icon-192.png", handle_pwa_file),
         web.get("/icons/icon-512.png", handle_pwa_file),
         web.get("/api/pastes", handle_pastes),
+        web.get("/api/submissions", handle_pastes),
         web.get("/api/links", handle_links),
         web.post("/api/links_done", handle_links_done),
         web.get("/api/commands", handle_commands_registry),

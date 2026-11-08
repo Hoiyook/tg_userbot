@@ -23,12 +23,14 @@ bot 对话缺抖音/IG 与 t.me，同样的链接换个入口就掉进外链台�
 收藏夹的转发消息仍不记外链台账（``skip_ledger_for_forwarded`` 是记录
 策略，不是链接类型差异）。
 """
+import json
 from dataclasses import dataclass, field
 
 from . import bili_dl
 from . import chrome_client
 from . import config
 from . import iwara
+from . import link_journal
 from . import manual_links
 from . import platform
 from . import state
@@ -207,7 +209,7 @@ def _lookup_chrome_ref(url):
     return None
 
 
-async def execute(decision, *, event=None, message=None):
+async def _execute_inner(decision, *, event=None, message=None):
     """调用该路对应的既有服务入口；不改变它们的内部行为。
 
     ``event`` 只在 iwara 需要（``chrome_client.handle_chrome_command`` 要
@@ -269,9 +271,20 @@ async def execute(decision, *, event=None, message=None):
         return RouteResult(kind=kind, message=out or "", urls=decision.urls)
 
     if kind == "tme":
-        out = await tme.handle_tme_url(decision.urls[0])
-        return RouteResult(kind=kind, message=out or "", urls=decision.urls,
-                           extra={"label": decision.extra.get("label")})
+        pairs = []
+
+        def _collect(m):
+            cid = getattr(m, "chat_id", None)
+            mid = getattr(m, "id", None)
+            if cid is not None and mid is not None:
+                pairs.append([cid, mid])
+
+        out = await tme.handle_tme_url(decision.urls[0],
+                                       on_enqueued=_collect)
+        return RouteResult(
+            kind=kind, message=out or "", urls=decision.urls,
+            ref=json.dumps(pairs) if pairs else None,
+            extra={"label": decision.extra.get("label")})
 
     if kind == "ledger":
         reply, buttons = manual_links.observe(decision.text)
@@ -279,3 +292,38 @@ async def execute(decision, *, event=None, message=None):
                            buttons=buttons, urls=decision.urls)
 
     raise ValueError(f"未知路由类型：{kind}")
+
+
+def _event_ids(event):
+    """取事件里的 (chat_id, message_id)——日志用，缺失即 None。"""
+    if event is None:
+        return None, None
+    msg = getattr(event, "message", None)
+    return getattr(event, "chat_id", None), getattr(msg, "id", None)
+
+
+async def execute(decision, *, event=None, message=None, surface="unknown"):
+    """执行分流并统一写链接日志（全入口唯一记录点）。
+
+    ``surface``：me（收藏夹）/ bot（bot 对话）/ api（看板、PWA、/api/cmd）/
+    app（套壳 app 分享中转）。失败也留痕（message 以 ❌ 开头），不吞异常。
+    """
+    try:
+        result = await _execute_inner(decision, event=event, message=message)
+    except Exception as e:
+        if decision.handled:
+            chat_id, message_id = _event_ids(event)
+            link_journal.record(
+                decision.text, (decision.urls or (None,))[0],
+                decision.kind, surface=surface,
+                chat_id=chat_id, message_id=message_id,
+                message=f"❌ {type(e).__name__}: {e}")
+        raise
+    if result.handled:
+        chat_id, message_id = _event_ids(event)
+        link_journal.record(
+            decision.text, (result.urls or decision.urls or (None,))[0],
+            result.kind, ref=result.ref, surface=surface,
+            chat_id=chat_id, message_id=message_id,
+            message=result.message)
+    return result

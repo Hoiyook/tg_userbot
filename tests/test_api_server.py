@@ -1109,6 +1109,35 @@ class PasteHistoryTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("解析 bot", text)
         self.assertEqual(kind, "info")
 
+    async def test_submissions_alias_and_surface(self):
+        """/api/submissions 与 /api/pastes 同源；新记录带入口来源。"""
+        api_server._log_paste("t", "https://a/1", "bili", None,
+                              surface="bot")
+        client = make_client()
+        await client.start_server()
+        try:
+            data = await (await client.get("/api/submissions?n=10")).json()
+        finally:
+            await client.close()
+        self.assertEqual(data["items"][0]["routed"], "bili")
+        self.assertEqual(data["items"][0]["surface"], "bot")
+
+    def test_torrent_paste_shows_submission_result(self):
+        text, kind = api_server._paste_status({
+            "routed": "torrent", "ref": None,
+            "url": "https://a/x.torrent", "text": "",
+            "message": "🧲 种子已转为 115 离线任务\n名称：x"})
+        self.assertIn("115 离线", text)
+        self.assertEqual(kind, "wait")
+
+    def test_torrent_paste_failure_is_bad(self):
+        text, kind = api_server._paste_status({
+            "routed": "torrent", "ref": None,
+            "url": "https://a/x.torrent", "text": "",
+            "message": "🧲 离线提交失败：boom"})
+        self.assertIn("失败", text)
+        self.assertEqual(kind, "bad")
+
     async def test_pastes_endpoint_resolves_statuses(self):
         from tg_userbot import chrome_client, stats
         api_server._log_paste("iwara 文本", "https://iwara.tv/video/1", "iwara", "TASK1")

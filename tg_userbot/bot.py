@@ -1238,7 +1238,7 @@ async def bot_message_handler(event):
     decision = routing.classify(text, allow=routing.SURFACE_BOT,
                                 message=message)
     if decision.handled:
-        res = await routing.execute(decision, event=event)
+        res = await routing.execute(decision, event=event, surface="bot")
         if res.kind == "iwara":
             # Chrome 命令入口自己回帖（含「已提交」），这里不再重复
             return

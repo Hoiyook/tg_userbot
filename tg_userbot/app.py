@@ -824,7 +824,8 @@ async def new_message_handler(event):
                     f"🔎 检测到 {len(decision.extra['douyin_urls'])} 个抖音"
                     f"链接、{len(decision.extra['instagram_urls'])} 个 "
                     "Instagram 链接")
-                spawn(routing.execute(decision), "平台链接转发")
+                spawn(routing.execute(decision, surface="me"),
+                      "平台链接转发")
                 return
 
             if decision.kind == "torrent":
@@ -834,7 +835,8 @@ async def new_message_handler(event):
                 _torrent_decision = decision
 
                 async def _torrent_job():
-                    res = await routing.execute(_torrent_decision)
+                    res = await routing.execute(_torrent_decision,
+                                                surface="me")
                     try:
                         await event.reply(res.message, link_preview=False)
                     except Exception as e:
@@ -851,13 +853,14 @@ async def new_message_handler(event):
                 # iwara 走 Chrome Agent 命令入口，它自己回帖（含「已提交」
                 # 「Agent 未运行」「URL 无效」）；重复判定在 execute 内短路、
                 # 不会进 handle_chrome_command，所以只有 iwara_dup 需要补回执。
-                res = await routing.execute(decision, event=event)
+                res = await routing.execute(decision, event=event,
+                                            surface="me")
                 if res.kind == "iwara_dup":
                     await event.reply(res.message, link_preview=False)
                 return
 
             if decision.kind in ("bili", "x"):
-                res = await routing.execute(decision)
+                res = await routing.execute(decision, surface="me")
                 await event.reply(res.message, link_preview=False)
                 return
 
@@ -873,7 +876,8 @@ async def new_message_handler(event):
 
                 async def _tme_job():
                     try:
-                        res = await routing.execute(_tme_decision)
+                        res = await routing.execute(_tme_decision,
+                                                    surface="me")
                         out = res.message
                     except Exception as e:
                         logger.exception(f"t.me 处理异常：{e}")
@@ -890,7 +894,7 @@ async def new_message_handler(event):
             # （2026-10-30）：台账语义是「我在外面找到的链接」，频道帖
             # 自带链接转发进来不算手工外链。
             if decision.kind == "ledger":
-                res = await routing.execute(decision)
+                res = await routing.execute(decision, surface="me")
                 await event.reply(res.message, buttons=res.buttons or None,
                                   link_preview=False)
                 return
