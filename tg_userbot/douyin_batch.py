@@ -262,7 +262,6 @@ def status_text():
                          f"（第 {r.get('attempts', 0)} 次）")
     # 最近完成（runtime_db 只读查询，bot 进程内合法）
     try:
-        import sqlite3
         from . import runtime_db
         def _q(c):
             from .runtime_db import _execute

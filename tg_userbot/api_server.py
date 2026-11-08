@@ -34,9 +34,8 @@ from . import state
 from . import stats
 from . import history
 from . import notify
-from . import manual_links
+from . import routing
 from .spawn import spawn
-from . import platform
 from .log import logger
 
 _STARTED_AT = time.time()
@@ -387,6 +386,12 @@ async def _auth_middleware(request, handler):
     if request.path in _PWA_PUBLIC_PATHS:
         pass                                   # PWA 静态资产免鉴权
     elif not token_ok(request):
+        # 临时诊断（2026-11-07 壳 app 401 排查）：看清请求形态
+        logger.warning(f"🔒 401 {request.method} {request.path} "
+                       f"remote={request.remote} "
+                       f"query_token={bool(request.query.get('token'))} "
+                       f"bearer={bool(request.headers.get('Authorization', '').startswith('Bearer '))} "
+                       f"xtoken={bool(request.headers.get('X-Token'))}")
         return web.json_response(
             {"ok": False, "error": "令牌无效或缺失（Authorization: Bearer / "
                                    "X-Token 头 / ?token= 任选其一）"},
@@ -493,113 +498,35 @@ def build_status() -> dict:
 async def dispatch_link_text(text: str) -> dict:
     """把一段含链接的文本按平台分流——语义与「往收藏夹发这条消息」一致。
 
-    分流顺序照抄 new_message_handler 的链接段：抖音/IG → platform（本地
-    解析入队 + bot 兜底）→ 种子直链 → torrent_offline → B站 → bili_dl →
-    其余外链 → manual_links 外链台账。每一路都复用既有入口，不在 API 里
-    重写任何下载/解析逻辑。
+    分流顺序与每路参数构造的唯一实现在 ``routing``（收藏夹 / bot 对话 /
+    看板三入口共用）；本函数只做 API 特有的交付：JSON 回执、粘贴历史，
+    以及种子任务的结果通知。
     """
-    from . import manual_links
+    text = str(text or "").strip()
+    decision = routing.classify(text, allow=routing.SURFACE_API,
+                                message=_ShimMessage(text))
+    if not decision.handled:
+        return {"ok": False, "routed": None,
+                "message": "没有识别到可处理的链接"}
 
-    douyin_urls = platform.extract_douyin_urls(text)
-    instagram_urls = platform.extract_instagram_urls(text)
-    if douyin_urls or instagram_urls:
-        # 同一条入口（含实体 URL 补抓的收藏夹路径之外，API 文本里链接
-        # 已经是明文，不需要 entity 兜底）。失败在 platform 内部已降级
-        # bot 并通知，不会静默丢。
-        await platform.relay_platform_links(
-            _ShimMessage(text), douyin_urls, instagram_urls)
-        kind = "douyin" if douyin_urls else "instagram"
-        _url0 = (douyin_urls or instagram_urls or [None])[0]
-        _ref = next((r.get("id") for r in
-                     (state.QUEUE.get("tasks") or []) +
-                     (state.QUEUE.get("retry") or [])
-                     if r.get("url") == _url0), None)
-        _log_paste(text, _url0, kind, _ref)
-        return {
-            "ok": True, "routed": kind,
-            "message": "链接已受理：本地解析成功会自动入队下载，"
-                       "失败已转解析 bot——进度看 Telegram 控制面板通知",
-        }
+    event = _HeadlessEvent() if decision.kind == "iwara" else None
+    res = await routing.execute(decision, event=event)
+    kind = res.kind
+    message = res.message
 
-    from . import torrent_offline
-    torrent_urls = [u for u in manual_links.extract_urls(text)
-                    if torrent_offline.is_torrent_url(u)]
-    if torrent_urls:
-        arg = torrent_offline.trailing_author(text, torrent_urls[0])
-        out = await torrent_offline.handle_torrent_url(
-            torrent_urls[0],
-            to_folder=(torrent_offline.resolve_to_folder(arg)
-                       if arg else None))
+    if kind in ("iwara", "iwara_dup") and event is not None:
+        message = "\n".join(event.replies) or message
+    elif kind in ("douyin", "instagram"):
+        message = ("链接已受理：本地解析成功会自动入队下载，"
+                   "失败已转解析 bot——进度看 Telegram 控制面板通知")
+    elif kind == "torrent":
         try:
-            await notify.notify_user(out)
+            await notify.notify_user(message)
         except Exception as e:
             logger.warning(f"API 种子离线结果通知失败：{e}")
-        _log_paste(text, torrent_urls[0], "torrent", None)
-        return {"ok": True, "routed": "torrent", "message": out}
 
-    # iwara 视频链接 → 提交 Chrome Agent 下载（CDP 解析签名直链）。
-    # 与 bot 对话路径（bot.py 收藏夹分支）同语义：判重（成功过才拦）+
-    # 提交 /chrome。结果通知走 chrome_requests 映射 → 收藏夹。
-    from .iwara import extract_iwara_video_id
-    iwara_urls = [u for u in manual_links.extract_urls(text)
-                  if extract_iwara_video_id(u)]
-    if iwara_urls:
-        from . import chrome_client
-        from . import iwara as iwara_mod
-        _vid = extract_iwara_video_id(iwara_urls[0])
-        try:
-            _hit = iwara_mod.find_previous_success(_vid) if _vid else None
-        except Exception:
-            _hit = None
-        if _hit:
-            _log_paste(text, iwara_urls[0], "iwara_dup", None)
-            return {"ok": True, "routed": "iwara_dup",
-                    "message": iwara_mod.duplicate_text(_hit)}
-        ev = _HeadlessEvent()
-        out = await chrome_client.handle_chrome_command(
-            ev, "/chrome " + iwara_urls[0],
-            owner_id=chrome_client.resolve_owner_id(state.MY_ID))
-        try:
-            from . import chrome_agent as _ca
-            _tasks = _ca.load_tasks(config.CHROME_TASKS_FILE)
-            _ref = next((t.get("task_id") for t in _tasks
-                         if t.get("url") == iwara_urls[0]), None)
-        except Exception:
-            _ref = None
-        _log_paste(text, iwara_urls[0], "iwara", _ref)
-        return {"ok": True, "routed": "iwara",
-                "message": "\n".join(ev.replies) or out or "已提交 Chrome 下载"}
-
-    from . import bili_dl
-    if bili_dl.looks_like_bili(text):
-        reply = await bili_dl.auto_reply(text)
-        return {"ok": True, "routed": "bili", "message": reply}
-
-    # X/Twitter 链接 → X 队列（2026-11-05 owner：分享即下载不落台账；
-    # 2026-11-06 补看板粘贴框入口——此前只挂了 Telegram 两路由，改一处
-    # 漏一处的现行犯）
-    from . import x_dl as _x_dl
-    if _x_dl.looks_like_x(text):
-        reply = await _x_dl.auto_reply(text)
-        _u = manual_links.extract_urls(text) or [None]
-        _log_paste(text, _u[0], "x", None)
-        return {"ok": True, "routed": "x", "message": reply}
-
-    # t.me 帖子链接 → bot 自己的客户端拉原帖入队（收藏夹同款路径）
-    from . import tme as _tme
-    _tme_urls = _tme.extract_tme_post_urls(text)
-    if _tme_urls:
-        out = await _tme.handle_tme_url(_tme_urls[0])
-        _log_paste(text, _tme_urls[0], "tme", None)
-        return {"ok": True, "routed": "tme", "message": out}
-
-    if not manual_links.extract_urls(text):
-        return {"ok": False, "routed": None, "message": "没有识别到可处理的链接"}
-
-    reply, _buttons = manual_links.observe(text)
-    _urls = manual_links.extract_urls(text)
-    _log_paste(text, (_urls or [None])[0], "ledger", None)
-    return {"ok": True, "routed": "ledger", "message": reply}
+    _log_paste(text, (res.urls or (None,))[0], kind, res.ref)
+    return {"ok": True, "routed": kind, "message": message}
 
 
 # ── HTTP 处理器 ──────────────────────────────────────────────

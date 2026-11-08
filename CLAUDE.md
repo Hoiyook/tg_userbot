@@ -41,9 +41,21 @@ All comments, log output, and user-facing Telegram replies are in Chinese. The s
 3. **看板粘贴框 / PWA 分享**（api_server `dispatch_link_text`——/api/enqueue 与 /share 同端点）
 4. （规划中）其它 API 消费方——一律走 dispatch_link_text，不得自建分流
 
-分流顺序统一：抖音/IG → 种子 → B站 → **X** → t.me → 外链台账。
+分流顺序统一：抖音/IG → 种子 → iwara → B站 → **X** → t.me → 外链台账。
 判重/解析逻辑以各下载模块的 `looks_like_*` + `_submit/auto_reply` 为准，
 路由层不得复制判断逻辑。
+
+**2026-11-08 起单一实现 = `routing.py`**：识别与参数构造只在
+`routing.classify()`，执行只走 `routing.execute()`；三个入口只保留自己的
+交付方式（收藏夹回帖 / bot 面板发送 / API JSON）。入口差异收敛为策略表
+`SURFACE_ME` / `SURFACE_BOT` / `SURFACE_API`（数据，不是逻辑）——新增链接
+类型只改 `classify` 一处；新增入口只需选（或新增）一个策略元组。
+**2026-11-08 三入口策略已统一为完整集合**（收藏夹补 iwara、bot 对话补
+抖音/IG 与 t.me；此前同样的链接换个入口就掉进外链台账）。入口差异只
+允许在「怎么交付结果」，不允许在「能识别哪些链接」。
+**回归测试** `tests/test_routing.py` 钉住优先级、每路参数、三入口策略一致
+与 execute 分支；`tests/test_architecture.py` 钉住三道棘轮——「后台任务
+必须持有引用 / SQL 只允许从 runtime_db 出去 / 下层模块不得 import 入口」。
 
 ## ⚠️ App 配套操作纪律（2026-11-02 owner 硬性要求，优先级：高）
 
@@ -103,6 +115,7 @@ Completed downloads are appended as one line per record to the download history 
 **回填执行情况（2026-11-03，v2.12）**：`backfill_loop` 每轮结束调 `log_backfill_round` 追加 `pawb_history.jsonl`（单行 append、保 200 条，字段 ts/author_count/summary/cursor）；`backfill_status_overview` 三段式一次取全（当前游标/节奏 + 按计划序的下一批作者 + 历史）；`GET /api/paw_backfill` 暴露给看板回填页（与 /paw_schedule 文本视图并存）。**三项修复（v2.13）**：① `/paw_backfill` 被 `_PAW_CMD_RE`（`^/paw(?:_\w+)?`）抢先路由进 `command_reply`——backfill 分支必须先分流转殊词（status/on/off → deferred 补扫状态/开关），其余才按作者名回填，否则「状态」被当作者名报错；② 重启快醒：backfill_loop 首醒 5 分钟（`first_wake` 标志），重启不再把 6h 醒次往后推（此前重启一次吞一个醒次）；③ 看板顺延如实报告：current 里新增 `last_run_at`/`deferred`（顺延 = 首批逾期 且 6h 内无实际执行记录）。
 `extract_dir.py` (目录解压工具（2026-11-02）：递归解压目录下压缩包到同名目录、成功才删——安全纪律与 Pawchive 解压同款（加密跳过/炸弹防护/幂等/失败保留现场/失败清空目录）；`/extract` 命令、scripts/extract_archives.py CLI、app 指令中心三方共用此核心；v2.14 增强：dry 三形态、数据卷绝对路径直收、7z 分卷（.7z.001 入口成功删全组）、加密 zip 密码自动多候选举密——**文件名规则（最后一个 # 后内容 = 密码，`password_from_filename`）→ 提示文件名 stem → 提示文件内容**逐个试；AES-256 加密 zip 必须走 p7zip（zipfile 不支持 AES，曾假失败「密码解不开」）；**统一密码候选链 `password_candidates(archive_path, extra)`（v2.15）**：/extract 与 /115x 共用——extra（/115x 目录名密码，最先）→ 文件名 # 段 → 提示文件 stem → 提示文件内容；extract_worker 需密码时逐候选调 extract_archive（bsdtar 路支持 AES）),
 `api_server.py` (本地 API（2026-11-01）：套壳 app/手机看板的唯一数据面——aiohttp 服务随主进程启停；只读快照 + 薄封装既有服务函数，不建第二套状态，见「本地 API」段),
+- `routing.py` (链接分流单点：`classify(text, allow=…)` 纯识别 + `execute(decision, event=…)` 调既有服务入口；`SURFACE_ME/BOT/API` 三张策略表 **2026-11-08 已统一为完整集合**——入口差异只在交付方式，见上方「链接分流入口统一纪律」).
 - Thin dispatchers `commands.py` (`handle_command`) and `bot.py` (`handle_menu_action`, `bot_message_handler`, `bot_callback_handler`).
 
 Dependency rule: leaves (`config`/`log`/`state`/`naming`/`sources`/`history`) may be function-imported (`from .config import X`); runtime cluster modules import each other only as `from . import X` and call `X.func()` at call time. (The former sole module cycle `queue ↔ platform` was dissolved by the unified-chain refactor: `platform` no longer imports `queue`, and `queue` no longer imports `platform` — the call-time rule now just protects forward references generally.) Functions under test-patch (`save_whitelist`, `save_queue`, `get_forward_source`, `execute_queued_task`) keep bare-name calls inside their own module so `mock.patch.object(module, name)` stays visible.

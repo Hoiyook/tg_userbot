@@ -81,7 +81,6 @@ def refresh_cookies():
     返回 (ok, msg)。
     """
     import shutil
-    import sqlite3
     import tempfile
     db = os.path.join(config.CHROME_PROFILE_DIR, "Default", "Cookies")
     if not os.path.exists(db):

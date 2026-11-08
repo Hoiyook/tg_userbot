@@ -49,6 +49,7 @@ def _restore_api_config():
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 
 from tg_userbot import api_server  # noqa: E402
+from tg_userbot import routing  # noqa: E402
 from tg_userbot import config  # noqa: E402
 from tg_userbot import state  # noqa: E402
 from tg_userbot import chrome_agent  # noqa: E402
@@ -199,11 +200,11 @@ class EnqueueTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_douyin_text_routes_to_platform_relay(self):
         with mock.patch.object(
-                api_server.platform, "extract_douyin_urls",
+                routing.platform, "extract_douyin_urls",
                 return_value=["https://v.douyin.com/abc/"]), \
-             mock.patch.object(api_server.platform,
+             mock.patch.object(routing.platform,
                                "extract_instagram_urls", return_value=[]), \
-             mock.patch.object(api_server.platform, "relay_platform_links",
+             mock.patch.object(routing.platform, "relay_platform_links",
                                new=mock.AsyncMock()) as relay:
             client = make_client()
             await client.start_server()
@@ -221,12 +222,12 @@ class EnqueueTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(shim.id, 10 ** 12)  # 不与真实消息 id 空间重叠
 
     async def test_instagram_text_routes_to_relay(self):
-        with mock.patch.object(api_server.platform,
+        with mock.patch.object(routing.platform,
                                "extract_douyin_urls", return_value=[]), \
-             mock.patch.object(api_server.platform,
+             mock.patch.object(routing.platform,
                                "extract_instagram_urls",
                                return_value=["https://instagram.com/x"]), \
-             mock.patch.object(api_server.platform, "relay_platform_links",
+             mock.patch.object(routing.platform, "relay_platform_links",
                                new=mock.AsyncMock()):
             client = make_client()
             await client.start_server()
@@ -239,9 +240,9 @@ class EnqueueTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_bili_text_routes_to_bili(self):
         from tg_userbot import bili_dl
-        with mock.patch.object(api_server.platform,
+        with mock.patch.object(routing.platform,
                                "extract_douyin_urls", return_value=[]), \
-             mock.patch.object(api_server.platform,
+             mock.patch.object(routing.platform,
                                "extract_instagram_urls", return_value=[]), \
              mock.patch.object(bili_dl, "looks_like_bili", return_value=True), \
              mock.patch.object(bili_dl, "auto_reply",
@@ -260,9 +261,9 @@ class EnqueueTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_torrent_text_routes_to_offline(self):
         from tg_userbot import manual_links, torrent_offline
-        with mock.patch.object(api_server.platform,
+        with mock.patch.object(routing.platform,
                                "extract_douyin_urls", return_value=[]), \
-             mock.patch.object(api_server.platform,
+             mock.patch.object(routing.platform,
                                "extract_instagram_urls", return_value=[]), \
              mock.patch.object(manual_links, "extract_urls",
                                return_value=["https://host/a.torrent"]), \

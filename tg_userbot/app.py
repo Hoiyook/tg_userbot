@@ -45,7 +45,6 @@ from . import runtime_db
 from . import sql_templates
 from . import cmd_templates
 from . import extract_worker
-from . import config
 from . import wnacg
 from . import asmr_dl
 from . import bili_dl
@@ -59,12 +58,10 @@ from . import memo
 from . import shell
 from . import reporter
 from . import history
-from . import manual_links
 from . import stats
 from . import thread
 from . import whitelist
-from . import platform
-from . import torrent_offline
+from . import routing
 from . import cleanup
 from . import bot
 from . import workers
@@ -805,131 +802,96 @@ async def new_message_handler(event):
                 return
 
         # ========================================================
-        # 抖音 / Instagram 链接：即使消息本身没有媒体，也要检查文字 URL
-        # 链接解析只在 Saved Messages 生效（白名单 chat 仅下载媒体）。
+        # 链接分流（单一实现 routing.py）：抖音/IG → 种子 → iwara → B站 →
+        # X → t.me → 外链台账。三个文本入口共用同一份识别与参数构造，
+        # 各入口只保留自己的交付方式。链接解析只在 Saved Messages 生效
+        # （白名单 chat 仅下载媒体）。
         # ========================================================
         if is_me:
-            douyin_urls = (platform.extract_douyin_urls(text)
-                           if config.AUTOROUTE_DOUYIN else [])
-            instagram_urls = platform.extract_instagram_urls(text)
+            # 消息自身带媒体时不抢 t.me / iwara：caption 里的链接不构成
+            # 下载指令，媒体本身先按附件下载；其余分支与媒体无关照旧分流。
+            _allow = routing.SURFACE_ME
+            if is_downloadable(message):
+                _allow = tuple(k for k in _allow
+                               if k not in ("tme", "iwara"))
+            decision = routing.classify(
+                text, allow=_allow, message=message,
+                entities=getattr(message, "entities", None) or [],
+                skip_ledger_for_forwarded=True)
 
-            # Telegram 可能把链接显示成 WebPage 预览（MessageMediaWebPage）。
-            # 即使 message.file=None，也必须按文字中的 URL 继续处理。
-            if not douyin_urls or not instagram_urls:
-                try:
-                    for entity in getattr(message, "entities", None) or []:
-                        url = getattr(entity, "url", None)
-                        if not url:
-                            continue
-                        if not douyin_urls:
-                            douyin_urls.extend(
-                                platform.extract_douyin_urls(url)
-                            )
-                        if not instagram_urls:
-                            instagram_urls.extend(
-                                platform.extract_instagram_urls(url)
-                            )
-                except Exception as e:
-                    logger.warning(f"读取 Telegram URL entity 失败：{e}")
-
-            # 去重
-            douyin_urls = list(dict.fromkeys(douyin_urls))
-            instagram_urls = list(dict.fromkeys(instagram_urls))
-
-            if douyin_urls or instagram_urls:
+            if decision.kind in ("douyin", "instagram"):
                 logger.info(
-                    f"🔎 检测到 {len(douyin_urls)} 个抖音链接、"
-                    f"{len(instagram_urls)} 个 Instagram 链接"
-                )
-                spawn(
-                    platform.relay_platform_links(
-                        message, douyin_urls, instagram_urls
-                    ), "平台链接转发")
+                    f"🔎 检测到 {len(decision.extra['douyin_urls'])} 个抖音"
+                    f"链接、{len(decision.extra['instagram_urls'])} 个 "
+                    "Instagram 链接")
+                spawn(routing.execute(decision), "平台链接转发")
                 return
 
-            # 种子直链（.torrent 结尾）→ 转 115 离线（bot 对话同款；
-            # 收藏夹发链接同样可用——2026-09-29 用户反馈 bot 断连丢消息）
-            torrent_urls = [u for u in manual_links.extract_urls(text)
-                            if torrent_offline.is_torrent_url(u)]
-            if torrent_urls:
+            if decision.kind == "torrent":
                 logger.info(
-                    f"🧲 Saved Messages 收到种子直链：{torrent_urls[0][:60]}")
-
-                _torrent_urls = torrent_urls
-                # 尾随裸 token 当作者（owner 2026-10-25）：链接行之外的
-                # 词 → 漫画/<作者>/；无则缺省 云下载/
-                _torrent_arg = torrent_offline.trailing_author(
-                    text, torrent_urls[0])
+                    f"🧲 Saved Messages 收到种子直链："
+                    f"{decision.urls[0][:60]}")
+                _torrent_decision = decision
 
                 async def _torrent_job():
-                    out = await torrent_offline.handle_torrent_url(
-                        _torrent_urls[0], to_folder=(
-                            torrent_offline.resolve_to_folder(_torrent_arg)
-                            if _torrent_arg else None))
+                    res = await routing.execute(_torrent_decision)
                     try:
-                        await event.reply(out, link_preview=False)
+                        await event.reply(res.message, link_preview=False)
                     except Exception as e:
                         logger.warning(f"🧲 离线结果回帖失败：{e}")
                     try:
-                        await notify.notify_user(out)
+                        await notify.notify_user(res.message)
                     except Exception as e:
                         logger.warning(f"🧲 离线结果通知失败：{e}")
 
                 spawn(_torrent_job(), "种子离线任务")
                 return
 
-            # 站点链接自动识别（2026-10-31 B站定档；2026-11-05 配置化 +
-            # X 加入，config.AUTOROUTE_* 可关——关掉的回落外链台账）。
-            # 必须在外链台账**之前**拦——否则会被登记成「待处理外链」。
-            from . import bili_dl
-            if config.AUTOROUTE_BILI and bili_dl.looks_like_bili(text):
-                reply = await bili_dl.auto_reply(text)
-                await event.reply(reply, link_preview=False)
-                return
-            if config.AUTOROUTE_X and x_dl_mod.looks_like_x(text):
-                reply = await x_dl_mod.auto_reply(text)
-                await event.reply(reply, link_preview=False)
+            if decision.kind in ("iwara", "iwara_dup"):
+                # iwara 走 Chrome Agent 命令入口，它自己回帖（含「已提交」
+                # 「Agent 未运行」「URL 无效」）；重复判定在 execute 内短路、
+                # 不会进 handle_chrome_command，所以只有 iwara_dup 需要补回执。
+                res = await routing.execute(decision, event=event)
+                if res.kind == "iwara_dup":
+                    await event.reply(res.message, link_preview=False)
                 return
 
-            # t.me 帖子链接（2026-11-02 owner）：bot 自己就是 Telegram
-            # 客户端，直接拉原帖媒体入队——不再落外链台账。消息自身带
-            # 媒体时不抢占（caption 里的 t.me 宣传链接不构成下载指令）；
-            # 粘贴文本剥掉链接后的剩余部分当命名标注（与手工转发评论
-            # 同款继承）。
-            if not is_downloadable(message):
-                from . import tme as _tme_mod
-                _tme_urls = _tme_mod.extract_tme_post_urls(text)
-                if _tme_urls:
-                    _label = _tme_mod.strip_link_text(text, _tme_urls)
-                    if _label:
-                        _record_me_label(_label)
-                        logger.info(
-                            f"🏷 t.me 粘贴标注：\"{_label}\"")
+            if decision.kind in ("bili", "x"):
+                res = await routing.execute(decision)
+                await event.reply(res.message, link_preview=False)
+                return
 
-                    async def _tme_job():
-                        try:
-                            out = await _tme_mod.handle_tme_url(_tme_urls[0])
-                        except Exception as e:
-                            logger.exception(f"t.me 处理异常：{e}")
-                            out = f"❌ t.me 处理异常：{type(e).__name__}"
-                        try:
-                            await event.reply(out, link_preview=False)
-                        except Exception as e:
-                            logger.warning(f"t.me 回执回帖失败：{e}")
+            # t.me 帖子链接：bot 自己就是 Telegram 客户端，直接拉原帖媒体
+            # 入队——不再落外链台账。粘贴文本剥掉链接后的剩余部分当命名
+            # 标注（与手工转发评论同款继承）。
+            if decision.kind == "tme":
+                label = decision.extra.get("label")
+                if label:
+                    _record_me_label(label)
+                    logger.info(f"🏷 t.me 粘贴标注：\"{label}\"")
+                _tme_decision = decision
 
-                    spawn(_tme_job(), "t.me 直下任务")
-                    return
+                async def _tme_job():
+                    try:
+                        res = await routing.execute(_tme_decision)
+                        out = res.message
+                    except Exception as e:
+                        logger.exception(f"t.me 处理异常：{e}")
+                        out = f"❌ t.me 处理异常：{type(e).__name__}"
+                    try:
+                        await event.reply(out, link_preview=False)
+                    except Exception as e:
+                        logger.warning(f"t.me 回执回帖失败：{e}")
 
-            # 非抖音/IG 的外链（MEGA/网盘等）→ 手动外链台账：登记（默认
-            # 未处理）+ 查重（台账历史 + Pawchive 已完成外链）。命中早退
-            # ——链接消息不是转发评论，不进标注捕获。
-            # 转发消息不记（2026-10-30）：台账语义是「我在外面找到的链接」，
-            # 频道帖自带链接转发进来（iwara/t.me 宣传链接等）不算手工外链
-            # ——2026-10-30 实查 250 行里混入大量转发链接，即此因。
-            if not getattr(message, "fwd_from", None) \
-                    and manual_links.extract_urls(text):
-                reply, buttons = manual_links.observe(text)
-                await event.reply(reply, buttons=buttons or None,
+                spawn(_tme_job(), "t.me 直下任务")
+                return
+
+            # 其余外链（MEGA/网盘等）→ 手动外链台账。转发消息不记
+            # （2026-10-30）：台账语义是「我在外面找到的链接」，频道帖
+            # 自带链接转发进来不算手工外链。
+            if decision.kind == "ledger":
+                res = await routing.execute(decision)
+                await event.reply(res.message, buttons=res.buttons or None,
                                   link_preview=False)
                 return
 
@@ -1826,13 +1788,15 @@ async def main():
         extract_worker.extract_worker_loop())
 
     # Chrome Agent 结果通知轮询（读 chrome_tasks.json 终态 → 通知收藏夹）
-    asyncio.create_task(chrome_client.notify_loop())
+    # 三个长驻循环必须保存引用：asyncio 对 Task 只持弱引用，裸 create_task
+    # 可能让任务被 GC 静默杀死（同 CLAUDE.md 第一条纪律，2026-11-08 补齐）。
+    chrome_notify_task = asyncio.create_task(chrome_client.notify_loop())
 
     # Chrome 下载台账定时上传 115（成功静默，失败才通知）
-    asyncio.create_task(_chrome_report_loop())
+    chrome_report_task = asyncio.create_task(_chrome_report_loop())
 
     # 每日状态备份（DB 快照+状态文件 → 115）
-    asyncio.create_task(_state_backup_loop())
+    state_backup_task = asyncio.create_task(_state_backup_loop())
 
     # bot 按钮菜单：登录失败只影响菜单，不影响主功能
     if BOT_TOKEN:
@@ -2067,7 +2031,8 @@ async def main():
                   notify_replay_task,
                   cmdq_task, health_monitor_task,
                   pawchive_worker_task, api_task,
-                  extract_worker_task):
+                  extract_worker_task, chrome_notify_task,
+                  chrome_report_task, state_backup_task):
             if t is not None:
                 t.cancel()
         for t in (main_serve_task, bot_keepalive_task, retry_sweeper_task,
@@ -2077,7 +2042,8 @@ async def main():
                   notify_replay_task,
                   cmdq_task, health_monitor_task,
                   pawchive_worker_task, api_task,
-                  extract_worker_task):
+                  extract_worker_task, chrome_notify_task,
+                  chrome_report_task, state_backup_task):
             if t is not None:
                 try:
                     await t

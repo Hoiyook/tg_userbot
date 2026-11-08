@@ -22,6 +22,7 @@ from .spawn import spawn
 from . import state
 from . import text as text_mod
 from . import manual_links
+from . import routing
 from . import torrent_offline
 from . import menu
 from . import queue
@@ -1217,44 +1218,9 @@ async def bot_message_handler(event):
         if await commands.handle_command(event, text):
             return
 
-    # iwara 视频链接 → 提交 Chrome Agent 下载（CDP 解析签名直链）
-    from .iwara import extract_iwara_video_id
-    iwara_urls = [u for u in manual_links.extract_urls(text)
-                  if extract_iwara_video_id(u)]
-    if iwara_urls:
-        from . import chrome_client
-        from . import iwara as iwara_mod
-        # URL 判重（2026-10-26 定档）：成功过才拦截；失败/取消不拦
-        _vid = extract_iwara_video_id(iwara_urls[0])
-        try:
-            _hit = iwara_mod.find_previous_success(_vid) if _vid else None
-        except Exception:
-            _hit = None
-        if _hit:
-            logger.info(f"⏭️ iwara 判重拦截（视频 {_vid}，首次成功 "
-                        f"{(_hit.get('notified_at') or '')[:16]}）")
-            await event.reply(iwara_mod.duplicate_text(_hit))
-            return
-        out = await chrome_client.handle_chrome_command(
-            event, "/chrome " + iwara_urls[0],
-            owner_id=chrome_client.resolve_owner_id(state.MY_ID))
-        return
-
-    # 种子直链（.torrent 结尾）→ 转 115 离线（不走外链台账/普通下载）
-    torrent_urls = [u for u in manual_links.extract_urls(text)
-                    if torrent_offline.is_torrent_url(u)]
-    if torrent_urls:
-        out = await torrent_offline.handle_torrent_url(
-            torrent_urls[0],
-            to_folder=(torrent_offline.resolve_to_folder(a)
-                       if (a := torrent_offline.trailing_author(
-                           text, torrent_urls[0])) else None))
-        await _send_owner(out, [[
-            Button.inline("📋 离线任务", menu.encode_menu_data("cd2tasks")),
-            Button.inline("🏠 首页", menu.encode_menu_data("home"))]])
-        return
-
-    # .torrent 文件（Document）→ 下载字节转磁力 → 115 离线
+    # .torrent 文件（Document）→ 下载字节转磁力 → 115 离线。
+    # 必须排在文本分流**之前**：种子文件常带一条来源页链接的 caption，
+    # 先分流会被外链台账/站点识别抢走，文件反而没人处理。
     doc = getattr(message, "document", None)
     doc_name = getattr(getattr(message, "file", None), "name", None)
     if doc is not None and isinstance(doc_name, str) \
@@ -1266,24 +1232,30 @@ async def bot_message_handler(event):
         await _send_owner(out, menu.back_home_buttons())
         return
 
-    # 站点链接自动识别（2026-11-05 owner 实测补：B站/X 只挂在收藏夹路由，
-    # bot 对话发裸链接曾直接落外链台账——配置同款 AUTOROUTE_* 可关）。
-    # 文本+链接混合形态（「标题 https://b23.tv/x」）由各自 auto_reply 抽取。
-    from . import bili_dl as _bili
-    from . import x_dl as _x_dl
-    if config.AUTOROUTE_BILI and _bili.looks_like_bili(text):
-        out = await _bili.auto_reply(text)
-        await _send_owner(out, menu.back_home_buttons())
-        return
-    if config.AUTOROUTE_X and _x_dl.looks_like_x(text):
-        out = await _x_dl.auto_reply(text)
-        await _send_owner(out, menu.back_home_buttons())
-        return
-
-    # 非命令文本里带 http(s) 链接 → 手动外链台账（记录/查重），不回落主菜单
-    if manual_links.extract_urls(text):
-        reply, buttons = manual_links.observe(text)
-        await _send_owner(reply, buttons)
+    # 链接分流（单一实现 routing.py）：抖音/IG → 种子 → iwara → B站 → X →
+    # t.me → 外链台账。三入口策略 2026-11-08 已统一（SURFACE_BOT 不再缺
+    # 抖音/IG 与 t.me）。
+    decision = routing.classify(text, allow=routing.SURFACE_BOT,
+                                message=message)
+    if decision.handled:
+        res = await routing.execute(decision, event=event)
+        if res.kind == "iwara":
+            # Chrome 命令入口自己回帖（含「已提交」），这里不再重复
+            return
+        if res.kind == "iwara_dup":
+            await event.reply(res.message)
+            return
+        if res.kind == "torrent":
+            await _send_owner(res.message, [[
+                Button.inline("📋 离线任务",
+                              menu.encode_menu_data("cd2tasks")),
+                Button.inline("🏠 首页", menu.encode_menu_data("home"))]])
+            return
+        if res.kind == "ledger":
+            await _send_owner(res.message, res.buttons)
+            return
+        # bili / x / t.me / 抖音/IG：统一回执（douyin 的回执由 routing 给）
+        await _send_owner(res.message, menu.back_home_buttons())
         return
 
     # 任意文本（含 /start）→ 主菜单
