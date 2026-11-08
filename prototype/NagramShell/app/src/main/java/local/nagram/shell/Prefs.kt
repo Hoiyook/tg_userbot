@@ -17,7 +17,9 @@ import org.json.JSONArray
  */
 object Prefs {
     private const val NAME = "nagram_shell"
-    private const val KEY_URL = "server_url"
+    private const val KEY_URL = "server_url"      // 家里地址（同一 WiFi）
+    private const val KEY_AWAY = "away_url"       // 外网地址（Tailscale 等）
+    private const val KEY_LAST_GOOD = "last_good_url"  // 探活赢家缓存
     private const val KEY_TOKEN = "token"
     private const val KEY_BOT_TOKEN = "bot_token"
     private const val KEY_CHAT_ID = "chat_id"
@@ -25,8 +27,30 @@ object Prefs {
 
     private fun sp(ctx: Context) = ctx.getSharedPreferences(NAME, 0)
 
-    fun url(ctx: Context): String =
+    /** 家里地址（同一 WiFi 时用，最快）。 */
+    fun homeUrl(ctx: Context): String =
         sp(ctx).getString(KEY_URL, "")!!.trim().trimEnd('/')
+
+    /** 外网地址（外出时用，如 Tailscale https://xxx.ts.net）。 */
+    fun awayUrl(ctx: Context): String =
+        sp(ctx).getString(KEY_AWAY, "")!!.trim().trimEnd('/')
+
+    /** 上次探活赢家的 base（不带尾斜杠）；空 = 还没探过。 */
+    fun lastGood(ctx: Context): String =
+        sp(ctx).getString(KEY_LAST_GOOD, "")!!.trim().trimEnd('/')
+
+    fun setLastGood(ctx: Context, base: String) {
+        sp(ctx).edit().putString(KEY_LAST_GOOD, base.trim().trimEnd('/')).apply()
+    }
+
+    /** 快速解析（不探活）：上次赢家优先 → 家里 → 外网。 */
+    fun resolveCached(ctx: Context): String {
+        val home = homeUrl(ctx)
+        val away = awayUrl(ctx)
+        return lastGood(ctx).ifEmpty {
+            if (home.startsWith("http")) home else if (away.startsWith("http")) away else ""
+        }
+    }
 
     fun token(ctx: Context): String =
         sp(ctx).getString(KEY_TOKEN, "")!!.trim()
@@ -40,19 +64,23 @@ object Prefs {
     fun telegramConfigured(ctx: Context): Boolean =
         botToken(ctx).isNotEmpty() && chatId(ctx).isNotEmpty()
 
-    fun httpConfigured(ctx: Context): Boolean = url(ctx).startsWith("http")
+    fun httpConfigured(ctx: Context): Boolean =
+        homeUrl(ctx).startsWith("http") || awayUrl(ctx).startsWith("http")
 
     /** 两条通道任一配好即算可用（分享优先 Telegram，看板用 HTTP） */
     fun configured(ctx: Context): Boolean =
         telegramConfigured(ctx) || httpConfigured(ctx)
 
-    fun save(ctx: Context, url: String, token: String,
+    fun save(ctx: Context, homeUrl: String, awayUrl: String, token: String,
              botToken: String, chatId: String) {
         sp(ctx).edit()
-            .putString(KEY_URL, url.trim().trimEnd('/'))
+            .putString(KEY_URL, homeUrl.trim().trimEnd('/'))
+            .putString(KEY_AWAY, awayUrl.trim().trimEnd('/'))
             .putString(KEY_TOKEN, token.trim())
             .putString(KEY_BOT_TOKEN, botToken.trim())
             .putString(KEY_CHAT_ID, chatId.trim())
+            // 地址变了，旧探活赢家不再可信，清掉让本轮重新探
+            .putString(KEY_LAST_GOOD, "")
             .apply()
     }
 

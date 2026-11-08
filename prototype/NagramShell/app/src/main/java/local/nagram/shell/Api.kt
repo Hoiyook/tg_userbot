@@ -78,8 +78,66 @@ object Api {
         }
     }
 
+    /** 并发探活家里/外网两个 base：先回 HTTP 响应的赢（家里直连通常快
+     *  得多）。可达 = 任意 HTTP 响应（401/404 也算，只测连通性）。
+     *  只配一个地址就不探直接验它。都不通返回 ""。 */
+    fun probeBoth(ctx: android.content.Context): String {
+        val candidates = listOf(Prefs.homeUrl(ctx), Prefs.awayUrl(ctx))
+            .filter { it.startsWith("http") }
+            .distinct()
+        if (candidates.isEmpty()) return ""
+        if (candidates.size == 1) return if (probe(candidates[0])) candidates[0] else ""
+        val es = java.util.concurrent.Executors.newFixedThreadPool(2)
+        try {
+            val futures = candidates.map { c ->
+                es.submit(java.util.concurrent.Callable {
+                    if (probe(c)) c else null
+                })
+            }
+            val deadline = System.currentTimeMillis() + 4500
+            while (System.currentTimeMillis() < deadline) {
+                for (f in futures) {
+                    if (f.isDone) {
+                        val r = f.get()
+                        if (r != null) return r
+                    }
+                }
+                Thread.sleep(50)
+            }
+            return ""
+        } finally {
+            es.shutdownNow()
+        }
+    }
+
+    private fun probe(base: String): Boolean = try {
+        val conn = URL("$base/api/version").openConnection()
+                as HttpURLConnection
+        conn.connectTimeout = 2_000
+        conn.readTimeout = 2_000
+        conn.instanceFollowRedirects = false
+        val code = conn.responseCode
+        conn.disconnect()
+        code > 0
+    } catch (e: Exception) {
+        false
+    }
+
     fun postEnqueue(ctx: android.content.Context, text: String): Result {
-        val base = Prefs.url(ctx)
+        val base = Prefs.resolveCached(ctx)
+        val r = postTo(ctx, base, text)
+        if (!r.offline) return r
+        // 缓存地址不通（在外/换了网络）→ 重新探活换路重试一次
+        val winner = probeBoth(ctx)
+        if (winner.isNotEmpty() && winner != base) {
+            Prefs.setLastGood(ctx, winner)
+            return postTo(ctx, winner, text)
+        }
+        return r
+    }
+
+    private fun postTo(ctx: android.content.Context, base: String,
+                       text: String): Result {
         return try {
             val conn = URL("$base/api/enqueue").openConnection()
                     as HttpURLConnection

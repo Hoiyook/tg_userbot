@@ -202,8 +202,9 @@ fun TelegramOnlyScreen(onEdit: () -> Unit, spoolNote: String) {
         }
         Spacer(Modifier.height(20.dp))
         Text(
-            "看板仪表盘需要「服务器直连」地址：家里同一 WiFi 时在 ⚙ 里填"
-                    + " http://<Mac的IP>:8765（token 见 tg_secrets.json api 段）；"
+            "看板仪表盘需要「服务器直连」地址：家里同一 WiFi 填"
+                    + " http://<Mac的IP>:8765，外出填 https://<你的>.ts.net"
+                    + "（两个都填自动切换；token 见 tg_secrets.json api 段）。"
                     + "填了以后打开 app 就是实时仪表盘",
             color = InkMut, fontSize = 13.sp, lineHeight = 19.sp,
         )
@@ -217,7 +218,8 @@ fun TelegramOnlyScreen(onEdit: () -> Unit, spoolNote: String) {
 @Composable
 fun ConfigScreen(onSaved: () -> Unit, onCancel: (() -> Unit)?) {
     val ctx = LocalContext.current
-    var url by remember { mutableStateOf(Prefs.url(ctx)) }
+    var url by remember { mutableStateOf(Prefs.homeUrl(ctx)) }
+    var awayUrl by remember { mutableStateOf(Prefs.awayUrl(ctx)) }
     var token by remember { mutableStateOf(Prefs.token(ctx)) }
     var botToken by remember { mutableStateOf(Prefs.botToken(ctx)) }
     var chatId by remember { mutableStateOf(Prefs.chatId(ctx)) }
@@ -259,11 +261,21 @@ fun ConfigScreen(onSaved: () -> Unit, onCancel: (() -> Unit)?) {
         }
         Spacer(Modifier.height(12.dp))
         ConfigCard("② 服务器直连 · 选填",
-            "家里同一 WiFi 时看板更快；token 见 tg_secrets.json 的 api 段") {
+            "家里地址同一 WiFi 时最快；外出用外网地址（Tailscale）。两个" +
+                "都填时 app 自动探活选路（零权限，随网络环境自动切换）；" +
+                "token 见 tg_secrets.json 的 api 段") {
             OutlinedTextField(
                 value = url,
                 onValueChange = { url = it },
-                label = { Text("服务器地址（如 http://192.168.31.161:8765）") },
+                label = { Text("家里地址（如 http://192.168.31.161:8765）") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+            )
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(
+                value = awayUrl,
+                onValueChange = { awayUrl = it },
+                label = { Text("外网地址（如 https://xxx.ts.net）") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
             )
@@ -280,11 +292,12 @@ fun ConfigScreen(onSaved: () -> Unit, onCancel: (() -> Unit)?) {
         Spacer(Modifier.height(20.dp))
         Button(
             onClick = {
-                if (botToken.isBlank() && !url.trim().startsWith("http")) {
+                if (botToken.isBlank() && !url.trim().startsWith("http")
+                    && !awayUrl.trim().startsWith("http")) {
                     note = "至少配置 Telegram 中转（Bot Token + 数字 ID）或服务器地址"
                     return@Button
                 }
-                Prefs.save(ctx, url, token, botToken, chatId)
+                Prefs.save(ctx, url, awayUrl, token, botToken, chatId)
                 onSaved()
             },
             modifier = Modifier.fillMaxWidth().height(50.dp),
@@ -328,10 +341,25 @@ private fun ConfigCard(title: String, desc: String,
 @Composable
 fun DashboardScreen(onEdit: () -> Unit, spoolNote: String) {
     val ctx = LocalContext.current
-    val base = Prefs.url(ctx)
+    var base by remember { mutableStateOf(Prefs.resolveCached(ctx)) }
     val token = Prefs.token(ctx)
     val target = if (token.isNotEmpty()) "$base/?token=$token" else "$base/"
     val refreshTrigger = remember { mutableStateOf(0) }
+    val probeTrigger = remember { mutableStateOf(0) }
+
+    // 双地址探活选路（2026-11-08）：家里 WiFi 时内网地址秒回赢；外出时
+    // 内网超时自动切外网地址。赢家写缓存（下次打开即用对的路），与本轮
+    // 加载地址不同时重载 WebView。
+    LaunchedEffect(probeTrigger.value) {
+        val winner = withContext(Dispatchers.IO) { Api.probeBoth(ctx) }
+        if (winner.isNotEmpty() && Prefs.lastGood(ctx) != winner) {
+            Prefs.setLastGood(ctx, winner)
+            if (winner != base) {
+                base = winner
+                refreshTrigger.value += 1
+            }
+        }
+    }
 
     Box(Modifier.fillMaxSize()) {
         // 下拉刷新：SwipeRefresh 包 WebView——WebView 内部滚动到顶时
@@ -339,7 +367,7 @@ fun DashboardScreen(onEdit: () -> Unit, spoolNote: String) {
         // serve，no-store 保证拿到最新版）
         com.google.accompanist.swiperefresh.SwipeRefresh(
             state = rememberSwipeRefreshState(isRefreshing = false),
-            onRefresh = { refreshTrigger.value += 1 },
+            onRefresh = { refreshTrigger.value += 1; probeTrigger.value += 1 },
             modifier = Modifier.fillMaxSize(),
             indicator = { state, trigger ->
                 com.google.accompanist.swiperefresh.SwipeRefreshIndicator(
