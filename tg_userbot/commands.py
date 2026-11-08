@@ -743,9 +743,10 @@ async def _handle_command_inner(event, cmd_text):
         # 先回执（枚举要几分钟），后台跑，进度走通知
         await _reply(event, f"🎵 开始枚举作者作品：{url_arg}\n"
                             "（翻页中，完成后通知汇总；作品将逐条串行下载）")
-        asyncio.create_task(
+        spawn(
             douyin_batch.run_dyu(url_arg, subdir_arg, since_arg,
-                                 original_only=not include_fwd))
+                                 original_only=not include_fwd),
+            "/dyu 枚举")
         return True
 
     if extract_worker.is_extract_command(cmd_text):

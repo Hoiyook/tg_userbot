@@ -997,6 +997,118 @@ class PasteHistoryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0]["routed"], "iwara")   # 新→旧
         self.assertEqual(items[0]["ref"], "task123")
 
+    def test_iwara_request_before_claim_shows_queue(self):
+        """Agent 每 5s 才认领：提交瞬间任务只在 requests 里，不能显示已受理。"""
+        url = "https://iwara.tv/video/pending1"
+        with mock.patch("tg_userbot.chrome_agent.load_tasks",
+                        return_value=[]), \
+                mock.patch("tg_userbot.chrome_client.load_requests",
+                           return_value=[{"task_id": "REQ1", "url": url}]):
+            text, kind = api_server._paste_status({
+                "routed": "iwara", "ref": "REQ1", "url": url, "text": ""})
+        self.assertIn("排队", text)
+        self.assertEqual(kind, "wait")
+
+    def test_iwara_ref_none_finds_task_by_url(self):
+        """老粘贴记录 ref 丢失时，按 URL 找回当前 Chrome 任务。"""
+        url = "https://iwara.tv/video/oldref"
+        with mock.patch("tg_userbot.chrome_agent.load_tasks",
+                        return_value=[{"task_id": "T1", "url": url,
+                                       "status": "RUNNING",
+                                       "filename": "x.mp4"}]), \
+                mock.patch("tg_userbot.chrome_client.load_requests",
+                           return_value=[]):
+            text, kind = api_server._paste_status({
+                "routed": "iwara", "ref": None, "url": url, "text": ""})
+        self.assertIn("下载中", text)
+        self.assertEqual(kind, "run")
+
+    def test_iwara_notified_request_outcome(self):
+        """任务滚出 200 条窗口后，requests 台账里的终态仍可回查。"""
+        url = "https://iwara.tv/video/done1"
+        with mock.patch("tg_userbot.chrome_agent.load_tasks",
+                        return_value=[]), \
+                mock.patch("tg_userbot.chrome_client.load_requests",
+                           return_value=[{"task_id": "REQ1", "url": url,
+                                          "notified_at": "x",
+                                          "outcome": "FAILED"}]):
+            text, kind = api_server._paste_status({
+                "routed": "iwara", "ref": "REQ1", "url": url, "text": ""})
+        self.assertIn("失败", text)
+        self.assertEqual(kind, "bad")
+
+    def test_bili_paste_resolves_done_task(self):
+        """B站粘贴记录必须查 bili_tasks（此前没有分支，永远显示已受理）。"""
+        url = "https://www.bilibili.com/video/BV1wtxT6tEzz"
+        with mock.patch.object(
+                runtime_db_mod.BILI_TASKS, "get",
+                return_value={"status": "DONE", "label": "合集sid9426924",
+                              "url": url}):
+            text, kind = api_server._paste_status({
+                "routed": "bili", "ref": None, "url": url, "text": url})
+        self.assertIn("已完成", text)
+        self.assertIn("合集sid9426924", text)
+        self.assertEqual(kind, "done")
+
+    def test_bili_paste_pending_retry(self):
+        url = "https://www.bilibili.com/video/BV1pending"
+        with mock.patch.object(
+                runtime_db_mod.BILI_TASKS, "get",
+                return_value={"status": "PENDING", "attempts": 2,
+                              "next_retry_at": 123, "url": url}):
+            text, kind = api_server._paste_status({
+                "routed": "bili", "ref": None, "url": url, "text": url})
+        self.assertIn("排队", text)
+        self.assertIn("等待重试", text)
+        self.assertEqual(kind, "wait")
+
+    def test_bili_paste_failed_shows_error(self):
+        url = "https://www.bilibili.com/video/BV1failed"
+        with mock.patch.object(
+                runtime_db_mod.BILI_TASKS, "get",
+                return_value={"status": "FAILED", "error": "403 风控",
+                              "url": url}):
+            text, kind = api_server._paste_status({
+                "routed": "bili", "ref": None, "url": url, "text": url})
+        self.assertIn("失败", text)
+        self.assertIn("403", text)
+        self.assertEqual(kind, "bad")
+
+    def test_bili_paste_bv_fallback(self):
+        """URL 带 query 参数、与任务键不一致时，按 BV 号找回。"""
+        url = "https://www.bilibili.com/video/BV1wtxT6tEzz?p=1"
+        with mock.patch.object(runtime_db_mod.BILI_TASKS, "get",
+                               return_value=None), \
+                mock.patch.object(
+                    runtime_db_mod.BILI_TASKS, "list",
+                    return_value=[{"status": "DONE", "url":
+                                   "https://www.bilibili.com/video/"
+                                   "BV1wtxT6tEzz", "label": "合集"}]):
+            text, kind = api_server._paste_status({
+                "routed": "bili", "ref": None, "url": url, "text": url})
+        self.assertIn("已完成", text)
+        self.assertEqual(kind, "done")
+
+    def test_x_paste_resolves_task(self):
+        url = "https://x.com/someone/status/123"
+        with mock.patch("tg_userbot.x_dl.normalize_target",
+                        return_value=(url, url, "@someone/status/123",
+                                      None)), \
+                mock.patch.object(
+                    runtime_db_mod.XN_TASKS, "get",
+                    return_value={"status": "PROCESSING", "target": url}):
+            text, kind = api_server._paste_status({
+                "routed": "x", "ref": None, "url": url, "text": url})
+        self.assertIn("下载中", text)
+        self.assertEqual(kind, "run")
+
+    def test_instagram_paste_no_ref(self):
+        url = "https://www.instagram.com/p/ABC123/"
+        text, kind = api_server._paste_status({
+            "routed": "instagram", "ref": None, "url": url, "text": url})
+        self.assertIn("解析 bot", text)
+        self.assertEqual(kind, "info")
+
     async def test_pastes_endpoint_resolves_statuses(self):
         from tg_userbot import chrome_client, stats
         api_server._log_paste("iwara 文本", "https://iwara.tv/video/1", "iwara", "TASK1")

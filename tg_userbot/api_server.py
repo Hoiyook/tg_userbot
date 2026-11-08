@@ -164,6 +164,26 @@ _EVENTS_STATUS_VIEW = {
     "DEDUP_HIT": ("去重拦截", "info"), "REMOVED": ("已移除", "info"),
     "CANCELLED": ("已取消", "info"), "DEDUP_SKIPPED": ("去重跳过", "info"),
 }
+_TASK_STATUS_VIEW = {
+    "PENDING": ("⏳ 排队", "wait"), "PROCESSING": ("下载中", "run"),
+    "DONE": ("✅ 已完成", "done"), "FAILED": ("❌ 失败", "bad"),
+}
+
+
+def _task_domain_status(row, label_key=None):
+    """TaskDomain 行（bili/xn/xi）→ 看板状态文本（含标签与失败原因）。"""
+    status = str(row.get("status") or "")
+    text, kind = _TASK_STATUS_VIEW.get(status, (status or "处理中", "info"))
+    label = str(row.get("label")
+                or (row.get(label_key) if label_key else "") or "")
+    if label:
+        text += f" · {label[:40]}"
+    if status == "FAILED" and row.get("error"):
+        text += f" · {str(row['error'])[:60]}"
+    elif status == "PENDING" and row.get("next_retry_at") \
+            and row.get("attempts"):
+        text += "（等待重试）"
+    return text, kind
 
 
 def _paste_status(p):
@@ -217,18 +237,45 @@ def _paste_status(p):
                 return "✅ 已处理完成（已出队列）", "done"
             return "📥 已入队下载（t.me 帖）", "run"
         if routed in ("iwara", "iwara_dup"):
-            # ① 有 ref → chrome 任务实时状态（排队/下载中/完成/失败）
+            # ① Chrome 任务实时状态（排队/下载中/完成/失败/重试）
+            from . import chrome_agent, chrome_client
+            tasks = chrome_agent.load_tasks(config.CHROME_TASKS_FILE)
+            t = None
             if ref:
-                from . import chrome_agent
-                tasks = chrome_agent.load_tasks(config.CHROME_TASKS_FILE)
                 t = next((x for x in tasks if x.get("task_id") == ref), None)
-                if t:
-                    text, kind = _CHROME_STATUS_VIEW.get(
-                        t.get("status"), (t.get("status") or "未知", "info"))
-                    if t.get("filename"):
-                        text += f" · {t['filename']}"
+            if t is None and url:
+                # 老粘贴记录 ref 丢失：按 URL 找回当前任务（取最新一条）
+                t = next((x for x in reversed(tasks)
+                          if x.get("url") == url), None)
+            if t:
+                text, kind = _CHROME_STATUS_VIEW.get(
+                    t.get("status"), (t.get("status") or "未知", "info"))
+                if t.get("filename"):
+                    text += f" · {t['filename']}"
+                return text, kind
+            # ② Agent 还没认领：requests 台账里已有 task_id（提交瞬间
+            #    routing 现在会把它的 ref 写进粘贴记录）
+            reqs = chrome_client.load_requests()
+            r = None
+            if ref:
+                r = next((x for x in reqs if x.get("task_id") == ref), None)
+            if r is None and url:
+                r = next((x for x in reversed(reqs)
+                          if x.get("url") == url), None)
+            if r:
+                if r.get("notified_at"):
+                    # 任务滚出 200 条窗口后，requests 里的终态仍可回查
+                    outcome = str(r.get("outcome") or "").upper()
+                    text, kind = {
+                        "SUCCESS": ("✅ 已完成", "done"),
+                        "FAILED": ("❌ 失败", "bad"),
+                        "CANCELLED": ("🛑 已取消", "info"),
+                    }.get(outcome, ("已处理（详见 Chrome 任务）", "info"))
+                    if r.get("filename"):
+                        text += f" · {r['filename']}"
                     return text, kind
-            # ② 兜底：按视频 ID 查既往成功——ref 缺失、任务滚出窗口、
+                return "⏳ 排队（待 Agent 认领）", "wait"
+            # ③ 兜底：按视频 ID 查既往成功——ref 缺失、任务滚出窗口、
             #    去重拦截三种情况都能对上（与 dispatch 判重同一数据源）
             from .iwara import extract_iwara_video_id
             vid = (extract_iwara_video_id(url or "")
@@ -243,7 +290,32 @@ def _paste_status(p):
                     fname = hit.get("filename") or ""
                     return ("✅ 已处理（重复拦截）"
                             + (f" · {fname}" if fname else ""), "done")
-        if routed in ("douyin",) and ref:
+        if routed == "bili" and url:
+            # B站任务在 bili_tasks（TaskDomain）；粘贴记录的 url 就是业务键
+            from . import bili_dl, runtime_db
+            row = runtime_db.BILI_TASKS.get(url)
+            if row is None:
+                # URL 带 query / 不同形态：按 BV 号从近期任务里找回
+                m = (bili_dl.BV_RE.search(url)
+                     or bili_dl.BV_RE.search(str(p.get("text") or "")))
+                if m:
+                    row = next(
+                        (r for r in runtime_db.BILI_TASKS.list(limit=200)
+                         if m.group(0) in (r.get("url") or "")), None)
+            if row:
+                return _task_domain_status(row, label_key="url")
+            return "已不在 B站队列（已完成或已移除）", "info"
+        if routed == "x" and (url or p.get("text")):
+            # X 任务的业务键 = normalize_target 后的 URL/@作者
+            from . import runtime_db, x_dl
+            key, _gallery, _label, _err = x_dl.normalize_target(
+                url or p.get("text"))
+            if key:
+                row = runtime_db.XN_TASKS.get(key)
+                if row:
+                    return _task_domain_status(row, label_key="target")
+                return "已不在 X 队列（已完成或已移除）", "info"
+        if routed in ("douyin", "instagram") and ref:
             last = None
             for e in stats.load_events():
                 if e.get("task_id") == ref:
@@ -253,7 +325,7 @@ def _paste_status(p):
                     last.get("ev"), (last.get("ev") or "处理中", "info"))
                 return text, kind
             return "已受理（解析中）", "info"
-        if routed in ("douyin",) and not ref:
+        if routed in ("douyin", "instagram") and not ref:
             return "已转解析 bot", "info"
         if routed == "ledger" and url:
             from . import runtime_db

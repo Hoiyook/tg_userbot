@@ -40,14 +40,22 @@ def unreferenced_create_task_lines(path):
 
 
 class BackgroundTaskDisciplineTest(unittest.TestCase):
-    def test_app_has_no_unreferenced_create_task(self):
-        path = os.path.join(PKG, "app.py")
+    def _check(self, filename):
+        path = os.path.join(PKG, filename)
         hits = unreferenced_create_task_lines(path)
         self.assertEqual(
             hits, [],
-            "app.py 存在返回值无人持有的 asyncio.create_task（行号 "
+            f"{filename} 存在返回值无人持有的 asyncio.create_task（行号 "
             f"{hits}）：任务可能被 GC 静默杀死，异常也无人可见。"
             "请改用 spawn() 或保存返回值并纳入停机取消列表。")
+
+    def test_app_has_no_unreferenced_create_task(self):
+        self._check("app.py")
+
+    def test_commands_has_no_unreferenced_create_task(self):
+        # /dyu 曾在这里裸 create_task：枚举任务被 GC 后枚举锁一直占着，
+        # 后续 /dyu 只回「已有一个枚举在进行中」，用户侧就是「执行不通」。
+        self._check("commands.py")
 
 
 # 链接分流只允许 routing.py 调用这些服务入口；三个文本入口（收藏夹 /

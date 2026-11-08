@@ -271,6 +271,28 @@ class ExecuteTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res.message, "")
 
 
+class ChromeRefLookupTest(unittest.TestCase):
+    """iwara 粘贴历史的 ref：提交瞬间任务还在 requests 里，Agent 尚未认领。"""
+
+    def test_prefers_latest_request_before_agent_claims(self):
+        with mock.patch("tg_userbot.chrome_agent.load_tasks",
+                        return_value=[]), \
+                mock.patch("tg_userbot.chrome_client.load_requests",
+                           return_value=[
+                               {"task_id": "old", "url": IWARA,
+                                "notified_at": "x"},
+                               {"task_id": "new", "url": IWARA},
+                           ]):
+            self.assertEqual(routing._lookup_chrome_ref(IWARA), "new")
+
+    def test_falls_back_to_claimed_task(self):
+        with mock.patch("tg_userbot.chrome_agent.load_tasks",
+                        return_value=[{"task_id": "task1", "url": IWARA}]), \
+                mock.patch("tg_userbot.chrome_client.load_requests",
+                           return_value=[]):
+            self.assertEqual(routing._lookup_chrome_ref(IWARA), "task1")
+
+
 class AppSurfaceIwaraDeliveryTest(unittest.IsolatedAsyncioTestCase):
     """收藏夹入口：iwara 必须交给 Chrome 命令入口。
 

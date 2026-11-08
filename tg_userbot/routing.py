@@ -183,14 +183,28 @@ def _lookup_queue_ref(url):
 
 
 def _lookup_chrome_ref(url):
-    """iwara 提交后按 URL 回查 Chrome task_id（粘贴历史用；best-effort）。"""
+    """iwara 提交后按 URL 回查 Chrome task_id（粘贴历史用；best-effort）。
+
+    两条数据源缺一不可：**requests** 是 User Bot 刚写入的提交台账（Agent
+    每 5s 轮询才认领，提交瞬间任务只在这里）；**tasks** 是 Agent 认领后的
+    实时任务台账。先 requests 后 tasks，各自取最新一条——否则 ref 永远是
+    None，看板粘贴历史只能显示「已受理」，后续状态全丢。
+    """
+    try:
+        for req in reversed(chrome_client.load_requests()):
+            if req.get("url") == url and req.get("task_id"):
+                return req["task_id"]
+    except Exception:
+        pass
     try:
         from . import chrome_agent
         tasks = chrome_agent.load_tasks(config.CHROME_TASKS_FILE)
-        return next((t.get("task_id") for t in tasks
-                     if t.get("url") == url), None)
+        for t in reversed(tasks):
+            if t.get("url") == url and t.get("task_id"):
+                return t["task_id"]
     except Exception:
-        return None
+        pass
+    return None
 
 
 async def execute(decision, *, event=None, message=None):

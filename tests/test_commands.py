@@ -26,6 +26,27 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 from tg_userbot import commands  # noqa: E402
 
 
+class DyuDispatchTest(unittest.TestCase):
+    """/dyu 必须经 spawn 启动后台枚举（裸 create_task 会静默死）。"""
+
+    def test_dyu_spawns_enumeration(self):
+        ev = FakeEvent()
+        sentinel = object()
+        with mock.patch.object(commands.douyin_batch, "enum_busy",
+                               return_value=False), \
+                mock.patch.object(commands.douyin_batch, "run_dyu",
+                                  new=mock.MagicMock(
+                                      return_value=sentinel)), \
+                mock.patch.object(commands, "spawn") as spawn:
+            ok = asyncio.run(commands.handle_command(
+                ev, "/dyu https://v.douyin.com/abc 我的目录"))
+        self.assertTrue(ok)
+        self.assertIn("开始枚举", ev.replies[0])
+        spawn.assert_called_once()
+        self.assertIs(spawn.call_args.args[0], sentinel)
+        self.assertEqual(spawn.call_args.args[1], "/dyu 枚举")
+
+
 class FakeEvent:
     """仅实现 handle_command 用到的 reply：捕获回复文本，不碰网络。"""
 
