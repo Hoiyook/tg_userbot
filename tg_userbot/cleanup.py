@@ -123,13 +123,6 @@ def is_cleanup_message(message, include_persistent=False) -> bool:
     也算清理对象；自动清理循环用默认 False——结果报告用户可能晚些才看，
     瞬态清理会让人错过（2026-09-09 验收实测）。
     """
-    """判断 Saved Messages 中的消息是否属于程序指令/通知。
-
-    真实媒体（含白名单转发进收藏夹待下载/已下载的副本）一律保留，即使
-    caption 里含抖音 URL 或通知前缀——副本是用户明言要留的记录/收藏。
-    纯文本命令/通知/抖音链接指令消息才清理（is_downloadable 对纯 WebPage
-    预览返回 False，带链接的纯文本指令照旧清理）。
-    """
     try:
         if is_downloadable(message):
             return False

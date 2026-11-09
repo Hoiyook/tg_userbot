@@ -89,9 +89,15 @@ def truncate_output(output):
 
 
 def _blacklisted_reason(raw, tokens):
-    """返回命中黑名单的描述；未命中返回 None。"""
+    """返回命中黑名单的描述；未命中返回 None。
+
+    黑名单是**防呆**不是安全边界（触发面 = Saved Messages 主账号本身）。
+    token 同时比对 basename：``/bin/rm`` 这类绝对路径写法与裸 ``rm``
+    一视同仁，堵住"换个路径就绕过"的最浅一种。仍可被 ``bash -c``/
+    ``xargs``/管道脚本等组合绕过——黑名单挡手滑，不挡恶意。"""
     for tok in tokens:
-        if tok in BLACKLIST_COMMANDS:
+        base = tok.rsplit("/", 1)[-1]
+        if tok in BLACKLIST_COMMANDS or base in BLACKLIST_COMMANDS:
             return f"禁用命令「{tok}」"
         if tok.startswith("/dev/"):
             return f"写块设备「{tok}」"

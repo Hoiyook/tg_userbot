@@ -36,9 +36,6 @@ _POSTED_NAME_RE = re.compile(r"Posted:.*?\n(.*?)\nClose", re.S)
 _HATH_LINK_RE = re.compile(r"href=\"(https?://[^\"']+?/archive/[^\"]+)\"")
 _COST_RE = re.compile(r"Download Cost:\s*([\d,]+)\s*GP", re.I)
 _FETCH_TIMEOUT = 25.0
-_STALE = {"running": False}
-
-
 def parse_gallery_ref(text):
     """画廊 URL → (gid, token)；认不出返回 None。"""
     m = _GALLERY_RE.search(str(text or ""))
@@ -156,14 +153,15 @@ def fetch_archive_link_blocking(gid, token):
     m = _HATH_LINK_RE.search(body)
     if not m:
         if "successfully prepared" in body or "start=1" in body:
-            # 已在直链页：链接可能就是当前 URL（?start 缺省）
-            m2 = re.search(r"(https?://[^\"' ]+?/archive/[^\"' ]+)", body)
+            # 已在直链页：链接可能就是当前 URL（?start 缺省）。
+            # [^\s] 而非 [^"' ]：裸直链后跟换行/HTML 标签，吞进尾巴会让
+            # 拼出的 ?start=1 链接必然失效。
+            m2 = re.search(r"(https?://[^\"'\s]+?/archive/[^\"'\s]+)", body)
             if not m2:
                 raise RuntimeError("hath 页解析不到下载链接（报维护者）")
             link = m2.group(1)
         else:
             raise RuntimeError("原包生成失败（GP 不足或改版）——看 /ehentai cookie")
-        link = m.group(1)
     else:
         link = m.group(1)
     if "start=" not in link:
@@ -317,8 +315,4 @@ async def command_reply(cmd_text):
     from .naming import sanitize_filename
     author = sanitize_filename(author)[:60] if author else None
     gid, token = ref
-    _STALE["running"] = True
-    try:
-        return await process_gallery(gid, token, author=author)
-    finally:
-        _STALE["running"] = False
+    return await process_gallery(gid, token, author=author)

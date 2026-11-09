@@ -208,6 +208,8 @@
   <section class="page" id="p-queue">
     <h2>全部队列</h2>
     <div id="queuesAll" class="card"><div class="note">读取中…</div></div>
+    <h2>⚠️ 失败与重试（全链路）</h2>
+    <div id="problems" class="card"><div class="note">读取中…</div></div>
     <h2>🔗 最近链接（全入口）</h2>
     <div id="pastes-queue"><div class="note">加载中…</div></div>
     <h2>下载队列</h2>
@@ -1272,7 +1274,51 @@ async function loadQueuesAll() {
         esc(stat) + (items ? "｜" + items : "") +
         '</div><div class="chips" style="margin-top:4px">' + ops + '</div></div></div>';
     }).join("");
+    renderProblems(d.problems);
   } catch (e) { /* 主循环退避已处理 */ }
+}
+
+/* ⚠️ 失败与重试（全链路，2026-11-10）：与 /api/queues 同一份响应渲染，
+   SSE 每 2s 随流刷新，零额外请求。每行：渠道徽章 + 内容 + 状态标签 +
+   重试次数 + 退避倒计时（next_in）+ 处置命令（hint 可点即执行）。 */
+function renderProblems(problems) {
+  const el = document.getElementById("problems");
+  if (!el) return;
+  const list = problems || [];
+  if (!list.length) {
+    el.innerHTML = '<div class="note">✅ 全链路无失败 / 待重试任务</div>';
+    return;
+  }
+  const stTag = s => {
+    if (s === "FAILED") return '<span class="tag t-retry">❌ 终态失败</span>';
+    if (s === "RETRY") return '<span class="tag t-retry">↻ 待重试</span>';
+    if (String(s).indexOf("FORWARDED") === 0)
+      return '<span class="tag t-run">📥 对账补建中</span>';
+    return '<span class="tag t-wait">' + esc(s) + '</span>';
+  };
+  el.innerHTML = list.map(p => {
+    const meta = [];
+    if (p.attempts != null) meta.push("第 " + p.attempts + " 次");
+    if (p.next_in != null) meta.push(p.next_in > 0
+      ? "⏱ " + (p.next_in >= 60
+          ? Math.floor(p.next_in / 60) + "分" + (p.next_in % 60) + "秒"
+          : p.next_in + "秒") + "后自动重试"
+      : "到期待放行");
+    if (p.next_in == null && p.status === "FAILED") meta.push("需人工处置");
+    const hint = p.hint
+      ? '<span class="chip mini" onclick="runCmdDirect(\'' +
+        esc(p.hint).replace(/'/g, "\\'") + '\')">⚡ ' + esc(p.hint) + '</span>'
+      : "";
+    const err = p.error
+      ? '<div class="dt" style="color:var(--amber)">' + esc(p.error) + '</div>'
+      : "";
+    return '<div class="qrow"><div class="info"><div class="nm">' +
+      '<span class="tag t-wait">' + esc(p.where) + '</span> ' +
+      esc(p.label) + ' ' + stTag(p.status) +
+      '</div><div class="dt">' + esc(meta.join(" · ")) + '</div>' + err +
+      (hint ? '<div class="chips" style="margin-top:4px">' + hint + '</div>' : "") +
+      '</div></div>';
+  }).join("");
 }
 function _applyBatch(data) {
   _BATCH = data || {};

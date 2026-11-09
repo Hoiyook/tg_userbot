@@ -559,6 +559,21 @@ async def _fallback_direct_download(task, messages, source_name):
     return ok
 
 
+async def _notify_permanent_failure(task_id, label, reason):
+    """永久失败主动通知（2026-11-10 审查补齐）：此前 FAILED 只落库，
+    用户只能 /listen_failed 被动查看。通知失败只记日志——状态机不受影响
+    （notify_user 自带三级兜底，这里兜的是 notify 自身抛异常）。"""
+    try:
+        from . import notify
+        await notify.notify_user(
+            f"📡❌ 监听任务永久失败 #{task_id}\n"
+            f"内容：{label}\n"
+            f"原因：{reason}\n"
+            f"重试：/listen_retry {task_id}｜明细：/listen_failed")
+    except Exception as e:
+        logger.warning(f"📡 永久失败通知发送失败（不影响状态机）：{e}")
+
+
 async def _handle_failure(task, exc):
     """失败分类 → 重试或永久失败。"""
     task_id = task["id"]
@@ -573,6 +588,8 @@ async def _handle_failure(task, exc):
         )
         _safe(lambda: runtime_db.fail_listener_task(
             task_id, error=f"{type(exc).__name__}: {exc}"))
+        await _notify_permanent_failure(
+            task_id, label, f"{type(exc).__name__}: {exc}")
         return
 
     if not should_retry(attempts):
@@ -582,6 +599,9 @@ async def _handle_failure(task, exc):
         )
         _safe(lambda: runtime_db.fail_listener_task(
             task_id, error=f"重试 {attempts} 次仍失败：{type(exc).__name__}: {exc}"))
+        await _notify_permanent_failure(
+            task_id, label,
+            f"重试 {attempts} 次仍失败：{type(exc).__name__}: {exc}")
         return
 
     if kind == "flood":

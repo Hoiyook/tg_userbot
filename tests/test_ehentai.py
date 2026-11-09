@@ -39,6 +39,13 @@ HATH_PAGE = """
 <a href="https://x.hath.network/archive/4277638/abc/12q/0">Click Here To Start Downloadin</a>
 </body>"""
 
+# 已在直链页的变体：直链是裸文本（无 href= 包裹），_HATH_LINK_RE 匹配不到，
+# 只能走 "successfully prepared" 兜底分支（ehentai.py:160-164 的 m2 路径）。
+DIRECT_LINK_PAGE = """
+<body>The file was successfully prepared
+https://x.hath.network/archive/4277638/abc/12q/0
+</body>"""
+
 
 class ParseTest(unittest.TestCase):
     def test_gallery_ref(self):
@@ -66,6 +73,21 @@ class ParseTest(unittest.TestCase):
     def test_hath_link_parse(self):
         m = ehentai._HATH_LINK_RE.search(HATH_PAGE)
         self.assertIn("/archive/", m.group(1))
+
+    def test_archive_link_direct_page_fallback(self):
+        """「已在直链页」兜底：body 无 href= 形态 hath 链接但有裸直链时，
+        应取 m2 的裸直链并补 ?start=1，而不是 AttributeError（回归
+        2026-11-10 审查：行 166 的 link = m.group(1) 误挂在 if not m
+        分支内，m 必为 None）。"""
+        with mock.patch.object(config, "EHENTAI_COOKIE", "ipb_member_id=1; ipb_pass_hash=x"), \
+                mock.patch.object(ehentai, "_proxy_url", return_value=None), \
+                mock.patch.object(ehentai.httpx, "Client") as MockClient:
+            MockClient.return_value.__enter__.return_value.post.\
+                return_value.text = DIRECT_LINK_PAGE
+            link, cost = ehentai.fetch_archive_link_blocking("4277638", "tok")
+        self.assertEqual(
+            link, "https://x.hath.network/archive/4277638/abc/12q/0?start=1")
+        self.assertEqual(cost, 0)
 
 
 class CookieTest(unittest.TestCase):

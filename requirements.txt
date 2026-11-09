@@ -1,0 +1,30 @@
+# tg_userbot 依赖清单（2026-11-10 审查补齐：此前依赖只存在于 .venv，无法重现环境）。
+# 安装：python -m venv .venv && .venv/bin/pip install -r requirements.txt
+# 原则：只列主代码直接 import 或以子进程调用的包；版本写下限不设上限，
+#       yt-dlp / gallery-dl 属"频繁更新是特性"（站点适配随它们走），升级后
+#       跑 tests/test_bili_dl.py + tests/test_x_dl.py 验证输出解析未被破坏。
+
+# ── Telegram 核心 ──
+Telethon>=1.45.0
+
+# ── HTTP 客户端 ──
+aiohttp>=3.14          # api_server（dashboard / PWA）
+httpx>=0.25            # 站点抓取（ehentai/wnacg/asmr 等）
+requests>=2.32         # pixiv_oauth.py 刷新 token 子进程
+websockets>=17.0       # chrome_agent 的 CDP WebSocket 客户端
+
+# ── cookie / 认证 ──
+browser-cookie3>=0.19  # 浏览器 cookie 导出（douyin/bilibili/x）
+
+# ── 站点解析 / 下载器（部分以子进程调用 venv 可执行文件）──
+f2>=0.0.1.5            # 抖音解析（douyin_batch 兜底路）
+gallery-dl>=1.32       # x_dl / pixiv_dl 子进程（.venv/bin/gallery-dl）
+yt-dlp>=2025.10.14     # bili_dl 子进程；版本追新，升级后跑 test_bili_dl
+
+# ── CloudDrive2 gRPC ──
+grpcio>=1.85           # cd2_api（cd2_proto/ 为预生成桩）
+protobuf>=7.0          # google.protobuf empty/wrappers
+
+# ── 开发 / 测试 ──
+pytest>=7.4
+pytest-asyncio>=0.21

@@ -14,6 +14,8 @@ import json
 import atexit
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -285,23 +287,32 @@ class TestPathResolution(unittest.TestCase):
         """import 期常量满足解耦模型的派生关系，且把基座注入的
         TG_SAVE_FOLDER 喂回纯函数能复现同一组值。
 
-        注意不能拿「测试运行时的 os.environ」对比：同进程 suite 里 config
-        由最先 import 的测试模块按它自己的临时目录解析，之后各模块再改
-        TG_SAVE_FOLDER 也不影响已 import 的常量。
+        断言在**子进程**里跑：import 期常量取决于「本进程最先 import
+        tg_userbot 的那个模块当时的环境」（同进程 suite 里各测试模块
+        互相污染 TG_SAVE_FOLDER），只有干净子进程的结果是确定的。
         """
-        self.assertEqual(config.SAVE_FOLDER, config.DOWNLOAD_DIR)
-        self.assertEqual(config.LOG_FILE,
-                         os.path.join(config.RUNTIME_DIR, "download.log"))
-        self.assertEqual(config.RUNTIME_DB_FILE,
-                         os.path.join(config.RUNTIME_DIR, "tg_userbot.db"))
-        self.assertEqual(config.CHROME_DOWNLOAD_DIR,
-                         os.path.join(config.DOWNLOAD_DIR,
-                                      "TG Chrome Download"))
-        p = config._resolve_paths(
-            {"TG_SAVE_FOLDER": config.SAVE_FOLDER}, config.IS_TERMUX)
-        self.assertEqual(p.download_dir, config.DOWNLOAD_DIR)
-        self.assertEqual(p.runtime_dir, config.RUNTIME_DIR)
-        self.assertEqual(p.runtime_db_file, config.RUNTIME_DB_FILE)
+        code = (
+            "import os, tg_userbot.config as c;"
+            "assert c.SAVE_FOLDER == c.DOWNLOAD_DIR;"
+            "assert c.LOG_FILE == os.path.join(c.RUNTIME_DIR, 'download.log');"
+            "assert c.RUNTIME_DB_FILE == os.path.join(c.RUNTIME_DIR,"
+            " 'tg_userbot.db');"
+            "assert c.CHROME_DOWNLOAD_DIR == os.path.join(c.DOWNLOAD_DIR,"
+            " 'TG Chrome Download');"
+            "p = c._resolve_paths({'TG_SAVE_FOLDER': c.SAVE_FOLDER},"
+            " c.IS_TERMUX);"
+            "assert p.download_dir == c.DOWNLOAD_DIR;"
+            "assert p.runtime_dir == c.RUNTIME_DIR;"
+            "assert p.runtime_db_file == c.RUNTIME_DB_FILE;"
+            "print('ok')"
+        )
+        r = subprocess.run([sys.executable, "-c", code],
+                           capture_output=True, text=True, timeout=60,
+                           cwd=os.path.dirname(
+                               os.path.dirname(os.path.abspath(__file__))))
+        self.assertEqual(
+            r.returncode, 0,
+            f"import 期常量子进程断言失败：\n{r.stdout}\n{r.stderr}")
 
 
 class TestLegacyMigration(unittest.TestCase):

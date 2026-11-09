@@ -41,7 +41,6 @@ AUTH_FAIL_MARKS = ("invalid_grant", "refresh-token", "authenticationerror",
                    "login failed", "http 401", "401 client error")
 
 _PIX_RUNNING = {}
-_PIX_TASKS = set()
 
 
 def _pixiv_root():
@@ -240,37 +239,6 @@ def run_user(target):
         return new_total, (f"⚠️ gallery-dl 退出码 {code}{retried}"
                            f"｜{last_tail}")
     return new_total, ""
-
-
-def status_text():
-    if _PIX_RUNNING:
-        uid = _PIX_RUNNING.get("user_id") or _PIX_RUNNING.get("target", "?")
-        done = _PIX_RUNNING.get("done", 0)
-        last = _PIX_RUNNING.get("last", "")
-        started = _PIX_RUNNING.get("started")
-        elapsed = ""
-        if started:
-            m, s = divmod(int(time.time() - started), 60)
-            elapsed = f"｜已跑 {m}分{s:02d}秒"
-        head = f"🎨 Pixiv 下载进行中（{uid}）：本次已收 {done} 个{elapsed}"
-        if _PIX_RUNNING.get("retry_wait"):
-            head += (f"\n⏳ 上轮失败，{_PIX_RUNNING['retry_wait']}s 后自动重跑"
-                     f"（第 {_PIX_RUNNING.get('attempt', '?')} 次，最多 "
-                     f"{getattr(config, 'GALLERY_DL_AUTO_RETRY_MAX', 2)} 次）")
-        if last:
-            head += f"\n最新：{last}"
-        return head + "\n（限速档约 30 个/分钟；完成会通知）"
-    state = _load_state()
-    if not state:
-        return ("🎨 /pixiv <用户ID|用户名> —— 下载该画师全部作品"
-                "（图+动图，refresh_token 已配置）")
-    lines = ["🎨 Pixiv 已跟画师"]
-    for uid, v in sorted(state.items(), key=lambda kv: -kv[1].get("total", 0)):
-        t = time.strftime("%m-%d %H:%M", time.localtime(v.get("last_run", 0)))
-        shown = v.get("dir") or v.get("target") or uid
-        lines.append(f"  {shown}：累计 {v.get('total', 0)} 个｜上次 {t}")
-    lines.append("增量重跑：/pixiv <ID|用户名>（只收新作品）")
-    return "\n".join(lines)
 
 
 # ── SerialTaskWorker 接线（2026-11-05 队列统一）──────────────

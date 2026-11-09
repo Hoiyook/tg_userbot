@@ -42,7 +42,6 @@ AUTH_FAIL_MARKS = ("http 401", "401 client error", "authenticate",
                    "login", "forbidden")
 
 _X_RUNNING = {}
-_X_TASKS = set()
 _PROCS = set()          # 在跑的 gallery-dl 子进程（停机回收用）
 
 

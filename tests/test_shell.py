@@ -141,6 +141,16 @@ class ShellCommandTest(unittest.TestCase):
                 self.assertTrue(ok)
                 self.assertIn("拒绝", replies[0])
 
+    def test_blacklist_rejects_absolute_path_forms(self):
+        """绝对路径调用黑名单命令同样拒绝（basename 比对，
+        2026-11-10 审查加固：/bin/rm 此前可绕过 token 精确匹配）。"""
+        for cmd in ["/sh /bin/rm -rf /tmp/x", "/sh /usr/bin/sudo ls",
+                    "/sh /bin/dd if=/a of=/b"]:
+            with self.subTest(cmd=cmd):
+                ok, replies = _run(cmd)
+                self.assertTrue(ok)
+                self.assertIn("拒绝", replies[0])
+
     def test_blacklist_allows_safe_command(self):
         ok, replies = _run("/sh echo blacklist-pass")
         self.assertTrue(ok)

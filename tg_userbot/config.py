@@ -47,9 +47,23 @@ def load_secret_config() -> dict:
     try:
         with open(SECRETS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+        _harden_secrets_perms(SECRETS_FILE)
         return data if isinstance(data, dict) else {}
     except (FileNotFoundError, OSError, ValueError):
         return {}
+
+
+def _harden_secrets_perms(path):
+    """secrets 文件权限自愈：组/其他可读（如历史遗留的 0644）收紧到 0600。
+
+    该文件集中 bot_token/api_hash/各站 cookie/cd2 token，权限只许属主。
+    失败静默（只读盘等场景不值得为 chmod 中断启动）。"""
+    try:
+        mode = os.stat(path).st_mode & 0o777
+        if mode & 0o077:
+            os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 _SECRET_CONFIG = load_secret_config()
@@ -783,6 +797,7 @@ def save_douyin_cookie(value, path=None):
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.write("\n")
+        os.chmod(tmp_path, 0o600)   # secrets 落盘即 0600（tmp 也不能宽）
         os.replace(tmp_path, target)
     except Exception as e:
         try:
@@ -822,6 +837,7 @@ def save_pawchive_cookie(value, path=None):
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.write("\n")
+        os.chmod(tmp_path, 0o600)   # secrets 落盘即 0600（tmp 也不能宽）
         os.replace(tmp_path, target)
     except Exception as e:
         try:
@@ -859,6 +875,7 @@ def save_ehentai_cookie(value, path=None):
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.write("\n")
+        os.chmod(tmp_path, 0o600)   # secrets 落盘即 0600（tmp 也不能宽）
         os.replace(tmp_path, target)
     except Exception as e:
         try:
@@ -896,6 +913,7 @@ def save_bilibili_cookie(value, path=None):
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.write("\n")
+        os.chmod(tmp_path, 0o600)   # secrets 落盘即 0600（tmp 也不能宽）
         os.replace(tmp_path, target)
     except Exception as e:
         try:
@@ -986,6 +1004,10 @@ REGISTERED_COMMAND_NAMES = frozenset({name for name in (
     "retry_all", "retry_del", "queue_del",
     "sqlt_add", "sqlt_del", "cmdt_add", "cmdt_del", "cmdt_run",
     "caption_filter_add", "caption_filter_del", "caption_filter_test",
+    # 2026-11-10 审查补登记：分发器在处理 / 面板在展示，但漏了审计
+    # 名单（_record_usage 不记账）——由 test_architecture 的清单守护钉住
+    "extract", "downloading", "tme_backfill", "now", "health",
+    "cmdq", "cmdt", "ehentai", "wnacg",
 )})
 
 

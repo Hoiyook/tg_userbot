@@ -80,6 +80,32 @@ class AuthTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await client.close()
 
+    def test_host_guard_accepts_loopback_forms(self):
+        rq = lambda h: mock.Mock(headers={"Host": h})
+        for h in ["127.0.0.1:8765", "localhost", "localhost:8765",
+                  "::1", "[::1]:8765", "127.0.0.1"]:
+            self.assertTrue(api_server._host_allowed_loopback(rq(h)), h)
+
+    def test_host_guard_rejects_foreign_and_missing(self):
+        rq = lambda h: mock.Mock(headers={"Host": h} if h else {})
+        for h in ["evil.com", "evil.com:8765", "127.0.0.1.evil.com",
+                  "rebind.attacker.io", "", None]:
+            self.assertFalse(api_server._host_allowed_loopback(rq(h)), h)
+
+    async def test_empty_token_blocks_foreign_host(self):
+        """token 为空 + 伪造 Host（CSRF/DNS rebinding 形态）→ 401，
+        不再是无条件放行（2026-11-10 审查 M5 加固）。"""
+        with patch_token(""), mock.patch.object(
+                api_server, "build_status", return_value={"ok": True}):
+            client = make_client()
+            await client.start_server()
+            try:
+                resp = await client.get(
+                    "/api/status", headers={"Host": "evil.com"})
+                self.assertEqual(resp.status, 401)
+            finally:
+                await client.close()
+
     async def test_missing_token_rejected_when_configured(self):
         with patch_token("sekret"), mock.patch.object(
                 api_server, "build_status", return_value={"ok": True}):
@@ -1935,3 +1961,83 @@ class FileManagerMkdirTouchTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((await r2.json())["ok"])
         finally:
             await client.close()
+
+
+class QueuesProblemsTest(unittest.IsolatedAsyncioTestCase):
+    """全链路可见性（2026-11-10）：/api/queues 补 listener/pawchive 域
+    与 problems（失败/重试明细，含退避剩余秒数与处置命令）。"""
+
+    async def asyncSetUp(self):
+        import asyncio
+        from tg_userbot import runtime_db, state
+        self._td = tempfile.mkdtemp(dir=_TMP)
+        self._saved_conn = runtime_db._CONN
+        runtime_db._CONN = None
+        runtime_db.init_db(os.path.join(self._td, "tg.db"))
+        # 生产前提：QUEUE_LOCK 由 app.main() 创建（API 服务在 main 内启动，
+        # 读队列一律持锁）；测试环境手动补齐同一前提。
+        self._saved_lock = state.QUEUE_LOCK
+        state.QUEUE_LOCK = asyncio.Lock()
+        self.addCleanup(lambda: (
+            runtime_db.close_db(),
+            setattr(runtime_db, "_CONN", self._saved_conn),
+            setattr(state, "QUEUE_LOCK", self._saved_lock),
+            shutil.rmtree(self._td, ignore_errors=True),
+        ))
+
+    async def _get_queues(self):
+        client = make_client()
+        await client.start_server()
+        try:
+            resp = await client.get("/api/queues")
+            return await resp.json()
+        finally:
+            await client.close()
+
+    async def test_queues_include_listener_and_pawchive(self):
+        from tg_userbot import runtime_db
+        runtime_db.enqueue_listener_tasks(
+            123, [{"message_id": 1, "target_type": "me",
+                   "target_chat_id": None, "download": 1,
+                   "payload": {"label": "测试任务"}}],
+            checkpoint=1)
+        data = await self._get_queues()
+        names = {q["name"] for q in data["queues"]}
+        self.assertIn("标签监听", names)
+        self.assertIn("pawchive", names)
+        lis = next(q for q in data["queues"] if q["name"] == "标签监听")
+        self.assertEqual(lis["pending"], 1)
+
+    async def test_problems_listens_failed_with_hint(self):
+        from tg_userbot import runtime_db
+        ids = runtime_db.enqueue_listener_tasks(
+            123, [{"message_id": 2, "target_type": "me",
+                   "target_chat_id": None, "download": 1,
+                   "payload": {"label": "会失败的任务"}}])
+        runtime_db.fail_listener_task(ids[0], error="ChannelPrivateError")
+        data = await self._get_queues()
+        problems = data.get("problems") or []
+        hit = [p for p in problems if p["where"] == "标签监听"]
+        self.assertTrue(hit, "listener FAILED 应出现在 problems")
+        self.assertEqual(hit[0]["status"], "FAILED")
+        self.assertEqual(hit[0]["hint"], f"/listen_retry {ids[0]}")
+        self.assertIn("ChannelPrivateError", hit[0]["error"] or "")
+
+    async def test_problems_media_retry_has_countdown(self):
+        """主队列 retry 榜条目带 next_in 退避倒计时。"""
+        import time as _time
+        from tg_userbot import state as _state
+        rec = {"id": "testretry1", "platform": "douyin", "name": "样例任务",
+               "url": "https://x.co/1", "attempts": 2,
+               "next_retry_at": _time.time() + 120}
+        _state.QUEUE["retry"].append(rec)
+        try:
+            data = await self._get_queues()
+            hit = [p for p in data["problems"]
+                   if p["where"] == "媒体队列" and p["label"] == "样例任务"]
+            self.assertTrue(hit)
+            self.assertEqual(hit[0]["status"], "RETRY")
+            self.assertIsNotNone(hit[0]["next_in"])
+            self.assertLessEqual(hit[0]["next_in"], 120)
+        finally:
+            _state.QUEUE["retry"].remove(rec)

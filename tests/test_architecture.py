@@ -12,6 +12,7 @@
 """
 import ast
 import os
+import tempfile
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -201,3 +202,87 @@ class ImportDirectionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── 第六道守卫：命令清单单一事实源 ─────────────────────────────────
+# 同一份命令知识此前抄了 ≥3 份（config.REGISTERED_COMMAND_NAMES /
+# bot.BOT_COMMANDS / _handle_command_inner 的分发字面量），已实际漂移
+# （extract/now/health 等 10 个命令处理着、展示着却不进审计名单，
+# 2026-11-10 补登记）。本守卫钉住三份的一致性：新增命令漏登记时，
+# 守护测试立刻红，而不是等审计对不上账才发现。
+
+def _command_literals_in_dispatcher():
+    """AST 抽 _handle_command_inner 里 cmd_text ==/in/startswith 的
+    "/..." 字面量（分发器实际认得的命令）。"""
+    path = os.path.join(PKG, "commands.py")
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=path)
+    lits = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Compare)
+                and isinstance(node.left, ast.Name)
+                and node.left.id == "cmd_text"):
+            continue
+        comps = list(node.comparators)
+        for op, comp in zip(node.ops, comps):
+            if isinstance(op, ast.In) and isinstance(
+                    comp, (ast.Tuple, ast.List)):
+                comps.extend(comp.elts)
+                continue
+            if isinstance(comp, ast.Call):
+                comps.extend(comp.args)
+                continue
+            if isinstance(comp, ast.Constant) and isinstance(comp.value, str):
+                lits.add(comp.value)
+    return {l for l in lits if l.startswith("/")}
+
+
+def _bot_panel_commands():
+    """bot.BOT_COMMANDS 的命令名（无斜杠）。"""
+    with open(os.path.join(PKG, "bot.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename="bot.py")
+    names = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "BOT_COMMANDS"):
+            continue
+        for elt in node.value.elts:          # (name, desc) 元组行
+            if isinstance(elt, ast.Tuple) and elt.elts \
+                    and isinstance(elt.elts[0], ast.Constant):
+                names.add(elt.elts[0].value)
+    return names
+
+
+class CommandRegistryConsistencyTest(unittest.TestCase):
+    """命令审计名单（config）↔ bot 面板 ↔ 分发器字面量 三方一致。"""
+
+    def test_dispatcher_literals_are_registered(self):
+        import importlib
+        import sys
+        sys.path.insert(0, REPO)
+        os.environ.setdefault("TG_SAVE_FOLDER",
+                              tempfile.gettempdir() + "/tg_arch_guard")
+        from tg_userbot import config
+        reg = {n.lstrip("/") for n in config.REGISTERED_COMMAND_NAMES}
+        disp = {c.lstrip("/") for c in _command_literals_in_dispatcher()}
+        missing = sorted(disp - reg)
+        self.assertEqual(
+            missing, [],
+            f"分发器处理了这些命令但没进 REGISTERED_COMMAND_NAMES（审计"
+            f"漏记账）：{missing}。请补登记进 config.py 的清单。")
+
+    def test_bot_panel_commands_are_registered(self):
+        import importlib
+        import sys
+        sys.path.insert(0, REPO)
+        os.environ.setdefault("TG_SAVE_FOLDER",
+                              tempfile.gettempdir() + "/tg_arch_guard")
+        from tg_userbot import config
+        reg = {n.lstrip("/") for n in config.REGISTERED_COMMAND_NAMES}
+        panel = _bot_panel_commands()
+        missing = sorted(panel - reg)
+        self.assertEqual(
+            missing, [],
+            f"bot 命令面板注册了这些命令但没进 REGISTERED_COMMAND_NAMES："
+            f"{missing}。面板展示与审计名单漂移，请补登记或下架面板项。")

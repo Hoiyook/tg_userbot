@@ -277,6 +277,13 @@ class RarMultipartTest(unittest.TestCase):
         calls = []
 
         def fake_run(cmd, **kw):
+            if len(cmd) > 1 and cmd[1] == "l":
+                # 预检（7z l -slt）：空 stdout → 守卫放行；不入解压计数
+                class R:
+                    returncode = 0
+                    stderr = b""
+                    stdout = b""
+                return R()
             calls.append(cmd)
             # 按 -o<dest> 建解压产物（模拟 7z 成功；不加会被 0 文件守卫判失败）
             for i, a in enumerate(cmd):
@@ -307,6 +314,13 @@ class RarMultipartTest(unittest.TestCase):
         calls = []
 
         def fake_run(cmd, **kw):
+            if len(cmd) > 1 and cmd[1] == "l":
+                # 预检（7z l -slt）：空 stdout → 守卫放行；不入解压计数
+                class R:
+                    returncode = 0
+                    stderr = b""
+                    stdout = b""
+                return R()
             calls.append(cmd)
             has_pwd = any(str(a).startswith("-p") for a in cmd)
             class R:
@@ -317,6 +331,13 @@ class RarMultipartTest(unittest.TestCase):
             # 失败时不建文件（模拟没解开）；成功时建
 
         def fake_run2(cmd, **kw):
+            if len(cmd) > 1 and cmd[1] == "l":
+                # 预检（7z l -slt）：空 stdout → 守卫放行；不入解压计数
+                class R:
+                    returncode = 0
+                    stderr = b""
+                    stdout = b""
+                return R()
             calls.append(cmd)
             has_pwd = any(str(a).startswith("-p") for a in cmd)
             if has_pwd:
@@ -513,6 +534,13 @@ class MagicSniffTest(unittest.TestCase):
 
     def _fake_7z_run(self, calls):
         def fake_run(cmd, **kw):
+            if len(cmd) > 1 and cmd[1] == "l":
+                # 预检（7z l -slt）：空 stdout → 守卫放行；不入解压计数
+                class R:
+                    returncode = 0
+                    stderr = b""
+                    stdout = b""
+                return R()
             calls.append(cmd)
             for a in cmd:   # 按 -o<dest> 造解压产物（过 0 文件守卫）
                 if str(a).startswith("-o"):
@@ -900,3 +928,63 @@ class PostsForBackfillMonthsTest(unittest.TestCase):
 
     def test_no_months_returns_all(self):
         self.assertEqual(len(self.rt.posts_for_backfill(creator_id=7)), 4)
+
+
+class PreGuard7zListTest(unittest.TestCase):
+    """_preguard_7z_list：7z/unrar 路解压前的炸弹预检（2026-11-10 补齐）。
+
+    zip 路在 extract_util 一直有四重守卫；7z/unrar 此前裸奔。这里用
+    mock 的 `7z l -slt` 列表输出验证四条判据与"列表失败放行"。"""
+
+    @staticmethod
+    def _slt(members):
+        """members: [(size, packed_size)] → 仿 7z l -slt 输出。"""
+        lines = []
+        for size, packed in members:
+            lines.append(f"Path = item{len(lines)}")
+            lines.append(f"Size = {size}")
+            lines.append(f"Packed Size = {packed}")
+            lines.append("")
+        return "\n".join(lines).encode()
+
+    def _run_guard(self, stdout, returncode=0):
+        with mock.patch.object(extract_dir.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=returncode, stdout=stdout)
+            return extract_dir._preguard_7z_list("7z", "/tmp/x.7z",
+                                                 "/tmp/dest")
+
+    def test_normal_archive_passes(self):
+        # 100MB × 10，压缩后 50MB：全部阈值内 → 放行
+        self.assertIsNone(self._run_guard(self._slt(
+            [(100 * 1024 ** 2, 5 * 1024 ** 2)] * 10)))
+
+    def test_entry_count_bomb_rejected(self):
+        # 20001 个条目 > PAWCHIVE_ZIP_MAX_ENTRIES(20000)
+        self.assertIsNotNone(self._run_guard(
+            self._slt([(1, 1)] * (int(config.PAWCHIVE_ZIP_MAX_ENTRIES) + 1))))
+
+    def test_single_member_too_big_rejected(self):
+        big = int(config.PAWCHIVE_ZIP_MAX_MEMBER_BYTES) + 1
+        self.assertIsNotNone(self._run_guard(self._slt([(big, big // 100)])))
+
+    def test_ratio_bomb_rejected(self):
+        # 400GB 压成 1GB = 400x > 200x
+        gb = 1024 ** 3
+        self.assertIsNotNone(self._run_guard(
+            self._slt([(400 * gb, gb)])))
+
+    def test_list_failure_passes_through(self):
+        """列表失败（加密头/损坏）不拦截——交给解压步骤如实报错。"""
+        self.assertIsNone(self._run_guard(b"", returncode=2))
+        self.assertIsNone(self._run_guard(None))
+
+    def test_disk_space_guard(self):
+        # 阈值内的包体（10×3GB，比例 1x）但磁盘余量不足：
+        # 30GB 需求 vs 5GB 余量-2GB margin → 只有磁盘守卫触发
+        gb = 1024 ** 3
+        with mock.patch.object(
+                extract_dir.shutil, "disk_usage",
+                lambda _: mock.Mock(free=5 * gb)):
+            got = self._run_guard(self._slt([(3 * gb, 3 * gb)] * 10))
+        self.assertIsNotNone(got)
+        self.assertIn("磁盘余量", got)

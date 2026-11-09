@@ -26,6 +26,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from . import config
 from .log import logger
 
 # 下载未完成的半成品后缀（跳过，绝不碰）
@@ -244,6 +245,58 @@ def find_password(path) -> str:
     return cands[0] if cands else ""
 
 
+def _preguard_7z_list(tool, path, dest_dir) -> str | None:
+    """7z/unrar 路的解压前炸弹预检（2026-11-10 审查补齐）。
+
+    ``7z l -slt`` 列表模式统计成员数/单成员峰值/总量与压缩比，复用
+    extract_util 的 zip 守卫阈值（PAWCHIVE_ZIP_MAX_*）。超限返回拒绝
+    文案；列表本身失败（加密头/损坏/工具异常）返回 None 放行——预检
+    只拦"能看清且超限"，看不清的交给真正解压步骤如实报错。rar 分卷
+    7z 也能列（列不出时放行，与现状一致）。"""
+    import re as _re
+    try:
+        r = subprocess.run([tool, "l", "-slt", str(path)],
+                           capture_output=True, stdin=subprocess.DEVNULL,
+                           timeout=60)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    if not isinstance(r.stdout, (bytes, bytearray)):
+        return None   # 读不懂列表（含测试 mock 环境）→ 放行，不拦截
+    out = r.stdout.decode("utf-8", "ignore")
+    total = biggest = total_comp = 0
+    entries = 0
+    for m in _re.finditer(r"^Size = (\d+)", out, _re.M):
+        size = int(m.group(1))
+        entries += 1
+        total += size
+        biggest = max(biggest, size)
+    for m in _re.finditer(r"^Packed Size = (\d+)", out, _re.M):
+        total_comp += int(m.group(1))
+    if entries == 0:
+        return None
+    max_entries = int(config.PAWCHIVE_ZIP_MAX_ENTRIES)
+    max_member = int(config.PAWCHIVE_ZIP_MAX_MEMBER_BYTES)
+    if entries > max_entries:
+        return f"成员数 {entries} 超限（>{max_entries}，疑似炸弹）"
+    if biggest > max_member:
+        return (f"单成员 {biggest / 1e9:.1f}GB 超限"
+                f"（>{max_member / 1e9:.0f}GB）")
+    if total_comp and total / total_comp > config.PAWCHIVE_ZIP_MAX_RATIO:
+        return (f"压缩比 {int(total / max(total_comp, 1))}x 超限"
+                f"（>{config.PAWCHIVE_ZIP_MAX_RATIO}x，疑似炸弹）")
+    try:
+        free = shutil.disk_usage(dest_dir).free
+    except OSError:
+        return None
+    margin = float(config.PAWCHIVE_MIN_FREE_GB) * 1024 ** 3
+    if total > free - margin:
+        return (f"解压需 {total / 1e9:.1f}GB 超出磁盘余量 "
+                f"{max(free - margin, 0) / 1e9:.1f}GB")
+    return None
+
+
 def process_archive(path, dry: bool = False,
                     timeout: int = SUBPROCESS_TIMEOUT_DEFAULT,
                     extra_pwd=None) -> tuple:
@@ -303,6 +356,9 @@ def process_archive(path, dry: bool = False,
         if dry:
             return "dry", f"将解压分卷（7z）→ {dest_dir.name}/"
         dest_dir.mkdir(parents=True, exist_ok=True)
+        guard = _preguard_7z_list(tool, path, dest_dir)
+        if guard:
+            return "fail", f"分卷预检不过（{guard}）——保留分卷"
         # 密码候选循环（2026-11-06 MMD 实测：外层分卷也加密；目录名
         # c291dGhwbHVz 就是密码——候选链目录名源命中）
         candidates = password_candidates(str(path), extra=extra_pwd)
@@ -386,6 +442,9 @@ def process_archive(path, dry: bool = False,
         if dry:
             return "dry", f"将解压（7z）→ {dest_dir.name}/"
         dest_dir.mkdir(parents=True, exist_ok=True)
+        guard = _preguard_7z_list(tool, path, dest_dir)
+        if guard:
+            return "fail", f"rar 预检不过（{guard}）——保留原包"
         candidates = password_candidates(path, extra=extra_pwd)
         tries = [None] + candidates   # 先无密码（很多 rar 只是假加密提示）
 
@@ -489,6 +548,9 @@ def process_archive(path, dry: bool = False,
         if dry:
             return "dry", f"将解压（7z）→ {dest_dir.name}/"
         dest_dir.mkdir(parents=True, exist_ok=True)
+        guard = _preguard_7z_list(tool, path, dest_dir)
+        if guard:
+            return "fail", f"7z 预检不过（{guard}）——保留原包"
         candidates = password_candidates(path)
         tries = [None] + candidates
         last_err = ""

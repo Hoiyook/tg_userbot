@@ -474,16 +474,40 @@ class _ShimMessage:
         self.message = text
 
 
+_LOOPBACK_HOSTS = frozenset({
+    "127.0.0.1", "localhost", "::1", "[::1]",
+})
+
+
+def _host_allowed_loopback(request) -> bool:
+    """token 为空（纯 loopback 部署）时的 Host 头校验。
+
+    防两类浏览器侧攻击（2026-11-10 审查 M5）：恶意网页 no-cors POST
+    （CSRF——浏览器会带真实 Host，跨站伪造不了 loopback Host 之外的值）
+    与 DNS rebinding（rebinding 域名解析到 127.0.0.1 后 Host 是攻击者
+    域名，此处拒之）。Host 带端口一起比，缺省端口（80/443 隐式）按裸
+    host 名放宽。"""
+    host = (request.headers.get("Host") or "").strip().lower()
+    if not host:
+        return False
+    if host in _LOOPBACK_HOSTS:
+        return True
+    # host:port 形态——按最后一个冒号切端口（IPv6 已被 [::1]:p 覆盖）
+    name, _, port = host.rpartition(":")
+    return port.isdigit() and name in _LOOPBACK_HOSTS
+
+
 def token_ok(request) -> bool:
     """校验请求令牌：Bearer 头 / X-Token 头 / ?token= 三选一。
 
     未配置 token（config.API_TOKEN 为空）= 仅 loopback 部署（start_api
-    已校验），一律放行。比较用非常量时间 hmac.compare_digest——本地方案
-    不严格需要，顺手做对。
+    已校验），此时仍校验 Host 头 ∈ loopback——挡 CSRF / DNS rebinding，
+    浏览器跨站请求伪造不出 loopback 之外的合法 Host。比较用非常量时间
+    hmac.compare_digest——本地方案不严格需要，顺手做对。
     """
     token = config.API_TOKEN
     if not token:
-        return True
+        return _host_allowed_loopback(request)
     auth = request.headers.get("Authorization", "")
     supplied = auth[7:].strip() if auth.startswith("Bearer ") else ""
     if not supplied:
@@ -1341,7 +1365,147 @@ async def handle_queues(request):
         except Exception as e:
             out.append({"name": name, "emoji": emoji, "error": str(e)[:80]})
 
-    return _json({"ok": True, "queues": out})
+    # ⑤ 标签监听（listener_tasks；2026-11-10 全链路可见性补齐）
+    try:
+        from . import runtime_db
+        rows = runtime_db.list_listener_tasks(limit=200)
+        from collections import Counter
+        counts = Counter(r["status"] for r in rows)
+        active = [r for r in rows
+                  if r["status"] in ("PENDING", "PROCESSING", "FORWARDED")]
+        out.append({
+            "name": "标签监听", "emoji": "📡",
+            "pending": counts.get("PENDING", 0),
+            "running": (counts.get("PROCESSING", 0)
+                        + counts.get("FORWARDED", 0)),
+            "failed": counts.get("FAILED", 0),
+            "items": [f"#{r['id']} {r.get('target_type', '?')}→"
+                      f"{r.get('target_chat_id') or '收藏'}"
+                      f"（第 {r.get('attempts', 0)} 次）"
+                      for r in active[:5]]})
+    except Exception as e:
+        out.append({"name": "标签监听", "emoji": "📡", "error": str(e)[:80]})
+
+    # ⑥ pawchive（posts 域）
+    try:
+        from . import runtime_db
+        rows = runtime_db.list_pawchive_posts(limit=200)
+        from collections import Counter
+        counts = Counter(r["status"] for r in rows)
+        active = [r for r in rows if r["status"] in ("PENDING", "PROCESSING")]
+        out.append({
+            "name": "pawchive", "emoji": "🐾",
+            "pending": counts.get("PENDING", 0),
+            "running": counts.get("PROCESSING", 0),
+            "failed": counts.get("FAILED", 0),
+            "items": [str(r.get("title") or r.get("post_id")
+                          or "?")[:36] for r in active[:5]]})
+    except Exception as e:
+        out.append({"name": "pawchive", "emoji": "🐾",
+                    "error": str(e)[:80]})
+
+    problems = await _queue_problems()
+    return _json({"ok": True, "queues": out, "problems": problems})
+
+
+async def _queue_problems():
+    """失败与重试明细（全链路可见性，2026-11-10）。
+
+    每条 {where, label, status, attempts, next_in, hint}：next_in=距下次
+    自动重试的秒数（null=无自动重试，需人工）；hint=处置命令。供看板
+    「⚠️ 失败与重试」面板——与队列卡片（只显示进行中）互补，不破坏
+    「DONE/FAILED 不混进进行中」的既有反馈（2026-11-05）。"""
+    import time as _time
+    problems = []
+
+    def _add(where, label, status, attempts=None, next_retry_at=None,
+             hint=None, error=None):
+        now = _time.time()
+        problems.append({
+            "where": where, "label": str(label)[:52], "status": status,
+            "attempts": attempts,
+            "next_in": (max(0, int(next_retry_at - now))
+                        if next_retry_at else None),
+            "hint": hint, "error": (str(error)[:80] if error else None),
+        })
+
+    # ① 主队列 retry 榜（内存）——含退避剩余
+    try:
+        from . import state as _state
+        async with _state.QUEUE_LOCK:
+            retry = list(_state.QUEUE.get("retry", []))
+        for r in retry[:10]:
+            _add("媒体队列", r.get("name") or r.get("url") or r.get("id", "?"),
+                 "RETRY", r.get("attempts"), r.get("next_retry_at"),
+                 "/retry 或 /queue del")
+    except Exception:
+        pass
+
+    # ② listener FAILED / 滞留 FORWARDED
+    try:
+        from . import runtime_db
+        for t in runtime_db.list_listener_tasks(status="FAILED", limit=10):
+            _add("标签监听", f"#{t['id']} {_task_label_of(t)}", "FAILED",
+                 t.get("attempts"), None, f"/listen_retry {t['id']}",
+                 t.get("last_error"))
+        for t in runtime_db.list_listener_tasks(
+                status="FORWARDED", limit=5):
+            _add("标签监听", f"#{t['id']} {_task_label_of(t)}",
+                 "FORWARDED(对账补建中)", t.get("attempts"),
+                 t.get("next_retry_at"), None, t.get("last_error"))
+    except Exception:
+        pass
+
+    # ③ 各站点 FAILED
+    try:
+        from . import runtime_db
+        domains = (
+            ("B站", runtime_db.BILI_TASKS.list(status="FAILED", limit=5),
+             lambda r: r.get("label") or r["url"]),
+            ("X", runtime_db.XN_TASKS.list(status="FAILED", limit=5),
+             lambda r: r.get("label") or r["url"]),
+            ("Pixiv", runtime_db.XI_TASKS.list(status="FAILED", limit=5),
+             lambda r: r.get("label") or r["url"]),
+        )
+        for name, rows, labeler in domains:
+            for r in rows:
+                _add(name, labeler(r), "FAILED", r.get("attempts"),
+                     r.get("next_retry_at"), None, r.get("error"))
+    except Exception:
+        pass
+    for name, fn, key in (("wnacg 漫画", "list_wnacg_tasks", "title"),
+                          ("asmr 音声", "list_asmr_tasks", "rj"),
+                          ("解压回传", "list_extract_tasks", "id")):
+        try:
+            from . import runtime_db
+            for r in getattr(runtime_db, fn)(status="FAILED", limit=5):
+                _add(name, r.get(key) or r.get("aid") or r.get("src_path")
+                     or "?", "FAILED", r.get("attempts"),
+                     r.get("next_retry_at"), None, r.get("error"))
+        except Exception:
+            pass
+    try:
+        from . import runtime_db
+        for r in runtime_db.list_pawchive_posts(status="FAILED", limit=5):
+            _add("pawchive", r.get("title") or r.get("post_id") or "?",
+                 "FAILED", r.get("attempts"), None, None,
+                 r.get("last_error"))
+    except Exception:
+        pass
+    return problems
+
+
+def _task_label_of(t):
+    """listener 任务的人读标签（target/payload 摘要）。"""
+    p = t.get("payload") or {}
+    if isinstance(p, str):
+        try:
+            import json as _json
+            p = _json.loads(p)
+        except Exception:
+            p = {}
+    return (str(p.get("label") or p.get("source_name") or
+                f"{t.get('target_type')}@{t.get('source_chat_id')}"))[:40]
 
 
 async def handle_stats(request):

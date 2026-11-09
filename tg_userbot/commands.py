@@ -220,7 +220,7 @@ def _help_text():
         "/status｜/folder｜/logpath —— 状态/目录/日志\n"
         "/start —— 打开按钮菜单（给 bot 发任意文本同效）\n"
         "/stats [天数] —— 台账（默认1，上限7）\n"
-        "/progress —— 下载进度\n"
+        "/progress｜/downloading —— 下载进度\n"
         "/done [N][关键词] —— 下载记录（默认10）\n"
         "/find 关键词 —— 媒体下落三源查询\n"
         "/queue；/queue_del 序号 —— 队列/移除\n"
@@ -236,6 +236,7 @@ def _help_text():
         "\n"
         "【外链台账】\n"
         "发『链接 备注』即登记（自动查重）；/links [关键词] 清单/搜索\n"
+        "/tme_backfill —— 台账 t.me 链接回灌入队\n"
         "\n"
         "【Pawchive】\n"
         "/paw（=status）—— 状态/失败画像/Cookie/扫描进度\n"
@@ -358,8 +359,6 @@ async def handle_command(event, cmd_text):
         pass
     try:
         handled = await _handle_command_inner(event, cmd_text)
-    except Exception:
-        raise
     finally:
         # 终态落账（失败也落——REPLY 已发出；error 面由异常分支补记）
         try:

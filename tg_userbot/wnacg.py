@@ -310,7 +310,7 @@ async def _run_one(task):
             pass
     except asyncio.CancelledError:
         # 取消放回由 SerialTaskWorker 框架统一接管（2026-10-26 迁移）；
-        # 本地半份 zip 下轮重下（requests 直写，无断点续传，代价可接受）。
+        # 本地半份 zip 下轮重下（download_zip_blocking 带 .part 断点续传，续传点有效）。
         raise
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
