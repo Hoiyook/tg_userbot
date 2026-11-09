@@ -466,7 +466,7 @@ REPORT_LISTEN = True
 # WAL 依赖 mmap 共享内存、在该文件系统上可能不可用；真机上若探测到 WAL 回落，
 # 可把 DB 挪到应用私有目录。注意：**只允许主进程写**，Chrome Agent 进程绝不
 # 能开连接（见 runtime_db 的「不做 import 期连接」）。
-RUNTIME_DB_SCHEMA_VERSION = 22  # v22：+ xn_tasks/xi_tasks（X/Pixiv 队列）
+RUNTIME_DB_SCHEMA_VERSION = 23  # v23：+ api_requests（分享提交幂等台账）
 # 单条写事务等锁的上限（毫秒）与 SQLITE_BUSY/LOCKED 的有限重试（规格 §39：
 # 记日志 → 短暂等待 → 有限次数重试，绝不无限循环、绝不因此崩掉主进程）。
 RUNTIME_DB_BUSY_TIMEOUT_MS = 5000
@@ -1781,6 +1781,12 @@ API_ENABLED = bool(_API_CFG.get("enabled"))
 API_BIND = str(_API_CFG.get("bind") or "127.0.0.1")
 API_PORT = int(_API_CFG.get("port") or 8765)
 API_TOKEN = str(_API_CFG.get("token") or "")
+# 分享提交幂等（2026-11-09）：客户端带 request_id 时，服务端在
+# api_requests 表里记「处理中/已完成」。处理中超过 stale 秒视为进程
+# 中途死掉，允许重新认领；已完成结果保留 keep 秒供重放读取，过期由
+# init_db 顺带裁剪。幂等只防重复受理，不改变分流语义。
+API_REQUEST_STALE_SECONDS = 300
+API_REQUEST_KEEP_SECONDS = 7 * 24 * 3600
 if _migrated_runtime_files:
     log.logger.info(
         "已把历史运行时文件迁入 runtime/ 目录："

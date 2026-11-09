@@ -1010,3 +1010,76 @@ class TaskDomainBackoffTest(unittest.TestCase):
         row = self.dom.get("u")
         d = row["next_retry_at"] - before
         self.assertTrue(290 <= d <= 310, f"固定 300s 语义保持: {d}")
+
+
+class ApiRequestIdempotencyTest(_DbTestCase):
+    """api_requests：分享提交的 request_id 幂等台账（schema v23）。
+
+    语义：
+    - 首次 claim → new；同一 id 在处理中再 claim → processing；
+    - complete 后 claim → done + 首次结果（重放不重新执行）；
+    - 处理中超过 stale_after 视为进程中途死掉，可被重新 claim；
+    - release（失败/异常）后立即可重新 claim；
+    - prune 只清过旧记录，不影响窗口内去重。
+    """
+    RID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+    def test_claim_new_then_processing(self):
+        state, result = runtime_db.api_request_claim(self.RID, now=1000)
+        self.assertEqual(state, "new")
+        self.assertIsNone(result)
+        state, result = runtime_db.api_request_claim(self.RID, now=1001)
+        self.assertEqual(state, "processing")
+        self.assertIsNone(result)
+
+    def test_complete_then_claim_returns_done_result(self):
+        self.assertEqual(
+            runtime_db.api_request_claim(self.RID, now=1000)[0], "new")
+        payload = {"ok": True, "routed": "ledger",
+                   "message": "📝 已登记：https://e/x"}
+        self.assertTrue(runtime_db.api_request_complete(
+            self.RID, payload, now=1001))
+        state, result = runtime_db.api_request_claim(self.RID, now=1002)
+        self.assertEqual(state, "done")
+        self.assertEqual(result, payload)
+
+    def test_complete_unknown_id_is_false(self):
+        self.assertFalse(runtime_db.api_request_complete(
+            "f" * 32, {"ok": True}, now=1000))
+
+    def test_stale_processing_can_be_reclaimed(self):
+        self.assertEqual(
+            runtime_db.api_request_claim(self.RID, now=1000)[0], "new")
+        state, _ = runtime_db.api_request_claim(
+            self.RID, now=1301, stale_after=300)
+        self.assertEqual(state, "new", "超时未完成应可重新认领")
+        state, _ = runtime_db.api_request_claim(
+            self.RID, now=1302, stale_after=300)
+        self.assertEqual(state, "processing")
+
+    def test_release_allows_reclaim(self):
+        self.assertEqual(
+            runtime_db.api_request_claim(self.RID, now=1000)[0], "new")
+        self.assertTrue(runtime_db.api_request_release(self.RID))
+        self.assertEqual(
+            runtime_db.api_request_claim(self.RID, now=1001)[0], "new")
+
+    def test_release_unknown_id_is_false(self):
+        self.assertFalse(runtime_db.api_request_release("f" * 32))
+
+    def test_prune_removes_only_old_rows(self):
+        self.assertEqual(
+            runtime_db.api_request_claim(self.RID, now=1000)[0], "new")
+        self.assertEqual(runtime_db.api_request_prune(
+            now=1000 + 7 * 24 * 3600 + 1, keep=7 * 24 * 3600), 1)
+        # 记录已清：同一 id 可以重新开始，不会被误判为 processing/done
+        self.assertEqual(
+            runtime_db.api_request_claim(self.RID, now=2000)[0], "new")
+
+    def test_prune_keeps_recent_rows(self):
+        self.assertEqual(
+            runtime_db.api_request_claim(self.RID, now=1000)[0], "new")
+        self.assertEqual(runtime_db.api_request_prune(
+            now=1000 + 60, keep=7 * 24 * 3600), 0)
+        self.assertEqual(
+            runtime_db.api_request_claim(self.RID, now=1061)[0], "processing")

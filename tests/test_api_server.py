@@ -536,6 +536,254 @@ class AppRelayTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("未受理", nfy.await_args.args[0])
 
 
+class _FakeRequestStore:
+    """api_requests 的进程内替身（真实现由 test_runtime_db 覆盖）。"""
+
+    def __init__(self):
+        self.rows = {}
+        self.claims = 0
+
+    def claim(self, rid):
+        self.claims += 1
+        row = self.rows.get(rid)
+        if row is None:
+            self.rows[rid] = {"status": "PROCESSING", "result": None}
+            return ("new", None)
+        if row["status"] == "DONE":
+            return ("done", dict(row["result"]))
+        return ("processing", None)
+
+    def complete(self, rid, result):
+        self.rows[rid] = {"status": "DONE", "result": dict(result)}
+        return True
+
+    def release(self, rid):
+        return self.rows.pop(rid, None) is not None
+
+
+class IdempotencyTest(unittest.IsolatedAsyncioTestCase):
+    """分享 request_id 幂等：同一 id 只执行一次分流。
+
+    套壳 app 的转屏重提、Telegram/HTTP 双通道回落、离线补投都可能把
+    同一分享送进来多次；服务端必须以 request_id 为键挡住重复执行。
+    """
+
+    RID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+    def _patches(self, store):
+        return (
+            mock.patch.object(runtime_db_mod, "api_request_claim",
+                              side_effect=store.claim),
+            mock.patch.object(runtime_db_mod, "api_request_complete",
+                              side_effect=store.complete),
+            mock.patch.object(runtime_db_mod, "api_request_release",
+                              side_effect=store.release),
+        )
+
+    async def test_same_request_id_dispatches_once(self):
+        from tg_userbot import routing
+        store = _FakeRequestStore()
+        decision = routing.Decision(kind="ledger", text="x",
+                                    urls=("https://e/x",))
+        result = routing.RouteResult(kind="ledger", message="📝 已登记",
+                                     urls=decision.urls)
+        p1, p2, p3 = self._patches(store)
+        with p1, p2, p3, \
+             mock.patch.object(routing, "classify", return_value=decision), \
+             mock.patch.object(routing, "execute",
+                               new=mock.AsyncMock(return_value=result)) as ex:
+            first = await api_server.dispatch_link_text(
+                "https://e/x", request_id=self.RID)
+            second = await api_server.dispatch_link_text(
+                "https://e/x", request_id=self.RID)
+        self.assertTrue(first["ok"])
+        self.assertFalse(first.get("duplicate"))
+        self.assertTrue(second.get("duplicate"))
+        self.assertIn("重复提交已忽略", second["message"])
+        self.assertEqual(ex.await_count, 1)
+        self.assertEqual(store.claims, 2)
+
+    async def test_different_request_ids_dispatch_twice(self):
+        from tg_userbot import routing
+        store = _FakeRequestStore()
+        decision = routing.Decision(kind="ledger", text="x",
+                                    urls=("https://e/x",))
+        result = routing.RouteResult(kind="ledger", message="👌",
+                                     urls=decision.urls)
+        p1, p2, p3 = self._patches(store)
+        with p1, p2, p3, \
+             mock.patch.object(routing, "classify", return_value=decision), \
+             mock.patch.object(routing, "execute",
+                               new=mock.AsyncMock(return_value=result)) as ex:
+            await api_server.dispatch_link_text("https://e/x", request_id="a" * 32)
+            await api_server.dispatch_link_text("https://e/x", request_id="b" * 32)
+        self.assertEqual(ex.await_count, 2)
+
+    async def test_without_request_id_skips_idempotency(self):
+        from tg_userbot import routing
+        store = _FakeRequestStore()
+        decision = routing.Decision(kind="ledger", text="x",
+                                    urls=("https://e/x",))
+        result = routing.RouteResult(kind="ledger", message="👌",
+                                     urls=decision.urls)
+        p1, p2, p3 = self._patches(store)
+        with p1, p2, p3, \
+             mock.patch.object(routing, "classify", return_value=decision), \
+             mock.patch.object(routing, "execute",
+                               new=mock.AsyncMock(return_value=result)) as ex:
+            await api_server.dispatch_link_text("https://e/x")
+            await api_server.dispatch_link_text("https://e/x")
+        self.assertEqual(ex.await_count, 2)
+        self.assertEqual(store.claims, 0)
+
+    async def test_failure_releases_claim_so_retry_runs(self):
+        from tg_userbot import routing
+        store = _FakeRequestStore()
+        decision = routing.Decision(kind="ledger", text="x",
+                                    urls=("https://e/x",))
+        result = routing.RouteResult(kind="ledger", message="👌",
+                                     urls=decision.urls)
+        p1, p2, p3 = self._patches(store)
+        with p1, p2, p3, \
+             mock.patch.object(routing, "classify", return_value=decision):
+            with mock.patch.object(routing, "execute",
+                                   new=mock.AsyncMock(
+                                       side_effect=RuntimeError("炸了"))):
+                with self.assertRaises(RuntimeError):
+                    await api_server.dispatch_link_text(
+                        "https://e/x", request_id=self.RID)
+            self.assertNotIn(self.RID, store.rows,
+                             "执行异常必须释放认领，重试才能重新执行")
+            with mock.patch.object(routing, "execute",
+                                   new=mock.AsyncMock(
+                                       return_value=result)) as ex:
+                out = await api_server.dispatch_link_text(
+                    "https://e/x", request_id=self.RID)
+            self.assertTrue(out["ok"])
+            self.assertEqual(ex.await_count, 1)
+
+    async def test_cancellation_releases_claim(self):
+        """wait_for 超时会取消 dispatch 协程；认领必须释放，重放才能重跑。"""
+        from tg_userbot import routing
+        store = _FakeRequestStore()
+        decision = routing.Decision(kind="ledger", text="x",
+                                    urls=("https://e/x",))
+        p1, p2, p3 = self._patches(store)
+        with p1, p2, p3, \
+             mock.patch.object(routing, "classify", return_value=decision), \
+             mock.patch.object(routing, "execute",
+                               new=mock.AsyncMock(
+                                   side_effect=asyncio.CancelledError())):
+            with self.assertRaises(asyncio.CancelledError):
+                await api_server.dispatch_link_text(
+                    "https://e/x", request_id=self.RID)
+        self.assertNotIn(self.RID, store.rows,
+                         "CancelledError 也必须释放认领")
+
+    async def test_unhandled_text_releases_claim(self):
+        from tg_userbot import routing
+        store = _FakeRequestStore()
+        p1, p2, p3 = self._patches(store)
+        with p1, p2, p3, \
+             mock.patch.object(routing, "classify",
+                               return_value=routing.Decision(kind="none")):
+            out = await api_server.dispatch_link_text(
+                "只是一句话", request_id=self.RID)
+        self.assertFalse(out["ok"])
+        self.assertNotIn(self.RID, store.rows)
+
+    async def test_processing_duplicate_returns_pending_without_notify(self):
+        with mock.patch.object(api_server, "dispatch_link_text",
+                               new=mock.AsyncMock(return_value={
+                                   "ok": True, "duplicate": True,
+                                   "message": "⏳ 处理中"})), \
+             mock.patch.object(api_server.notify, "notify_user",
+                               new=mock.AsyncMock()) as nfy:
+            await asyncio.wait_for(
+                api_server.handle_app_relay("https://e/x"), 5)
+        nfy.assert_not_awaited()
+
+
+class RelayRequestIdTest(unittest.IsolatedAsyncioTestCase):
+    """🛰 中转载荷的 request_id 前缀解析（向后兼容无前缀）。"""
+
+    RID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+    async def test_relay_parses_request_id_prefix(self):
+        with mock.patch.object(api_server, "dispatch_link_text",
+                               new=mock.AsyncMock(return_value={
+                                   "ok": True, "routed": "ledger",
+                                   "message": "已登记"})) as dp, \
+             mock.patch.object(api_server.notify, "notify_user",
+                               new=mock.AsyncMock()):
+            await asyncio.wait_for(
+                api_server.handle_app_relay(
+                    f"{self.RID} https://example.com/x"), 5)
+        self.assertEqual(dp.await_args.args[0], "https://example.com/x")
+        self.assertEqual(dp.await_args.kwargs.get("request_id"), self.RID)
+
+    async def test_relay_without_prefix_keeps_whole_text(self):
+        with mock.patch.object(api_server, "dispatch_link_text",
+                               new=mock.AsyncMock(return_value={
+                                   "ok": True, "routed": "ledger",
+                                   "message": "已登记"})) as dp, \
+             mock.patch.object(api_server.notify, "notify_user",
+                               new=mock.AsyncMock()):
+            await asyncio.wait_for(
+                api_server.handle_app_relay("https://example.com/x"), 5)
+        self.assertEqual(dp.await_args.args[0], "https://example.com/x")
+        self.assertIsNone(dp.await_args.kwargs.get("request_id"))
+
+    async def test_random_32_char_word_is_not_treated_as_id(self):
+        with mock.patch.object(api_server, "dispatch_link_text",
+                               new=mock.AsyncMock(return_value={
+                                   "ok": True, "routed": "ledger",
+                                   "message": "已登记"})) as dp, \
+             mock.patch.object(api_server.notify, "notify_user",
+                               new=mock.AsyncMock()):
+            text = "z" * 32 + " https://example.com/x"
+            await asyncio.wait_for(
+                api_server.handle_app_relay(text), 5)
+        self.assertEqual(dp.await_args.args[0], text)
+        self.assertIsNone(dp.await_args.kwargs.get("request_id"))
+
+
+class EnqueueRequestIdTest(unittest.IsolatedAsyncioTestCase):
+    """HTTP /api/enqueue 读取 request_id（非法形态按无幂等处理）。"""
+
+    async def test_enqueue_passes_request_id(self):
+        rid = "0123456789abcdef0123456789abcdef"
+        with mock.patch.object(api_server, "dispatch_link_text",
+                               new=mock.AsyncMock(return_value={
+                                   "ok": True, "routed": "ledger",
+                                   "message": "已登记"})) as dp:
+            client = make_client()
+            await client.start_server()
+            try:
+                data = await _post_json(client, "/api/enqueue",
+                                        {"text": "https://e/x",
+                                         "request_id": rid})
+            finally:
+                await client.close()
+        self.assertTrue(data["ok"])
+        self.assertEqual(dp.await_args.kwargs.get("request_id"), rid)
+
+    async def test_enqueue_ignores_invalid_request_id(self):
+        with mock.patch.object(api_server, "dispatch_link_text",
+                               new=mock.AsyncMock(return_value={
+                                   "ok": True, "routed": "ledger",
+                                   "message": "已登记"})) as dp:
+            client = make_client()
+            await client.start_server()
+            try:
+                await _post_json(client, "/api/enqueue",
+                                 {"text": "https://e/x",
+                                  "request_id": "not-a-valid-id"})
+            finally:
+                await client.close()
+        self.assertIsNone(dp.await_args.kwargs.get("request_id"))
+
+
 class StatsFindChromeTest(unittest.IsolatedAsyncioTestCase):
     """文本视图端点：stats / find / chrome（全部 mock 底层渲染）。"""
 

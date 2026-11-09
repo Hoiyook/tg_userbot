@@ -23,6 +23,7 @@ import collections
 import hmac
 import json
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -44,6 +45,31 @@ _DASHBOARD_PATH = Path(__file__).with_name("api_dashboard.html")
 
 # 单次链接分流的硬顶：resolver 每条 30s、转 bot 每条 60s，多条链接取上限
 _DISPATCH_TIMEOUT_SECONDS = 120
+
+# 分享幂等 id：套壳 app 用 UUID4 去掉横线（32 位小写十六进制）。只认这个
+# 精确形态，避免把普通文本开头的 32 字符单词误当 id。
+_REQUEST_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def _clean_request_id(value):
+    """合法 request_id 原样返回；缺失/形态不对返回 None（按无幂等处理）。"""
+    rid = str(value or "").strip()
+    return rid if _REQUEST_ID_RE.match(rid) else None
+
+
+def _split_relay_payload(payload):
+    """拆 🛰 中转载荷的 ``<request_id> <原文>`` 前缀。
+
+    旧版 app / 手工发的 🛰 没有前缀：整段当原文（向后兼容）。
+    """
+    text = str(payload or "").strip()
+    if not text:
+        return None, ""
+    head, _, rest = text.partition(" ")
+    rid = _clean_request_id(head)
+    if rid:
+        return rid, rest.strip()
+    return None, text
 
 # 动作白名单：名字 → 描述（/api/action/<name> 只认这里的键）。
 # 全部薄封装既有服务函数；thread/chrome_cancel 带 JSON body 参数。
@@ -392,22 +418,33 @@ async def handle_app_relay(text: str) -> None:
 
     fire-and-forget：app 端拿不到同步回执，结果统一经 Telegram 通知回
     控制面板（成功/失败都说人话）。任何异常都不外泄——这是后台任务。
+
+    载荷形态：``<request_id> <原文>``（2026-11-09 起的套壳 app）；没有
+    32 位十六进制前缀的旧形态整段当原文。重复提交（duplicate）不再发
+    通知——首次已发过，重放只记日志。
     """
+    request_id, payload = _split_relay_payload(text)
     try:
         result = await asyncio.wait_for(
-            dispatch_link_text(text, surface="app"),
+            dispatch_link_text(payload, surface="app",
+                               request_id=request_id),
             timeout=_DISPATCH_TIMEOUT_SECONDS)
     except Exception as e:
         logger.exception(f"🛰 app 中转入队失败：{e}")
         try:
             await notify.notify_user(
-                f"📲 分享直达失败：{type(e).__name__}: {e}\n{text[:80]}")
+                f"📲 分享直达失败：{type(e).__name__}: {e}\n{payload[:80]}")
         except Exception:
             pass
         return
     if result.get("ok"):
+        if result.get("duplicate"):
+            logger.info(
+                f"🛰 app 中转重复提交已忽略（{result.get('routed')}）："
+                f"{payload[:60]}")
+            return
         logger.info(
-            f"🛰 app 中转已受理（{result.get('routed')}）：{text[:60]}")
+            f"🛰 app 中转已受理（{result.get('routed')}）：{payload[:60]}")
         try:
             await notify.notify_user(
                 f"📲 分享直达已受理\n{result.get('message', '')}")
@@ -571,14 +608,74 @@ def build_status() -> dict:
     }
 
 
-async def dispatch_link_text(text: str, surface: str = "api") -> dict:
+async def dispatch_link_text(text: str, surface: str = "api",
+                             request_id: str = None) -> dict:
     """把一段含链接的文本按平台分流——语义与「往收藏夹发这条消息」一致。
 
     分流顺序与每路参数构造的唯一实现在 ``routing``（收藏夹 / bot 对话 /
     看板三入口共用）；本函数只做 API 特有的交付：JSON 回执与种子任务
     结果通知。链接日志由 ``routing.execute`` 统一写（surface 标明入口）。
+
+    ``request_id``（2026-11-09）：可选的 32 位十六进制幂等键。同一 id
+    首次执行后结果落 api_requests；重放直接返回首次结果并带
+    ``duplicate=True``，绝不再次执行分流。客户端转屏重提、Telegram/HTTP
+    双通道回落、离线 spool 补投都靠它去重。没有 id 时行为与旧版一致。
+    幂等台账不可用时按无幂等继续——它只是防重复，不是任务真相源。
     """
     text = str(text or "").strip()
+    rid = _clean_request_id(request_id)
+    rdb = None
+    claimed = False
+    if rid:
+        try:
+            from . import runtime_db as rdb
+            claim_state, stored = rdb.api_request_claim(rid)
+            if claim_state == "done":
+                out = dict(stored or {"ok": True, "routed": None,
+                                      "message": ""})
+                out["duplicate"] = True
+                base_msg = str(out.get("message") or "").strip()
+                out["message"] = ("♻️ 重复提交已忽略（首次已受理）"
+                                  + (f"：{base_msg}" if base_msg else ""))
+                logger.info(f"♻️ 分享重复提交已忽略：{rid[:8]}")
+                return out
+            if claim_state == "processing":
+                logger.info(f"⏳ 分享正在处理中（重复提交已忽略）：{rid[:8]}")
+                return {"ok": True, "routed": None, "duplicate": True,
+                        "message": "⏳ 该分享正在处理中（重复提交已忽略）"}
+            claimed = True
+        except Exception as e:
+            logger.warning(f"分享幂等台账不可用（按无幂等继续）：{e}")
+            rdb = None
+            claimed = False
+
+    try:
+        result = await _dispatch_link_text_inner(text, surface)
+    except BaseException:
+        # 含 CancelledError：handle_enqueue / handle_app_relay 的 wait_for
+        # 超时会取消本协程。必须释放认领，否则 300s 内同一 id 的重放
+        # 会读到 PROCESSING 被当成「正在处理」而丢掉，第一次却永远没完成。
+        if claimed and rdb is not None:
+            try:
+                rdb.api_request_release(rid)
+            except Exception as e:
+                logger.warning(f"分享幂等台账释放失败（忽略）：{e}")
+        raise
+
+    if claimed and rdb is not None:
+        try:
+            if result.get("ok"):
+                rdb.api_request_complete(rid, result)
+            else:
+                # 失败结果不缓存：重放允许重新执行（例如解析 bot 恢复后）
+                rdb.api_request_release(rid)
+        except Exception as e:
+            logger.warning(f"分享幂等台账写回失败（忽略）：{e}")
+    return result
+
+
+async def _dispatch_link_text_inner(text: str, surface: str) -> dict:
+    """真正的分流执行（不含幂等包装；供 ``dispatch_link_text`` 调用）。"""
     decision = routing.classify(text, allow=routing.SURFACE_API,
                                 message=_ShimMessage(text))
     if not decision.handled:
@@ -1049,9 +1146,11 @@ async def handle_enqueue(request):
         return _json({"ok": False,
                       "error": "缺少 text 字段（分享的原文即可，无需自行截取链接）"},
                      400)
+    request_id = _clean_request_id(body.get("request_id"))
     try:
         result = await asyncio.wait_for(
-            dispatch_link_text(text), timeout=_DISPATCH_TIMEOUT_SECONDS)
+            dispatch_link_text(text, request_id=request_id),
+            timeout=_DISPATCH_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         return _json({"ok": False,
                       "error": f"处理超时（>{_DISPATCH_TIMEOUT_SECONDS}s），"

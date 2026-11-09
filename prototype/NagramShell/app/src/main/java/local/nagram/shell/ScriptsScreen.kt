@@ -25,6 +25,7 @@ private const val TERMUX_PREFIX = "/data/data/com.termux/files/usr"
 private const val TERMUX_HOME = "/data/data/com.termux/files/home"
 private const val PREFS = "scripts"
 private const val KEY_SCRIPTS = "scripts_json"
+private const val KEY_SCRIPTS_BACKUP = "scripts_json_backup"
 private const val PERM_RUN_COMMAND = "com.termux.permission.RUN_COMMAND"
 
 data class Script(
@@ -76,6 +77,18 @@ private fun loadScripts(ctx: Context): MutableList<Script> {
         migrateStaleDefaults(list)
         list
     } catch (e: Exception) {
+        // 坏数据不静默丢弃：原文备份到 scripts_json_backup，再回默认脚本
+        val old = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_SCRIPTS, null)
+        if (!old.isNullOrEmpty()) {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putString(KEY_SCRIPTS_BACKUP, old).apply()
+        }
+        Toast.makeText(
+            ctx,
+            "⚠️ 脚本配置损坏，已载入默认脚本；原内容备份在 $KEY_SCRIPTS_BACKUP",
+            Toast.LENGTH_LONG,
+        ).show()
         defaultScripts().toMutableList()
     }
 }
@@ -153,10 +166,9 @@ private fun runInTermux(ctx: Context, script: Script,
 }
 
 private fun runCardCmd(ctx: Context, body: String) {
-    val out = "/sdcard/Download/scriptrunner_out.txt"
-    val wrapped = "{ $body ; } > \"$out\" 2>&1; " +
-        "echo '── 完成 ──' >> \"$out\"; " +
-        "termux-open \"$out\""
+    val wrapped = "{ $body ; } > \"$OUT_FILE\" 2>&1; " +
+        "echo '── 完成 ──' >> \"$OUT_FILE\"; " +
+        "termux-open \"$OUT_FILE\""
     runRaw(ctx, "$TERMUX_PREFIX/bin/bash", arrayOf("-c", wrapped))
 }
 
@@ -168,9 +180,12 @@ fun ScriptsScreen() {
     var editingIndex by remember { mutableIntStateOf(-1) }
     var running by remember { mutableStateOf<Script?>(null) }
     // 文件管理卡状态（composable 顶层——删除确认对话框在 Column 外）
-    var srcPath by remember { mutableStateOf("/sdcard/Download/") }
+    var srcPath by remember {
+        mutableStateOf("/sdcard/Download/extract.pyz")
+    }
     var delName by remember { mutableStateOf("") }
     var pendingDel by remember { mutableStateOf<String?>(null) }
+    var pendingScriptDel by remember { mutableStateOf<Int?>(null) }
 
     Column(Modifier.fillMaxSize().background(BgApp).padding(16.dp)) {
         Text("🛠 脚本", color = InkStrong, fontSize = 22.sp,
@@ -208,9 +223,7 @@ fun ScriptsScreen() {
                                 editing = s; editingIndex = i }) {
                                 Text("编辑") }
                             TextButton(onClick = {
-                                scripts = scripts.toMutableList()
-                                    .apply { removeAt(i) }
-                                saveScripts(ctx, scripts)
+                                pendingScriptDel = i
                             }) { Text("删除", color = Danger) }
                         }
                     }
@@ -265,9 +278,13 @@ fun ScriptsScreen() {
                 Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = {
-                        runCardCmd(ctx,
-                            "cp \"$srcPath\" \"\$HOME/\" 2>&1 " +
-                            "&& echo \"✅ 已复制：\$(basename \"$srcPath\")\"")
+                        // 路径作为 $1 传给 bash，不拼进脚本文本——文件名里的
+                        // 引号/$()/换行不会再被当成 shell 代码执行
+                        runRaw(ctx, "$TERMUX_PREFIX/bin/bash", arrayOf(
+                            "-c",
+                            "cp -- \"\$1\" \"\$HOME/\" && echo " +
+                                "\"✅ 已复制：\$(basename \"\$1\")\"",
+                            "_", srcPath))
                     }) { Text("📋 复制到 Termux") }
                     OutlinedButton(onClick = {
                         runCardCmd(ctx,
@@ -286,8 +303,18 @@ fun ScriptsScreen() {
                     )
                     Button(
                         onClick = {
-                            if (delName.isNotBlank())
-                                pendingDel = delName.trim()
+                            val name = delName.trim()
+                            if (name.isEmpty()) return@Button
+                            if (name.contains('/') || name.contains('\\') ||
+                                name == "." || name == "..") {
+                                Toast.makeText(
+                                    ctx,
+                                    "只支持删除 home 下的文件名（不能含路径）",
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                                return@Button
+                            }
+                            pendingDel = name
                         },
                         colors = ButtonDefaults.buttonColors(
                             containerColor = Danger),
@@ -306,8 +333,11 @@ fun ScriptsScreen() {
             confirmButton = {
                 Button(
                     onClick = {
+                        // 文件名走 $1，绝不拼进脚本（防 " / $() 注入）
                         runRaw(ctx, "$TERMUX_PREFIX/bin/bash", arrayOf(
-                            "-c", "rm ~/\"$name\" && echo \"✅ 已删除 $name\""))
+                            "-c",
+                            "rm -- \"\$HOME/\$1\" && echo \"✅ 已删除 \$1\"",
+                            "_", name))
                         pendingDel = null
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Danger),
@@ -315,6 +345,35 @@ fun ScriptsScreen() {
             },
             dismissButton = {
                 OutlinedButton(onClick = { pendingDel = null }) { Text("取消") }
+            },
+        )
+    }
+
+    // ── 删除脚本确认（与文件删除一致，不再一点就删）──
+    val scriptToDelete = pendingScriptDel?.let { idx ->
+        scripts.getOrNull(idx)?.let { idx to it }
+    }
+    if (scriptToDelete != null) {
+        val (idx, s) = scriptToDelete
+        AlertDialog(
+            onDismissRequest = { pendingScriptDel = null },
+            title = { Text("删除脚本") },
+            text = { Text("确定删除「${s.name}」？此操作不可恢复。") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        scripts = scripts.toMutableList()
+                            .apply { removeAt(idx) }
+                        saveScripts(ctx, scripts)
+                        pendingScriptDel = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Danger),
+                ) { Text("删除") }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = {
+                    pendingScriptDel = null
+                }) { Text("取消") }
             },
         )
     }

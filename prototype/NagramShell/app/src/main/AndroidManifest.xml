@@ -5,9 +5,12 @@
         <intent><action android:name="com.termux.RUN_COMMAND" /></intent>
     </queries>
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- allowBackup=false：SharedPreferences / WebView localStorage 里有
+         bot token 与 API token，云备份/换机迁移会把它们一起带走 -->
     <application
         android:icon="@mipmap/ic_launcher"
-        android:allowBackup="true"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
@@ -29,6 +32,11 @@
             android:theme="@style/AppTheme">
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="text/plain" />
             </intent-filter>

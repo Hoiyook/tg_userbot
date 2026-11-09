@@ -52,6 +52,17 @@
 const p = new URLSearchParams(location.search);
 const text = [p.get("title"), p.get("text"), p.get("url")]
   .filter(Boolean).join(" ").trim();
+// 幂等键：同一页面内重复点提交/超时重试复用同一 id，服务端只受理一次。
+// 非 HTTPS（局域网 http）没有 crypto.randomUUID，退回 Math.random。
+function newReqId() {
+  try {
+    if (window.crypto && crypto.randomUUID)
+      return crypto.randomUUID().replace(/-/g, "");
+  } catch (e) { /* 非安全上下文 */ }
+  return Array.from({ length: 32 },
+    () => Math.floor(Math.random() * 16).toString(16)).join("");
+}
+const REQ = newReqId();
 const TOK = () => localStorage.getItem("nagram_token") || "";
 if (p.get("token")) { localStorage.setItem("nagram_token", p.get("token")); }
 document.getElementById("shared").textContent = text || "（未收到内容）";
@@ -73,7 +84,7 @@ async function submit() {
   fb.className = "fb"; fb.textContent = "提交中…（本地解析最长约 30s/条）";
   try {
     const d = await api("/api/enqueue", { method: "POST",
-      body: JSON.stringify({ text }) });
+      body: JSON.stringify({ text, request_id: REQ }) });
     fb.className = "fb " + (d.ok ? "ok" : "bad");
     fb.textContent = (d.ok ? "✅ " : "❌ ") + (d.message || d.error || "");
   } catch (e) { fb.className = "fb bad"; fb.textContent = "❌ " + e; }

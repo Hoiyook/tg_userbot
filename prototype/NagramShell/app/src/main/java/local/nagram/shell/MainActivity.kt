@@ -2,7 +2,12 @@ package local.nagram.shell
 
 import android.annotation.SuppressLint
 import android.os.Bundle
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import com.google.accompanist.swiperefresh.rememberSwipeRefreshState
@@ -26,6 +31,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material3.Button
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.ui.text.font.FontWeight
@@ -36,21 +42,28 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.net.URLEncoder
 
 /**
  * 主界面 = 配置页（未配置时）或后端看板 WebView。
@@ -93,14 +106,37 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun App() {
     val ctx = LocalContext.current
-    var configured by remember { mutableStateOf(Prefs.configured(ctx)) }
-    var editing by remember { mutableStateOf(false) }
+    var configured by rememberSaveable { mutableStateOf(Prefs.configured(ctx)) }
+    var editing by rememberSaveable { mutableStateOf(false) }
     var spoolNote by remember { mutableStateOf("") }
-    var tab by remember { mutableStateOf("panel") }
+    var tab by rememberSaveable { mutableStateOf("panel") }
+    var flushTrigger by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(Unit) {
-        val remaining = withContext(Dispatchers.IO) { Api.flushSpool(ctx) }
-        if (remaining > 0) spoolNote = "⏳ 有 $remaining 条离线分享待补投"
+    // 补投触发点：启动、回到前台（ON_RESUME）、配置保存后。此前只在
+    // Activity 创建时跑一次——app 进程一直活着时，离线暂存可能永远不补。
+    LaunchedEffect(flushTrigger) {
+        val res = withContext(Dispatchers.IO) { Api.flushSpool(ctx) }
+        spoolNote = when {
+            res.remaining > 0 && res.dropped > 0 ->
+                "⏳ 有 ${res.remaining} 条离线分享待补投" +
+                    "（${res.dropped} 条永久失败已丢弃）"
+            res.remaining > 0 -> "⏳ 有 ${res.remaining} 条离线分享待补投"
+            res.dropped > 0 -> "⚠️ ${res.dropped} 条离线分享无法受理，已丢弃"
+            else -> ""
+        }
+    }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        var resumedOnce = false
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                // 首次 ON_RESUME 与上面的初始 LaunchedEffect 重合，跳过；
+                // 之后的每次回到前台都补投一次
+                if (resumedOnce) flushTrigger++ else resumedOnce = true
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     // 未配置：先全屏走配置页（配好才出现双页签）
@@ -108,15 +144,18 @@ fun App() {
         ConfigScreen(
             onCancel = { if (configured) editing = false },
             onSaved = {
-                configured = true
+                // 以 Prefs 的真实状态为准：只填了 bot token 之类不能算配置完成
+                configured = Prefs.configured(ctx)
                 editing = false
+                flushTrigger++
             },
         )
         return
     }
 
     // 已配置：面板 / 脚本 双页签（2026-11-07 合并 ScriptRunner）
-    Column(Modifier.fillMaxSize().background(BgApp)) {
+    // statusBarsPadding：Android 15 强制 edge-to-edge，不垫高会顶到状态栏
+    Column(Modifier.fillMaxSize().background(BgApp).statusBarsPadding()) {
         Box(Modifier.weight(1f)) {
             when {
                 tab == "scripts" -> ScriptsScreen()
@@ -218,17 +257,19 @@ fun TelegramOnlyScreen(onEdit: () -> Unit, spoolNote: String) {
 @Composable
 fun ConfigScreen(onSaved: () -> Unit, onCancel: (() -> Unit)?) {
     val ctx = LocalContext.current
-    var url by remember { mutableStateOf(Prefs.homeUrl(ctx)) }
-    var awayUrl by remember { mutableStateOf(Prefs.awayUrl(ctx)) }
-    var token by remember { mutableStateOf(Prefs.token(ctx)) }
-    var botToken by remember { mutableStateOf(Prefs.botToken(ctx)) }
-    var chatId by remember { mutableStateOf(Prefs.chatId(ctx)) }
+    // rememberSaveable：转屏/系统回收不丢用户已经输入的长 token
+    var url by rememberSaveable { mutableStateOf(Prefs.homeUrl(ctx)) }
+    var awayUrl by rememberSaveable { mutableStateOf(Prefs.awayUrl(ctx)) }
+    var token by rememberSaveable { mutableStateOf(Prefs.token(ctx)) }
+    var botToken by rememberSaveable { mutableStateOf(Prefs.botToken(ctx)) }
+    var chatId by rememberSaveable { mutableStateOf(Prefs.chatId(ctx)) }
     var note by remember { mutableStateOf("") }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(BgApp)
+            .statusBarsPadding()
             .verticalScroll(rememberScrollState())
             .padding(20.dp),
     ) {
@@ -245,7 +286,7 @@ fun ConfigScreen(onSaved: () -> Unit, onCancel: (() -> Unit)?) {
             OutlinedTextField(
                 value = botToken,
                 onValueChange = { botToken = it },
-                label = { Text("Bot Token（选填，如 123456:ABC-xxx）") },
+                label = { Text("Bot Token（与数字 ID 一起填，如 123456:ABC-xxx）") },
                 visualTransformation = PasswordVisualTransformation(),
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
@@ -254,7 +295,7 @@ fun ConfigScreen(onSaved: () -> Unit, onCancel: (() -> Unit)?) {
             OutlinedTextField(
                 value = chatId,
                 onValueChange = { chatId = it },
-                label = { Text("你的数字 ID（选填，如 5452449426）") },
+                label = { Text("你的数字 ID（纯数字，与 Bot Token 一起填）") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
             )
@@ -283,7 +324,7 @@ fun ConfigScreen(onSaved: () -> Unit, onCancel: (() -> Unit)?) {
             OutlinedTextField(
                 value = token,
                 onValueChange = { token = it },
-                label = { Text("API 访问令牌（选填）") },
+                label = { Text("API 访问令牌（服务器开了鉴权就必填）") },
                 visualTransformation = PasswordVisualTransformation(),
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
@@ -292,10 +333,28 @@ fun ConfigScreen(onSaved: () -> Unit, onCancel: (() -> Unit)?) {
         Spacer(Modifier.height(20.dp))
         Button(
             onClick = {
-                if (botToken.isBlank() && !url.trim().startsWith("http")
-                    && !awayUrl.trim().startsWith("http")) {
-                    note = "至少配置 Telegram 中转（Bot Token + 数字 ID）或服务器地址"
-                    return@Button
+                val tgAny = botToken.isNotBlank() || chatId.isNotBlank()
+                val tgComplete = botToken.isNotBlank() && chatId.isNotBlank()
+                val chatNumeric = chatId.isBlank() ||
+                    chatId.trim().toLongOrNull() != null
+                val httpOk = listOf(url.trim(), awayUrl.trim()).any {
+                    it.startsWith("http://") || it.startsWith("https://")
+                }
+                when {
+                    tgAny && !tgComplete -> {
+                        note = "Telegram 中转需要同时填写 Bot Token 和数字 ID" +
+                            "（两项要么都填，要么都不填）"
+                        return@Button
+                    }
+                    !chatNumeric -> {
+                        note = "数字 ID 必须是纯数字（如 5452449426）"
+                        return@Button
+                    }
+                    !tgComplete && !httpOk -> {
+                        note = "至少配置 Telegram 中转（Token + 数字 ID）" +
+                            "或服务器地址（以 http:// / https:// 开头）"
+                        return@Button
+                    }
                 }
                 Prefs.save(ctx, url, awayUrl, token, botToken, chatId)
                 onSaved()
@@ -343,17 +402,25 @@ fun DashboardScreen(onEdit: () -> Unit, spoolNote: String) {
     val ctx = LocalContext.current
     var base by remember { mutableStateOf(Prefs.resolveCached(ctx)) }
     val token = Prefs.token(ctx)
-    val target = if (token.isNotEmpty()) "$base/?token=$token" else "$base/"
+    // token 可能含 + / = 等字符（base64）——不编码会被 query 解码成空格
+    val encodedToken = URLEncoder.encode(token, "UTF-8")
+    val target = if (token.isNotEmpty()) "$base/?token=$encodedToken" else "$base/"
     val refreshTrigger = remember { mutableStateOf(0) }
     val probeTrigger = remember { mutableStateOf(0) }
+    var refreshing by remember { mutableStateOf(false) }
+    val swipeState = rememberSwipeRefreshState(isRefreshing = refreshing)
 
     // 双地址探活选路（2026-11-08）：家里 WiFi 时内网地址秒回赢；外出时
     // 内网超时自动切外网地址。赢家写缓存（下次打开即用对的路），与本轮
     // 加载地址不同时重载 WebView。
+    //
+    // 注意判据必须比 base，不能比 lastGood：ShareReceiver 的
+    // postEnqueue 也会更新 lastGood，若它先把 lastGood 改成新赢家，
+    // 这里会误以为「缓存已经对了」而跳过 base 更新，看板就卡在死地址。
     LaunchedEffect(probeTrigger.value) {
         val winner = withContext(Dispatchers.IO) { Api.probeBoth(ctx) }
-        if (winner.isNotEmpty() && Prefs.lastGood(ctx) != winner) {
-            Prefs.setLastGood(ctx, winner)
+        if (winner.isNotEmpty()) {
+            if (Prefs.lastGood(ctx) != winner) Prefs.setLastGood(ctx, winner)
             if (winner != base) {
                 base = winner
                 refreshTrigger.value += 1
@@ -363,14 +430,19 @@ fun DashboardScreen(onEdit: () -> Unit, spoolNote: String) {
 
     Box(Modifier.fillMaxSize()) {
         // 下拉刷新：SwipeRefresh 包 WebView——WebView 内部滚动到顶时
-        // 才触发刷新手势，刷新 = window.location.reload()（看板由后端
-        // serve，no-store 保证拿到最新版）
-        com.google.accompanist.swiperefresh.SwipeRefresh(
-            state = rememberSwipeRefreshState(isRefreshing = false),
-            onRefresh = { refreshTrigger.value += 1; probeTrigger.value += 1 },
+        // 才触发刷新手势，刷新 = 用同一个 URL 重新 loadUrl（看板由后端
+        // serve，no-store 保证拿到最新版）。refreshing 由 WebViewClient
+        // 的 onPageFinished/onReceivedError 收尾，否则指示器永远不转。
+        SwipeRefresh(
+            state = swipeState,
+            onRefresh = {
+                refreshing = true
+                refreshTrigger.value += 1
+                probeTrigger.value += 1
+            },
             modifier = Modifier.fillMaxSize(),
             indicator = { state, trigger ->
-                com.google.accompanist.swiperefresh.SwipeRefreshIndicator(
+                SwipeRefreshIndicator(
                     state = state,
                     refreshTriggerDistance = trigger,
                     scale = true,
@@ -379,20 +451,53 @@ fun DashboardScreen(onEdit: () -> Unit, spoolNote: String) {
                 )
             },
         ) {
-            val currentTarget = remember(refreshTrigger.value) { target }
+            val currentTarget = target
+            // tag 里带 refreshTrigger：下拉刷新时 URL 不变也要重新 loadUrl；
+            // 而普通重组（spoolNote 变化等）tag 不变，不会冲掉看板 JS 状态
+            val loadKey = "${refreshTrigger.value}|$currentTarget"
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { context ->
                     WebView(context).apply {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
+                        // 不设 WebChromeClient 时 confirm() 立即返回 false、
+                        // prompt() 立即返回 null——看板「移除队列」和 401
+                        // 令牌输入框会静默失效（浏览器/PWA 里正常）
+                        webChromeClient = WebChromeClient()
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(
+                                view: WebView?, url: String?
+                            ) {
+                                refreshing = false
+                            }
+
+                            override fun onReceivedError(
+                                view: WebView?,
+                                request: WebResourceRequest?,
+                                error: WebResourceError?,
+                            ) {
+                                super.onReceivedError(view, request, error)
+                                refreshing = false
+                            }
+                        }
+                        // 看板 401 时把修正后的 token 回写原生配置；
+                        // 浏览器里 window.NagramShell 不存在，自然跳过
+                        addJavascriptInterface(TokenBridge(context), "NagramShell")
+                        tag = loadKey
                         loadUrl(currentTarget)
                     }
                 },
                 update = { webView ->
-                    // refreshTrigger 变化时重载（下拉刷新）
-                    webView.loadUrl(currentTarget)
+                    // Compose 每次重组都会调 update；无条件 loadUrl 会
+                    // 把看板 JS 状态（文件管理器路径/勾选）冲掉，首次
+                    // 组合还会与 factory 里的 loadUrl 叠加成两次加载
+                    if (webView.tag != loadKey) {
+                        webView.tag = loadKey
+                        webView.loadUrl(currentTarget)
+                    }
                 },
+                onRelease = { it.destroy() },
             )
         }
         if (spoolNote.isNotEmpty()) {
@@ -418,5 +523,19 @@ fun DashboardScreen(onEdit: () -> Unit, spoolNote: String) {
         ) {
             Text("⚙", fontSize = 20.sp, color = Color(0xFF334155))
         }
+    }
+}
+
+/**
+ * 看板 JS bridge（只暴露一个写 token 的方法）。
+ *
+ * 看板的 401 处理在浏览器里是 prompt + localStorage；在 WebView 里
+ * 额外调用 `NagramShell.saveToken(t)`，把修正后的 token 回写原生
+ * Prefs——否则下次 loadUrl 又用旧 token 覆盖 localStorage，永远修不好。
+ */
+private class TokenBridge(private val ctx: android.content.Context) {
+    @JavascriptInterface
+    fun saveToken(token: String) {
+        if (token.isNotBlank()) Prefs.saveToken(ctx, token)
     }
 }

@@ -465,7 +465,16 @@ async function api(path, opts) {
   const r = await fetch(path, Object.assign({headers: H()}, opts||{}));
   if (r.status === 401) {
     const t = prompt("访问令牌：");
-    if (t) { localStorage.setItem("nagram_token", t); return api(path, opts); }
+    if (t) {
+      localStorage.setItem("nagram_token", t);
+      // 套壳 app 的 WebView 会注入 NagramShell.saveToken：把修正值回写
+      // 原生 Prefs，否则下次 loadUrl 又用旧 token 覆盖 localStorage。
+      // 浏览器/PWA 里没有这个对象，自然跳过。
+      try {
+        if (window.NagramShell && NagramShell.saveToken) NagramShell.saveToken(t);
+      } catch (e) { /* bridge 不可用不影响浏览器路径 */ }
+      return api(path, opts);
+    }
     throw new Error("未授权");
   }
   return r.json();
@@ -607,6 +616,25 @@ async function act(name, body) {
   } catch (e) { showResult(false, String(e)); }
 }
 
+// 同一段文本在「失败后重试」时复用同一 request_id（服务端幂等），
+// 成功后再提交（哪怕文本相同）换新 id——否则重下同一链接永远被当重复。
+let lastReqText = null, lastReqId = null;
+function requestIdFor(text) {
+  if (text !== lastReqText) {
+    lastReqText = text;
+    lastReqId = newReqId();
+  }
+  return lastReqId;
+}
+function newReqId() {
+  try {
+    if (window.crypto && crypto.randomUUID)
+      return crypto.randomUUID().replace(/-/g, "");
+  } catch (e) { /* 非安全上下文 */ }
+  return Array.from({ length: 32 },
+    () => Math.floor(Math.random() * 16).toString(16)).join("");
+}
+
 async function submit() {
   const el = document.getElementById("u");
   const text = el.value.trim();
@@ -614,9 +642,13 @@ async function submit() {
   setFb("fb", null, "提交中…（本地解析最长约 30s/条）");
   try {
     const d = await api("/api/enqueue", {method:"POST",
-      body: JSON.stringify({text})});
+      body: JSON.stringify({text, request_id: requestIdFor(text)})});
     setFb("fb", d.ok, (d.ok ? "✅ " : "❌ ") + (d.message || d.error || ""));
-    if (d.ok) el.value = "";
+    if (d.ok) {
+      el.value = "";
+      lastReqText = null;
+      lastReqId = null;
+    }
     refresh();
   } catch (e) { setFb("fb", false, "❌ 网络错误：" + e); }
 }
@@ -753,7 +785,15 @@ async function doneLink(id) {
 /* 队列/待重试行内操作：/api/cmd 标准形（queue_del N / retry N），
    结果走统一弹卡 */
 async function queueDel(n) {
-  if (!confirm("从队列移除第 " + n + " 条？（执行中的会先取消在途下载）")) return;
+  // 用页内模态框而不是原生 confirm：WebView 未设 WebChromeClient 时
+  // confirm() 静默返回 false，按钮会「点了没反应」（iOS PWA 同款问题，
+  // 文件管理器已经全部改用 fsModal）。
+  const yes = await fsModal({
+    title: "移除队列任务",
+    body: "从队列移除第 " + n + " 条？（执行中的会先取消在途下载）",
+    okText: "移除",
+  });
+  if (!yes) return;
   try {
     const d = await api("/api/cmd", {method:"POST",
       body: JSON.stringify({cmd: "/queue_del " + n})});

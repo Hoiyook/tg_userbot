@@ -624,7 +624,22 @@ _SCHEMA = (
         updated_at   INTEGER NOT NULL
     )
     """,
+    # v23：分享提交幂等台账（2026-11-09）。客户端每次分享带一个 32 位
+    # request_id；服务端先 claim（INSERT PROCESSING），成功后写 DONE +
+    # 首次结果。重放读到 DONE 直接返回原结果，不再执行分流。处理中超过
+    # stale 秒视为进程中途死掉，允许重新 claim；过期行由 init_db 裁剪。
+    """CREATE TABLE IF NOT EXISTS api_requests (
+        request_id TEXT PRIMARY KEY,
+        status     TEXT NOT NULL,          -- PROCESSING / DONE
+        result     TEXT,                   -- DONE 时的首次结果 JSON
+        created_at INTEGER NOT NULL
+    )
+    """,
 )
+
+# 分享幂等的两种状态（api_requests.status）
+API_REQUEST_PROCESSING = "PROCESSING"
+API_REQUEST_DONE = "DONE"
 
 # SQLITE_BUSY / SQLITE_LOCKED 的典型文案（只用于判定是否值得重试）
 _BUSY_MARKERS = ("locked", "busy")
@@ -812,6 +827,13 @@ def init_db(path=None) -> bool:
         _CONN = conn
         _OPEN_PATH = target
         version = migrate()
+        try:
+            pruned = api_request_prune()
+            if pruned:
+                logger.info(f"🗄 分享幂等台账裁剪：{pruned} 条过期记录")
+        except Exception as e:
+            # 裁剪失败不影响启动（幂等台账只是防重复，不是任务真相源）
+            logger.warning(f"🗄 分享幂等台账裁剪失败（忽略）：{e}")
         logger.info(
             f"🗄 Runtime DB 就绪：{target} | schema v{version} | "
             f"journal={_JOURNAL_MODE} | synchronous={synchronous} | "
@@ -1013,6 +1035,9 @@ def migrate() -> int:
     if version < 22:
         # v21 → v22：新增 xn_tasks / xi_tasks（X/Pixiv 下载队列）。纯建表。
         logger.info("🗄 Runtime DB 迁移：v22（+ xn_tasks/xi_tasks X/Pixiv 队列）")
+    if version < 23:
+        # v22 → v23：新增 api_requests（分享提交幂等台账）。纯建表。
+        logger.info("🗄 Runtime DB 迁移：v23（+ api_requests 分享幂等）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -4783,3 +4808,124 @@ XN_TASKS = TaskDomain(table="xn_tasks", key="target",
                       what="x 任务", emoji="🐦")
 XI_TASKS = TaskDomain(table="xi_tasks", key="target",
                       what="pixiv 任务", emoji="🎨")
+
+
+# ============================================================
+# 分享提交幂等台账（api_requests，schema v23，2026-11-09）
+#
+# 客户端（套壳 app / PWA / 任何带 request_id 的调用方）每次分享生成一个
+# 32 位十六进制 id，HTTP body 与 🛰 中转都携带它。服务端先 claim：
+#   new        → 首次，执行分流；成功后 complete 写 DONE + 首次结果
+#   processing → 同一 id 正在处理（并发重放），等首次完成
+#   done       → 已完成，直接返回首次结果，绝不重复执行
+# 一旦 claim 后执行失败/异常，调用方 release，允许下次重放重新执行。
+# 处理中超过 API_REQUEST_STALE_SECONDS 视为进程中途死掉，可重新 claim。
+# ============================================================
+def _api_request_stale_seconds(stale_after=None):
+    if stale_after is not None:
+        try:
+            return max(1, int(stale_after))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(1, int(getattr(config, "API_REQUEST_STALE_SECONDS", 300)))
+    except (TypeError, ValueError):
+        return 300
+
+
+def _api_request_keep_seconds(keep=None):
+    if keep is not None:
+        try:
+            return max(1, int(keep))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(1, int(getattr(config, "API_REQUEST_KEEP_SECONDS",
+                                7 * 24 * 3600)))
+    except (TypeError, ValueError):
+        return 7 * 24 * 3600
+
+
+def api_request_claim(request_id, now=None, stale_after=None):
+    """认领一个分享请求 id。返回 ``(state, result)``。
+
+    state ∈ {"new", "processing", "done"}；result 只在 "done" 时非空。
+    整段在 IMMEDIATE 事务里完成，并发重放只有一个能拿到 "new"。
+    """
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise ValueError("request_id 不能为空")
+    now = _now(now)
+    stale = _api_request_stale_seconds(stale_after)
+
+    def do(conn):
+        row = _execute(
+            conn,
+            "SELECT status, result, created_at FROM api_requests "
+            "WHERE request_id=?", (rid,)).fetchone()
+        if row is None:
+            _execute(
+                conn,
+                "INSERT INTO api_requests"
+                "(request_id, status, result, created_at) VALUES(?,?,NULL,?)",
+                (rid, API_REQUEST_PROCESSING, now))
+            return ("new", None)
+        if row["status"] == API_REQUEST_DONE:
+            return ("done", _loads(row["result"]))
+        if now - int(row["created_at"] or 0) >= stale:
+            # 上一次处理中途死掉（或卡死超过 stale 秒）：允许重新认领。
+            _execute(
+                conn,
+                "UPDATE api_requests SET status=?, result=NULL, created_at=? "
+                "WHERE request_id=?",
+                (API_REQUEST_PROCESSING, now, rid))
+            logger.warning(
+                f"🗄 分享幂等台账：{rid[:8]} 处理中超时，已重新认领")
+            return ("new", None)
+        return ("processing", None)
+
+    return _write(do, f"分享请求认领（{rid[:12]}）")
+
+
+def api_request_complete(request_id, result, now=None):
+    """把首次执行结果写回 DONE（只有已 claim 的行会更新）。"""
+    rid = str(request_id or "").strip()
+    if not rid:
+        return False
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            "UPDATE api_requests SET status=?, result=? WHERE request_id=?",
+            (API_REQUEST_DONE, _dumps(result), rid))
+        return cur.rowcount > 0
+
+    return _write(do, f"分享请求完成（{rid[:12]}）")
+
+
+def api_request_release(request_id):
+    """释放认领（执行失败/异常时调用），让同一 id 的重放可以重新执行。"""
+    rid = str(request_id or "").strip()
+    if not rid:
+        return False
+
+    def do(conn):
+        cur = _execute(
+            conn, "DELETE FROM api_requests WHERE request_id=?", (rid,))
+        return cur.rowcount > 0
+
+    return _write(do, f"分享请求释放（{rid[:12]}）")
+
+
+def api_request_prune(now=None, keep=None):
+    """裁掉超过保留期的幂等记录；返回删除条数。"""
+    now = _now(now)
+    keep = _api_request_keep_seconds(keep)
+    cutoff = now - keep
+
+    def do(conn):
+        cur = _execute(
+            conn, "DELETE FROM api_requests WHERE created_at < ?", (cutoff,))
+        return cur.rowcount
+
+    return _write(do, "分享幂等台账裁剪")
