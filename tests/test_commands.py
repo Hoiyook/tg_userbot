@@ -26,6 +26,28 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 from tg_userbot import commands  # noqa: E402
 
 
+class AndroidCommandGuardTest(unittest.TestCase):
+    """Android 版桌面专属指令必须给明确提示，不能静默失败。"""
+
+    def test_android_blocks_desktop_command(self):
+        # /asmr /pd* /115x 同样依赖桌面组件（CD2 / 115 中转 / 外部二进制），
+        # 手机端必须给明确提示而不是落进排队后静默失败。
+        for cmd, token in (
+                ("/bili https://www.bilibili.com/video/BV1xx411c7mD", "/bili"),
+                ("/asmr RJ123", "/asmr"),
+                ("/pd https://example.com/a", "/pd"),
+                ("/pdst", "/pdst"),
+                ("/115x /115open/a.zip", "/115x"),
+        ):
+            with self.subTest(cmd=cmd):
+                ev = FakeEvent()
+                with mock.patch.object(commands.config, "IS_ANDROID", True):
+                    ok = asyncio.run(commands.handle_command(ev, cmd))
+                self.assertTrue(ok)
+                self.assertIn("Android", ev.replies[0])
+                self.assertIn(token, ev.replies[0])
+
+
 class DyuDispatchTest(unittest.TestCase):
     """/dyu 必须经 spawn 启动后台枚举（裸 create_task 会静默死）。"""
 

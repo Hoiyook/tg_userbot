@@ -126,6 +126,13 @@ class ClassifyTest(unittest.TestCase):
             d = routing.classify(BILI, allow=routing.SURFACE_ME)
         self.assertEqual(d.kind, "ledger")
 
+    def test_android_disables_desktop_routes(self):
+        """Android 版没有 yt-dlp/gallery-dl/Chrome/CD2：桌面路由落台账。"""
+        with mock.patch.object(routing.config, "IS_ANDROID", True):
+            for url in (IWARA, TORRENT, BILI, X_URL):
+                d = routing.classify(url, allow=routing.SURFACE_ME)
+                self.assertEqual(d.kind, "ledger", url)
+
     def test_priority_douyin_before_torrent(self):
         d = routing.classify(f"{DOUYIN} {TORRENT}",
                              allow=routing.SURFACE_ME)

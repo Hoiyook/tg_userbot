@@ -1195,6 +1195,24 @@ class PasteHistoryTest(unittest.IsolatedAsyncioTestCase):
                             for i in items))
 
 
+class AndroidApiGuardTest(unittest.IsolatedAsyncioTestCase):
+    """Android 版 API 对 CD2/Chrome 返回友好文本，不抛异常、不刷日志。"""
+
+    async def test_backup_guard(self):
+        with mock.patch.object(api_server.config, "IS_ANDROID", True):
+            resp = await api_server.handle_backup(mock.MagicMock())
+        data = json.loads(resp.text)
+        self.assertTrue(data.get("android"))
+        self.assertIn("CD2", data.get("error", ""))
+
+    async def test_chrome_guard(self):
+        with mock.patch.object(api_server.config, "IS_ANDROID", True):
+            resp = await api_server.handle_chrome(mock.MagicMock())
+        data = json.loads(resp.text)
+        self.assertTrue(data.get("android"))
+        self.assertIn("Chrome", data.get("text", ""))
+
+
 class LinksEndpointsTest(unittest.IsolatedAsyncioTestCase):
     """/api/links（待人工清单）+ /api/links_done（幂等标记完成）。"""
 

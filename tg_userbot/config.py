@@ -72,6 +72,10 @@ def is_termux() -> bool:
 
 IS_TERMUX = is_termux()
 
+# 嵌入式 Android App（ChaquopyProbe）通过 TG_ANDROID=1 标记；用于禁用
+# 桌面专属能力（Chrome Agent / CD2 / yt-dlp / gallery-dl / 外部二进制）。
+IS_ANDROID = os.environ.get("TG_ANDROID") == "1"
+
 # 会话文件：两个平台都用 ~/tg_downloader。
 # 每台设备首次运行各自独立登录，互不影响。
 # 注意：不要把同一台设备的 .session 文件复制到另一台同时运行。

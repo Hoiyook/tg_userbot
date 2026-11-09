@@ -547,6 +547,7 @@ def build_status() -> dict:
         "save_folder": config.DOWNLOAD_DIR,
         "rate": _recent_rate(),
         "db_ready": bool(state.RUNTIME_DB_READY),
+        "android": config.IS_ANDROID,
         "concurrency": state.DOWNLOAD_CONCURRENCY,
         "toggles": {
             "dedup": bool(getattr(state, "DEDUP_ENABLED", False)),
@@ -1275,6 +1276,12 @@ async def handle_find(request):
 
 async def handle_chrome(request):
     """Chrome Agent 视图（status_view：状态 + 任务列表，bot 菜单同源）。"""
+    if config.IS_ANDROID:
+        return _json({
+            "ok": True, "android": True, "progress": None,
+            "text": "🤖 Android 端不支持 Chrome Agent"
+                    "（需要桌面 Chrome + CDP）",
+        })
     from . import chrome_client
     try:
         text = await chrome_client.status_view()
@@ -1290,6 +1297,11 @@ async def handle_backup(request):
 
     gRPC 阻塞调用下放线程并加 30s 硬顶——CD2 没跑/卡死时返回友好错误，
     绝不挂死事件循环。"""
+    if config.IS_ANDROID:
+        return _json({
+            "ok": False, "android": True,
+            "error": "Android 端不支持 CD2 备份（需要桌面 CloudDrive2）",
+        })
     from . import cd2_api
 
     try:

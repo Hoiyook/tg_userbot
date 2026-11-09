@@ -208,9 +208,14 @@ def _record_usage(cmd_text):
 def _help_text():
     """完整命令手册（下划线标准形；空格形保留为兼容别名）。
     详版（含例子与语义说明）在仓库 docs/操作手册.md，两处同源维护。"""
+    head = "📖 TG Userbot 操作手册（详版见 docs/操作手册.md）\n"
+    if config.IS_ANDROID:
+        head += ("⚠️ Android 版不支持：/chrome* /cd2* /bili /x /pixiv "
+                 "/paw* /wnacg /ehentai /dyu* /extract /shell "
+                 "/asmr /pd /115x\n")
     return (
-        "📖 TG Userbot 操作手册（详版见 docs/操作手册.md）\n"
-        "\n"
+        head
+        + "\n"
         "【监控查询】\n"
         "/status｜/folder｜/logpath —— 状态/目录/日志\n"
         "/start —— 打开按钮菜单（给 bot 发任意文本同效）\n"
@@ -374,6 +379,27 @@ async def _handle_command_inner(event, cmd_text):
 
     # 功能使用审计（2026-09-24）：只记已注册指令，失败不影响命令
     _record_usage(cmd_text)
+
+    # Android 版：桌面专属指令直接给明确提示（不静默失败）
+    if config.IS_ANDROID:
+        first = cmd_text.split(None, 1)[0].lower() if cmd_text.strip() else ""
+        blocked = (
+            first.startswith("/chrome") or first.startswith("/cd2")
+            or first.startswith("/bili") or first.startswith("/pixiv")
+            or first.startswith("/paw") or first.startswith("/wnacg")
+            or first.startswith("/ehentai") or first.startswith("/dyu")
+            or first.startswith("/extract") or first.startswith("/shell")
+            or first.startswith("/asmr") or first.startswith("/pd")
+            or first.startswith("/115x")
+            or first in ("/x", "/sh", "/up")
+        )
+        if blocked:
+            await _reply(
+                event,
+                f"🤖 Android 端不支持 {first}\n"
+                "（需要桌面 Chrome Agent / CD2 / yt-dlp / gallery-dl 等）")
+            logger.info(f"Android 拦截桌面指令：{first}")
+            return True
 
     # 快捷指令（如发 1 = /cmdhis）：调用方（bot 对话 / 主账号 Saved Messages）
     # 已各自解析过才会带映射命令进来，这里不做二次解析

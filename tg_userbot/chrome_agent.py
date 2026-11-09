@@ -194,6 +194,9 @@ def load_tasks(path):
     - primary 缺失/损坏 + .bak 正常 → 用 .bak 并立即回写 primary（自愈）；
     - 两者都不可读 → 高声报错并返回 []，**保留现场**（save 前人工可恢复），
       绝不静默当空列表后被覆盖。"""
+    # Android 版没有 Chrome Agent：不要每条轮询都刷“文件不可读”ERROR
+    if os.environ.get("TG_ANDROID") == "1":
+        return []
     tasks = _load_tasks_file(path)
     if tasks is not None:
         return [t for t in tasks if isinstance(t, dict) and t.get("task_id")]

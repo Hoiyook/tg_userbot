@@ -189,6 +189,7 @@
       <span class="chip" onclick="act('health')">🩺 一键巡检</span>
       <span class="chip" onclick="act('now')">ℹ️ 现在在干嘛</span>
     </div>
+    <div class="android-hide">
     <h2>☁️ 备份到 115（CD2 实时）</h2>
     <div class="chips">
       <span class="chip" onclick="loadBackup()">🔄 刷新</span>
@@ -196,6 +197,7 @@
       <span class="chip" onclick="runCmdDirect('/cd2check')">📋 完整对账</span>
     </div>
     <div id="backup"><div class="note">加载中…</div></div>
+    </div>
 
     <div class="note">与 bot 菜单、/queue、/stats 同一套状态（单一真相源）；
       通知仍走 Telegram 控制面板，这里不再重复推送。</div>
@@ -212,6 +214,7 @@
     <div id="queue"></div>
     <h2>待重试</h2>
     <div id="retry"></div>
+    <div class="android-hide">
     <h2>Chrome Agent 任务</h2>
     <div class="chips">
       <span class="chip" onclick="loadChrome()">🔄 刷新任务</span>
@@ -226,6 +229,7 @@
         <button class="ghost" onclick="cancelChrome()">🛑 取消</button>
       </div>
       <div class="fb" id="ccfb"></div>
+    </div>
     </div>
   </section>
 
@@ -489,6 +493,11 @@ function setFb(id, ok, msg) {
 async function refresh() {
   try {
     const d = await api("/api/status");
+    // Android 版没有 Chrome Agent / CD2：隐藏对应卡片（API 仍返回友好文本）
+    const isAndroid = !!d.android;
+    document.querySelectorAll(".android-hide").forEach(el => {
+      el.style.display = isAndroid ? "none" : "";
+    });
     const s = d.stats || {};
     document.getElementById("conn").textContent =
       "已连接 · " + (d.save_folder||"") + " · 并发 " + (d.concurrency??"–")

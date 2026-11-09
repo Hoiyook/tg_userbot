@@ -123,7 +123,9 @@ def classify(text, *, allow, message=None, entities=None,
 
     # ── 种子直链 ────────────────────────────────────────────────
     urls = manual_links.extract_urls(text)
-    if "torrent" in allow:
+    # Android 版没有 yt-dlp/gallery-dl/Chrome/CD2：桌面专属路由直接跳过，
+    # 让链接落到外链台账（用户仍能看到/手动处理），而不是静默失败。
+    if "torrent" in allow and not config.IS_ANDROID:
         torrent_urls = [u for u in urls if torrent_offline.is_torrent_url(u)]
         if torrent_urls:
             url = torrent_urls[0]
@@ -134,7 +136,7 @@ def classify(text, *, allow, message=None, entities=None,
                                      if author else None)})
 
     # ── iwara（Chrome Agent 直下）────────────────────────────────
-    if "iwara" in allow:
+    if "iwara" in allow and not config.IS_ANDROID:
         iwara_urls = [u for u in urls if iwara.extract_iwara_video_id(u)]
         if iwara_urls:
             url = iwara_urls[0]
@@ -143,11 +145,12 @@ def classify(text, *, allow, message=None, entities=None,
                 extra={"video_id": iwara.extract_iwara_video_id(url)})
 
     # ── B站 / X（各自 auto_reply 会从混合文本抽链接）────────────
-    if "bili" in allow and config.AUTOROUTE_BILI \
-            and bili_dl.looks_like_bili(text):
+    if "bili" in allow and not config.IS_ANDROID \
+            and config.AUTOROUTE_BILI and bili_dl.looks_like_bili(text):
         return Decision(kind="bili", urls=tuple(urls), text=text,
                         message=message)
-    if "x" in allow and config.AUTOROUTE_X and x_dl.looks_like_x(text):
+    if "x" in allow and not config.IS_ANDROID \
+            and config.AUTOROUTE_X and x_dl.looks_like_x(text):
         return Decision(kind="x", urls=tuple(urls), text=text,
                         message=message)
 
