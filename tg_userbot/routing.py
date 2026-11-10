@@ -26,9 +26,11 @@ bot 对话缺抖音/IG 与 t.me，同样的链接换个入口就掉进外链台�
 import json
 from dataclasses import dataclass, field
 
+from . import asmr_dl
 from . import bili_dl
 from . import chrome_client
 from . import config
+from . import ehentai
 from . import iwara
 from . import link_journal
 from . import manual_links
@@ -36,13 +38,14 @@ from . import platform
 from . import state
 from . import tme
 from . import torrent_offline
+from . import wnacg
 from . import x_dl
 
 # 入口策略（顺序无关：真正的优先级在 classify 里固定）。
 # 三张表内容必须一致（tests/test_routing.py 钉住）；保留三个名字是为了
 # 未来真出现「交付能力」差异时有明确的落点，而不是让入口各抄一份判断。
 _ALL_LINK_TYPES = ("douyin", "instagram", "torrent", "iwara", "bili", "x",
-                   "tme", "ledger")
+                   "tme", "wnacg", "asmr", "ehentai", "ledger")
 SURFACE_ME = tuple(_ALL_LINK_TYPES)
 SURFACE_BOT = tuple(_ALL_LINK_TYPES)
 SURFACE_API = tuple(_ALL_LINK_TYPES)
@@ -153,6 +156,26 @@ def classify(text, *, allow, message=None, entities=None,
             and config.AUTOROUTE_X and x_dl.looks_like_x(text):
         return Decision(kind="x", urls=tuple(urls), text=text,
                         message=message)
+
+    # ── wnacg / asmr / ehentai（站点 worker 直提交；2026-11-10）────
+    # 只认 URL 形态：裸 aid 数字 / 裸 RJ 号不劫持（纯文本里的数字照旧
+    # 落外链台账）。Android 端无 CD2/115 → 落台账（用户可见可手动）。
+    if "wnacg" in allow and not config.IS_ANDROID:
+        wn_urls = [u for u in urls if wnacg.parse_wnacg_ref(u)]
+        if wn_urls:
+            return Decision(kind="wnacg", urls=(wn_urls[0],), text=text,
+                            message=message)
+    if "asmr" in allow and not config.IS_ANDROID:
+        asmr_urls = [u for u in urls
+                     if "asmr-300.com" in u and asmr_dl.parse_asmr_ref(u)]
+        if asmr_urls:
+            return Decision(kind="asmr", urls=(asmr_urls[0],), text=text,
+                            message=message)
+    if "ehentai" in allow and not config.IS_ANDROID:
+        eh_urls = [u for u in urls if ehentai.parse_gallery_ref(u)]
+        if eh_urls:
+            return Decision(kind="ehentai", urls=(eh_urls[0],), text=text,
+                            message=message)
 
     # ── t.me 帖子 ───────────────────────────────────────────────
     if "tme" in allow:
@@ -288,6 +311,36 @@ async def _execute_inner(decision, *, event=None, message=None):
             kind=kind, message=out or "", urls=decision.urls,
             ref=json.dumps(pairs) if pairs else None,
             extra={"label": decision.extra.get("label")})
+
+    if kind == "wnacg":
+        # 同步提交（入 DB 队列即返回，下载由 wnacg worker 领取）
+        out = wnacg.command_reply(f"/wnacg {decision.urls[0]}")
+        return RouteResult(kind=kind, message=out or "", urls=decision.urls)
+
+    if kind == "asmr":
+        # 提交时拉一次站点 API（数秒）即返回；下载由 asmr worker 领取
+        out = await asmr_dl.command_reply(f"/asmr {decision.urls[0]}")
+        return RouteResult(kind=kind, message=out or "", urls=decision.urls)
+
+    if kind == "ehentai":
+        # ehentai 无队列 worker：command_reply 内联跑完整下载（可能远超
+        # API 分流的 120s 超时）→ spawn 后台 + 结果转通知；立即回执受理。
+        from .spawn import spawn
+        url = decision.urls[0]
+
+        async def _ehentai_bg():
+            out = await ehentai.command_reply(f"/ehentai {url}")
+            if out:
+                try:
+                    from . import notify
+                    await notify.notify_user(out)
+                except Exception:
+                    pass
+
+        spawn(_ehentai_bg(), "ehentai 分流下载")
+        return RouteResult(
+            kind=kind, urls=decision.urls,
+            message="🌸 ehentai 已受理（后台下载，结果会通知到控制面板）")
 
     if kind == "ledger":
         reply, buttons = manual_links.observe(decision.text)

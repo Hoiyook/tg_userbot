@@ -145,7 +145,7 @@ class ClassifyTest(unittest.TestCase):
         新增链接类型时只改 classify + 策略表一处，不要再让入口各持一份。
         """
         expected = {"douyin", "instagram", "torrent", "iwara", "bili", "x",
-                    "tme", "ledger"}
+                    "tme", "wnacg", "asmr", "ehentai", "ledger"}
         for name, allow in (("SURFACE_ME", routing.SURFACE_ME),
                             ("SURFACE_BOT", routing.SURFACE_BOT),
                             ("SURFACE_API", routing.SURFACE_API)):
@@ -440,3 +440,47 @@ class JournalRecordTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SiteCommandRoutingTest(unittest.TestCase):
+    """wnacg / asmr / ehentai URL 自动分流（2026-11-10）。
+
+    URL 形态 → 直提交站点任务；裸 aid 数字 / 裸 RJ 号 / 其它链接仍落
+    外链台账（纯文本数字不劫持）。Android 端无 CD2/115 → 落台账。
+    """
+
+    WNACG = "https://www.wnacg.com/photos-index-aid-400952.html"
+    ASMR = "https://www.asmr-300.com/work/RJ01207846"
+    EHENTAI = "https://e-hentai.org/g/4277638/baedd2e998/"
+
+    def test_wnacg_url_classifies(self):
+        d = routing.classify(self.WNACG, allow=routing.SURFACE_ME)
+        self.assertEqual(d.kind, "wnacg")
+        self.assertEqual(d.urls, (self.WNACG,))
+
+    def test_asmr_url_classifies(self):
+        d = routing.classify(self.ASMR, allow=routing.SURFACE_API)
+        self.assertEqual(d.kind, "asmr")
+        self.assertEqual(d.urls, (self.ASMR,))
+
+    def test_ehentai_url_classifies(self):
+        d = routing.classify(self.EHENTAI, allow=routing.SURFACE_BOT)
+        self.assertEqual(d.kind, "ehentai")
+
+    def test_bare_aid_and_rj_do_not_hijack(self):
+        """裸数字不是链接：manual_links.extract_urls 抽不到 URL →
+        自然不进站点路（这里验证即便文本里带 aid 字样也不误判）。"""
+        d = routing.classify("aid-400952 这个不错", allow=routing.SURFACE_ME)
+        self.assertIn(d.kind, ("none", "ledger"))
+        d = routing.classify("RJ01207846 纯文本", allow=routing.SURFACE_ME)
+        self.assertIn(d.kind, ("none", "ledger"))
+
+    def test_android_falls_to_ledger(self):
+        with mock.patch.object(routing.config, "IS_ANDROID", True):
+            d = routing.classify(self.WNACG, allow=routing.SURFACE_ME)
+        self.assertEqual(d.kind, "ledger")
+
+    def test_mixed_text_wins_earlier_kinds(self):
+        """wnacg 链接 + MEGA 链接混合：wnacg 识别在 ledger 前 → wnacg 胜。"""
+        d = routing.classify(f"{self.WNACG} {MEGA}", allow=routing.SURFACE_ME)
+        self.assertEqual(d.kind, "wnacg")

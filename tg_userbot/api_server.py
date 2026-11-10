@@ -343,6 +343,25 @@ def _paste_status(p):
                 if row:
                     return _task_domain_status(row, label_key="target")
                 return "已不在 X 队列（已完成或已移除）", "info"
+        if routed == "wnacg" and url:
+            # wnacg 业务键 = URL 里的 aid
+            from . import runtime_db, wnacg
+            aid = wnacg.parse_wnacg_ref(url)
+            row = runtime_db.get_wnacg_task(aid) if aid else None
+            if row:
+                return _task_domain_status(row, label_key="title")
+            return "已不在 wnacg 队列（已完成或已移除）", "info"
+        if routed == "asmr" and url:
+            # asmr 业务键 = URL 里的 RJ 号
+            from . import asmr_dl, runtime_db
+            rj = asmr_dl.parse_asmr_ref(url)
+            row = runtime_db.get_asmr_task(rj) if rj else None
+            if row:
+                return _task_domain_status(row, label_key="rj")
+            return "已不在 asmr 队列（已完成或已移除）", "info"
+        if routed == "ehentai":
+            # 无任务表：后台跑完即通知；受理态静态展示
+            return "🌸 后台下载中（结果会通知）", "run"
         if routed in ("douyin", "instagram") and ref:
             last = None
             for e in stats.load_events():
