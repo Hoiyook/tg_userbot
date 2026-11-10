@@ -1816,6 +1816,16 @@ async def main():
                 bot.bot_callback_handler, events.CallbackQuery()
             )
             logger.info(f"✅ bot 菜单已启用：{BOT_USERNAME}（ID={state.BOT_ID}）")
+            # 启动补拉（2026-11-10，对齐 keepalive 重连路径）：进程停机窗口
+            # 里发到 bot 对话的消息与 🛰 app 中继，Telegram 对 bot 账号不保证
+            # 离线回放——不 catch_up 就静默丢失（收藏夹主客户端在 1760 有
+            # 同款启动补拉）。
+            try:
+                await state.bot_client.catch_up()
+                logger.info("🤖 bot 启动补拉完成（停机窗口的对话已追上）")
+            except Exception as e:
+                logger.warning(
+                    f"🤖 bot 启动 catch_up 失败（停机窗口的 bot 对话可能有缺口）：{e}")
             try:
                 await bot.register_bot_commands(state.bot_client)
             except Exception as e:
