@@ -1306,21 +1306,25 @@ function renderQdChips() {
   }).join("");
 }
 
+const _qdCache = {};   // domain -> 上次渲染的数据；切换时先渲染缓存
+
 function qdSelect(d) {
   _qdDomain = d;
   try { localStorage.setItem("qd_domain", d); } catch (e) {}
   renderQdChips();
-  // 即时反馈：旧内容立即变暗 + 顶部提示，不等网络往返（手机 ts.net
-  // 单请求 0.5~2s，不变暗的话点击后像"没反应"）
   const el = document.getElementById("qdDetail");
-  if (el) {
+  if (!el) return;
+  if (_qdCache[d]) {
+    // 访问过的渠道：缓存直接上屏（零等待），后台再静默更新
+    el.style.opacity = "1";
+    _qdRender(_qdCache[d]);
+    loadQueueDetail(true);
+  } else {
+    // 首次访问：变暗 + 切换中，等一次 RTT
     el.style.opacity = "0.45";
-    const head = el.firstChild;
-    if (head && head.classList && head.classList.contains("nm")) {
-      head.textContent = head.textContent + "（⏳ 切换中…）";
-    }
+    el.innerHTML = '<div class="note">⏳ 读取 ' + esc(d) + ' 队列…</div>';
+    loadQueueDetail(true);
   }
-  loadQueueDetail(true);
 }
 
 function _qdSec(title, icon, items, renderExtra) {
@@ -1346,6 +1350,20 @@ function _qdSec(title, icon, items, renderExtra) {
   }).join("");
 }
 
+function _qdRender(d) {
+  const el = document.getElementById("qdDetail");
+  if (!el) return;
+  el.style.opacity = "1";
+  const secs =
+    _qdSec("正在执行", "▶️", d.running ||
+      (d.note ? [{label: d.note}] : [])) +
+    _qdSec("排队中", "⏳", d.pending || []) +
+    _qdSec("失败待重试", "❌", d.failed || []) +
+    _qdSec("已完成", "✅", d.done || []);
+  el.innerHTML = '<div class="nm" style="font-weight:700;margin-bottom:2px">' +
+    esc((d.emoji || "") + " " + (d.name || _qdDomain)) + '</div>' + secs;
+}
+
 async function loadQueueDetail(force) {
   const el = document.getElementById("qdDetail");
   if (!el) return;
@@ -1354,20 +1372,13 @@ async function loadQueueDetail(force) {
     const d = await api("/api/queue_detail?domain=" +
       encodeURIComponent(_qdDomain) + (force ? "&_=" + Date.now() : ""));
     if (seq !== _qdSeq) return;   // 已切到别的渠道：丢弃过期响应
-    el.style.opacity = "1";
     if (!d.ok) {
       el.style.opacity = "1";
       el.innerHTML = '<div class="note">❌ ' + esc(d.error || "读取失败") + '</div>';
       return;
     }
-    const secs =
-      _qdSec("正在执行", "▶️", d.running ||
-        (d.note ? [{label: d.note}] : [])) +
-      _qdSec("排队中", "⏳", d.pending || []) +
-      _qdSec("失败待重试", "❌", d.failed || []) +
-      _qdSec("已完成", "✅", d.done || []);
-    el.innerHTML = '<div class="nm" style="font-weight:700;margin-bottom:2px">' +
-      esc((d.emoji || "") + " " + (d.name || _qdDomain)) + '</div>' + secs;
+    _qdCache[_qdDomain] = d;
+    _qdRender(d);
   } catch (e) {
     // 网络失败也要恢复可读状态（但若已切走则不动新选中渠道的视图）
     if (seq === _qdSeq && el) el.style.opacity = "1";
