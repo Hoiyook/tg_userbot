@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # 数据目录钉住（2026-11-06 实测：restart 从无该变量的 shell 启动会把
-# runtime DB/下载目录回落到 ~/tg_downloader/ 旁库——看板与台账全失明）
-export TG_SAVE_FOLDER="${TG_SAVE_FOLDER:-/Volumes/V1}"
+# runtime DB/下载目录回落到 ~/tg_downloader/ 旁库——看板与台账全失明）。
+# 2026-11-10 改钉新式变量 TG_DATA_ROOT：旧 TG_SAVE_FOLDER 会触发 config
+# 的 legacy 耦合（媒体直接落数据根，丢掉 downloads/ 一层）——11-07~11-10
+# 的媒体因此落在了 V1 根；改钉后恢复设计布局：媒体 → V1/downloads/<来源>/
+# runtime → V1/runtime/（DB 仍由 TG_RUNTIME_DB 单独钉在内置盘，见 do_start）。
+export TG_DATA_ROOT="${TG_DATA_ROOT:-/Volumes/V1}"
 # TG Userbot 一键启停：优雅停机（SIGTERM）+ 启动。
 #
 #   ./run.sh start      启动（已在跑就跳过，不重复拉）
