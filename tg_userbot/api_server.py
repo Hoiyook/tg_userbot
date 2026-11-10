@@ -1684,11 +1684,23 @@ async def handle_queue_detail(request):
                   "name": name, **buckets})
 
 
+async def _qd_bili():
+    return _qd_taskdomain(_td_bili(), "url")
+
+
+async def _qd_x():
+    return _qd_taskdomain(_td_x(), "url")
+
+
+async def _qd_pixiv():
+    return _qd_taskdomain(_td_pixiv(), "url")
+
+
 _QUEUE_DETAIL_PROVIDER = {
     "media": _qd_media,
-    "bili": lambda: _qd_taskdomain(_td_bili(), "url"),
-    "x": lambda: _qd_taskdomain(_td_x(), "url"),
-    "pixiv": lambda: _qd_taskdomain(_td_pixiv(), "url"),
+    "bili": _qd_bili,
+    "x": _qd_x,
+    "pixiv": _qd_pixiv,
     "wnacg": _qd_wnacg,
     "asmr": _qd_asmr,
     "extract": _qd_extract,

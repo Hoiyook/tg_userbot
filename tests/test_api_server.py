@@ -2142,3 +2142,38 @@ class QueueDetailTest(unittest.IsolatedAsyncioTestCase):
         status, data = await self._get_detail("nope")
         self.assertEqual(status, 400)
         self.assertFalse(data["ok"])
+
+
+class QueueDetailAllDomainsTest(unittest.IsolatedAsyncioTestCase):
+    """全渠道冒烟：11 个 domain 全部 200 且四桶齐（回归 2026-11-10
+    bili/x/pixiv 同步 lambda 被 await 成 500 的漏测）。"""
+
+    async def asyncSetUp(self):
+        import asyncio
+        from tg_userbot import runtime_db, state
+        self._td = tempfile.mkdtemp(dir=_TMP)
+        self._saved_conn = runtime_db._CONN
+        runtime_db._CONN = None
+        runtime_db.init_db(os.path.join(self._td, "tg.db"))
+        self._saved_lock = state.QUEUE_LOCK
+        state.QUEUE_LOCK = asyncio.Lock()
+        self.addCleanup(lambda: (
+            runtime_db.close_db(),
+            setattr(runtime_db, "_CONN", self._saved_conn),
+            setattr(state, "QUEUE_LOCK", self._saved_lock),
+            shutil.rmtree(self._td, ignore_errors=True),
+        ))
+
+    async def test_all_domains_return_ok(self):
+        client = make_client()
+        await client.start_server()
+        try:
+            for domain in ("media", "bili", "x", "pixiv", "wnacg", "asmr",
+                           "extract", "pawchive", "listener", "chrome", "pd"):
+                resp = await client.get("/api/queue_detail?domain=" + domain)
+                data = await resp.json()
+                assert data.get("ok"), f"{domain} 未 ok: {data}"
+                for bucket in ("running", "pending", "failed", "done"):
+                    assert bucket in data, f"{domain} 缺 {bucket} 桶"
+        finally:
+            await client.close()
