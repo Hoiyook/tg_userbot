@@ -3364,6 +3364,37 @@ def download_events_all():
     return _read(read, "装载任务事件")
 
 
+def recent_events(ev=None, limit=50):
+    """按 ev 取最近 N 条事件（id 降序，新→旧；payload 反序列化）。
+
+    download_events_all 会把数万行全量装进内存——看板渠道队列的 done/
+    failed 桶只要"最近几条"，必须走这条 LIMIT 路（2026-11-10）。"""
+    limit = max(1, int(limit))
+
+    def read(conn):
+        out = []
+        if ev:
+            rows = _execute(
+                conn, "SELECT id, ts, ev, task_id, payload FROM "
+                      "download_events WHERE ev=? ORDER BY id DESC LIMIT ?",
+                (str(ev), limit)).fetchall()
+        else:
+            rows = _execute(
+                conn, "SELECT id, ts, ev, task_id, payload FROM "
+                      "download_events ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall()
+        for row in rows:
+            try:
+                rec = _event_row_to_rec(row)
+            except Exception as e:
+                logger.warning(f"🗄 事件坏行已跳过（id={row['id']}）：{e}")
+                continue
+            out.append(rec)
+        return out
+
+    return _read(read, f"取最近事件（ev={ev}, limit={limit}）")
+
+
 def download_events_since(last_id, limit=2000):
     """id > last_id 的增量事件按序返回（reporter 游标读取）。"""
     def read(conn):

@@ -2050,3 +2050,95 @@ class QueuesProblemsTest(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(hit[0]["next_in"], 120)
         finally:
             _state.QUEUE["retry"].remove(rec)
+
+
+class QueueDetailTest(unittest.IsolatedAsyncioTestCase):
+    """/api/queue_detail：单渠道四段队列（正在执行/排队/失败带原因/已完成）。"""
+
+    async def asyncSetUp(self):
+        import asyncio
+        from tg_userbot import runtime_db, state
+        self._td = tempfile.mkdtemp(dir=_TMP)
+        self._saved_conn = runtime_db._CONN
+        runtime_db._CONN = None
+        runtime_db.init_db(os.path.join(self._td, "tg.db"))
+        self._saved_lock = state.QUEUE_LOCK
+        state.QUEUE_LOCK = asyncio.Lock()
+        self.addCleanup(lambda: (
+            runtime_db.close_db(),
+            setattr(runtime_db, "_CONN", self._saved_conn),
+            setattr(state, "QUEUE_LOCK", self._saved_lock),
+            shutil.rmtree(self._td, ignore_errors=True),
+        ))
+
+    async def _get_detail(self, domain):
+        client = make_client()
+        await client.start_server()
+        try:
+            resp = await client.get("/api/queue_detail?domain=" + domain)
+            return resp.status, await resp.json()
+        finally:
+            await client.close()
+
+    async def test_wnacg_four_buckets(self):
+        from tg_userbot import runtime_db
+        runtime_db.enqueue_wnacg_task(400001, title="排队中的本子")
+        runtime_db.enqueue_wnacg_task(400002, title="失败的本子")
+        runtime_db.fail_wnacg_task(400002, error="CDN 503", max_attempts=1)
+        # max_attempts=1：首败即 FAILED（默认 5 次内是 PENDING 退避重试）
+        runtime_db.enqueue_wnacg_task(400003, title="完成的本子")
+        runtime_db.complete_wnacg_task(400003, size_bytes=2048)
+        status, data = await self._get_detail("wnacg")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["emoji"], "📖")
+        self.assertEqual([i["label"] for i in data["pending"]],
+                         ["排队中的本子"])
+        self.assertEqual(len(data["failed"]), 1)
+        self.assertIn("CDN 503", data["failed"][0]["error"])
+        self.assertEqual(len(data["done"]), 1)
+        self.assertEqual(data["done"][0]["label"], "完成的本子")
+
+    async def test_media_running_vs_pending_and_retry_countdown(self):
+        import time as _time
+        from tg_userbot import state as _state
+        _state.QUEUE["tasks"] = [
+            {"id": "run0001", "platform": "douyin", "name": "在途任务"},
+            {"id": "pen0002", "platform": "url", "name": "排队任务"},
+        ]
+        _state.EXECUTING.add("run0001")
+        _state.QUEUE["retry"] = [
+            {"id": "ret0003", "platform": "douyin", "name": "退避中的任务",
+             "attempts": 2, "next_retry_at": _time.time() + 300},
+        ]
+        try:
+            status, data = await self._get_detail("media")
+            self.assertEqual(status, 200)
+            self.assertEqual(data["running"][0]["label"], "在途任务")
+            self.assertEqual(data["pending"][0]["label"], "排队任务")
+            fail = data["failed"][0]
+            self.assertEqual(fail["label"], "退避中的任务")
+            self.assertIsNotNone(fail["next_in"])
+            self.assertLessEqual(fail["next_in"], 300)
+        finally:
+            _state.QUEUE["tasks"] = []
+            _state.QUEUE["retry"] = []
+            _state.EXECUTING.discard("run0001")
+
+    async def test_listener_failed_surfaces_error(self):
+        from tg_userbot import runtime_db
+        ids = runtime_db.enqueue_listener_tasks(
+            777, [{"message_id": 9, "target_type": "me",
+                   "target_chat_id": None, "download": 1,
+                   "payload": {"label": "监听失败样例"}}])
+        runtime_db.fail_listener_task(ids[0], error="ChannelPrivateError: x")
+        status, data = await self._get_detail("listener")
+        self.assertEqual(status, 200)
+        hit = [i for i in data["failed"] if "监听失败样例" in i["label"]]
+        self.assertTrue(hit)
+        self.assertIn("ChannelPrivateError", hit[0]["error"])
+
+    async def test_unknown_domain_400(self):
+        status, data = await self._get_detail("nope")
+        self.assertEqual(status, 400)
+        self.assertFalse(data["ok"])

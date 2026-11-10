@@ -210,6 +210,9 @@
     <div id="queuesAll" class="card"><div class="note">读取中…</div></div>
     <h2>⚠️ 失败与重试（全链路）</h2>
     <div id="problems" class="card"><div class="note">读取中…</div></div>
+    <h2>📡 渠道队列（点渠道看四段状态）</h2>
+    <div class="chips" id="qdChips" style="flex-wrap:nowrap; overflow-x:auto; -webkit-overflow-scrolling:touch; padding-bottom:4px"></div>
+    <div id="qdDetail" class="card"><div class="note">读取中…</div></div>
     <h2>🔗 最近链接（全入口）</h2>
     <div id="pastes-queue"><div class="note">加载中…</div></div>
     <h2>下载队列</h2>
@@ -1278,6 +1281,81 @@ async function loadQueuesAll() {
   } catch (e) { /* 主循环退避已处理 */ }
 }
 
+/* ── 渠道队列（2026-11-10）：每渠道独立四段视图 ─────────────────
+   chips 选渠道 → /api/queue_detail?domain= 取该渠道四段桶（正在执行/
+   排队/失败带原因/已完成），随主循环逐轮刷新。选中态存 localStorage，
+   下拉刷新不丢。*/
+const QD_DOMAINS = [
+  ["media", "📥", "媒体"], ["bili", "📺", "B站"], ["x", "🐦", "X"],
+  ["pixiv", "🎨", "Pixiv"], ["wnacg", "📖", "wnacg"], ["asmr", "🎧", "asmr"],
+  ["extract", "📦", "115解压"], ["pawchive", "🐾", "pawchive"],
+  ["listener", "📡", "标签监听"], ["chrome", "🌐", "Chrome"],
+  ["pd", "⚡", "pixeldrain"],
+];
+let _qdDomain = localStorage.getItem("qd_domain") || "media";
+
+function renderQdChips() {
+  const el = document.getElementById("qdChips");
+  if (!el) return;
+  el.innerHTML = QD_DOMAINS.map(([d, e, n]) => {
+    const on = d === _qdDomain;
+    return '<span class="chip" style="flex-shrink:0' +
+      (on ? ';background:var(--blue);color:#fff;border-color:var(--blue)' : '') +
+      '" onclick="qdSelect(\'' + d + '\')">' + e + " " + n + '</span>';
+  }).join("");
+}
+
+function qdSelect(d) {
+  _qdDomain = d;
+  try { localStorage.setItem("qd_domain", d); } catch (e) {}
+  renderQdChips();
+  loadQueueDetail(true);
+}
+
+function _qdSec(title, icon, items, renderExtra) {
+  const head = '<div class="nm" style="margin:10px 0 4px;color:var(--tx2)">' +
+    icon + ' ' + title + '（' + items.length + '）</div>';
+  if (!items.length) return head + '<div class="dt" style="color:var(--tx3)">— 无 —</div>';
+  return head + items.map(it => {
+    const bits = [];
+    if (it.sub) bits.push(esc(it.sub));
+    if (it.attempts != null) bits.push("第 " + it.attempts + " 次");
+    if (it.next_in != null) bits.push(it.next_in > 0
+      ? "⏱ " + (it.next_in >= 60
+          ? Math.floor(it.next_in / 60) + "分" + (it.next_in % 60) + "秒"
+          : it.next_in + "秒") + "后重试"
+      : "到期待放行");
+    if (it.when) bits.push(esc(it.when));
+    const err = it.error
+      ? '<div class="dt" style="color:var(--amber)">' + esc(it.error) + '</div>'
+      : "";
+    return '<div class="qrow"><div class="info"><div class="nm wrap">' +
+      esc(it.label) + '</div><div class="dt">' + bits.join(" · ") +
+      '</div>' + err + (renderExtra ? renderExtra(it) : "") + '</div></div>';
+  }).join("");
+}
+
+async function loadQueueDetail(force) {
+  const el = document.getElementById("qdDetail");
+  if (!el) return;
+  try {
+    const d = await api("/api/queue_detail?domain=" +
+      encodeURIComponent(_qdDomain) + (force ? "&_=" + Date.now() : ""));
+    if (!d.ok) {
+      el.innerHTML = '<div class="note">❌ ' + esc(d.error || "读取失败") + '</div>';
+      return;
+    }
+    const secs =
+      _qdSec("正在执行", "▶️", d.running ||
+        (d.note ? [{label: d.note}] : [])) +
+      _qdSec("排队中", "⏳", d.pending || []) +
+      _qdSec("失败待重试", "❌", d.failed || []) +
+      _qdSec("已完成", "✅", d.done || []);
+    el.innerHTML = '<div class="nm" style="font-weight:700;margin-bottom:2px">' +
+      esc((d.emoji || "") + " " + (d.name || _qdDomain)) + '</div>' + secs;
+  } catch (e) { /* 主循环退避已处理 */ }
+}
+
 /* ⚠️ 失败与重试（全链路，2026-11-10）：与 /api/queues 同一份响应渲染，
    SSE 每 2s 随流刷新，零额外请求。每行：渠道徽章 + 内容 + 状态标签 +
    重试次数 + 退避倒计时（next_in）+ 处置命令（hint 可点即执行）。 */
@@ -1354,9 +1432,10 @@ async function _refreshLoop() {
       if (d.ok) { _BATCH = d.data; await refresh(); _pollMs = 2000; }
       else { _pollMs = Math.min(_pollMs * 2, 30000); }
     } catch (e) { _BATCH = {}; _pollMs = Math.min(_pollMs * 2, 30000); }
-    for (const job of [loadQueuesAll, loadExtractState, loadChrome,
-                       loadBackup, loadPastes, loadLinks, loadHistory,
-                       loadPawSchedule, loadPawBackfill, loadPD, loadCmds]) {
+    for (const job of [loadQueuesAll, loadQueueDetail, loadExtractState,
+                       loadChrome, loadBackup, loadPastes, loadLinks,
+                       loadHistory, loadPawSchedule, loadPawBackfill,
+                       loadPD, loadCmds]) {
       try { await job(); } catch (e) { /* 主轮询已计退避 */ }
     }
   }
@@ -1365,6 +1444,8 @@ async function _refreshLoop() {
 setInterval(loadQueuesAll, 5000);
 setInterval(loadExtractState, 8000);
 loadQueuesAll();
+renderQdChips();
+loadQueueDetail();
 loadExtractState();
 
 // ── 应用内刷新（2026-11-05 owner：点按钮/下拉屏都不跳浏览器）──
@@ -1373,7 +1454,7 @@ loadExtractState();
 let _curDays = 1;
 async function refreshAll() {
   const jobs = [refresh(), loadStats(_curDays), loadHistory(),
-                loadQueuesAll(), loadChrome(), loadBackup(),
+                loadQueuesAll(), loadQueueDetail(), loadChrome(), loadBackup(),
                 loadPastes(), loadLinks(), loadPawSchedule(),
                 loadPawBackfill(), loadPD(), loadCmds()];
   await Promise.allSettled(jobs);
