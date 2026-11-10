@@ -552,3 +552,71 @@ class RouteLedgerAutoCloseTest(unittest.IsolatedAsyncioTestCase):
                 row = r
         self.assertIsNotNone(row)
         self.assertEqual(row["status"], "PENDING")
+
+
+class DescOrderingTest(unittest.TestCase):
+    """runtime_db list 函数 desc=True（2026-11-10）：看板 done 桶必须
+    "最新在前"——此前 ASC+LIMIT 在大表上舀到最老一批（B站 done 显示
+    11-05 旧记录而 11-10 有新完成的）。"""
+
+    WNACG = "https://www.wnacg.com/photos-index-aid-400952.html"
+
+    def setUp(self):
+        from tg_userbot import runtime_db
+        self._td = tempfile.mkdtemp(prefix="rt_desc_")
+        self._saved_conn = runtime_db._CONN
+        runtime_db._CONN = None
+        runtime_db.init_db(os.path.join(self._td, "tg.db"))
+        self.addCleanup(lambda: (
+            runtime_db.close_db(),
+            setattr(runtime_db, "_CONN", self._saved_conn),
+            shutil.rmtree(self._td, ignore_errors=True),
+        ))
+
+    def test_listener_done_desc(self):
+        from tg_userbot import runtime_db
+        ids = runtime_db.enqueue_listener_tasks(
+            42, [{"message_id": i, "target_type": "me",
+                  "target_chat_id": None, "download": 0, "payload": {}}
+                 for i in (1, 2, 3)])
+        for tid in ids:
+            # complete 只认 PROCESSING/FORWARDED → 先领取落 PROCESSING
+            runtime_db.claim_listener_task()
+            runtime_db.complete_listener_task(tid)
+        rows = runtime_db.list_listener_tasks(status="SUCCESS", desc=True)
+        self.assertEqual([r["id"] for r in rows[:2]],
+                         [ids[2], ids[1]], "desc=True 应最新在前")
+
+    def test_wnacg_done_desc(self):
+        from tg_userbot import runtime_db
+        runtime_db.enqueue_wnacg_task(800001, title="旧")
+        runtime_db.complete_wnacg_task(800001, size_bytes=1)
+        runtime_db.enqueue_wnacg_task(800002, title="新")
+        runtime_db.complete_wnacg_task(800002, size_bytes=2)
+        rows = runtime_db.list_wnacg_tasks(status="DONE", desc=True)
+        self.assertEqual(rows[0]["aid"], 800002)
+
+    def test_extract_desc(self):
+        from tg_userbot import runtime_db
+        runtime_db.enqueue_extract_tasks("/a", [("旧.zip", 100)])
+        runtime_db.enqueue_extract_tasks("/b", [("新.zip", 200)])
+        rows = runtime_db.list_extract_tasks(desc=True)
+        self.assertEqual(rows[0]["archive_name"], "新.zip")
+        self.assertEqual(rows[0]["remote_dir"], "/b")
+
+    def test_pawchive_desc_matches_no_status_semantics(self):
+        """desc=True（看板路）与无 status（既有"最新在前"路）同一排序。"""
+        from tg_userbot import runtime_db
+        a = runtime_db.list_pawchive_posts(limit=5, desc=True)
+        b = runtime_db.list_pawchive_posts(limit=5)
+        self.assertEqual([r["id"] for r in a], [r["id"] for r in b])
+
+    def test_desc_default_unchanged(self):
+        """不传 desc 的既有调用方语义不变（listener 仍 ASC）。"""
+        from tg_userbot import runtime_db
+        runtime_db.enqueue_listener_tasks(
+            43, [{"message_id": i, "target_type": "me",
+                  "target_chat_id": None, "download": 0, "payload": {}}
+                 for i in (1, 2)])
+        rows = runtime_db.list_listener_tasks(status="PENDING")
+        self.assertEqual([r["message_id"] for r in rows], [1, 2], "默认仍升序")

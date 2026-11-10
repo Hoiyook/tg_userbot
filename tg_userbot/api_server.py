@@ -1467,15 +1467,15 @@ def _qd_taskdomain(domain, label_key):
     out = {"running": [], "pending": [], "failed": [], "done": []}
     for status, bucket in (("PROCESSING", "running"), ("PENDING", "pending"),
                            ("FAILED", "failed")):
-        for r in domain.list(status=status, limit=_QD_LIMIT):
+        for r in domain.list(status=status, limit=_QD_LIMIT, desc=True):
             out[bucket].append(_qd_item(
                 r.get("label") or r.get("url") or r.get("target"),
                 attempts=r.get("attempts"),
                 error=r.get("error"),
                 next_in=(max(0, int(r["next_retry_at"] - time.time()))
                          if r.get("next_retry_at") else None)))
-    done_rows = domain.list(status="DONE", limit=200)
-    for r in done_rows[-_QD_DONE_LIMIT:][::-1]:
+    done_rows = domain.list(status="DONE", limit=_QD_DONE_LIMIT, desc=True)
+    for r in done_rows:
         out["done"].append(_qd_item(
             r.get("label") or r.get("url") or r.get("target"),
             when=_qd_when(r.get("updated_at"))))
@@ -1525,15 +1525,16 @@ async def _qd_wnacg():
     out = {"running": [], "pending": [], "failed": [], "done": []}
     for status, bucket in (("PROCESSING", "running"), ("PENDING", "pending"),
                            ("FAILED", "failed")):
-        for r in runtime_db.list_wnacg_tasks(status=status,
-                                             limit=_QD_LIMIT):
+        for r in runtime_db.list_wnacg_tasks(status=status, limit=_QD_LIMIT,
+                                             desc=True):
             out[bucket].append(_qd_item(
                 r.get("title") or f"aid {r.get('aid')}",
                 attempts=r.get("attempts"), error=r.get("error"),
                 next_in=(max(0, int(r["next_retry_at"] - time.time()))
                          if r.get("next_retry_at") else None)))
-    done_rows = runtime_db.list_wnacg_tasks(status="DONE", limit=200)
-    for r in done_rows[-_QD_DONE_LIMIT:][::-1]:
+    done_rows = runtime_db.list_wnacg_tasks(status="DONE",
+                                            limit=_QD_DONE_LIMIT, desc=True)
+    for r in done_rows:
         out["done"].append(_qd_item(
             r.get("title") or f"aid {r.get('aid')}",
             when=_qd_when(r.get("updated_at"))))
@@ -1545,15 +1546,16 @@ async def _qd_asmr():
     out = {"running": [], "pending": [], "failed": [], "done": []}
     for status, bucket in (("PROCESSING", "running"), ("PENDING", "pending"),
                            ("FAILED", "failed")):
-        for r in runtime_db.list_asmr_tasks(status=status,
-                                            limit=_QD_LIMIT):
+        for r in runtime_db.list_asmr_tasks(status=status, limit=_QD_LIMIT,
+                                            desc=True):
             out[bucket].append(_qd_item(
                 r.get("title") or f"RJ {r.get('rj')}",
                 attempts=r.get("attempts"), error=r.get("error"),
                 next_in=(max(0, int(r["next_retry_at"] - time.time()))
                          if r.get("next_retry_at") else None)))
-    done_rows = runtime_db.list_asmr_tasks(status="DONE", limit=200)
-    for r in done_rows[-_QD_DONE_LIMIT:][::-1]:
+    done_rows = runtime_db.list_asmr_tasks(status="DONE",
+                                           limit=_QD_DONE_LIMIT, desc=True)
+    for r in done_rows:
         out["done"].append(_qd_item(
             r.get("title") or f"RJ {r.get('rj')}",
             when=_qd_when(r.get("updated_at"))))
@@ -1566,14 +1568,19 @@ async def _qd_extract():
     for status, bucket in (("PROCESSING", "running"), ("PENDING", "pending"),
                            ("FAILED", "failed")):
         for r in runtime_db.list_extract_tasks(status=status,
-                                               limit=_QD_LIMIT):
+                                               limit=_QD_LIMIT, desc=True):
             out[bucket].append(_qd_item(
-                r.get("src_path") or r.get("id"),
+                (str(r.get("remote_dir")).rstrip("/") + "/"
+                 + r.get("archive_name")) if r.get("archive_name")
+                else f"#{r.get('id')}",
                 attempts=r.get("attempts"), error=r.get("error")))
-    done_rows = runtime_db.list_extract_tasks(status="COMPLETED", limit=200)
-    for r in done_rows[-_QD_DONE_LIMIT:][::-1]:
+    done_rows = runtime_db.list_extract_tasks(status="COMPLETED",
+                                              limit=_QD_DONE_LIMIT, desc=True)
+    for r in done_rows:
         out["done"].append(_qd_item(
-            r.get("src_path") or r.get("id"),
+            (str(r.get("remote_dir")).rstrip("/") + "/"
+             + r.get("archive_name")) if r.get("archive_name")
+            else f"#{r.get('id')}",
             when=_qd_when(r.get("updated_at"))))
     return out
 
@@ -1584,13 +1591,14 @@ async def _qd_pawchive():
     for status, bucket in (("PROCESSING", "running"), ("PENDING", "pending"),
                            ("FAILED", "failed")):
         for r in runtime_db.list_pawchive_posts(status=status,
-                                                limit=_QD_LIMIT):
+                                                limit=_QD_LIMIT, desc=True):
             out[bucket].append(_qd_item(
                 r.get("title") or f"post {r.get('post_id')}",
                 attempts=r.get("attempts"), error=r.get("last_error")))
     for status in ("COMPLETED", "MANUAL"):
-        done_rows = runtime_db.list_pawchive_posts(status=status, limit=200)
-        for r in done_rows[-_QD_DONE_LIMIT:][::-1]:
+        done_rows = runtime_db.list_pawchive_posts(
+            status=status, limit=_QD_DONE_LIMIT, desc=True)
+        for r in done_rows:
             out["done"].append(_qd_item(
                 r.get("title") or f"post {r.get('post_id')}",
                 sub=status, when=_qd_when(r.get("updated_at"))))
@@ -1604,7 +1612,7 @@ async def _qd_listener():
                            ("FORWARDED", "running"), ("PENDING", "pending"),
                            ("FAILED", "failed")):
         for t in runtime_db.list_listener_tasks(status=status,
-                                                limit=_QD_LIMIT):
+                                                limit=_QD_LIMIT, desc=True):
             sub = (f"#{t['id']} 第 {t.get('attempts', 0)} 次"
                    if bucket != "running" else
                    f"#{t['id']} 第 {t.get('attempts', 0)} 次"
@@ -1614,8 +1622,9 @@ async def _qd_listener():
                 attempts=t.get("attempts"), error=t.get("last_error"),
                 next_in=(max(0, int(t["next_retry_at"] - time.time()))
                          if t.get("next_retry_at") else None)))
-    done_rows = runtime_db.list_listener_tasks(status="SUCCESS", limit=200)
-    for t in done_rows[-_QD_DONE_LIMIT:][::-1]:
+    done_rows = runtime_db.list_listener_tasks(status="SUCCESS",
+                                               limit=_QD_DONE_LIMIT, desc=True)
+    for t in done_rows:
         out["done"].append(_qd_item(
             f"#{t['id']} {_task_label_of(t)}",
             when=_qd_when(t.get("completed_at"))))
@@ -1816,8 +1825,9 @@ async def _queue_problems():
         try:
             from . import runtime_db
             for r in getattr(runtime_db, fn)(status="FAILED", limit=5):
-                _add(name, r.get(key) or r.get("aid") or r.get("src_path")
-                     or "?", "FAILED", r.get("attempts"),
+                _add(name, r.get(key) or r.get("aid")
+                     or r.get("archive_name") or "?", "FAILED",
+                     r.get("attempts"),
                      r.get("next_retry_at"), None, r.get("error"))
         except Exception:
             pass

@@ -1232,16 +1232,21 @@ def get_listener_task(task_id):
     return _row_to_task(row)
 
 
-def list_listener_tasks(status=None, limit=200):
-    """列任务（排查与统计用；按 id 升序，与领取顺序一致）。"""
+def list_listener_tasks(status=None, limit=200, desc=False):
+    """列任务（排查与统计用；默认按 id 升序，与领取顺序一致）。
+
+    desc=True：id 降序（最新在前）——看板渠道队列的 done/failed 桶取
+    "最近几条"用；ASC + LIMIT 在大表上只会舀到最老的一批
+    （2026-11-10 实测：B站 done 显示的是 11-05 的旧记录）。"""
+    order = "DESC" if desc else "ASC"
     if status:
         rows = _read(lambda c: _execute(
-            c, "SELECT * FROM listener_tasks WHERE status=? ORDER BY id "
-               "LIMIT ?", (str(status), int(limit))).fetchall(),
+            c, f"SELECT * FROM listener_tasks WHERE status=? ORDER BY id "
+               f"{order} LIMIT ?", (str(status), int(limit))).fetchall(),
             "列监听任务")
     else:
         rows = _read(lambda c: _execute(
-            c, "SELECT * FROM listener_tasks ORDER BY id LIMIT ?",
+            c, f"SELECT * FROM listener_tasks ORDER BY id {order} LIMIT ?",
             (int(limit),)).fetchall(), "列监听任务")
     return [_row_to_task(r) for r in rows]
 
@@ -1788,12 +1793,16 @@ def get_pawchive_post(row_id):
     return _row_to_pawchive_post(row)
 
 
-def list_pawchive_posts(status=None, limit=100):
-    """列帖子；status 给定时按 id 升序（领取顺序），否则按 id 降序（最新在前）。"""
+def list_pawchive_posts(status=None, limit=100, desc=False):
+    """列帖子；默认行为：status 给定时按 id 升序（领取顺序），否则降序。
+
+    desc=True 强制 id 降序（最新在前）——看板渠道队列 done 桶取最近
+    完成的帖子用（ASC + LIMIT 在大表上只会舀到最老一批，2026-11-10）。"""
+    order = "DESC" if (desc or not status) else "ASC"
     if status:
         rows = _read(lambda c: _execute(
-            c, "SELECT * FROM pawchive_posts WHERE status=? ORDER BY id "
-               "LIMIT ?", (str(status), int(limit))).fetchall(),
+            c, f"SELECT * FROM pawchive_posts WHERE status=? ORDER BY id "
+               f"{order} LIMIT ?", (str(status), int(limit))).fetchall(),
             "列 Pawchive 帖子")
     else:
         rows = _read(lambda c: _execute(
@@ -2648,16 +2657,17 @@ def get_extract_task(task_id):
     return _row_to_extract_task(row) if row else None
 
 
-def list_extract_tasks(status=None, limit=50):
-    """任务列表（按 id 升序）；status=None 列全部。"""
+def list_extract_tasks(status=None, limit=50, desc=False):
+    """任务列表（默认按 id 升序；desc=True 最新在前，看板 done 桶用）。"""
+    order = "DESC" if desc else "ASC"
     if status is None:
         rows = _read(lambda c: _execute(
-            c, "SELECT * FROM extract_tasks ORDER BY id LIMIT ?",
+            c, f"SELECT * FROM extract_tasks ORDER BY id {order} LIMIT ?",
             (int(limit),)).fetchall(), "列 115 解压任务")
     else:
         rows = _read(lambda c: _execute(
-            c, "SELECT * FROM extract_tasks WHERE status=? ORDER BY id "
-               "LIMIT ?", (str(status), int(limit))).fetchall(),
+            c, f"SELECT * FROM extract_tasks WHERE status=? ORDER BY id "
+               f"{order} LIMIT ?", (str(status), int(limit))).fetchall(),
             "列 115 解压任务")
     return [_row_to_extract_task(r) for r in rows]
 
@@ -4053,15 +4063,16 @@ def retry_wnacg_task(aid=None, now=None):
     return _write(do, "重投 wnacg 任务")
 
 
-def list_wnacg_tasks(status=None, limit=30):
+def list_wnacg_tasks(status=None, limit=30, desc=True):
     def do(conn):
+        order = "DESC" if desc else "ASC"
         if status:
             rows = _execute(
-                conn, "SELECT * FROM wnacg_tasks WHERE status=? "
-                "ORDER BY aid DESC LIMIT ?", (str(status), int(limit))).fetchall()
+                conn, f"SELECT * FROM wnacg_tasks WHERE status=? "
+                f"ORDER BY aid {order} LIMIT ?", (str(status), int(limit))).fetchall()
         else:
             rows = _execute(
-                conn, "SELECT * FROM wnacg_tasks ORDER BY aid DESC LIMIT ?",
+                conn, f"SELECT * FROM wnacg_tasks ORDER BY aid {order} LIMIT ?",
                 (int(limit),)).fetchall()
         return [_row_to_wnacg(r) for r in rows]
 
@@ -4297,15 +4308,16 @@ def retry_asmr_task(rj=None, now=None):
     return _write(do, "重投 asmr 任务")
 
 
-def list_asmr_tasks(status=None, limit=30):
+def list_asmr_tasks(status=None, limit=30, desc=True):
     def do(conn):
+        order = "DESC" if desc else "ASC"
         if status:
             rows = _execute(
-                conn, "SELECT * FROM asmr_tasks WHERE status=? "
-                "ORDER BY rj DESC LIMIT ?", (str(status), int(limit))).fetchall()
+                conn, f"SELECT * FROM asmr_tasks WHERE status=? "
+                f"ORDER BY rj {order} LIMIT ?", (str(status), int(limit))).fetchall()
         else:
             rows = _execute(
-                conn, "SELECT * FROM asmr_tasks ORDER BY rj DESC LIMIT ?",
+                conn, f"SELECT * FROM asmr_tasks ORDER BY rj {order} LIMIT ?",
                 (int(limit),)).fetchall()
         return [_row_to_asmr(r) for r in rows]
 
@@ -4811,17 +4823,18 @@ class TaskDomain:
         return _write(do, f"重投 {self.what}")
 
     # ── 读路径 ──
-    def list(self, status=None, limit=30):
+    def list(self, status=None, limit=30, desc=True):
         def do(conn):
+            order = "DESC" if desc else "ASC"
             if status:
                 rows = _execute(
                     conn, f"SELECT * FROM {self.table} WHERE status=? "
-                    "ORDER BY id DESC LIMIT ?",
+                    f"ORDER BY id {order} LIMIT ?",
                     (str(status), int(limit))).fetchall()
             else:
                 rows = _execute(
                     conn, f"SELECT * FROM {self.table} "
-                    "ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+                    f"ORDER BY id {order} LIMIT ?", (int(limit),)).fetchall()
             return [dict(r) for r in rows]
 
         return _read(do, f"列 {self.what}")
