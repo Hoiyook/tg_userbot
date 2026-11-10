@@ -1445,9 +1445,15 @@ async def _queue_problems():
     try:
         from . import runtime_db
         for t in runtime_db.list_listener_tasks(status="FAILED", limit=10):
+            err = str(t.get("last_error") or "")
+            # 源消息已消失类失败重试无用（源被删，再试还是取不回）——
+            # hint 直接指向删除，不给无效的 retry 按钮（2026-11-10）
+            gone = any(m in err for m in
+                       ("源消息不可读", "源消息取不回", "可能已删除"))
+            hint = (f"/listen_failed del {t['id']}" if gone
+                    else f"/listen_retry {t['id']}")
             _add("标签监听", f"#{t['id']} {_task_label_of(t)}", "FAILED",
-                 t.get("attempts"), None, f"/listen_retry {t['id']}",
-                 t.get("last_error"))
+                 t.get("attempts"), None, hint, t.get("last_error"))
         for t in runtime_db.list_listener_tasks(
                 status="FORWARDED", limit=5):
             _add("标签监听", f"#{t['id']} {_task_label_of(t)}",

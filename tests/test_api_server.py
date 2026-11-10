@@ -2009,19 +2009,28 @@ class QueuesProblemsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lis["pending"], 1)
 
     async def test_problems_listens_failed_with_hint(self):
+        """两类失败给不同处置 hint：源已消失 → del（重试无用）；
+        其它（如无权限）→ retry。"""
         from tg_userbot import runtime_db
         ids = runtime_db.enqueue_listener_tasks(
             123, [{"message_id": 2, "target_type": "me",
                    "target_chat_id": None, "download": 1,
-                   "payload": {"label": "会失败的任务"}}])
-        runtime_db.fail_listener_task(ids[0], error="ChannelPrivateError")
+                   "payload": {"label": "权限类失败"}},
+                  {"message_id": 3, "target_type": "me",
+                   "target_chat_id": None, "download": 1,
+                   "payload": {"label": "源已删除"}}])
+        runtime_db.fail_listener_task(ids[0], error="ChannelPrivateError: x")
+        runtime_db.fail_listener_task(
+            ids[1], error="源消息不可读（可能已删除）")
         data = await self._get_queues()
-        problems = data.get("problems") or []
-        hit = [p for p in problems if p["where"] == "标签监听"]
-        self.assertTrue(hit, "listener FAILED 应出现在 problems")
-        self.assertEqual(hit[0]["status"], "FAILED")
-        self.assertEqual(hit[0]["hint"], f"/listen_retry {ids[0]}")
-        self.assertIn("ChannelPrivateError", hit[0]["error"] or "")
+        problems = [p for p in (data.get("problems") or [])
+                    if p["where"] == "标签监听"]
+        self.assertEqual(len(problems), 2)
+        by_hint = {p["hint"]: p for p in problems}
+        self.assertIn(f"/listen_retry {ids[0]}", by_hint)
+        self.assertIn(f"/listen_failed del {ids[1]}", by_hint)
+        gone = by_hint[f"/listen_failed del {ids[1]}"]
+        self.assertIn("源消息不可读", gone["error"] or "")
 
     async def test_problems_media_retry_has_countdown(self):
         """主队列 retry 榜条目带 next_in 退避倒计时。"""
