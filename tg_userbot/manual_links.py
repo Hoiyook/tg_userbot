@@ -202,6 +202,23 @@ def unified_view(limit=20):
     return out, rows
 
 
+def close_for(urls):
+    """路由成功后的台账自动销账（best-effort：失败只记日志不炸路由）。
+
+    同一链接先前落入台账（不识别 / Android 端缺路 / 台账兜底），后来经
+    正常路由（wnacg/asmr/ehentai/bili/x/t.me/抖音…）处理成功时，由
+    routing.execute 调用本函数把匹配的 PENDING 条目关闭——否则台账永远
+    挂着待人工，与粘贴历史的"已完成"两头对不上（2026-11-10 实测）。"""
+    try:
+        n = runtime_db.manual_link_close_by_urls(urls)
+        if n:
+            logger.info(f"🔗 台账自动销账 {n} 条（链接已被正常路由处理）")
+        return n
+    except Exception as e:
+        logger.warning(f"台账自动销账失败（忽略）：{e}")
+        return 0
+
+
 def done_paw_post(arg):
     """🐾 paw 帖 ✅ 按钮：标记该帖完成并返回刷新后的统一看板。"""
     from . import pawchive

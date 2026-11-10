@@ -382,4 +382,11 @@ async def execute(decision, *, event=None, message=None, surface="unknown"):
             result.kind, ref=result.ref, surface=surface,
             chat_id=chat_id, message_id=message_id,
             message=result.message)
+        if result.kind != "ledger":
+            # 台账自动销账：同一链接先前落入台账待人工（不识别/Android/
+            # 台账兜底），如今被正常路由处理成功 → 关闭匹配的 PENDING
+            # 条目，台账与粘贴历史不再两头对不上（2026-11-10；t.me 回灌
+            # 的按 id 销账不变）。close_for 自吞异常，不影响路由结果。
+            manual_links.close_for(
+                [u for u in (result.urls or decision.urls) if u])
     return result

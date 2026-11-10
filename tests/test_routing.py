@@ -484,3 +484,71 @@ class SiteCommandRoutingTest(unittest.TestCase):
         """wnacg 链接 + MEGA 链接混合：wnacg 识别在 ledger 前 → wnacg 胜。"""
         d = routing.classify(f"{self.WNACG} {MEGA}", allow=routing.SURFACE_ME)
         self.assertEqual(d.kind, "wnacg")
+
+
+class RouteLedgerAutoCloseTest(unittest.IsolatedAsyncioTestCase):
+    """路由成功 → 台账自动销账（2026-11-10）。
+
+    同一链接先前落台账待人工（当时不识别/Android/兜底），后来被正常
+    路由处理成功：台账 PENDING 条目必须自动关闭——否则台账永远挂着
+    待人工，与粘贴历史的"已完成"两头对不上（aid 400952 实测案例）。"""
+
+    WNACG = "https://www.wnacg.com/photos-index-aid-400952.html"
+
+    def setUp(self):
+        import asyncio
+        from tg_userbot import runtime_db, state
+        self._td = tempfile.mkdtemp(prefix="rt_ledger_close_")
+        self._saved_conn = runtime_db._CONN
+        runtime_db._CONN = None
+        runtime_db.init_db(os.path.join(self._td, "tg.db"))
+        self._saved_lock = state.QUEUE_LOCK
+        state.QUEUE_LOCK = asyncio.Lock()
+        self.addCleanup(lambda: (
+            runtime_db.close_db(),
+            setattr(runtime_db, "_CONN", self._saved_conn),
+            setattr(state, "QUEUE_LOCK", self._saved_lock),
+            shutil.rmtree(self._td, ignore_errors=True),
+        ))
+
+    def _ledger_row(self):
+        from tg_userbot import manual_links, runtime_db
+        rows = runtime_db.list_manual_links(limit=100)
+        return next((r for r in rows if r["url"] == self.WNACG), None)
+
+    async def test_successful_route_closes_pending_ledger(self):
+        import shutil
+        from unittest import mock
+        from tg_userbot import manual_links, runtime_db
+        # ① 链接先落台账待人工（模拟早前不识别时的兜底登记）
+        manual_links.observe(self.WNACG)
+        row = self._ledger_row()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "PENDING")
+        # ② 同一链接后来被正常路由（wnacg）处理成功
+        d = routing.classify(self.WNACG, allow=routing.SURFACE_ME)
+        self.assertEqual(d.kind, "wnacg")
+        with mock.patch.object(routing.wnacg, "command_reply",
+                               return_value="📖 已入队"):
+            res = await routing.execute(d, surface="test")
+        self.assertTrue(res.handled)
+        # ③ 台账自动关闭（不再待人工），粘贴历史与台账一致
+        row = self._ledger_row()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "DONE")
+
+    async def test_ledger_route_itself_does_not_double_close(self):
+        """ledger 路由（登记动作本身）不触发销账——observe 刚写的
+        PENDING 不能被自己立刻关掉。"""
+        from tg_userbot import manual_links
+        d = routing.classify("https://mega.nz/file/xyz 分享",
+                             allow=routing.SURFACE_ME)
+        self.assertEqual(d.kind, "ledger")
+        await routing.execute(d, surface="test")
+        from tg_userbot import runtime_db
+        row = None
+        for r in runtime_db.list_manual_links(limit=100):
+            if "mega.nz/file/xyz" in (r["url"] or ""):
+                row = r
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "PENDING")

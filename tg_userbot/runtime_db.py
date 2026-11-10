@@ -3571,6 +3571,28 @@ def manual_link_done(link_id, now=None):
     return _write(do, f"外链台账标记完成（{link_id}）")
 
 
+def manual_link_close_by_urls(urls, now=None):
+    """按 URL（url_key 精确匹配）把台账 PENDING 条目销账，返回关闭条数。
+
+    供路由成功后的**自动销账**（2026-11-10）：同一链接先前因不识别/
+    Android 端缺路落入台账待人工，后来经正常路由处理成功时，台账不应
+    继续挂着——此前只有 t.me 回灌按 id 销账，其它路由完成后台账永远
+    PENDING（面板显示待人工，点完成又是"已不是待处理"，两头对不上）。"""
+    keys = [str(u).strip() for u in (urls or []) if u]
+    if not keys:
+        return 0
+    marks = ",".join("?" * len(keys))
+
+    def do(conn):
+        cur = _execute(
+            conn,
+            f"UPDATE manual_links SET status='DONE', done_at=? "
+            f"WHERE status='PENDING' AND url_key IN ({marks})",
+            (_now(now), *keys))
+        return cur.rowcount
+    return _write(do, "外链台账按 URL 自动销账")
+
+
 def get_manual_link(link_id):
     """按行 id 取台账行（找不到返回 None）。"""
     row = _read(lambda c: _execute(
