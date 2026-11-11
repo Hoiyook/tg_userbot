@@ -956,6 +956,7 @@ AUTO_CLEAN_SAVED_MESSAGES = True
 
 # 消息至少存在多少分钟后才允许删除
 CLEAN_MESSAGE_AGE_MINUTES = 1
+QUEUE_BACKLOG_WARN_RETRY = 50     # 待重试榜积压告警线（stall 哨兵）
 
 # bot 控制面板对话里额外保留的「最近消息」条数（除最新菜单与最新状态面板外）。
 # 2026-09-11 起程序主动通知都发到这个对话，若照旧「超时即删」，面板就成不了

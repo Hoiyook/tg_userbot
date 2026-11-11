@@ -315,6 +315,17 @@ def decide_stall_signals(snap, now=None):
         out.append({"key": "dup", "text":
                     f"⚠️ 查重 run running 超 90 分钟（疑似巨目录流卡死，"
                     "上次同类卡死已修页粒度判停——若再现在报维护者）"})
+    # 队列积压哨兵（2026-11-12）：retry 榜是"退避重放蓄水池"，正常一轮
+    # （≤30 分钟）就在消化；≥50 条说明有系统性故障在批量产生失败
+    # （代理挂/线路故障/站点风控）， owner 需要知道
+    dc = (snap.get("download") or {}).get("counts") or {}
+    retry_n = int(dc.get("RETRY", 0) or 0)
+    if retry_n >= int(getattr(__import__("tg_userbot.config", fromlist=["x"]),
+                              "QUEUE_BACKLOG_WARN_RETRY", 50)):
+        out.append({"key": "backlog", "text":
+                    f"⚠️ 待重试榜积压 {retry_n} 条——自动重放持续失败，"
+                    "通常是代理/线路系统性故障。/retry all 强推、"
+                    "/queue 看明细，或修网络后等自动重放消化"})
     return out
 
 

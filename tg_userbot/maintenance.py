@@ -14,6 +14,10 @@ from .log import logger
 
 BACKUP_KEEP = 3            # 备份滚动保留份数（2026-10-29：7→3——
                            # DB 日增量极小，3 份足够回滚，省 ~370MB）
+DISK_WARN_FREE_GB = 50     # 磁盘剩余低于此值（GB）→ 每日维护告警
+                           # （媒体库 373G，磁盘满只会静默下载失败——
+                           # wnacg/pawchive 各有自己的保护线，但主链
+                           # 没有全局预警）
 EVENTS_TRIM_MAX = 30000    # 与 TASK_EVENTS_MAX_EVENTS 同源（台账封顶）
 LISTENER_DONE_RETENTION_DAYS = 90   # 监听任务 SUCCESS/DISMISSED 保留天数
 
@@ -45,7 +49,7 @@ def backup_db(out_dir, keep=BACKUP_KEEP, now=None):
         # 没有备份更危险（给人虚假的安全感）
         logger.error(f"🗄 备份完整性验证失败：{target} — {detail}")
     logger.info(f"🗄 Runtime DB 已备份 → {target}（验证 {'✅' if ok else '❌ ' + detail}）")
-    return target
+    return target, ok, detail
 
 
 def verify_backup(path):
@@ -94,13 +98,34 @@ def _rotate(out_dir, keep):
             pass
 
 
+def disk_free_gb(path):
+    """路径所在卷的剩余 GB（异常返回 None——不阻塞维护）。"""
+    try:
+        import shutil as _sh
+        return _sh.disk_usage(path).free / 1024 ** 3
+    except OSError:
+        return None
+
+
 def daily_maintenance():
     """每日维护入口（app._maintenance_loop 每天调用一次）：
-    ① DB 备份（滚动 7 份）② 事件流裁剪（台账封顶）。失败只告警不抛。"""
+    ① DB 备份（滚动 7 份+验证）② 事件流裁剪 ③ 监听终态清理
+    ④ 凭据巡检 ⑤ 磁盘预警。汇总一条维护报告推 TG（N4，2026-11-12）。
+    失败只告警不抛——维护报告本身也聚合失败项，绝不静默黑盒。"""
+    report = []          # 维护报告行（好/坏都记，最后一条 TG 汇总）
+    bad = []             # 异常项（决定报告的标题色）
+
+    # ① DB 备份 + 验证
     try:
-        backup_db(config.RUNTIME_DIR)
+        target, ok, vdetail = backup_db(config.RUNTIME_DIR)
+        report.append(("✅" if ok else "❌", f"备份 {os.path.basename(target)}"
+                       + ("" if ok else f" — {vdetail}")))
+        if not ok:
+            bad.append("备份验证失败")
     except Exception as e:
         logger.warning(f"🗄 每日 DB 备份失败：{e}")
+        report.append(("❌", f"备份失败：{type(e).__name__}: {str(e)[:60]}"))
+        bad.append("备份失败")
     try:
         # 维护在 to_thread 线程里跑：不能复用主线程的 sqlite 连接
         #（check_same_thread），这里开独立连接直写。业务连接若同时写
@@ -117,8 +142,11 @@ def daily_maintenance():
             conn.close()
         if removed:
             logger.info(f"🗄 事件流已裁剪 {removed} 条（封顶 {EVENTS_TRIM_MAX}）")
+        report.append(("✅", f"事件流裁剪 {'-' + str(removed) + ' 条' if removed else '无需'}"))
     except sqlite3.Error as e:
         logger.warning(f"🗄 事件流裁剪失败：{e}")
+        report.append(("❌", f"事件流裁剪失败：{str(e)[:50]}"))
+        bad.append("事件流裁剪失败")
     try:
         # 监听任务 SUCCESS 终态 90 天清理（2026-10-29）：SUCCESS 行永久
         # 留存是唯一无界的业务表；判重不依赖它（dedup_index 独立），删
@@ -139,18 +167,89 @@ def daily_maintenance():
         if removed:
             logger.info(f"🗄 监听任务终态清理 {removed} 条"
                         f"（SUCCESS/DISMISSED 保留 {LISTENER_DONE_RETENTION_DAYS} 天）")
+        report.append(("✅", f"监听终态清理 {'-' + str(removed) + ' 条' if removed else '无需'}"))
     except sqlite3.Error as e:
         logger.warning(f"🗄 监听任务终态清理失败：{e}")
+        report.append(("❌", f"监听终态清理失败：{str(e)[:50]}"))
+        bad.append("监听终态清理失败")
     # 凭据健康度巡检（2026-11-12）：零联网字段完整性检查，新失效才告警。
     # 挂最后——它有自己的 try 兜底，绝不影响前面任何清理动作。
+    cred_bad_sites = []
     try:
         from . import credentials, notify as _notify_mod
         results, alert = credentials.daily_check_and_alert(
             notify_coro=_notify_mod.notify_user)
-        bad = [r for r in results if not r["ok"]]
-        if bad:
-            logger.warning(f"🔑 凭据巡检：{len(bad)} 站失效（已告警）")
+        cred_bad = [r for r in results if not r["ok"]]
+        cred_bad_sites = [r["site"] for r in cred_bad]
+        if cred_bad:
+            logger.warning(f"🔑 凭据巡检：{len(cred_bad)} 站失效（已告警）")
+            report.append(("❌", "凭据失效：" + "、".join(
+                f"{r['display']}（{r['detail'][:40]}）" for r in cred_bad)))
+            bad.append("凭据失效")
         else:
             logger.info("🔑 凭据巡检：全部正常")
+            report.append(("✅", "凭据巡检：四站正常"))
     except Exception as e:
         logger.warning(f"🔑 凭据巡检失败（不影响维护）：{e}")
+        report.append(("❌", f"凭据巡检失败：{str(e)[:50]}"))
+        bad.append("凭据巡检失败")
+
+    # ⑤ 磁盘容量预警（2026-11-12）：媒体根与运行盘都查，增量告警——
+    #    "低于阈值"的新状态才推 TG（恢复/持续低不重复吵），状态落 schema_meta
+    disk_bad = []
+    try:
+        for label, path in (("媒体盘", config.DOWNLOAD_DIR),
+                            ("运行盘", os.path.dirname(runtime_db.db_path()))):
+            free = disk_free_gb(path)
+            if free is None:
+                continue
+            low = free < DISK_WARN_FREE_GB
+            mark = "⚠️" if low else "✅"
+            report.append((mark, f"{label} {path} 剩余 {free:.0f}GB"))
+            if low:
+                disk_bad.append((label, free))
+        if disk_bad:
+            bad.append("磁盘空间不足")
+        _disk_alert(disk_bad, notify=_notify_mod.notify_user
+                    if "_notify_mod" in dir() else None)
+    except Exception as e:
+        logger.warning(f"💾 磁盘预警失败（不影响维护）：{e}")
+
+    # ⑥ 维护报告（一条 TG：N4）——报告自身失败绝不影响主流程
+    try:
+        icon, title = (("🔴", "每日维护报告（有异常）") if bad
+                       else ("🟢", "每日维护报告"))
+        body = "\n".join(f"{m} {t}" for m, t in report)
+        try:
+            import asyncio as _aio
+            _aio.run(_notify_mod.notify_user(f"{icon} {title}\n\n{body}"))
+        except Exception as _ne:
+            logger.warning(f"🗄 维护报告发送失败（忽略）：{_ne}")
+        logger.info(f"🗄 每日维护完成：{'异常 ' + str(bad) if bad else '全部正常'}")
+    except Exception as e:
+        logger.warning(f"🗄 维护报告组装失败：{e}")
+
+
+def _disk_alert(disk_bad, notify=None):
+    """磁盘预警增量推送：状态（各卷是否低于阈值）与上次不同才推。"""
+    if not disk_bad:
+        key = "-"
+    else:
+        key = ",".join(f"{label}:{free:.0f}GB" for label, free in disk_bad)
+    try:
+        prev = runtime_db.get_schema_meta("disk_last_warn")
+        runtime_db.set_schema_meta("disk_last_warn", key)
+    except Exception as e:
+        logger.warning(f"磁盘预警状态写库失败（忽略）：{e}")
+        return
+    if key == "-" or key == (prev or "-"):
+        return
+    if notify is not None:
+        import asyncio as _aio
+        lines = "\n".join(f"  ⚠️ {label} 剩余 {free:.0f}GB（阈值 "
+                          f"{DISK_WARN_FREE_GB}GB）" for label, free in disk_bad)
+        try:
+            _aio.run(notify("💾 磁盘空间预警\n\n" + lines
+                            + "\n\n（媒体盘满会导致下载静默失败，请清理或扩容）"))
+        except Exception as e:
+            logger.warning(f"磁盘预警发送失败（忽略）：{e}")

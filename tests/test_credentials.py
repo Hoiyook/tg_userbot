@@ -9,7 +9,7 @@ from unittest import mock
 _TMP = tempfile.mkdtemp(prefix="cred_test_")
 os.environ["TG_SAVE_FOLDER"] = _TMP
 
-from tg_userbot import credentials, maintenance, runtime_db, state  # noqa: E402
+from tg_userbot import config, credentials, maintenance, runtime_db, state  # noqa: E402
 
 
 class CredentialsCheckTest(unittest.TestCase):
@@ -114,7 +114,7 @@ class VerifyBackupTest(unittest.TestCase):
         ))
 
     def test_good_backup_passes(self):
-        path = maintenance.backup_db(self._td)
+        path, _ok, _vd = maintenance.backup_db(self._td)
         ok, detail = maintenance.verify_backup(path)
         self.assertTrue(ok, detail)
         self.assertIn("listener=", detail)
@@ -131,3 +131,82 @@ class VerifyBackupTest(unittest.TestCase):
             f.write(b"not a sqlite file at all" * 100)
         ok, detail = maintenance.verify_backup(bad)
         self.assertFalse(ok)
+
+
+class DiskAlertTest(unittest.TestCase):
+    """磁盘容量预警（N3）：增量语义 + 维护报告聚合（N4）。"""
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp(prefix="disk_test_")
+        self._saved_conn = runtime_db._CONN
+        runtime_db._CONN = None
+        runtime_db.init_db(os.path.join(self._td, "tg.db"))
+        self.addCleanup(lambda: (
+            runtime_db.close_db(),
+            setattr(runtime_db, "_CONN", self._saved_conn),
+            shutil.rmtree(self._td, ignore_errors=True),
+        ))
+
+    def test_disk_alert_incremental(self):
+        import asyncio
+        calls = []
+        async def fake(text, **kw):
+            calls.append(text); return True
+        # 低磁盘 → 告警
+        maintenance._disk_alert([("媒体盘", 12.3)], notify=fake)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("媒体盘", calls[0])
+        # 同状态 → 不重复
+        maintenance._disk_alert([("媒体盘", 12.1)], notify=fake)
+        self.assertEqual(len(calls), 1)
+        # 恢复 → 不告警（key 变 "-"），下次再低会再告警
+        maintenance._disk_alert([], notify=fake)
+        self.assertEqual(len(calls), 1)
+        maintenance._disk_alert([("媒体盘", 9.9)], notify=fake)
+        self.assertEqual(len(calls), 2)
+
+    def test_disk_free_gb(self):
+        v = maintenance.disk_free_gb("/Volumes/V1")
+        self.assertIsNotNone(v)
+        self.assertGreater(v, 0)
+        self.assertIsNone(maintenance.disk_free_gb("/nonexistent/path/x"))
+
+
+class DailyReportTest(unittest.TestCase):
+    """每日维护报告（N4）：聚合行 + 失败项进 bad。"""
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp(prefix="rep_test_")
+        self._saved_conn = runtime_db._CONN
+        runtime_db._CONN = None
+        runtime_db.init_db(os.path.join(self._td, "tg.db"))
+        self._saved_proxy = getattr(config, "TG_PROXY", None)
+        config.TG_PROXY = "socks5://127.0.0.1:1"  # 占位（wnacg 探测不用网）
+        self.addCleanup(lambda: (
+            runtime_db.close_db(),
+            setattr(runtime_db, "_CONN", self._saved_conn),
+            setattr(config, "TG_PROXY", self._saved_proxy),
+            shutil.rmtree(self._td, ignore_errors=True),
+        ))
+
+    def test_daily_maintenance_emits_report(self):
+        import asyncio
+        calls = []
+        from tg_userbot import notify
+        async def fake(text, **kw):
+            calls.append(text); return True
+        with mock.patch.object(notify, "notify_user", side_effect=fake):
+            maintenance.daily_maintenance()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("每日维护报告", calls[0])
+        self.assertIn("备份", calls[0])
+
+    def test_backlog_signal_fires_at_threshold(self):
+        from tg_userbot import health
+        snap = {"download": {"counts": {"RETRY": 60}}, "extract": {},
+                "pawchive": {}, "listener": {}, "wnacg": {}, "asmr": {}}
+        sigs = health.decide_stall_signals(snap)
+        self.assertTrue(any(s["key"] == "backlog" for s in sigs))
+        snap["download"]["counts"]["RETRY"] = 10
+        sigs = health.decide_stall_signals(snap)
+        self.assertFalse(any(s["key"] == "backlog" for s in sigs))
