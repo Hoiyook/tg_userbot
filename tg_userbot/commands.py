@@ -263,7 +263,9 @@ def _help_text():
         "/chrome_start｜/chrome_stop｜/chrome_status\n"
         "/chrome_tasks；/chrome_cancel 序号\n"
         "\n"
-        "\n【pixeldrain】\n"
+        "\n【Gumroad】\n"
+        "/gum <链接> [目录] —— 购买内容批量下载（重跑即续传）\n"
+        "/gumst [目录] —— 各任务进度；/gumjobs —— 任务列表\n"
         "/pd <链接> [目录] —— 中转下载（列表/单文件均可，重跑即续传）\n"
         "/pdst [tag] —— 各任务进度\n"
         "/pdst [tag] —— 各任务进度；/pdjobs —— 任务列表\n"
@@ -739,7 +741,8 @@ async def _handle_command_inner(event, cmd_text):
         return True
 
     if cmd_text.lower().startswith("/dyu"):
-        logger.info(f"执行命令：/dyu {cmd_text[:60]}")
+        # cmd_text 已含 /dyu 前缀（parse_dyu_command 内部剥）——日志别重复拼
+        logger.info(f"执行命令：{cmd_text[:60]}")
         url_arg, subdir_arg, since_arg, include_fwd = (
             douyin_batch.parse_dyu_command(cmd_text))
         if url_arg is None:
@@ -1183,6 +1186,13 @@ async def _handle_command_inner(event, cmd_text):
         # B站视频下载（yt-dlp + bilibili cookie；后台 task + 通知）
         logger.info(f"执行命令：{cmd_text[:40]}")
         await _reply(event, await bili_dl.command_reply(cmd_text))
+        return True
+
+    from . import gum_dl
+    if gum_dl.is_gum_command(cmd_text):
+        # Gumroad 下载（gum.sh 桥接：/gum /gumst）
+        logger.info(f"执行命令：{cmd_text[:40]}")
+        await _reply(event, await gum_dl.command_reply(cmd_text))
         return True
 
     from . import pd_dl

@@ -9,10 +9,15 @@ Telethon>=1.45.0
 
 # ── HTTP 客户端 ──
 aiohttp>=3.14          # api_server（dashboard / PWA）
-# 站点抓取（ehentai/wnacg/asmr 等）。>=0.26 才有 proxy= 单数参数
-# （0.25 会 TypeError）；[socks] 是 SOCKS 代理（socksio）必需——wnacg
-# 走 tg_proxy=socks5 抓下载页，缺它报 ImportError
-httpx[socks]>=0.28
+# 站点抓取（ehentai/wnacg/asmr 等）+ f2 的 HTTP 底座。
+# **版本被 f2 夹住**：f2 0.0.1.7 精确要求 httpx==0.27.2。0.27 是唯一
+# 同时支持两侧写法的版本——我们的代码用 proxy=（单数，0.26+ 新签名，
+# wnacg/ehentai 依赖），f2 内部用 proxies=（复数，0.28 已移除）。
+# 升级任一侧都会炸另一侧：升 httpx 0.28 → f2 报 "AsyncClient.init()
+# got an unexpected keyword argument 'proxies'"（2026-11-11 生产实测）；
+# 降 0.25 → wnacg/ehentai 报同名 TypeError。改版本前先确认 f2 的 pin。
+# [socks] 是 SOCKS 代理（socksio）必需——wnacg 走 socks5 抓下载页。
+httpx[socks]==0.27.2
 requests>=2.32         # pixiv_oauth.py 刷新 token 子进程
 websockets>=17.0       # chrome_agent 的 CDP WebSocket 客户端
 
@@ -20,7 +25,13 @@ websockets>=17.0       # chrome_agent 的 CDP WebSocket 客户端
 browser-cookie3>=0.19  # 浏览器 cookie 导出（douyin/bilibili/x）
 
 # ── 站点解析 / 下载器（部分以子进程调用 venv 可执行文件）──
-f2>=0.0.1.5            # 抖音解析（douyin_batch 兜底路）
+# 抖音解析。**必须 --no-deps 安装**：f2 0.0.1.7 的 METADATA 精确锁死
+# 十余个与它无关的包（protobuf==5.28.3 会让 clouddrive_pb2 的 gencode
+# 6.31 报 VersionError；pytest 8 / pytest-asyncio 0.25 换掉测试基座；
+# browser-cookie3 0.20 等），直接 pip install 会搅乱整个 venv。
+# 正确装法：pip install --no-deps f2==0.0.1.7，其余按本文件显式装。
+# 选 0.0.1.7 而非 0.0.1.5：后者对抖音 Argus 风控会 403（0.0.1.7 实测可枚举）。
+f2==0.0.1.7
 gallery-dl>=1.32       # x_dl / pixiv_dl 子进程（.venv/bin/gallery-dl）
 yt-dlp>=2025.10.14     # bili_dl 子进程；版本追新，升级后跑 test_bili_dl
 
