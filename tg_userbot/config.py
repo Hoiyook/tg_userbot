@@ -984,6 +984,7 @@ REGISTERED_COMMAND_NAMES = frozenset({name for name in (
     "dedup",
     "caption_filter", "listen", "wl", "sql", "sqlt", "paw", "origin",
     "clean", "clearmsg", "setcleartime", "done", "thread", "folder",
+    "donenotify",
     "logpath", "links", "help", "start", "cd2ck", "cmdhis",
     "usage", "help2", "restart", "inspect", "memo",
     "botclean", "cd2check", "cd2tasks", "manual", "115x", "115dup",

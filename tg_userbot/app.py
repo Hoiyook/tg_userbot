@@ -37,6 +37,7 @@ from . import commands
 from . import caption_filter
 from . import chrome_client
 from . import dedup
+from . import done_notify
 from . import listener
 from . import listener_worker
 from . import wl_scan
@@ -1630,6 +1631,7 @@ async def main():
     state.client = create_client()
     state.bot_client = None
     thread.load_thread_config()
+    done_notify.load_config()
     dedup.load_dedup_config()
     caption_filter.load_caption_filter_config()
     listener.load_listen_config()

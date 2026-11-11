@@ -465,7 +465,8 @@ def result_text(task):
         f"状态：FAILED\n"
         f"URL：{task.get('url')}\n"
         f"错误：{task.get('error') or '(未知)'}\n"
-        f"尝试次数：{attempts}"
+        f"尝试次数：{attempts}\n"
+        f"🔁 重试：/chrome_retry {tid}"
     )
 
 

@@ -20,6 +20,7 @@ from . import text
 from . import queue
 from . import thread
 from . import dedup
+from . import done_notify
 from . import whitelist
 from . import cleanup
 from . import stats
@@ -233,6 +234,7 @@ def _help_text():
         "评论『/子目录#标注』（前后5秒）= 落子目录并加标注\n"
         "抖音/IG 链接发收藏夹 = 自动转解析 bot 下载\n"
         "/dedup [off]；/thread [3-20] —— 去重/并发\n"
+        "/donenotify [on|off] —— 完成即时通知（默认关）\n"
         "\n"
         "【外链台账】\n"
         "发『链接 备注』即登记（自动查重）；/links [关键词] 清单/搜索\n"
@@ -262,6 +264,7 @@ def _help_text():
         "/chrome [子目录/][#标注] URL —— 直链下载，网盘页可见打开\n"
         "/chrome_start｜/chrome_stop｜/chrome_status\n"
         "/chrome_tasks；/chrome_cancel 序号\n"
+        "/chrome_failed —— 最近失败任务；/chrome_retry 序号 —— 重试\n"
         "\n"
         "\n【Gumroad】\n"
         "/gum <链接> [目录] —— 购买内容批量下载（重跑即续传）\n"
@@ -487,6 +490,11 @@ async def _handle_command_inner(event, cmd_text):
         arg = parts[1].strip().lower()
         await _reply(event, dedup.set_enabled(arg == "on"))
         logger.info(f"执行命令：/dedup {arg}")
+        return True
+
+    if done_notify.is_command(cmd_text):
+        await _reply(event, done_notify.handle(cmd_text))
+        logger.info("执行命令：/donenotify")
         return True
 
     parsed_wl = whitelist.parse_wl_command(cmd_text)

@@ -813,6 +813,13 @@ async def execute_queued_task(record):
                         if r.get("id") != record["id"]
                     ]
                 _save_after_mutation(record, "delete")
+                # 完成即时通知（/donenotify 开关，默认关）：开关在
+                # done_notify.notify_success 内部自判，关 = no-op
+                try:
+                    from . import done_notify
+                    await done_notify.notify_success(record)
+                except Exception as _dn_e:
+                    logger.warning(f"完成通知失败（忽略）：{_dn_e}")
                 state.DOWNLOAD_PROGRESS_SEEN.pop(record["id"], None)
             else:
                 # 终结性失败（2026-09-30，Evanescia 案例）：download_file 判定

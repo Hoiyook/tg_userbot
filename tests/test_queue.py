@@ -1155,3 +1155,78 @@ class RetryViewButtonsTest(unittest.TestCase):
         seg = src.split('is_retry_command')[1][:1600] if 'is_retry_command' in src else \
             inspect.getsource(commands._handle_command_inner).split('is_retry_command')[1][:1600]
         self.assertIn("format_retry_view", seg)
+
+
+class DoneNotifyTest(unittest.TestCase):
+    """/donenotify 完成通知开关（2026-11-12 ops-hardening R5）：
+    默认关（收藏夹降噪），开了后主队列 SUCCESS 推精简通知。"""
+
+    def setUp(self):
+        import asyncio, shutil, tempfile
+        from tg_userbot import done_notify, runtime_db, state
+        self._td = tempfile.mkdtemp(prefix="dn_test_")
+        self._saved_conn = runtime_db._CONN
+        runtime_db._CONN = None
+        runtime_db.init_db(os.path.join(self._td, "tg.db"))
+        self._saved_lock = state.QUEUE_LOCK
+        state.QUEUE_LOCK = asyncio.Lock()
+        self._saved_flag = state.DONE_NOTIFY_ENABLED
+        state.DONE_NOTIFY_ENABLED = False
+        self.addCleanup(lambda: (
+            runtime_db.close_db(),
+            setattr(runtime_db, "_CONN", self._saved_conn),
+            setattr(state, "QUEUE_LOCK", self._saved_lock),
+            setattr(state, "DONE_NOTIFY_ENABLED", self._saved_flag),
+            shutil.rmtree(self._td, ignore_errors=True),
+        ))
+
+    def test_command_parse_and_toggle(self):
+        from tg_userbot import done_notify
+        self.assertTrue(done_notify.is_command("/donenotify"))
+        self.assertTrue(done_notify.is_command("/donenotify on"))
+        self.assertTrue(done_notify.is_command("/donenotify off"))
+        self.assertFalse(done_notify.is_command("/donenotifyxx"))
+        self.assertFalse(done_notify.is_command("donenotify"))
+        self.assertIn("关闭", done_notify.handle("/donenotify"))
+        self.assertIn("开启", done_notify.handle("/donenotify on"))
+        self.assertTrue(self._state_flag())
+        self.assertIn("关闭", done_notify.handle("/donenotify off"))
+        self.assertFalse(self._state_flag())
+
+    def _state_flag(self):
+        from tg_userbot import state
+        return state.DONE_NOTIFY_ENABLED
+
+    def test_persistence_roundtrip(self):
+        import os
+        from tg_userbot import done_notify, state
+        done_notify.set_enabled(True)
+        self.assertTrue(state.DONE_NOTIFY_ENABLED)
+        # 模拟重启：直接再 load
+        state.DONE_NOTIFY_ENABLED = False
+        done_notify.load_config()
+        self.assertTrue(state.DONE_NOTIFY_ENABLED,
+                        "load_config 应从 json 还原开启态")
+
+    def test_notify_success_respects_switch(self):
+        """关 = 完全不调用 notify；开 = 调用且带文件名。"""
+        import asyncio
+        from unittest import mock
+        from tg_userbot import done_notify, notify
+        rec = {"final_name": "大文件.mp4", "total_bytes": 123456,
+               "platform": "douyin"}
+        calls = []
+        async def fake_notify(text, **kw):
+            calls.append(text)
+            return True
+        with mock.patch.object(notify, "notify_user", side_effect=fake_notify):
+            # 关：no-op
+            state.DONE_NOTIFY_ENABLED = False
+            asyncio.run(done_notify.notify_success(rec))
+            self.assertEqual(calls, [])
+            # 开：推一条
+            state.DONE_NOTIFY_ENABLED = True
+            asyncio.run(done_notify.notify_success(rec))
+            self.assertEqual(len(calls), 1)
+            self.assertIn("大文件.mp4", calls[0])
+            self.assertIn("120.56 KB", calls[0])  # format_size 格式化后的值

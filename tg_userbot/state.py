@@ -72,6 +72,9 @@ WHITELIST_CHATS = {}
 # dedup.load_dedup_config() 从 dedup_config.json 还原（/dedup off|on 切换）
 DEDUP_INDEX = {}
 DEDUP_ENABLED = True
+# 下载完成即时通知开关（done_notify.py，/donenotify）：默认关（收藏夹
+# 降噪决策——SUCCESS 静默），开了后主队列每个成功推一条精简通知
+DONE_NOTIFY_ENABLED = False
 
 # Caption 清洗规则当前值（列表，顺序=用户看到的顺序）。初值是 config 里的
 # 默认规则；启动时 caption_filter.load_caption_filter_config() 从

@@ -22,6 +22,7 @@ from . import config
 from . import runtime_db
 from . import state
 from .log import logger
+from . import credentials as _credentials_mod
 
 TEXT_PREFIX = "🩺"
 _MONITOR_TASKS = set()
@@ -38,6 +39,11 @@ def _fmt_age(ts):
         return "-"
     s = max(0, int(time.time() - ts))
     return f"{s // 60}m{s % 60:02d}s" if s < 3600 else f"{s // 3600}h"
+
+
+def _credentials_health_line():
+    """凭据巡检的 /health 行文本；全好返回 None。"""
+    return _credentials_mod.health_line()
 
 
 def render_now() -> str:
@@ -263,6 +269,15 @@ def render_health() -> str:
                 f"{snap['dup_running_long']} 个 running 超 90min（疑似卡死）")
     except Exception as e:
         row("队列快照", False, str(e)[:50])
+    # 凭据健康度（2026-11-12）：字段完整性巡检的当前快照，失效才占行
+    try:
+        cred_line = _credentials_health_line()
+        if cred_line:
+            row("凭据", False, cred_line)
+        else:
+            row("凭据", True, "四站字段完整（douyin/ehentai/pawchive/bilibili）")
+    except Exception as e:
+        row("凭据", False, f"巡检失败：{str(e)[:40]}")
     lines.append("")
     lines.append("总体：" + ("🟢 健康" if ok_all else "🔴 有异常项（见上）")
                  + "｜/now 看实时在干什么")

@@ -39,8 +39,44 @@ def backup_db(out_dir, keep=BACKUP_KEEP, now=None):
     finally:
         src.close()
     _rotate(out_dir, keep)
-    logger.info(f"🗄 Runtime DB 已备份 → {target}")
+    ok, detail = verify_backup(target)
+    if not ok:
+        # 备份坏了必须高声——备份的"在"不等于"能恢复"，静默坏备份比
+        # 没有备份更危险（给人虚假的安全感）
+        logger.error(f"🗄 备份完整性验证失败：{target} — {detail}")
+    logger.info(f"🗄 Runtime DB 已备份 → {target}（验证 {'✅' if ok else '❌ ' + detail}）")
     return target
+
+
+def verify_backup(path):
+    """备份可恢复性验证（2026-11-12）：integrity_check + 关键表行数抽样。
+
+    "备份文件存在"不等于"能恢复"——磁盘满时 backup API 可能留下截断
+    文件。这里对备份副本独立开连接：quick_check 通过 + 5 张核心表都
+    SELECT 得出行数，才算验证过。返回 (ok, detail)。"""
+    try:
+        # immutable=1：纯只读打开，不产生 -shm/-wal 旁文件（此前验证一次
+        # 就在备份目录留一对残片——2026-11-10 发现的孤儿残片同源问题）
+        conn = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+        try:
+            rc = conn.execute("PRAGMA quick_check").fetchone()[0]
+            if rc != "ok":
+                return False, f"quick_check: {rc}"
+            counts = {}
+            for table in ("listener_tasks", "download_events",
+                          "wnacg_tasks", "pawchive_posts", "schema_meta"):
+                counts[table] = conn.execute(
+                    f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            size = os.path.getsize(path)
+            if size < 4096:
+                return False, f"文件过小（{size}B），疑似截断"
+            return True, (f"表行数 listener={counts['listener_tasks']} "
+                          f"events={counts['download_events']} "
+                          f"pawchive={counts['pawchive_posts']}")
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        return False, f"{type(e).__name__}: {str(e)[:80]}"
 
 
 def _rotate(out_dir, keep):
@@ -105,3 +141,16 @@ def daily_maintenance():
                         f"（SUCCESS/DISMISSED 保留 {LISTENER_DONE_RETENTION_DAYS} 天）")
     except sqlite3.Error as e:
         logger.warning(f"🗄 监听任务终态清理失败：{e}")
+    # 凭据健康度巡检（2026-11-12）：零联网字段完整性检查，新失效才告警。
+    # 挂最后——它有自己的 try 兜底，绝不影响前面任何清理动作。
+    try:
+        from . import credentials, notify as _notify_mod
+        results, alert = credentials.daily_check_and_alert(
+            notify_coro=_notify_mod.notify_user)
+        bad = [r for r in results if not r["ok"]]
+        if bad:
+            logger.warning(f"🔑 凭据巡检：{len(bad)} 站失效（已告警）")
+        else:
+            logger.info("🔑 凭据巡检：全部正常")
+    except Exception as e:
+        logger.warning(f"🔑 凭据巡检失败（不影响维护）：{e}")
