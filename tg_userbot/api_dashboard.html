@@ -913,7 +913,7 @@ async function pdClean() {
     setFb("pdfb", !!r.ok, r.ok ? "🧹 已清理" : ("❌ " + (r.error || "失败")));
   } catch (e) { setFb("pdfb", false, "❌ " + e); }
 }
-async async function loadGum() {
+async function loadGum() {
   const el = document.getElementById("gumJobs");
   try {
     const r = await api("/api/gum/status?dest=" + encodeURIComponent(document.getElementById("gumDest").value || ""));
@@ -931,7 +931,7 @@ async function gumStart() {
     loadGum();
   } catch (e) { setFb("gumfb", false, "❌ " + e); }
 }
-function loadCmds() {
+async function loadCmds() {
   try {
     const d = await api("/api/commands");
     if (!d.ok) { document.getElementById("cmdGroups").textContent = d.error; return; }
@@ -1382,10 +1382,32 @@ function _qdSec(title, icon, items, renderExtra) {
     const err = it.error
       ? '<div class="dt" style="color:var(--amber)">' + esc(it.error) + '</div>'
       : "";
+    // 操作按钮（2026-11-12）：hint 形如 "/cmd arg｜/cmd2 arg"，按 | 拆
+    // 成多个可点 chip（经 /api/cmd 白名单管道执行，与指令中心同语义）
+    const ops = it.hint
+      ? '<div class="chips" style="margin-top:4px">' +
+        it.hint.split("｜").map(c =>
+          '<span class="chip mini" onclick="runCmdDirect(\'' +
+          esc(c.trim()).replace(/'/g, "\'") + '\')">⚡ ' + esc(c.trim()) +
+          '</span>').join("") + '</div>'
+      : "";
     return '<div class="qrow"><div class="info"><div class="nm wrap">' +
       esc(it.label) + '</div><div class="dt">' + bits.join(" · ") +
-      '</div>' + err + (renderExtra ? renderExtra(it) : "") + '</div></div>';
+      '</div>' + err + ops + (renderExtra ? renderExtra(it) : "") +
+      '</div></div>';
   }).join("");
+}
+
+function _qdApply(d) {
+  const el = document.getElementById("qdDetail");
+  if (!el) return;
+  if (!d.ok) {
+    el.style.opacity = "1";
+    el.innerHTML = '<div class="note">❌ ' + esc(d.error || "读取失败") + '</div>';
+    return;
+  }
+  _qdCache[d.domain || _qdDomain] = d;
+  _qdRender(d);
 }
 
 function _qdRender(d) {
@@ -1406,17 +1428,18 @@ async function loadQueueDetail(force) {
   const el = document.getElementById("qdDetail");
   if (!el) return;
   const seq = ++_qdSeq;
+  // SSE/batch 里已有当前渠道的数据 → 直接用（零请求，2s 实时）；只有
+  // 首次访问非 media 渠道时才发独立请求（batch 只预取 media）
+  if (!force) {
+    const cached = _BATCH["/api/queue_detail?domain=" +
+      encodeURIComponent(_qdDomain)];
+    if (cached && cached.ok) { _qdApply(cached); return; }
+  }
   try {
     const d = await api("/api/queue_detail?domain=" +
       encodeURIComponent(_qdDomain) + (force ? "&_=" + Date.now() : ""));
     if (seq !== _qdSeq) return;   // 已切到别的渠道：丢弃过期响应
-    if (!d.ok) {
-      el.style.opacity = "1";
-      el.innerHTML = '<div class="note">❌ ' + esc(d.error || "读取失败") + '</div>';
-      return;
-    }
-    _qdCache[_qdDomain] = d;
-    _qdRender(d);
+    _qdApply(d);
   } catch (e) {
     // 网络失败也要恢复可读状态（但若已切走则不动新选中渠道的视图）
     if (seq === _qdSeq && el) el.style.opacity = "1";

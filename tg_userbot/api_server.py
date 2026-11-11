@@ -1073,6 +1073,7 @@ _BATCH_HANDLERS = {
     "/api/submissions": lambda r: handle_pastes(r),
     "/api/links": lambda r: handle_links(r),
     "/api/commands": lambda r: handle_commands_registry(r),
+    "/api/queue_detail": lambda r: handle_queue_detail(r),
 }
 
 
@@ -1092,7 +1093,8 @@ async def handle_sse(request):
     try:
         while True:
             data = {"ok": True, "data": await _batch_data(
-                ["/api/status", "/api/queues", "/api/chrome", "/api/backup",
+                ["/api/status", "/api/queues", "/api/queue_detail",
+                 "/api/chrome", "/api/backup",
                  "/api/pd/jobs", "/api/paw_backfill", "/api/paw_schedule",
                  "/api/history?n=30", "/api/submissions?n=30", "/api/links",
                  "/api/commands"])}
@@ -1437,11 +1439,11 @@ _QD_DONE_LIMIT = 15
 
 
 def _qd_item(label=None, sub=None, attempts=None, error=None, when=None,
-             next_in=None):
+             next_in=None, hint=None):
     return {"label": str(label or "?")[:60], "sub": sub,
             "attempts": attempts,
             "error": (str(error)[:120] if error else None),
-            "when": when, "next_in": next_in}
+            "when": when, "next_in": next_in, "hint": hint}
 
 
 def _qd_when(ts):
@@ -1460,20 +1462,28 @@ def _qd_payload_label(payload):
         return None
 
 
-def _qd_taskdomain(domain, label_key):
+def _qd_taskdomain(domain, label_key, retry_cmd=None, del_cmd=None):
     """TaskDomain 三兄弟（bili/x/pixiv）通用：list 全量按 status 分桶。
 
-    list 按 id 升序（老→新）→ done 取尾部（最新完成的在最后）。"""
+    list 按 id 升序（老→新）→ done 取尾部（最新完成的在最后）。
+    retry_cmd/del_cmd：失败条目的操作命令模板（{key} 占位）——站点侧
+    没有重试命令（x/pixiv）就传 None 不出按钮。"""
     out = {"running": [], "pending": [], "failed": [], "done": []}
     for status, bucket in (("PROCESSING", "running"), ("PENDING", "pending"),
                            ("FAILED", "failed")):
         for r in domain.list(status=status, limit=_QD_LIMIT, desc=True):
+            hint = None
+            if bucket == "failed" and retry_cmd:
+                hint = (retry_cmd.format(key=r.get("id"))
+                        + (f"｜{del_cmd.format(key=r.get('id'))}"
+                           if del_cmd else ""))
             out[bucket].append(_qd_item(
                 r.get("label") or r.get("url") or r.get("target"),
                 attempts=r.get("attempts"),
                 error=r.get("error"),
                 next_in=(max(0, int(r["next_retry_at"] - time.time()))
-                         if r.get("next_retry_at") else None)))
+                         if r.get("next_retry_at") else None),
+                hint=hint))
     done_rows = domain.list(status="DONE", limit=_QD_DONE_LIMIT, desc=True)
     for r in done_rows:
         out["done"].append(_qd_item(
@@ -1527,11 +1537,14 @@ async def _qd_wnacg():
                            ("FAILED", "failed")):
         for r in runtime_db.list_wnacg_tasks(status=status, limit=_QD_LIMIT,
                                              desc=True):
+            hint = (f"/wnacg retry {r['aid']}｜/wnacg del {r['aid']}"
+                    if bucket == "failed" else None)
             out[bucket].append(_qd_item(
                 r.get("title") or f"aid {r.get('aid')}",
                 attempts=r.get("attempts"), error=r.get("error"),
                 next_in=(max(0, int(r["next_retry_at"] - time.time()))
-                         if r.get("next_retry_at") else None)))
+                         if r.get("next_retry_at") else None),
+                hint=hint))
     done_rows = runtime_db.list_wnacg_tasks(status="DONE",
                                             limit=_QD_DONE_LIMIT, desc=True)
     for r in done_rows:
@@ -1548,11 +1561,14 @@ async def _qd_asmr():
                            ("FAILED", "failed")):
         for r in runtime_db.list_asmr_tasks(status=status, limit=_QD_LIMIT,
                                             desc=True):
+            hint = (f"/asmr retry {r['rj']}｜/asmr del {r['rj']}"
+                    if bucket == "failed" else None)
             out[bucket].append(_qd_item(
                 r.get("title") or f"RJ {r.get('rj')}",
                 attempts=r.get("attempts"), error=r.get("error"),
                 next_in=(max(0, int(r["next_retry_at"] - time.time()))
-                         if r.get("next_retry_at") else None)))
+                         if r.get("next_retry_at") else None),
+                hint=hint))
     done_rows = runtime_db.list_asmr_tasks(status="DONE",
                                            limit=_QD_DONE_LIMIT, desc=True)
     for r in done_rows:
@@ -1617,11 +1633,15 @@ async def _qd_listener():
                    if bucket != "running" else
                    f"#{t['id']} 第 {t.get('attempts', 0)} 次"
                    + ("·对账补建中" if status == "FORWARDED" else ""))
+            hint = (f"/listen_retry {t['id']}｜"
+                    f"/listen_failed del {t['id']}"
+                    if bucket == "failed" else None)
             out[bucket].append(_qd_item(
                 f"#{t['id']} {_task_label_of(t)}", sub=sub,
                 attempts=t.get("attempts"), error=t.get("last_error"),
                 next_in=(max(0, int(t["next_retry_at"] - time.time()))
-                         if t.get("next_retry_at") else None)))
+                         if t.get("next_retry_at") else None),
+                hint=hint))
     done_rows = runtime_db.list_listener_tasks(status="SUCCESS",
                                                limit=_QD_DONE_LIMIT, desc=True)
     for t in done_rows:
@@ -1643,10 +1663,12 @@ async def _qd_chrome():
         bucket = buckets.get(str(t.get("status")).upper())
         if bucket is None:
             continue
+        hint = (f"/chrome_retry {str(t.get('task_id') or '')[:8]}"
+                if bucket == "failed" else None)
         item = _qd_item(t.get("filename") or t.get("url"),
                         sub=(str(t.get("status")) if bucket == "pending"
                              else None),
-                        error=t.get("error"))
+                        error=t.get("error"), hint=hint)
         if bucket == "done":
             item["when"] = _qd_when(t.get("updated_at"))
         if len(out[bucket]) >= _QD_LIMIT:
@@ -1694,7 +1716,8 @@ async def handle_queue_detail(request):
 
 
 async def _qd_bili():
-    return _qd_taskdomain(_td_bili(), "url")
+    return _qd_taskdomain(_td_bili(), "url", "/bili retry {key}",
+                          "/bili del {key}")
 
 
 async def _qd_x():
