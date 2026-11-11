@@ -77,6 +77,8 @@ BOT_COMMANDS = (
     ("pd", "pixeldrain 下载：/pd <链接> [目录]；裸命令看任务"),
     ("pdst", "pixeldrain 进度：/pdst [tag]；裸命令看全部"),
     ("pdclean", "pixeldrain 清理云端中转：/pdclean <链接>"),
+    ("gum", "Gumroad 下载：/gum <链接> [目录]；裸命令看任务"),
+    ("gumst", "Gumroad 进度：/gumst [目录]"),
     ("dyu", "抖音作者批量：/dyu <主页链接> [子目录]"),
     ("pixiv", "Pixiv 画师下载：/pixiv <ID|用户名>；裸命令看已跟列表"),
     ("manual", "下载链路操作指引文档"),

@@ -4442,7 +4442,7 @@ class MemoCommandTest(unittest.TestCase):
                      "extract_worker": "115x", "douyin_batch": "dyu",
                      "shell": "sh", "dup_scan": "115dup", "ops_report": "report", "inventory": "115inv",
                      "x_dl": "x", "pixiv_dl": "pixiv", "asmr_dl": "asmr",
-                     "bili_dl": "bili", "pd_dl": "pd"}
+                     "bili_dl": "bili", "pd_dl": "pd", "gum_dl": "gum"}
         # /cd2check 写在 botclean 分支体内（共享 is_botclean_command 入口），
         # 其日志行会被 botclean 家族覆盖
         panel = {name for name, _ in b.BOT_COMMANDS}
@@ -4461,7 +4461,8 @@ class MemoCommandTest(unittest.TestCase):
                     if any(name == f or name.startswith(f + "_")
                            for f in families)}
         missing = panel - handled - {"help", "start", "paw",
-                                        "pdst", "pdclean"}
+                                        "pdst", "pdclean",
+                                        "gumst", "gumjobs"}
         # paw 家族在 pawchive.command_reply 分发、help/start 有专门分支
         self.assertEqual(missing, set(),
                          f"面板命令无 dispatch: {sorted(missing)}")

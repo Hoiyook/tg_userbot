@@ -2068,6 +2068,31 @@ _GROUP_ORDER = ("📊 监控与查询", "📺 平台下载", "📥 下载与队�
                 "☁️ CD2 与 115")
 
 
+async def handle_gum_status(request):
+    """Gumroad 进度：?dest= 目录。"""
+    from . import gum_dl
+    dest = request.query.get("dest") or ""
+    return _json({"ok": True, "status": gum_dl.status_text(dest)})
+
+
+async def handle_gum_start(request):
+    """启动 Gumroad 下载：body {"link": "...", "dest": "可选"}。"""
+    from . import gum_dl
+    try:
+        body = await request.json()
+    except Exception:
+        return _json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+    link = str(body.get("link") or "").strip()
+    if not link:
+        return _json({"ok": False, "error": "缺少 link"}, 400)
+    dest = str(body.get("dest") or "").strip()
+    try:
+        reply = await gum_dl.command_reply(f"/gum {link} {dest}".strip())
+        return _json({"ok": True, "message": reply})
+    except Exception as e:
+        return _json({"ok": False, "error": str(e)[:150]})
+
+
 async def handle_pd_status(request):
     """pixeldrain 进度：?tag= 单任务；缺省全部任务。薄封装 pd_daemon。"""
     from . import pd_dl
@@ -2219,6 +2244,8 @@ def make_app() -> web.Application:
         web.post("/api/links_done", handle_links_done),
         web.get("/api/commands", handle_commands_registry),
         web.get("/api/pd/status", handle_pd_status),
+        web.get("/api/gum/status", handle_gum_status),
+        web.post("/api/gum/start", handle_gum_start),
         web.get("/api/pd/jobs", handle_pd_jobs),
         web.post("/api/pd/start", handle_pd_start),
         web.post("/api/pd/clean", handle_pd_clean),

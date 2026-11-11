@@ -313,6 +313,24 @@
   </section>
 
   <!-- ── 指令中心 ──────────────────────── -->
+  <section class="page" id="p-gum">
+    <h2>📦 Gumroad 购买内容下载</h2>
+    <div class="card">
+      <div class="row">
+        <input type="text" id="gumLink" placeholder="https://gumroad.com/d/xxxx?...">
+        <button onclick="gumStart()">开始</button>
+      </div>
+      <div class="fb" id="gumfb">粘贴购买下载链接点「开始」；重复开始同一链接是幂等的（自动续传）。</div>
+      <div class="row" style="margin-top:8px">
+        <input type="text" id="gumDest" placeholder="/Volumes/V1/gumroad/xxxx（可选，默认自动）">
+        <button onclick="loadGum()">刷新任务</button>
+      </div>
+    </div>
+    <div id="gumJobs">加载中…</div>
+    <div class="note">下载管线 = gum.sh（解析产品页 → 逐文件 curl → 尺寸校验 → .ok）。
+      完成后文件直接可在共享目录播放。</div>
+  </section>
+
   <section class="page" id="p-pd">
     <h2>🛰 pixeldrain 直链下载</h2>
     <div class="card">
@@ -422,6 +440,7 @@
   <div data-p="p-find"><span class="e">🔍</span>发现</div>
   <div data-p="p-ledger"><span class="e">📈</span>台账</div>
   <div data-p="p-paw"><span class="e">🐾</span>回填</div>
+  <div data-p="p-gum"><span class="e">📦</span>Gumroad</div>
   <div data-p="p-pd"><span class="e">🛰</span>直链</div>
   <div data-p="p-cmds"><span class="e">⌨</span>指令</div>
   <div data-p="p-set"><span class="e">⚙️</span>设置</div>
@@ -894,7 +913,25 @@ async function pdClean() {
     setFb("pdfb", !!r.ok, r.ok ? "🧹 已清理" : ("❌ " + (r.error || "失败")));
   } catch (e) { setFb("pdfb", false, "❌ " + e); }
 }
-async function loadCmds() {
+async async function loadGum() {
+  const el = document.getElementById("gumJobs");
+  try {
+    const r = await api("/api/gum/status?dest=" + encodeURIComponent(document.getElementById("gumDest").value || ""));
+    el.innerHTML = '<pre class="mono">' + esc(r.status || "?") + '</pre>';
+  } catch (e) { el.innerHTML = '<div class="note">❌ ' + esc(String(e)) + '</div>'; }
+}
+async function gumStart() {
+  const link = document.getElementById("gumLink").value.trim();
+  const dest = document.getElementById("gumDest").value.trim();
+  const fb = document.getElementById("gumfb");
+  if (!link) { setFb("gumfb", false, "先粘贴 Gumroad 链接"); return; }
+  try {
+    const r = await api("/api/gum/start", { method: "POST", body: JSON.stringify({ link, dest: dest || undefined }) });
+    setFb("gumfb", !!r.ok, r.ok ? "🚀 已开始" : "❌ " + (r.error || "失败"));
+    loadGum();
+  } catch (e) { setFb("gumfb", false, "❌ " + e); }
+}
+function loadCmds() {
   try {
     const d = await api("/api/commands");
     if (!d.ok) { document.getElementById("cmdGroups").textContent = d.error; return; }
@@ -945,6 +982,7 @@ document.querySelectorAll("nav div").forEach(t => t.onclick = () => {
   else refresh();   // 切页即刷新徽标状态
   if (t.dataset.p === "p-find") { loadPastes(); loadLinks(); }
   if (t.dataset.p === "p-cmds") loadCmds();
+  if (t.dataset.p === "p-gum") loadGum();
   if (t.dataset.p === "p-pd") loadPD();
   if (t.dataset.p === "p-paw") loadPawSchedule();
   window.scrollTo(0, 0);

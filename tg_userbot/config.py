@@ -989,6 +989,7 @@ REGISTERED_COMMAND_NAMES = frozenset({name for name in (
     "botclean", "cd2check", "cd2tasks", "manual", "115x", "115dup",
     "report", "115inv", "x", "dyu", "pixiv", "asmr", "bili",
     "pd", "pdst", "pdjobs", "pdclean",
+    "gum", "gumst", "gumjobs",
     "chrome", "chrome_start", "chrome_stop", "chrome_status",
     "chrome_tasks", "chrome_cancel",
     # /paw 子命令标准形
