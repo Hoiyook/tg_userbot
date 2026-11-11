@@ -1755,3 +1755,66 @@ class ProgressFileTest(unittest.TestCase):
             "g3", "f3", {}, task_id="T3", now=20.0))
         data = json.load(open(config.CHROME_PROGRESS_FILE, encoding="utf-8"))
         self.assertIsNone(data["items"][0]["received"])
+
+
+class ChromeRetryCommandTest(unittest.TestCase):
+    """/chrome_failed + /chrome_retry：FAILED 任务可见 + 一键重试闭环
+    （2026-11-12。此前失败任务只能翻看板，重试要手敲完整 URL 重新提交）。"""
+
+    def setUp(self):
+        import time as _t
+        self.tasks = [
+            {"task_id": "aaaa1111" + "0" * 24, "status": "FAILED",
+             "url": "https://example.com/a", "filename": "a.mp4",
+             "error": "CDP timeout", "updated_at": _t.time()},
+            {"task_id": "bbbb2222" + "0" * 24, "status": "FAILED",
+             "url": "https://example.com/b", "filename": "b.zip",
+             "error": "net::ERR_ABORTED", "updated_at": _t.time() - 100},
+            {"task_id": "cccc3333" + "0" * 24, "status": "SUCCESS",
+             "url": "https://example.com/c", "filename": "c.mp4"},
+            {"task_id": "dddd4444" + "0" * 24, "status": "RUNNING",
+             "url": "https://example.com/d"},
+        ]
+
+    def test_failed_tasks_lists_only_failed_newest_first(self):
+        from tg_userbot import chrome_client
+        items = chrome_client.failed_tasks(self.tasks)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["task_id"], "aaaa1111" + "0" * 24,
+                         "新失败的在前")
+
+    def test_failed_text_contains_reason_and_hint(self):
+        from tg_userbot import chrome_client
+        text = chrome_client.failed_text(self.tasks)
+        self.assertIn("a.mp4", text)
+        self.assertIn("CDP timeout", text)
+        self.assertIn("/chrome_retry", text)
+
+    def test_failed_text_empty(self):
+        from tg_userbot import chrome_client
+        self.assertIn("没有失败", chrome_client.failed_text([]))
+
+    def test_retry_resolves_by_index_and_id(self):
+        from tg_userbot import chrome_client
+        t, err = chrome_client.resolve_retry_target(self.tasks, "1")
+        self.assertIsNone(err)
+        self.assertEqual(t["task_id"], "aaaa1111" + "0" * 24)
+        t2, err2 = chrome_client.resolve_retry_target(
+            self.tasks, "bbbb22")
+        self.assertIsNone(err2)
+        self.assertEqual(t2["filename"], "b.zip")
+        # 越界 / 无效 / 无失败
+        _, e3 = chrome_client.resolve_retry_target(self.tasks, "9")
+        self.assertIn("无效", e3)
+        _, e4 = chrome_client.resolve_retry_target(self.tasks, "ff9999")
+        self.assertIn("没有失败任务", e4)
+        _, e5b = chrome_client.resolve_retry_target(self.tasks, "非hex")
+        self.assertIn("用法", e5b)
+        _, e5 = chrome_client.resolve_retry_target([], "1")
+        self.assertIn("没有失败", e5)
+
+    def test_retry_command_regex_matches(self):
+        from tg_userbot import chrome_client
+        for cmd in ("/chrome_failed", "/chrome_retry 1",
+                    "/chrome_retry bbbb22", "/CHROME_RETRY 2"):
+            self.assertTrue(chrome_client._CHROME_CMD_RE.fullmatch(cmd), cmd)

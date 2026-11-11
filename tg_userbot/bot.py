@@ -111,6 +111,8 @@ BOT_COMMANDS = (
     ("chrome_status", "查看 Chrome Agent 状态"),
     ("chrome_tasks", "查看可取消的 Chrome 任务"),
     ("chrome_cancel", "取消 Chrome 任务：/chrome_cancel <序号>"),
+    ("chrome_failed", "Chrome 最近失败任务明细"),
+    ("chrome_retry", "重试 Chrome 失败任务：/chrome_retry <序号>"),
     ("chrome", "用 Chrome 下载：/chrome <URL>"),
     ("paw", "Pawchive：状态总览（失败画像/扫描进度）"),
     ("paw_plan", "Pawchive 扫描作者入队：/paw_plan 作者 [all]"),

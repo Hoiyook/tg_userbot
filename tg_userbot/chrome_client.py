@@ -53,7 +53,8 @@ CANCEL_KEEP_ENTRIES = 200
 _TASK_ID_TOKEN_RE = re.compile(r"[0-9a-fA-F]{6,32}")
 
 _CHROME_CMD_RE = re.compile(
-    r"^/(chrome_tasks|chrome_cancel|chrome_start|chrome_stop|chrome_status|chrome)"
+    r"^/(chrome_tasks|chrome_cancel|chrome_failed|chrome_retry|chrome_start"
+    r"|chrome_stop|chrome_status|chrome)"
     r"(?:\s+(\S+))?(?:\s+(\S+))?\s*$",
     re.IGNORECASE,
 )
@@ -282,6 +283,103 @@ def cancel_usage_text():
     return ("❌ 用法：/chrome_cancel <序号>\n\n"
             "先发送 /chrome_tasks 查看任务列表。\n"
             "也可以直接给任务 ID：/chrome_cancel a1b2c3d4（不受列表变动影响）。")
+
+
+def failed_tasks(tasks, limit=15):
+    """FAILED 任务（按 updated_at 新→旧），/chrome_failed 与 /chrome_retry
+    共用列表——序号寻址两边必须出自同一函数（与 cancelable_tasks 同款
+    纪律）。updated_at 缺失的任务排最后（保持稳定）。"""
+    failed = [t for t in tasks
+              if str(t.get("status")).upper() == "FAILED"]
+    failed.sort(key=lambda t: -(float(t.get("updated_at") or 0)))
+    return failed[:limit]
+
+
+def failed_text(tasks):
+    """`/chrome_failed` 正文：最近失败的任务 + 原因 + 重试指引。"""
+    items = failed_tasks(tasks)
+    if not items:
+        return (f"{CHROME_TEXT_PREFIX} 最近没有失败的任务 🎉\n\n"
+                "（/chrome_tasks 看在途任务）")
+    lines = [f"{CHROME_TEXT_PREFIX} 最近失败的任务（{len(items)}）", ""]
+    for i, t in enumerate(items, 1):
+        lines.append(f"{i}. ❌ {t.get('filename') or t.get('url')}")
+        lines.append(f"   ID: {str(t.get('task_id') or '')[:8]}")
+        if t.get("error"):
+            lines.append(f"   原因：{str(t['error'])[:90]}")
+        when = t.get("updated_at")
+        if when:
+            try:
+                import time as _t
+                lines.append(f"   时间：{_t.strftime('%m-%d %H:%M', _t.localtime(float(when)))}")
+            except (TypeError, ValueError, OSError):
+                pass
+        lines.append("")
+    lines.append("重试：/chrome_retry <序号>（或 ID 前缀）——原地改回排队，"
+                 "Agent 自动重下")
+    return "\n".join(lines)
+
+
+def retry_usage_text():
+    return ("❌ 用法：/chrome_retry <序号>\n\n"
+            "先发送 /chrome_failed 查看失败任务列表。\n"
+            "也可以直接给任务 ID：/chrome_retry a1b2c3d4。")
+
+
+def resolve_retry_target(tasks, token):
+    """把 `/chrome_retry` 的参数解析成 (task, error_text)——寻址方式与
+    resolve_cancel_target 同款（序号 = /chrome_failed 列表下标；或 ID 前缀）。"""
+    text = (token or "").strip()
+    if not text:
+        return None, retry_usage_text()
+    items = failed_tasks(tasks)
+    if text.isdigit():
+        index = int(text)
+        if index < 1 or index > len(items):
+            return None, ("❌ 失败任务序号无效，请先发送 /chrome_failed。"
+                          if items else "没有失败的任务 🎉")
+        return items[index - 1], None
+    if _TASK_ID_TOKEN_RE.fullmatch(text):
+        for t in items:
+            if str(t.get("task_id") or "").startswith(text):
+                return t, None
+        return None, f"❌ 没有失败任务的 ID 以 {text} 开头。"
+    return None, retry_usage_text()
+
+
+def retry_ok_text(task):
+    return (f"{CHROME_TEXT_PREFIX} 🔁 任务已重新排队\n\n"
+            f"ID：{str(task.get('task_id') or '')[:8]}\n"
+            f"URL：{task.get('url')}\n\n"
+            "Agent 会自动领取重下（原子目录/标注保留），完成后照常通知。")
+
+
+async def _handle_retry(event, arg):
+    """`/chrome_retry <序号|ID前缀>`：FAILED → PENDING（原地重排）。
+
+    直接改 chrome_tasks.json（原子写）；Agent 在跑时无需重启——认领循环
+    每圈读文件。任务不在 FAILED 状态（已完成/在途/不存在）时如实拒绝，
+    绝不改判终态（§14：SUCCESS 不重下）。"""
+    tasks = chrome_agent.load_tasks(CHROME_TASKS_FILE)
+    task, err = resolve_retry_target(tasks, arg)
+    if err:
+        await event.reply(err)
+        return
+    if str(task.get("status")).upper() != "FAILED":
+        await event.reply(
+            f"{CHROME_TEXT_PREFIX} ℹ️ 该任务不是失败状态"
+            f"（当前 {task.get('status')}），无需重试。")
+        return
+    task["status"] = "PENDING"
+    task["attempts"] = 0
+    task["next_retry_at"] = None
+    task["error"] = None
+    task["updated_at"] = time.time()
+    chrome_agent.save_tasks(tasks, CHROME_TASKS_FILE)
+    await event.reply(retry_ok_text(task))
+    logger.info(f"执行命令：/chrome_retry（{str(task.get('task_id'))[:8]}）")
+
+
 
 
 def resolve_cancel_target(tasks, token):
@@ -853,6 +951,16 @@ async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
 
     if sub == "chrome_cancel":
         await _handle_cancel(event, arg)
+        return True
+
+    if sub == "chrome_failed":
+        await event.reply(failed_text(
+            chrome_agent.load_tasks(CHROME_TASKS_FILE)))
+        logger.info("执行命令：/chrome_failed")
+        return True
+
+    if sub == "chrome_retry":
+        await _handle_retry(event, arg)
         return True
 
     # sub == "chrome"：[目录/][#标注] <URL> 提交下载（规格 15：Agent 未运行不自动启动）
