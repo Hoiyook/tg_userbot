@@ -269,6 +269,13 @@ def render_health() -> str:
                 f"{snap['dup_running_long']} 个 running 超 90min（疑似卡死）")
     except Exception as e:
         row("队列快照", False, str(e)[:50])
+    # pawchive creators 缓存年龄（2026-11-12）：>7 天占行提示
+    try:
+        cache_line = _credentials_mod.pawchive_creators_line()
+        if cache_line:
+            row("pawchive 缓存", False, cache_line)
+    except Exception:
+        pass
     # 凭据健康度（2026-11-12）：字段完整性巡检的当前快照，失效才占行
     try:
         cred_line = _credentials_health_line()

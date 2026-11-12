@@ -129,6 +129,15 @@ def daily_check_and_alert(notify_coro=None):
     return results, None
 
 
+def pawchive_creators_line():
+    """pawchive creators 缓存年龄行（转发 pawchive 模块，避免循环导入）。"""
+    try:
+        from . import pawchive
+        return pawchive.creators_cache_health_line()
+    except Exception:
+        return None
+
+
 def health_line():
     """/health 集成行：一行汇总（全好 / 列失效站）。返回 None=无事。"""
     results = check_all()

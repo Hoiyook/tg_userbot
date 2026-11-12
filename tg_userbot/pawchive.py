@@ -119,6 +119,14 @@ def load_creators(refresh=False, max_age=None):
         if stale is not None:
             logger.warning(
                 f"🐾 creators 刷新失败，退回过期缓存（{len(stale)} 条）：{e}")
+            # 刷新失败落痕（2026-11-12）：stale-if-error 曾让缓存静默
+            # 腐烂 39 天无人知晓——记录最后成功/最后失败时间供 /health
+            try:
+                from . import runtime_db
+                runtime_db.set_schema_meta(
+                    "creators_refresh_fail_at", str(int(time.time())))
+            except Exception:
+                pass
             return stale
         raise
     os.makedirs(config.PAWCHIVE_DATA_DIR, exist_ok=True)
@@ -126,7 +134,34 @@ def load_creators(refresh=False, max_age=None):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f)
     os.replace(tmp, path)
+    try:
+        from . import runtime_db
+        runtime_db.set_schema_meta("creators_refresh_ok_at", str(int(time.time())))
+        runtime_db.set_schema_meta("creators_refresh_fail_at", "")
+    except Exception:
+        pass
     return data
+
+
+def creators_cache_health_line():
+    """/health 行：creators 缓存年龄 + 刷新失败状态；健康返回 None。"""
+    try:
+        import os as _os
+        st = _os.stat(_cache_path())
+        age_days = (time.time() - st.st_mtime) / 86400
+        if age_days < 7:
+            return None
+        return (f"creators 缓存 {age_days:.0f} 天未更新（{len(_load_quiet())} 条）"
+                "——新收录作者会「明明有却找不到」，/paw_plan 一次可触发刷新")
+    except (OSError, ValueError):
+        return None
+
+
+def _load_quiet():
+    try:
+        return load_creators(refresh=False)
+    except Exception:
+        return []
 
 
 def search_creators(term, limit=5):

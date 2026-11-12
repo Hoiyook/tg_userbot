@@ -176,6 +176,13 @@ def daily_maintenance():
     # 挂最后——它有自己的 try 兜底，绝不影响前面任何清理动作。
     cred_bad_sites = []
     try:
+        from . import pawchive as _paw
+        cl = _paw.creators_cache_health_line()
+        if cl:
+            report.append(("⚠️", cl))
+    except Exception:
+        pass
+    try:
         from . import credentials, notify as _notify_mod
         results, alert = credentials.daily_check_and_alert(
             notify_coro=_notify_mod.notify_user)

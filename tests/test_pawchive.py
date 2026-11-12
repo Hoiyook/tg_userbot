@@ -1026,3 +1026,31 @@ class RefreshOnMissTest(unittest.TestCase):
                                           allow_refresh=False,
                                           refresh_on_miss=True)
         self.assertEqual(r["kind"], "none")
+
+
+class CreatorsCacheHealthTest(unittest.TestCase):
+    """creators 缓存年龄告警（2026-11-12）：>7 天占 /health 行，
+    把 stale-if-error 的静默腐烂变可见。"""
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp(prefix="paw_cache_age_")
+        self._saved_path = pawchive._cache_path
+        self._cache = os.path.join(self._td, "creators.json")
+        pawchive._cache_path = lambda: self._cache
+        self.addCleanup(setattr, pawchive, "_cache_path", self._saved_path)
+
+    def test_fresh_cache_returns_none(self):
+        import json as _j, time as _t
+        json.dump([{"id": "1"}], open(self._cache, "w"))
+        os.utime(self._cache, (_t.time(), _t.time()))
+        self.assertIsNone(pawchive.creators_cache_health_line())
+
+    def test_stale_cache_warns_with_age(self):
+        import json as _j, time as _t
+        json.dump([{"id": "1"}, {"id": "2"}], open(self._cache, "w"))
+        old = _t.time() - 39 * 86400
+        os.utime(self._cache, (old, old))
+        line = pawchive.creators_cache_health_line()
+        self.assertIsNotNone(line)
+        self.assertIn("39 天", line)
+        self.assertIn("2 条", line)
