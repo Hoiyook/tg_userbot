@@ -288,11 +288,17 @@ def cancel_usage_text():
 def failed_tasks(tasks, limit=15):
     """FAILED 任务（按 updated_at 新→旧），/chrome_failed 与 /chrome_retry
     共用列表——序号寻址两边必须出自同一函数（与 cancelable_tasks 同款
-    纪律）。updated_at 缺失的任务排最后（保持稳定）。"""
+    纪律）。updated_at 实际是字符串时间（"2026-09-29 20:02:16"）——按
+    字符串排序即时间序（同格式零歧义）；缺失/异形的排最后。"""
     failed = [t for t in tasks
               if str(t.get("status")).upper() == "FAILED"]
-    failed.sort(key=lambda t: -(float(t.get("updated_at") or 0)))
-    return failed[:limit]
+    # 分两段：字符串时间组（正常）按时间降序（字典序=时间序），异形垫底
+    # ——混合 key 排序会 TypeError 或错序，分组处理最直白
+    normal = [t for t in failed
+              if isinstance(t.get("updated_at"), str) and t["updated_at"]]
+    other = [t for t in failed if t not in normal]
+    normal.sort(key=lambda t: t["updated_at"], reverse=True)
+    return (normal + other)[:limit]
 
 
 def failed_text(tasks):
@@ -905,7 +911,11 @@ def open_in_visible_chrome(url):
 
 
 async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
-    """处理 /chrome* 命令；返回 True（命令已被识别消费）。"""
+    """处理 /chrome* 命令；返回 True（命令已被识别消费）。
+
+    顶层异常兜底（2026-11-13）：子命令处理的任何异常都回一句 ❌ 并记
+    完整栈——此前 ValueError 会静默上抛（收藏夹事件处理器的全局 try
+    收口），用户端表现就是"指令没反应"（/chrome_failed 生产实测）。"""
     sender = sender_id if sender_id is not None else getattr(
         event, "sender_id", None)
     if sender is not None and sender != owner_id:
@@ -914,6 +924,25 @@ async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
             f"Chrome 命令被拒绝：sender {sender} ≠ owner {owner_id}")
         return True
 
+    try:
+        return await _handle_chrome_command_inner(event, cmd_text,
+                                                  owner_id, sender)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception(f"Chrome 命令处理异常：{cmd_text[:60]}")
+        try:
+            await event.reply(
+                f"{CHROME_TEXT_PREFIX} ❌ 命令处理出错：{type(e).__name__}: "
+                f"{str(e)[:120]}\n（详见服务端日志）")
+        except Exception:
+            pass
+        return True
+
+
+async def _handle_chrome_command_inner(event, cmd_text, owner_id,
+                                       sender=None):
+    """子命令分派主体（异常由 handle_chrome_command 兜底）。"""
     match = _CHROME_CMD_RE.fullmatch(cmd_text.strip())
     if not match:
         await event.reply(

@@ -1762,14 +1762,16 @@ class ChromeRetryCommandTest(unittest.TestCase):
     （2026-11-12。此前失败任务只能翻看板，重试要手敲完整 URL 重新提交）。"""
 
     def setUp(self):
-        import time as _t
+        # updated_at 用**真实生产格式**（字符串时间）——此前测试用 float
+        # 时间戳，而 failed_tasks 对字符串做 float() 直接 ValueError
+        # （2026-11-13 生产实测：/chrome_failed 静默无回复的根因）
         self.tasks = [
             {"task_id": "aaaa1111" + "0" * 24, "status": "FAILED",
              "url": "https://example.com/a", "filename": "a.mp4",
-             "error": "CDP timeout", "updated_at": _t.time()},
+             "error": "CDP timeout", "updated_at": "2026-11-13 01:00:00"},
             {"task_id": "bbbb2222" + "0" * 24, "status": "FAILED",
              "url": "https://example.com/b", "filename": "b.zip",
-             "error": "net::ERR_ABORTED", "updated_at": _t.time() - 100},
+             "error": "net::ERR_ABORTED", "updated_at": "2026-11-12 23:58:00"},
             {"task_id": "cccc3333" + "0" * 24, "status": "SUCCESS",
              "url": "https://example.com/c", "filename": "c.mp4"},
             {"task_id": "dddd4444" + "0" * 24, "status": "RUNNING",
@@ -1818,3 +1820,56 @@ class ChromeRetryCommandTest(unittest.TestCase):
         for cmd in ("/chrome_failed", "/chrome_retry 1",
                     "/chrome_retry bbbb22", "/CHROME_RETRY 2"):
             self.assertTrue(chrome_client._CHROME_CMD_RE.fullmatch(cmd), cmd)
+
+
+    def test_failed_tasks_survives_malformed_updated_at(self):
+        """updated_at 异形（数字/缺失混合）不炸排序——生产真实数据是
+        字符串时间，但防御异形。"""
+        from tg_userbot import chrome_client
+        self.tasks.append({"task_id": "eeee5555" + "0" * 24,
+                           "status": "FAILED", "url": "https://x/e",
+                           "updated_at": 1731200000})   # 数字形态
+        items = chrome_client.failed_tasks(self.tasks)
+        self.assertEqual(items[0]["task_id"], "aaaa1111" + "0" * 24,
+                         "字符串时间仍排最前")
+
+
+class ChromeCommandTopLevelGuardTest(unittest.IsolatedAsyncioTestCase):
+    """handle_chrome_command 顶层异常兜底（2026-11-13）：子命令异常必须
+    回一句 ❌ 而非静默上抛（/chrome_failed 生产实测静默无回复的根因）。"""
+
+    async def test_inner_exception_replies_error(self):
+        import asyncio
+        from tg_userbot import chrome_client
+
+        class FakeEv:
+            def __init__(self):
+                self.replies = []
+            async def reply(self, text, **kw):
+                self.replies.append(text)
+
+        ev = FakeEv()
+        with mock.patch.object(
+                chrome_client, "_handle_chrome_command_inner",
+                side_effect=ValueError("boom")):
+            ok = await chrome_client.handle_chrome_command(
+                ev, "/chrome_failed", owner_id=1)
+        self.assertTrue(ok)
+        self.assertEqual(len(ev.replies), 1)
+        self.assertIn("boom", ev.replies[0])
+
+    async def test_cancelled_error_propagates(self):
+        import asyncio
+        from tg_userbot import chrome_client
+
+        class FakeEv:
+            async def reply(self, text, **kw):
+                pass
+
+        ev = FakeEv()
+        with mock.patch.object(
+                chrome_client, "_handle_chrome_command_inner",
+                side_effect=asyncio.CancelledError()):
+            with self.assertRaises(asyncio.CancelledError):
+                await chrome_client.handle_chrome_command(
+                    ev, "/chrome_failed", owner_id=1)
