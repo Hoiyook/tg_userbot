@@ -41,7 +41,7 @@ class BackupTest(_DbBase):
 
     def test_backup_creates_copy_with_tables(self):
         out = os.path.join(self.dir, "bak")
-        path = maintenance.backup_db(out)
+        path, _ok, _vd = maintenance.backup_db(out)
         self.assertTrue(os.path.exists(path))
         # 备份副本可独立打开且含业务表
         conn = sqlite3.connect(path)
@@ -66,7 +66,7 @@ class BackupTest(_DbBase):
     def test_backup_no_connection_needed(self):
         """备份用 sqlite .backup API 独立开源库，不依赖进程内连接。"""
         runtime_db.close_db()
-        path = maintenance.backup_db(os.path.join(self.dir, "bak2"))
+        path, _ok, _vd = maintenance.backup_db(os.path.join(self.dir, "bak2"))
         self.assertTrue(os.path.exists(path))
 
 
