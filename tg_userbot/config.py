@@ -980,38 +980,14 @@ CD2_API_TOKEN = (_SECRET_CONFIG.get("cd2") or {}).get("api_token", "")
 # 以 / 开头但不是命令，靠这份名单区分（2026-09-16）。
 # 含 2026-09-25 指令重构后的全部下划线标准形（/paw_plan 等）——
 # 多词指令标准化后每个都是独立 token，必须各自注册
-REGISTERED_COMMAND_NAMES = frozenset({name for name in (
-    "status", "stats", "find", "progress", "up", "sh", "queue", "retry",
-    "dedup",
-    "caption_filter", "listen", "wl", "sql", "sqlt", "paw", "origin",
-    "clean", "clearmsg", "setcleartime", "done", "thread", "folder",
-    "donenotify",
-    "logpath", "links", "help", "start", "cd2ck", "cmdhis",
-    "usage", "help2", "restart", "inspect", "memo",
-    "botclean", "cd2check", "cd2tasks", "manual", "115x", "115dup",
-    "report", "115inv", "x", "dyu", "pixiv", "asmr", "bili",
-    "pd", "pdst", "pdjobs", "pdclean",
-    "gum", "gumst", "gumjobs",
-    "chrome", "chrome_start", "chrome_stop", "chrome_status",
-    "chrome_tasks", "chrome_cancel", "chrome_failed", "chrome_retry",
-    # /paw 子命令标准形
-    "paw_status", "paw_help", "paw_plan", "paw_search", "paw_retry",
-    "paw_pause", "paw_resume", "paw_manual", "paw_done", "paw_archive",
-    "paw_att", "paw_post", "paw_cookie", "paw_csv", "paw_find", "paw_pr",
-    "paw_since", "paw_fail", "paw_progress", "paw_backfill", "paw_notify",
-    # 其余多词指令标准形
-    "listen_on", "listen_off", "listen_scan", "listen_list", "listen_add",
-    "listen_failed", "listen_retry",
-    "listen_del", "listen_edit", "listen_interval",
-    "wl_list", "wl_add", "wl_del", "wl_scan", "wl_since",
-    "retry_all", "retry_del", "queue_del",
-    "sqlt_add", "sqlt_del", "cmdt_add", "cmdt_del", "cmdt_run",
-    "caption_filter_add", "caption_filter_del", "caption_filter_test",
-    # 2026-11-10 审查补登记：分发器在处理 / 面板在展示，但漏了审计
-    # 名单（_record_usage 不记账）——由 test_architecture 的清单守护钉住
-    "extract", "downloading", "tme_backfill", "now", "health",
-    "cmdq", "cmdt", "ehentai", "wnacg",
-)})
+# 已注册命令名全集（/ 开头的输入判「是不是命令」用）：**唯一事实源是
+# command_registry.ALL**——本 frozenset 只是派生物（2026-11-12 结构债
+# 工程 A）。此前手工维护 118 条，与面板/手册/Android 名单漂移过三次。
+# 新增命令：在 command_registry.py 的 ALL 加一行，这里自动跟上。
+# 评论捕获的目录模式标注（/A#x）以 / 开头但不是命令，靠这份名单区分
+# （2026-09-16）。
+from .command_registry import registered as _cr_registered
+REGISTERED_COMMAND_NAMES = frozenset(_cr_registered())
 
 
 # 需要自动清理的命令（精确匹配）

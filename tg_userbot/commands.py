@@ -386,17 +386,13 @@ async def _handle_command_inner(event, cmd_text):
 
     # Android 版：桌面专属指令直接给明确提示（不静默失败）
     if config.IS_ANDROID:
+        from .command_registry import android_blocked
         first = cmd_text.split(None, 1)[0].lower() if cmd_text.strip() else ""
-        blocked = (
-            first.startswith("/chrome") or first.startswith("/cd2")
-            or first.startswith("/bili") or first.startswith("/pixiv")
-            or first.startswith("/paw") or first.startswith("/wnacg")
-            or first.startswith("/ehentai") or first.startswith("/dyu")
-            or first.startswith("/extract") or first.startswith("/shell")
-            or first.startswith("/asmr") or first.startswith("/pd")
-            or first.startswith("/115x")
-            or first in ("/x", "/sh", "/up")
-        )
+        # Android 拦截判定源 = command_registry（2026-11-12 工程 A）：
+        # 13 项 startswith 手工名单漂移过，registry 显式标记 + 宽前缀
+        # fallback 保持历史行为（/pdst 一直被 /pd 前缀拦）
+        _bare = first[1:] if first.startswith("/") else first
+        blocked = android_blocked(_bare)
         if blocked:
             await _reply(
                 event,

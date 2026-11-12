@@ -237,21 +237,17 @@ def _command_literals_in_dispatcher():
     return {l for l in lits if l.startswith("/")}
 
 
-def _bot_panel_commands():
-    """bot.BOT_COMMANDS 的命令名（无斜杠）。"""
-    with open(os.path.join(PKG, "bot.py"), encoding="utf-8") as f:
-        tree = ast.parse(f.read(), filename="bot.py")
-    names = set()
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and node.targets[0].id == "BOT_COMMANDS"):
-            continue
-        for elt in node.value.elts:          # (name, desc) 元组行
-            if isinstance(elt, ast.Tuple) and elt.elts \
-                    and isinstance(elt.elts[0], ast.Constant):
-                names.add(elt.elts[0].value)
-    return names
+def _runtime_panel_and_registry():
+    """运行时取面板清单与 registry（registry 化后清单是派生物，
+    AST 抽字面量已不适用——不变式升级为「运行时同源一致」）。"""
+    import sys
+    sys.path.insert(0, REPO)
+    os.environ.setdefault("TG_SAVE_FOLDER",
+                          tempfile.gettempdir() + "/tg_arch_guard")
+    from tg_userbot import bot, command_registry
+    panel = {name for name, _ in bot.BOT_COMMANDS}
+    derived = {n for n, _ in command_registry.panel_commands()}
+    return panel, derived
 
 
 class CommandRegistryConsistencyTest(unittest.TestCase):
@@ -280,7 +276,11 @@ class CommandRegistryConsistencyTest(unittest.TestCase):
                               tempfile.gettempdir() + "/tg_arch_guard")
         from tg_userbot import config
         reg = {n.lstrip("/") for n in config.REGISTERED_COMMAND_NAMES}
-        panel = _bot_panel_commands()
+        panel, derived = _runtime_panel_and_registry()
+        # registry 化后：面板必须与 registry 派生同源（结构性不变式）
+        self.assertEqual(panel, derived,
+                         "bot 面板与 command_registry 派生不一致——"
+                         "BOT_COMMANDS 必须由 panel_commands() 派生")
         missing = sorted(panel - reg)
         self.assertEqual(
             missing, [],
