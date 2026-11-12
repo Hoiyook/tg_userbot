@@ -7,6 +7,7 @@
     .venv/bin/python -m unittest discover -s tests -p "test_*.py" -v
 """
 import atexit
+import json
 import os
 import shutil
 import tempfile
@@ -977,3 +978,51 @@ class PlanPendingTest(unittest.TestCase):
         pawchive.enqueue_plan_pending("作者B")
         self.assertEqual(pawchive.take_plan_pending(), "作者B")
         self.assertEqual(pawchive.take_plan_pending(), "")
+
+
+class RefreshOnMissTest(unittest.TestCase):
+    """resolve_creators 的 refresh_on_miss（2026-11-12）：缓存未命中
+    （新收录创作者）→ 自动刷新一次再试；命中零开销；刷新失败回落
+    stale。背景：creators.json 39 天未刷导致"明明有却找不到"。"""
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp(prefix="paw_rom_")
+        self._saved_path = pawchive._cache_path
+        self._cache = os.path.join(self._td, "creators.json")
+        pawchive._cache_path = lambda: self._cache
+        self._stale = [{"id": "1", "name": "Old Creator", "favorited": 1}]
+        json.dump(self._stale, open(self._cache, "w"))
+        self._fresh = self._stale + [
+            {"id": "171130186", "name": "Azur Lane BBC", "favorited": 3}]
+        self.addCleanup(lambda: (
+            setattr(pawchive, "_cache_path", self._saved_path),
+            shutil.rmtree(self._td, ignore_errors=True),
+        ))
+
+    def test_miss_triggers_refresh_and_finds(self):
+        with mock.patch.object(pawchive, "load_creators",
+                               side_effect=[self._stale, self._fresh]):
+            r = pawchive.resolve_creators("Azur Lane BBC",
+                                          allow_refresh=False,
+                                          refresh_on_miss=True)
+        self.assertEqual(r["kind"], "exact",
+                         "fresh 里有精确同名 → exact（刷新后命中）")
+        self.assertEqual(r["hits"][0]["id"], "171130186")
+
+    def test_hit_skips_refresh(self):
+        with mock.patch.object(pawchive, "load_creators",
+                               side_effect=[self._stale]) as m:
+            r = pawchive.resolve_creators("Old Creator",
+                                          allow_refresh=False,
+                                          refresh_on_miss=True)
+        self.assertEqual(r["kind"], "exact")
+        self.assertEqual(m.call_count, 1, "命中不应触发刷新")
+
+    def test_refresh_failure_falls_back_to_stale_none(self):
+        with mock.patch.object(
+                pawchive, "load_creators",
+                side_effect=[self._stale, self._stale]):  # 刷新失败回落旧
+            r = pawchive.resolve_creators("Azur Lane BBC",
+                                          allow_refresh=False,
+                                          refresh_on_miss=True)
+        self.assertEqual(r["kind"], "none")

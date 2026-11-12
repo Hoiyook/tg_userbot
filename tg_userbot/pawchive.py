@@ -162,7 +162,7 @@ def parse_creator_ref(name):
     return q, None
 
 
-def resolve_creators(name, allow_refresh=True):
+def resolve_creators(name, allow_refresh=True, refresh_on_miss=False):
     """名字 → 全部候选（重名消歧，2026-10-21：全量缓存 9.6 万创作者里
     实测 2,684 个重名组，旧逻辑静默取第一个可能扫错人）。
 
@@ -170,9 +170,25 @@ def resolve_creators(name, allow_refresh=True):
       kind: "none" | "id" | "exact" | "fuzzy"
       hits: 候选列表（exact = 同名全部，按收藏降序；fuzzy = 包含命中，
             按收藏降序；id = 单元素）
-    传「名字#id」或纯数字 id 时按 id 精确解析（kind="id"）。"""
+    传「名字#id」或纯数字 id 时按 id 精确解析（kind="id"）。
+
+    refresh_on_miss（2026-11-12）：缓存未命中时自动刷新一次再试——
+    缓存 39 天未刷导致新收录创作者"明明有却找不到"的生产案例。刷新
+    带 120s 超时 + stale-if-error 回落，最坏多等 2 分钟；未命中才付
+    这个成本（命中零开销）。"""
     name_part, id_part = parse_creator_ref(name)
     creators = load_creators(refresh=allow_refresh)
+    res = _resolve_from(creators, name_part, id_part)
+    if res["kind"] != "none" or not refresh_on_miss or allow_refresh:
+        return res
+    # 未命中 → 可能是新收录创作者：刷新一次（超时+stale 回落兜底）
+    creators = load_creators(refresh=True)
+    return _resolve_from(creators, name_part, id_part)
+
+
+def _resolve_from(creators, name_part, id_part):
+    """纯函数：creators 快照 + 查询词 → 候选结果（resolve_creators 的
+    解析核，供缓存/刷新两轮复用）。"""
     if id_part:
         hit = next((c for c in creators if str(c.get("id")) == id_part), None)
         return {"kind": "id" if hit else "none", "hits": [hit] if hit else []}
@@ -555,7 +571,7 @@ async def _kick_plan_pending():
     logger.info(f"🐾 待办 /paw_plan 自动执行：{name}")
     try:
         import asyncio as _a
-        res = await _a.to_thread(resolve_creators, name, False)
+        res = await _a.to_thread(resolve_creators, name, False, True)
         kind = res.get("kind")
         if kind == "exact":
             creator, _note = pick_favorited_creator(res["hits"])
@@ -2760,8 +2776,10 @@ async def _reply_plan(event, arg):
     try:
         # 名字→id 映射极少变动：禁联网走旧缓存（2026-10-18 实测联网刷新
         # 在站点慢时挂起 20 分钟）
+        # refresh_on_miss：缓存未命中（新收录创作者）时刷新一次再试
+        # （120s 超时 + stale 回落；39 天未刷导致"明明有却找不到"的教训）
         res = await asyncio.to_thread(resolve_creators, name,
-                                      False)
+                                      False, True)
     except Exception as e:
         await event.reply(f"{TEXT_PREFIX}\n❌ 解析作者失败：{e}",
                           link_preview=False)
