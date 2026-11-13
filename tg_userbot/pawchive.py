@@ -1021,8 +1021,8 @@ def creators_cache_stale():
 # 缓存过期时的即时提示：解析要现拉约 14MB 创作者列表，站点直连较慢
 # （2026-09-24 实测 1~2 分钟），不提示的话用户全程静默像「没反应」
 STALE_CREATORS_ACK = (
-    "⏳ 创作者列表缓存已过期，正在拉取最新列表"
-    "（约 1~2 分钟，完成后自动继续，请稍等）")
+    "⏳ 创作者列表缓存已过期，正在拉取最新列表（站点慢时最长约 30 分钟，"
+    "完成后自动继续；期间可先干别的，不用等）")
 
 
 async def ack_stale_creators(reply):
@@ -2821,8 +2821,20 @@ async def _reply_plan(event, arg):
         return
     note = ""
     if res["kind"] == "none":
+        # 区分"真没有"与"站点拉不动没法确认"（2026-11-13：refresh_on_miss
+        # 的刷新失败回落旧缓存时，none 可能只是旧缓存缺数据）
+        recent_fail = False
+        try:
+            import runtime_db as _rtdb
+            fail_at = _rtdb.get_schema_meta("creators_refresh_fail_at")
+            recent_fail = bool(fail_at and time.time() - float(fail_at) < 3600)
+        except Exception:
+            pass
+        tail = ("\n⚠️ 站点拉取失败——以上结果基于过期缓存，"
+                "站点恢复后重发可复核" if recent_fail else
+                "\n先 /paw search <词> 模糊搜索")
         await event.reply(
-            f"{TEXT_PREFIX}\n没有叫「{name}」的创作者，先 /paw search <词>",
+            f"{TEXT_PREFIX}\n没有叫「{name}」的创作者{tail}",
             link_preview=False)
         return
     if res["kind"] == "exact":

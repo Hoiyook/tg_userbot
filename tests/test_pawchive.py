@@ -1054,3 +1054,33 @@ class CreatorsCacheHealthTest(unittest.TestCase):
         self.assertIsNotNone(line)
         self.assertIn("39 天", line)
         self.assertIn("2 条", line)
+
+
+class NoneReplyDistinguishesFailureTest(unittest.TestCase):
+    """resolve 未命中时区分「真没有」与「站点拉取失败」（2026-11-13）：
+    refresh_on_miss 失败回落旧缓存时，none 可能只是旧缓存缺数据，
+    回复必须可感知这一点，不能伪装成确定结论。"""
+
+    def test_schema_meta_gate(self):
+        import time as _t
+        from tg_userbot import runtime_db
+        self._td = tempfile.mkdtemp(prefix="paw_none_")
+        self._saved_conn = runtime_db._CONN
+        runtime_db._CONN = None
+        runtime_db.init_db(os.path.join(self._td, "tg.db"))
+        self.addCleanup(lambda: (
+            runtime_db.close_db(),
+            setattr(runtime_db, "_CONN", self._saved_conn),
+            shutil.rmtree(self._td, ignore_errors=True),
+        ))
+        # 近 1h 有失败 → recent_fail=True
+        runtime_db.set_schema_meta("creators_refresh_fail_at",
+                                   str(_t.time() - 600))
+        from tg_userbot import pawchive
+        self._p = mock.patch.object(pawchive, "load_creators",
+                                    return_value=[{"id": "1", "name": "x"}])
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        res = pawchive.resolve_creators("不存在的作者", allow_refresh=False,
+                                        refresh_on_miss=True)
+        self.assertEqual(res["kind"], "none")
