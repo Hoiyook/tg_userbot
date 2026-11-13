@@ -149,6 +149,19 @@ def configure(log_file: str, retention_days: int = 7) -> None:
     tl = logging.getLogger("telethon")
     tl.setLevel(logging.INFO)
     tl.propagate = False
+    # 降噪过滤（2026-11-13 巡检）：auto_reconnect=False 时 mtprotosender
+    # 每次断连仍会打一条 ERROR "Automatic reconnection failed 0 time(s)"
+    # （源码 389 行：retries=0 → 循环体不执行 → ok=False 必打）——我们用
+    # 自己的稳态守护接管重连，这条 ERROR 是设计内的必然噪音，一周 2.3 万
+    # 条会把真错误淹没。降级为 DEBUG：断连本身仍有守护层 INFO 记录。
+    class _AutoReconnectNoiseFilter(logging.Filter):
+        def filter(self, record):
+            if (record.levelno >= logging.ERROR
+                    and "Automatic reconnection failed" in record.getMessage()):
+                record.levelno = logging.DEBUG
+                record.levelname = "DEBUG"
+            return True
+    tl.addFilter(_AutoReconnectNoiseFilter())
     for old in list(tl.handlers):
         tl.removeHandler(old)
         try:

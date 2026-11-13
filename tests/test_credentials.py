@@ -210,3 +210,39 @@ class DailyReportTest(unittest.TestCase):
         snap["download"]["counts"]["RETRY"] = 10
         sigs = health.decide_stall_signals(snap)
         self.assertFalse(any(s["key"] == "backlog" for s in sigs))
+
+
+class Behavior403Test(unittest.TestCase):
+    """凭据行为层 403 计数（2026-11-13）：下载路径遇 403 时计入，
+    /health 显示近 24h 频次；过期桶自动清理。"""
+
+    def setUp(self):
+        from tg_userbot import credentials
+        self._saved = dict(credentials._403_HITS)
+        credentials._403_HITS.clear()
+        self.addCleanup(lambda: (
+            credentials._403_HITS.clear(),
+            credentials._403_HITS.update(self._saved),
+        ))
+
+    def test_note_and_line(self):
+        from tg_userbot import credentials
+        for _ in range(3):
+            credentials.note_403("douyin")
+        credentials.note_403("ehentai")
+        line = credentials.behavior_403_line()
+        self.assertIsNotNone(line)
+        self.assertIn("douyin×3", line)
+        self.assertIn("ehentai×1", line)
+
+    def test_empty_returns_none(self):
+        from tg_userbot import credentials
+        self.assertIsNone(credentials.behavior_403_line())
+
+    def test_old_buckets_expired(self):
+        import time as _t
+        from tg_userbot import credentials
+        old_hour = int(_t.time() // 3600) - 25
+        credentials._403_HITS[("douyin", old_hour)] = 5
+        self.assertIsNone(credentials.behavior_403_line(),
+                          "25h 前的桶应已过期清零")

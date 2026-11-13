@@ -636,8 +636,9 @@ async def enqueue_and_start(record, src=None):
             "RECEIVED", task_id=record["id"], label=record.get("label"),
             src=src or ("me" if record.get("chat_id") == state.MY_ID else "wl"),
         )
-    stats.emit_event("QUEUED", task_id=record["id"],
-                     label=record.get("label"), kind=kind)
+    stats.emit_event("QUEUED", task_id=record["id"], kind=kind,
+                     platform=record.get("platform"),
+                     label=record.get("label"))
     spawn_execute(record)
     return True
 
@@ -778,7 +779,8 @@ async def execute_queued_task(record):
     set_trace(record["id"][:8])
     state.EXECUTING.add(record["id"])
     stats.emit_event("RUNNING", task_id=record["id"],
-                     label=record.get("label"))
+                     label=record.get("label"), kind=record.get("kind"),
+                     platform=record.get("platform"))
     logger.info(
         f"▶️ 队列任务开始：{record.get('label') or record.get('url') or '(无)'}"
     )
@@ -865,9 +867,13 @@ async def execute_queued_task(record):
                     # 失败尝试单独计次：SUCCESS/REMOVED/CANCELLED 由各自发点发，
                     # 这里只发 RETRY（次数）+ FAILED（任务停在待重试的终态）
                     stats.emit_event("RETRY", task_id=record["id"],
-                                     attempts=record.get("attempts", 0))
+                                     attempts=record.get("attempts", 0),
+                                     kind=record.get("kind"),
+                                     platform=record.get("platform"))
                     stats.emit_event("FAILED", task_id=record["id"],
-                                     label=record.get("label"))
+                                     label=record.get("label"),
+                                     kind=record.get("kind"),
+                                     platform=record.get("platform"))
                     # 死文件熔断标记：本次尝试零进度（起步即败）→ 记快速失败
                     # 时刻（AUTO_REPLAY 据此跳过）；有进度 → 清标记（链路类可重试）。
                     # /dyu 委托等待中视为有进展（owner 策略：无上限、每轮都转

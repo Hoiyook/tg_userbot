@@ -118,6 +118,14 @@ async def resolve_douyin(url: str):
         logger.warning(
             f"⚠️ 本地解析失败，降级解析 bot：{type(e).__name__}: {e} | {url}"
         )
+        # 行为层凭据信号（2026-11-13）：403 = cookie 失效/被拉黑，
+        # 计入 credentials 的 /health 计数（进程内，重启清零）
+        if "403" in str(e):
+            try:
+                from . import credentials
+                credentials.note_403("douyin")
+            except Exception:
+                pass
         return None
 
 

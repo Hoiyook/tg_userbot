@@ -15,8 +15,42 @@ douyin cookie 失效 = /dyu 与本地解析 403；ehentai 失效 = 种子页进
 """
 import re
 import time
+from collections import Counter
 
 from .log import logger
+
+# 行为层失效信号（2026-11-13）：403/风控类错误计数——字段巡检（零联网）
+# 无法覆盖"cookie 有效但被站点拉黑"的行为失效，下载路径遇 403 时在此
+# 计数，/health 显示近 24h 频次。进程内计数（重启清零）够用：失效后
+# 每次下载都会撞 403，一天内必然重新累积。
+_403_HITS = Counter()
+
+
+def note_403(site):
+    """下载路径遇 403/风控类错误时调用（worker/解析失败分支）。"""
+    if site:
+        _403_HITS[(site, int(time.time() // 3600))] += 1
+
+
+def _403_recent_24h():
+    """近 24h 的 403 次数 {site: n}（清掉过期桶）。"""
+    cutoff = int(time.time() // 3600) - 24
+    stale = [k for k in _403_HITS if k[1] < cutoff]
+    for k in stale:
+        del _403_HITS[k]
+    from collections import Counter as _C
+    out = _C()
+    for (site, _hour), n in _403_HITS.items():
+        out[site] += n
+    return out
+
+
+def behavior_403_line():
+    """/health 行：近 24h 403 计数；无失效返回 None。"""
+    hits = _403_recent_24h()
+    if not hits:
+        return None
+    return "近 24h 403：" + "、".join(f"{s}×{n}" for s, n in hits.most_common())
 
 # 各站 cookie 的"登录态存在"判据：至少包含这些字段之一（=1 才算有值）
 # cookie 串按 "; " 分段、name= 不分大小写。

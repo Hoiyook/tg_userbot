@@ -283,6 +283,9 @@ def render_health() -> str:
             row("凭据", False, cred_line)
         else:
             row("凭据", True, "四站字段完整（douyin/ehentai/pawchive/bilibili）")
+        behavior = _credentials_mod.behavior_403_line()
+        if behavior:
+            row("凭据行为", False, behavior)
     except Exception as e:
         row("凭据", False, f"巡检失败：{str(e)[:40]}")
     lines.append("")

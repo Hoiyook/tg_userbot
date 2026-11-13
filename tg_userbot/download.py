@@ -913,7 +913,7 @@ async def download_file(message, source_override=None, caption_override=None,
             if task_id:
                 stats.emit_event(
                     "SUCCESS", task_id=task_id, bytes=actual_size,
-                    label=final_filename,
+                    label=final_filename, kind="media", source=source,
                 )
             append_history(
                 f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 普通 | "
