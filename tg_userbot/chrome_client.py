@@ -286,17 +286,20 @@ def cancel_usage_text():
 
 
 def failed_tasks(tasks, limit=15):
-    """FAILED 任务（按 updated_at 新→旧），/chrome_failed 与 /chrome_retry
-    共用列表——序号寻址两边必须出自同一函数（与 cancelable_tasks 同款
-    纪律）。updated_at 实际是字符串时间（"2026-09-29 20:02:16"）——按
-    字符串排序即时间序（同格式零歧义）；缺失/异形的排最后。"""
-    failed = [t for t in tasks
-              if str(t.get("status")).upper() == "FAILED"]
+    """可手动重试的任务（FAILED + RETRY_WAIT 退避中），/chrome_failed 与
+    /chrome_retry 共用列表——序号寻址两边必须出自同一函数（与
+    cancelable_tasks 同款纪律）。按 updated_at 新→旧；异形排最后。
+
+    2026-11-13 扩展：RETRY_WAIT（退避等待自动重试中）也允许手动立即
+    重试——手动 retry 语义 = 清退避立即跑（生产实测：退避中的任务点
+    retry 被"没有失败任务的 ID"拒绝，owner 困惑）。"""
+    retryable = [t for t in tasks
+                 if str(t.get("status")).upper() in ("FAILED", "RETRY_WAIT")]
     # 分两段：字符串时间组（正常）按时间降序（字典序=时间序），异形垫底
     # ——混合 key 排序会 TypeError 或错序，分组处理最直白
-    normal = [t for t in failed
+    normal = [t for t in retryable
               if isinstance(t.get("updated_at"), str) and t["updated_at"]]
-    other = [t for t in failed if t not in normal]
+    other = [t for t in retryable if t not in normal]
     normal.sort(key=lambda t: t["updated_at"], reverse=True)
     return (normal + other)[:limit]
 
@@ -371,7 +374,7 @@ async def _handle_retry(event, arg):
     if err:
         await event.reply(err)
         return
-    if str(task.get("status")).upper() != "FAILED":
+    if str(task.get("status")).upper() not in ("FAILED", "RETRY_WAIT"):
         await event.reply(
             f"{CHROME_TEXT_PREFIX} ℹ️ 该任务不是失败状态"
             f"（当前 {task.get('status')}），无需重试。")

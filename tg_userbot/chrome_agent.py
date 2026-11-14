@@ -1111,10 +1111,12 @@ def apply_retrials(tasks, retry_path, now=None):
         if t is None:
             continue
         st = str(t.get("status")).upper()
-        if st in ("PENDING", "PROCESSING", "RUNNING", "RETRY_WAIT"):
+        if st in ("PENDING", "PROCESSING", "RUNNING"):
             continue   # 已在途/已排队，无须重排
         if st == "SUCCESS":
             continue   # §14：成功的绝不重跑
+        # RETRY_WAIT 也应用（2026-11-14）：手动重试 = 清退避立即跑
+        # （自动重放会等退避到期，手动等不了那么久）
         t["status"] = "PENDING"
         t["attempts"] = 0
         t["next_retry_at"] = None
