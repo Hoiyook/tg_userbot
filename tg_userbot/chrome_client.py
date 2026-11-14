@@ -787,15 +787,19 @@ def request_cancel(task_id):
     status = task.get("status")
     if status == "SUCCESS":
         return False, "ℹ️ 任务已经完成，无法取消。"
-    if status == "FAILED":
-        return False, "ℹ️ 任务已经失败，无法取消。"
     if status == "CANCELLED":
         return False, "ℹ️ 任务已经取消。"
+    # FAILED 放行（2026-11-13）：用户明确放弃失败任务 → CANCELLED
+    # （agent apply_cancellations 已支持 FAILED 改判）
     if not add_cancellation(task_id):
         # 单向通道：写失败必须如实说，否则用户以为取消了、实际没有任何动作
         logger.warning(f"取消请求写入失败，任务 [{task_id[:8]}]")
         return False, "❌ 取消请求写入失败，请重试。"
     logger.info(f"提交取消请求 → 任务 [{task_id[:8]}] {status}")
+    if status == "FAILED":
+        return True, (f"{CHROME_TEXT_PREFIX} 🗑 失败任务已标记取消（从待处置清单移除）\n"
+                      f"任务 ID：{task_id[:8]}\n"
+                      f"URL：{task.get('url')}")
     return True, cancel_ok_text(task, agent_up=agent_running())
 
 

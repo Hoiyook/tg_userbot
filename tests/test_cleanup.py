@@ -207,7 +207,6 @@ class ChromeResultNotificationTest(unittest.TestCase):
             "❌ 序号必须是数字。",
             "❌ 任务序号无效，请先发送 /chrome_tasks。",
             "ℹ️ 任务已经完成，无法取消。",
-            "ℹ️ 任务已经失败，无法取消。",
             "ℹ️ 任务已经取消。",
         ):
             with self.subTest(text=text):

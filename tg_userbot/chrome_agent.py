@@ -1049,7 +1049,9 @@ def apply_cancellations(tasks, cancel_path, now=None):
     process_pending_tasks 里那条并行 watcher 的路（边跑边写状态会让
     「下载还在写文件、任务已判 CANCELLED」自相矛盾）。
 
-    SUCCESS / FAILED / 已 CANCELLED 一律不动（§14：已完成的不因取消改判）。
+    FAILED 也处理（2026-11-13 owner 要求）：失败任务对用户而言是"还在
+    等待处置的待办"，明确取消 = 放弃它 → FAILED → CANCELLED。SUCCESS
+    绝不改判（已完成的不因取消改判，§14）。
     请求文件是 append-only 的，同一 id 会被反复读到，因此本函数是幂等的。
     """
     if not cancel_path:
@@ -1062,11 +1064,13 @@ def apply_cancellations(tasks, cancel_path, now=None):
     for task in tasks:
         if task.get("task_id") not in ids:
             continue
-        if task.get("status") not in ("PENDING", "RETRY_WAIT"):
+        st = str(task.get("status")).upper()
+        if st not in ("PENDING", "RETRY_WAIT", "FAILED"):
             continue
         mark_cancelled(task, now=now)
         cancelled.append(task["task_id"])
-        logger.info(f"🛑 任务已取消 [{task['task_id'][:8]}]（排队/等待重试）")
+        where = "排队/等待重试" if st in ("PENDING", "RETRY_WAIT") else "失败任务（用户放弃）"
+        logger.info(f"🛑 任务已取消 [{task['task_id'][:8]}]（{where}）")
     return cancelled
 
 

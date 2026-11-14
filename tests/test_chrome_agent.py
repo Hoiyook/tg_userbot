@@ -1100,7 +1100,9 @@ class ApplyCancellationsTest(unittest.TestCase):
         self.assertEqual(retry["status"], "CANCELLED")
 
     def test_terminal_tasks_untouched(self):
-        """§21 测试 7：SUCCESS / FAILED / 已取消的任务一律不动。"""
+        """SUCCESS 绝不改判（§14）；FAILED 有用户取消请求时**改判
+        CANCELLED**（2026-11-13 owner 需求变更：失败任务可被用户明确
+        放弃——旧语义"FAILED 一律不动"已废止）；无请求时不动。"""
         ok = _task("k3")
         chrome_agent.finish_success(ok, "a.zip", 1)
         bad = _task("k4")
@@ -1109,11 +1111,14 @@ class ApplyCancellationsTest(unittest.TestCase):
         chrome_agent.fail_attempt(bad, "x", retries=3, wait_seconds=0)
         done = _task("k5")
         chrome_agent.mark_cancelled(done)
-        self._write(["k3", "k4", "k5"])
-        self.assertEqual(
-            chrome_agent.apply_cancellations([ok, bad, done], self.path), [])
+        self._write(["k3", "k4", "k5"])   # 取消请求含 k4（FAILED）
+        cancelled = chrome_agent.apply_cancellations(
+            [ok, bad, done], self.path)
+        self.assertEqual(cancelled, ["k4"], "FAILED 被用户放弃 → CANCELLED")
         self.assertEqual([ok["status"], bad["status"], done["status"]],
-                         ["SUCCESS", "FAILED", "CANCELLED"])
+                         ["SUCCESS", "CANCELLED", "CANCELLED"])
+
+
 
     def test_missing_file_is_noop(self):
         task = _task("k6")
