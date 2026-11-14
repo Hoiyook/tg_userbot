@@ -1398,13 +1398,25 @@ function _qdSec(title, icon, items, renderExtra) {
     // 成多个可点 chip（经 /api/cmd 白名单管道执行，与指令中心同语义）
     const ops = it.hint
       ? '<div class="chips" style="margin-top:4px">' +
-        it.hint.split("｜").map(c =>
-          '<span class="chip mini" onclick="runCmdDirect(\'' +
-          esc(c.trim()).replace(/'/g, "\'") + '\')">⚡ ' + esc(c.trim()) +
-          '</span>').join("") + '</div>'
+        it.hint.split("｜").map(c => {
+          const cmd = c.trim();
+          // 取消类操作是终态不可逆——执行前确认（防误触）
+          const isCancel = /cancel/i.test(cmd);
+          const onclick = isCancel
+            ? 'if(confirm(\'确认取消该任务？\'))runCmdDirect(\'' +
+              esc(cmd).replace(/'/g, "\'") + '\')'
+            : 'runCmdDirect(\'' + esc(cmd).replace(/'/g, "\'") + '\')';
+          return '<span class="chip mini" onclick="' + onclick +
+            '">⚡ ' + esc(cmd) + '</span>';
+        }).join("") + '</div>'
       : "";
+    const labelHtml = it.url
+      ? '<a href="' + esc(it.url) + '" target="_blank" rel="noopener" ' +
+        'style="color:var(--blue);text-decoration:underline">' +
+        esc(it.label) + '</a>'
+      : esc(it.label);
     return '<div class="qrow"><div class="info"><div class="nm wrap">' +
-      esc(it.label) + '</div><div class="dt">' + bits.join(" · ") +
+      labelHtml + '</div><div class="dt">' + bits.join(" · ") +
       '</div>' + err + ops + (renderExtra ? renderExtra(it) : "") +
       '</div></div>';
   }).join("");

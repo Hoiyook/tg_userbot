@@ -1439,11 +1439,12 @@ _QD_DONE_LIMIT = 15
 
 
 def _qd_item(label=None, sub=None, attempts=None, error=None, when=None,
-             next_in=None, hint=None):
+             next_in=None, hint=None, url=None):
     return {"label": str(label or "?")[:60], "sub": sub,
             "attempts": attempts,
             "error": (str(error)[:120] if error else None),
-            "when": when, "next_in": next_in, "hint": hint}
+            "when": when, "next_in": next_in, "hint": hint,
+            "url": (str(url) if url else None)}
 
 
 def _qd_when(ts):
@@ -1663,12 +1664,15 @@ async def _qd_chrome():
         bucket = buckets.get(str(t.get("status")).upper())
         if bucket is None:
             continue
-        hint = (f"/chrome_retry {str(t.get('task_id') or '')[:8]}"
+        tid8 = str(t.get("task_id") or "")[:8]
+        # 失败条目双操作：重试 + 取消（2026-11-13 owner 要求）
+        hint = (f"/chrome_retry {tid8}｜/chrome_cancel {tid8}"
                 if bucket == "failed" else None)
         item = _qd_item(t.get("filename") or t.get("url"),
                         sub=(str(t.get("status")) if bucket == "pending"
                              else None),
-                        error=t.get("error"), hint=hint)
+                        error=t.get("error"), hint=hint,
+                        url=t.get("url"))
         if bucket == "done":
             item["when"] = _qd_when(t.get("updated_at"))
         if len(out[bucket]) >= _QD_LIMIT:

@@ -2177,3 +2177,42 @@ class QueueDetailAllDomainsTest(unittest.IsolatedAsyncioTestCase):
                     assert bucket in data, f"{domain} 缺 {bucket} 桶"
         finally:
             await client.close()
+
+
+class ChromeQueueDetailUrlTest(unittest.IsolatedAsyncioTestCase):
+    """Chrome 渠道队列条目带 url 字段（前端渲染可点超链接）+ 失败条目
+    双操作 hint（重试+取消）。owner 要求：失败列表链接可点 + 取消按钮。"""
+
+    async def asyncSetUp(self):
+        self._td = tempfile.mkdtemp(dir=_TMP)
+        self._saved_path = None
+        import shutil
+        from tg_userbot import chrome_agent
+        import json as _json
+        # 造一个临时 chrome_tasks.json（写真实路径让 load_tasks 读到）
+        real = chrome_agent.load_tasks(config.CHROME_TASKS_FILE)
+        self._saved_tasks = real
+        self._test_tasks = [
+            {"task_id": "abcd1234" + "0" * 24, "status": "FAILED",
+             "url": "https://www.iwara.tv/video/xyz1",
+             "filename": None, "error": "iwara UI 复刻失败：no-gear",
+             "updated_at": "2026-11-13 20:00:00"},
+        ]
+        chrome_agent.save_tasks(self._test_tasks, config.CHROME_TASKS_FILE)
+        self.addCleanup(lambda: chrome_agent.save_tasks(
+            self._saved_tasks, config.CHROME_TASKS_FILE))
+
+    async def test_failed_entry_has_url_and_dual_actions(self):
+        client = make_client()
+        await client.start_server()
+        try:
+            resp = await client.get("/api/queue_detail?domain=chrome")
+            data = await resp.json()
+        finally:
+            await client.close()
+        self.assertTrue(data["ok"])
+        hit = [i for i in data["failed"] if "iwara" in (i.get("url") or "")]
+        self.assertEqual(len(hit), 1)
+        self.assertEqual(hit[0]["url"], "https://www.iwara.tv/video/xyz1")
+        self.assertIn("/chrome_retry abcd1234", hit[0]["hint"])
+        self.assertIn("/chrome_cancel abcd1234", hit[0]["hint"])
