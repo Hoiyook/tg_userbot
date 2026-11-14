@@ -1660,6 +1660,16 @@ async def _qd_chrome():
     buckets = {"RUNNING": "running", "PENDING": "pending",
                "RETRY_WAIT": "pending", "FAILED": "failed",
                "SUCCESS": "done"}
+    # 实时下载进度（chrome_progress.json，Agent 独占写 1s 节流）：单在途
+    prog = None
+    try:
+        pdata = json.load(open(_config.CHROME_PROGRESS_FILE,
+                               encoding="utf-8"))
+        items = pdata.get("items") or []
+        if items:
+            prog = items[-1]
+    except (OSError, ValueError):
+        pass
     for t in reversed(tasks):          # 新任务在前
         bucket = buckets.get(str(t.get("status")).upper())
         if bucket is None:
@@ -1668,9 +1678,13 @@ async def _qd_chrome():
         # 失败条目双操作：重试 + 取消（2026-11-13 owner 要求）
         hint = (f"/chrome_retry {tid8}｜/chrome_cancel {tid8}"
                 if bucket == "failed" else None)
+        # RUNNING 条目带实时下载进度（received/total → MB 读数）
+        sub = str(t.get("status")) if bucket == "pending" else None
+        if bucket == "running" and prog:
+            sub = (f"{prog.get('received', 0) / 1048576:.0f}/"
+                   f"{prog.get('total', 0) / 1048576:.0f}MB")
         item = _qd_item(t.get("filename") or t.get("url"),
-                        sub=(str(t.get("status")) if bucket == "pending"
-                             else None),
+                        sub=sub,
                         error=t.get("error"), hint=hint,
                         url=t.get("url"))
         if bucket == "done":
