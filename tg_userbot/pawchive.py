@@ -2766,6 +2766,25 @@ def encode_pick(index):
     return encode_menu_data("paw_pick", str(index))
 
 
+_CREATOR_URL_RE = re.compile(
+    r"^https?://pawchive\.pw/(\w+)/user/(\d+)", re.I)
+
+
+def plan_from_creator_url(url):
+    """创作者页 URL → 直投 creator dict（绕过 creators 缓存解析）。
+
+    背景（2026-11-13 生产案例）：/paw_plan Azur Lane BBC 走 creators 缓存
+    解析报"找不到"——站点 creators API 全量列表与单创作者端点均查无此
+    id，但用户手里的作者页 URL 是真实存在的。URL 里的 service/id 就是
+    扫描所需的全部信息，无须缓存背书。返回 creator dict 或 None。"""
+    m = _CREATOR_URL_RE.match(str(url or "").strip())
+    if not m:
+        return None
+    service, cid = m.group(1).lower(), m.group(2)
+    return {"service": service, "id": int(cid),
+            "name": f"{service} {cid}", "favorited": 0}
+
+
 async def _reply_plan(event, arg):
     if state.PAW_SCAN_RUNNING is not None:
         # 撞锁 → 自动排队：把参数记下，锁释放后按 /paw_plan 真实链路执行
@@ -2809,6 +2828,16 @@ async def _reply_plan(event, arg):
             link_preview=False)
         return
     try:
+        # 创作者页 URL 直投（2026-11-13）：URL 自带 service/id，无须
+        # creators 缓存背书——缓存查无此作者但 URL 真实存在的场景
+        url_creator = plan_from_creator_url(name)
+        if url_creator is not None:
+            await event.reply(
+                f"{TEXT_PREFIX}\n🔗 创作者页链接识别：{url_creator['service']} "
+                f"#{url_creator['id']}\n开始扫描（不查创作者缓存，直接投）…",
+                link_preview=False)
+            await start_scan(url_creator, scope="all")
+            return
         # 名字→id 映射极少变动：禁联网走旧缓存（2026-10-18 实测联网刷新
         # 在站点慢时挂起 20 分钟）
         # refresh_on_miss：缓存未命中（新收录创作者）时刷新一次再试

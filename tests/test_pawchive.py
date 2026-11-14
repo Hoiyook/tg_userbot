@@ -1084,3 +1084,24 @@ class NoneReplyDistinguishesFailureTest(unittest.TestCase):
         res = pawchive.resolve_creators("不存在的作者", allow_refresh=False,
                                         refresh_on_miss=True)
         self.assertEqual(res["kind"], "none")
+
+
+class CreatorUrlDirectTest(unittest.TestCase):
+    """创作者页 URL 直投（2026-11-13）：/paw_plan <作者页URL> 绕过
+    creators 缓存解析直接扫描——URL 自带 service/id 无须缓存背书。"""
+
+    def test_parse_creator_url(self):
+        from tg_userbot import pawchive
+        c = pawchive.plan_from_creator_url(
+            "https://pawchive.pw/patreon/user/171130186")
+        self.assertEqual(c["service"], "patreon")
+        self.assertEqual(c["id"], 171130186)
+        # 带尾部路径（/post/xxx）也能吃
+        c2 = pawchive.plan_from_creator_url(
+            "https://pawchive.pw/fanbox/user/999/post/1")
+        self.assertEqual(c2["service"], "fanbox")
+        self.assertEqual(c2["id"], 999)
+        # 非 URL / 其它站 → None
+        self.assertIsNone(pawchive.plan_from_creator_url("Azur Lane BBC"))
+        self.assertIsNone(pawchive.plan_from_creator_url(
+            "https://mega.nz/file/x"))
