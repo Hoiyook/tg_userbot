@@ -382,6 +382,14 @@ async def _handle_retry(event, arg):
     task["error"] = None
     task["updated_at"] = time.time()
     chrome_agent.save_tasks(tasks, CHROME_TASKS_FILE)
+    # 关键竞态修复（2026-11-14）：清除该任务的**挂起取消请求**——用户
+    # 早前取消过、又点了重试时，重启后 agent 的 apply_cancellations 会
+    # 把刚重排的 PENDING 任务再次标 CANCELLED（重试意图被旧取消请求
+    # 覆盖，生产实测）。幂等：无挂起请求时为 no-op。
+    remove_cancellation(task.get("task_id"))
+    logger.info(
+        f"执行命令：/chrome_retry（{str(task.get('task_id'))[:8]} 已重排，"
+        "挂起取消请求已清除）")
     await event.reply(retry_ok_text(task))
     logger.info(f"执行命令：/chrome_retry（{str(task.get('task_id'))[:8]}）")
 
@@ -719,6 +727,18 @@ def save_cancellations(items, path=None):
     except Exception as e:
         logger.warning(f"保存 Chrome 取消请求文件失败：{e}")
         return False
+
+
+def remove_cancellation(task_id, path=None):
+    """清除某任务的挂起取消请求（retry 时必须做——否则重启后 agent 的
+    apply_cancellations 会把刚重排的 PENDING 任务再次标 CANCELLED，
+    用户的重试意图被旧取消请求覆盖，2026-11-14 生产实测）。幂等。"""
+    path = path or CHROME_CANCEL_REQUESTS_FILE
+    items = load_cancellations(path)
+    kept = [c for c in items if c.get("task_id") != task_id]
+    if len(kept) == len(items):
+        return True
+    return save_cancellations(kept, path)
 
 
 def add_cancellation(task_id, path=None, now=None):

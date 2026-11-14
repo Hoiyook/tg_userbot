@@ -844,7 +844,15 @@ class ChromeCDPClient:
         payload = {"id": msg_id, "method": method, "params": params or {}}
         if session_id:
             payload["sessionId"] = session_id
-        await self._ws.send(json.dumps(payload))
+        # send 加超时（2026-11-13）：WebSocket 半死时 send 会无限挂起
+        # （recv 有超时保护、send 没有）——主循环卡死在第一条 CDP 命令，
+        # 全部后续任务停摆（生产实测：iwara 任务把 agent 卡了 12 小时，
+        # PENDING 不认领、取消请求无人处理）。
+        try:
+            await asyncio.wait_for(self._ws.send(json.dumps(payload)), 15)
+        except asyncio.TimeoutError as e:
+            self._pending.pop(msg_id, None)
+            raise RuntimeError(f"CDP WebSocket 发送超时（连接半死）：{method}") from e
         reply = await asyncio.wait_for(fut, timeout)
         if reply.get("error"):
             raise RuntimeError(f"CDP {method} 失败：{reply['error']}")

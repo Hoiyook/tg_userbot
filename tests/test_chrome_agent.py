@@ -1878,3 +1878,38 @@ class ChromeCommandTopLevelGuardTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await chrome_client.handle_chrome_command(
                     ev, "/chrome_failed", owner_id=1)
+
+
+class RetryClearsPendingCancelTest(unittest.TestCase):
+    """retry 清除挂起取消请求（2026-11-14）：用户取消过又点重试时，
+    重启后 apply_cancellations 不得把刚重排的 PENDING 再次标 CANCELLED
+    （生产实测：重试意图被旧取消请求覆盖）。"""
+
+    def test_remove_cancellation_idempotent(self):
+        import json as _json
+        from tg_userbot import chrome_client
+        path = os.path.join(_TMP, "cancel_remove_test.json")
+        chrome_client.add_cancellation("abcd1234" + "0" * 24, path=path)
+        self.assertTrue(chrome_client.remove_cancellation(
+            "abcd1234" + "0" * 24, path=path))
+        items = chrome_client.load_cancellations(path)
+        self.assertFalse(any(c.get("task_id") == "abcd1234" + "0" * 24
+                             for c in items))
+        # 幂等：再删一次不报错
+        self.assertTrue(chrome_client.remove_cancellation(
+            "abcd1234" + "0" * 24, path=path))
+
+    def test_agent_apply_skips_after_removal(self):
+        """清除挂起取消请求后，agent 的 apply_cancellations 不再应用它。"""
+        from tg_userbot import chrome_client
+        import json as _json
+        tasks = [{"task_id": "ffff9999" + "0" * 24, "status": "PENDING",
+                  "url": "https://example.com/r"}]
+        path = os.path.join(_TMP, "cancel_apply_test.json")
+        chrome_client.add_cancellation("ffff9999" + "0" * 24, path=path)
+        # 模拟 retry：先移除挂起取消请求
+        chrome_client.remove_cancellation("ffff9999" + "0" * 24, path=path)
+        cancelled = chrome_agent.apply_cancellations(tasks, path)
+        self.assertEqual(cancelled, [],
+                         "清除挂起取消请求后不应再应用取消")
+        self.assertEqual(tasks[0]["status"], "PENDING")
