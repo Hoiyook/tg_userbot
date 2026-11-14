@@ -376,20 +376,19 @@ async def _handle_retry(event, arg):
             f"{CHROME_TEXT_PREFIX} ℹ️ 该任务不是失败状态"
             f"（当前 {task.get('status')}），无需重试。")
         return
-    task["status"] = "PENDING"
-    task["attempts"] = 0
-    task["next_retry_at"] = None
-    task["error"] = None
-    task["updated_at"] = time.time()
-    chrome_agent.save_tasks(tasks, CHROME_TASKS_FILE)
-    # 关键竞态修复（2026-11-14）：清除该任务的**挂起取消请求**——用户
-    # 早前取消过、又点了重试时，重启后 agent 的 apply_cancellations 会
-    # 把刚重排的 PENDING 任务再次标 CANCELLED（重试意图被旧取消请求
-    # 覆盖，生产实测）。幂等：无挂起请求时为 no-op。
+    # retry 走**请求文件 IPC**（2026-11-14 修复）：chrome_tasks.json 是
+    # Agent 独占写（内存权威，循环内不重读）——此前直接改文件，Agent
+    # 内存不知道且会被 save 覆盖，"重试成功但永不执行"（生产实测）。
+    # 同时清除该任务的挂起取消请求（用户取消过又重试的场景）。
+    retry_ok = request_retry(task.get("task_id"),
+                             url=task.get("url"))
+    if not retry_ok:
+        await event.reply(
+            f"{CHROME_TEXT_PREFIX} ❌ 重试请求写入失败，请重试。")
+        return
     remove_cancellation(task.get("task_id"))
     logger.info(
-        f"执行命令：/chrome_retry（{str(task.get('task_id'))[:8]} 已重排，"
-        "挂起取消请求已清除）")
+        f"执行命令：/chrome_retry（{str(task.get('task_id'))[:8]} 已提交重试）")
     await event.reply(retry_ok_text(task))
     logger.info(f"执行命令：/chrome_retry（{str(task.get('task_id'))[:8]}）")
 
@@ -739,6 +738,53 @@ def remove_cancellation(task_id, path=None):
     if len(kept) == len(items):
         return True
     return save_cancellations(kept, path)
+
+
+CHROME_RETRY_REQUESTS_FILE = os.path.join(
+    os.path.dirname(CHROME_CANCEL_REQUESTS_FILE),
+    "chrome_retry_requests.json")
+
+
+def load_retry_requests(path=None):
+    path = path or CHROME_RETRY_REQUESTS_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        logger.warning(f"读取 Chrome 重试请求文件失败：{e}")
+        return []
+    items = (data or {}).get("retrials") if isinstance(data, dict) else None
+    return [c for c in items if isinstance(c, dict)] if isinstance(
+        items, list) else []
+
+
+def save_retry_requests(items, path=None):
+    """原子写重试请求；失败抛异常（调用方如实回话）。"""
+    path = path or CHROME_RETRY_REQUESTS_FILE
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump({"retrials": items}, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+
+
+def request_retry(task_id, url=None, path=None):
+    """登记一条重试请求；已存在同 id 的挂起重试时幂等返回 True。"""
+    path = path or CHROME_RETRY_REQUESTS_FILE
+    items = load_retry_requests(path)
+    if any(c.get("task_id") == task_id for c in items):
+        return True
+    try:
+        items.append({"task_id": task_id,
+                      "url": url or "",
+                      "created_at": (datetime.now()).strftime(
+                          "%Y-%m-%d %H:%M:%S")})
+        save_retry_requests(items, path)
+        return True
+    except Exception as e:
+        logger.warning(f"重试请求写入失败，任务 [{str(task_id)[:8]}]：{e}")
+        return False
 
 
 def add_cancellation(task_id, path=None, now=None):

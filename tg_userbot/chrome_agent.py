@@ -27,6 +27,7 @@ from .config import (
     CHROME_AGENT_PID_FILE,
     CHROME_CANCEL_GUID_GRACE_SECONDS,
     CHROME_CANCEL_REQUESTS_FILE,
+    CHROME_RETRY_REQUESTS_FILE,
     CHROME_CDP_CONNECT_TIMEOUT,
     CHROME_CDP_HOST,
     CHROME_CDP_PORT,
@@ -1082,6 +1083,54 @@ def apply_cancellations(tasks, cancel_path, now=None):
     return cancelled
 
 
+def apply_retrials(tasks, retry_path, now=None):
+    """重试请求文件 → FAILED/CANCELLED 任务改回 PENDING（2026-11-14）。
+
+    /chrome_retry 走与 /chrome_cancel 同款 IPC（请求文件；chrome_tasks.json
+    是 Agent 独占写，User Bot 直改会被内存覆盖——"重试成功但永不执行"
+    的生产根因）。应用后**清空重试请求文件**（一次性消费，与取消请求
+    的幂等语义不同：重试请求未命中即失效，避免陈旧请求复活旧任务）。
+    返回本次重排的 task_id 列表。"""
+    try:
+        with open(retry_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        logger.warning(f"读取重试请求文件失败（忽略）：{e}")
+        return []
+    reqs = data.get("retrials") if isinstance(data, dict) else None
+    if not isinstance(reqs, list) or not reqs:
+        return []
+    retried = []
+    by_id = {str(t.get("task_id")): t for t in tasks}
+    now_fmt = _fmt(now)
+    for req in reqs:
+        tid = str(req.get("task_id") or "")
+        t = by_id.get(tid)
+        if t is None:
+            continue
+        st = str(t.get("status")).upper()
+        if st in ("PENDING", "PROCESSING", "RUNNING", "RETRY_WAIT"):
+            continue   # 已在途/已排队，无须重排
+        if st == "SUCCESS":
+            continue   # §14：成功的绝不重跑
+        t["status"] = "PENDING"
+        t["attempts"] = 0
+        t["next_retry_at"] = None
+        t["error"] = None
+        t["updated_at"] = now_fmt
+        retried.append(tid)
+        logger.info(f"🔁 重试请求已应用 [{tid[:8]}]（{st} → PENDING）")
+    if retried:
+        try:
+            os.remove(retry_path)
+        except OSError:
+            pass
+        logger.info(f"🔁 重试请求应用 {len(retried)} 条，请求文件已清空")
+    return retried
+
+
 def apply_label_rename(download_dir, task):
     """成功后按 #标注 重命名：「#标注 原文件名」（磁盘 + 记录同步）。
 
@@ -1270,6 +1319,7 @@ async def agent_main():
                     await asyncio.sleep(CHROME_CDP_RECONNECT_DELAY_SECONDS)
                     continue
             claim_new_requests(tasks, CHROME_REQUESTS_FILE)
+            apply_retrials(tasks, CHROME_RETRY_REQUESTS_FILE)
             await process_pending_tasks(
                 client, tasks, CHROME_TASKS_FILE, CHROME_DOWNLOAD_DIR,
                 CHROME_DOWNLOAD_TIMEOUT, CHROME_DOWNLOAD_RETRIES,

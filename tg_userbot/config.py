@@ -1587,6 +1587,9 @@ CHROME_REQUESTS_FILE = os.path.join(RUNTIME_DIR, "chrome_requests.json")
 # 取消请求：User Bot 独占写、Agent 只读（与 chrome_requests.json 同款单向通道）
 CHROME_CANCEL_REQUESTS_FILE = os.path.join(
     RUNTIME_DIR, "chrome_cancel_requests.json")
+# 重试请求（2026-11-14）：同款单向通道——/chrome_retry 写、Agent 应用后清空
+CHROME_RETRY_REQUESTS_FILE = os.path.join(
+    RUNTIME_DIR, "chrome_retry_requests.json")
 # 取消请求到达时 downloadWillBegin 还没来：在这段时间内继续等它，等到就能按
 # guid 真正中止下载；等不到说明下载还没开始，靠关标签页兜底。太短会错过
 # 「点开链接后隔几秒才开始下载」的站点（取消变成只改状态、文件照样落地），
