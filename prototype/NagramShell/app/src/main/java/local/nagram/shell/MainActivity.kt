@@ -466,6 +466,30 @@ fun DashboardScreen(onEdit: () -> Unit, spoolNote: String) {
                         // 令牌输入框会静默失效（浏览器/PWA 里正常）
                         webChromeClient = WebChromeClient()
                         webViewClient = object : WebViewClient() {
+                            // 外部链接跳系统浏览器（2026-11-13）：看板
+                            // 失败列表的 iwara 链接 target=_blank，默认
+                            // 行为会在面板 WebView 里直接导航走，看板被
+                            // 破坏。非面板地址一律交给系统浏览器。
+                            override fun shouldOverrideUrlLoading(
+                                view: WebView?, request: WebResourceRequest?
+                            ): Boolean {
+                                val u = request?.url ?: return false
+                                val base = Prefs.resolveCached(ctx)
+                                val sameSite = base.isNotEmpty() &&
+                                    (u.toString().startsWith(base))
+                                if (sameSite || u.scheme == "about") {
+                                    return false   // 面板内导航照常
+                                }
+                                try {
+                                    ctx.startActivity(
+                                        android.content.Intent(
+                                            android.content.Intent.ACTION_VIEW,
+                                            u))
+                                } catch (_: Exception) {
+                                }
+                                return true   // WebView 不导航
+                            }
+
                             override fun onPageFinished(
                                 view: WebView?, url: String?
                             ) {
