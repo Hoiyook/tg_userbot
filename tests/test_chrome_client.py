@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from datetime import datetime as _dt
 from unittest import mock
 
 # 必须在首个 tg_userbot import 之前把保存目录指到临时目录
@@ -100,6 +101,37 @@ class ChromeRequestsStoreTest(unittest.TestCase):
         chrome_client.mark_notified("t1", path=self.path)
         rec = chrome_client.get_request("t1", path=self.path)
         self.assertIn("notified_at", rec)
+
+    def test_prune_keeps_freshest_marked_record(self):
+        """裁剪按 notified_at 语义取「最近 N 条」，不得按数组位置。
+
+        2026-11-15 生产事故：pending+done 拼接把刚标记的记录排在数组
+        头部，done 超限后 done[-N:] 把它当「最老」裁掉——通知完即从
+        判重台账消失（022bcd70）。此处精确重现该场景。"""
+        for i in range(chrome_client._REQUESTS_KEEP_DONE):
+            tid = f"old{i:03d}"
+            chrome_client.add_request(
+                tid, f"https://a.com/{i}.zip",
+                user_id=1, chat_id=1, message_id=i, path=self.path,
+                now=_dt(2026, 11, 1, 0, i % 60, 0))
+            chrome_client.mark_notified(tid, path=self.path,
+                                        now=_dt(2026, 11, 2, 0, i % 60, 0))
+        # done 已满 200 条；新请求进 pending 区（数组头），完成并通知
+        chrome_client.add_request(
+            "fresh", "https://a.com/fresh.zip",
+            user_id=1, chat_id=1, message_id=9, path=self.path,
+            now=_dt(2026, 11, 15, 21, 7, 36))
+        chrome_client.mark_notified("fresh", path=self.path,
+                                    now=_dt(2026, 11, 15, 21, 9, 48))
+        rec = chrome_client.get_request("fresh", path=self.path)
+        self.assertIsNotNone(rec, "刚通知的记录不得被裁剪")
+        self.assertEqual(rec.get("notified_at"), "2026-11-15 21:09:48")
+        # 被裁的是 notified_at 最老的记录
+        ids = {r["task_id"] for r in chrome_client.load_requests(self.path)}
+        self.assertNotIn("old000", ids)
+        self.assertIn("old001", ids)
+        self.assertEqual(len(chrome_client.load_requests(self.path)),
+                         chrome_client._REQUESTS_KEEP_DONE)
 
 
 class AgentProcessTest(unittest.TestCase):

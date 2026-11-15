@@ -644,9 +644,15 @@ _REQUESTS_KEEP_DONE = 200   # 已通知终态记录保留条数（对齐 tasks �
 def _prune_requests(reqs):
     """裁剪已通知的终态记录到最近 N 条（2026-11-05 审计：requests 台账
     只进不出，172KB 且每次提交全量刷盘）。未通知（notified_at 空）的
-    记录**绝不裁**——那是待通知承诺。返回 (裁剪后, 裁掉数)。"""
+    记录**绝不裁**——那是待通知承诺。返回 (裁剪后, 裁掉数)。
+
+    「最近」按 notified_at 排序判定，**不能按数组位置**——save 的拼接
+    顺序是 pending + done，刚打上标记的记录（原 pending 区）位于数组
+    头部，按位置取 done[-N:] 会把最新记录当最老裁掉（2026-11-15
+    022bcd70 通知完即从台账消失的根因，iwara 判重随之失真）。"""
     done = [r for r in reqs if r.get("notified_at")]
     pending = [r for r in reqs if not r.get("notified_at")]
+    done.sort(key=lambda r: str(r.get("notified_at") or ""))
     keep = done[-_REQUESTS_KEEP_DONE:]
     return pending + keep, len(done) - len(keep)
 
@@ -811,18 +817,25 @@ def get_request(task_id, path=None):
                  if r.get("task_id") == task_id), None)
 
 
-def mark_notified(task_id, path=None, outcome=None, filename=None):
+def mark_notified(task_id, path=None, outcome=None, filename=None, now=None):
     """打已通知标记；outcome（终态）与 filename 随写——请求台账只进
     不出，是「哪些 URL 成功过」的唯一持久层（iwara 判重的数据源，
-    2026-10-26）。"""
+    2026-10-26）。
+
+    标记后把记录挪到数组尾：done 区从此按通知序排列，save 的位置裁剪
+    （done[-N:]）与 notified_at 语义一致；同秒多条通知时也不受稳定排序
+    的原位置影响。"""
     reqs = load_requests(path)
     for r in reqs:
         if r.get("task_id") == task_id:
-            r["notified_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            r["notified_at"] = (now or datetime.now()).strftime(
+                "%Y-%m-%d %H:%M:%S")
             if outcome is not None:
                 r["outcome"] = str(outcome)
             if filename:
                 r["filename"] = str(filename)
+            reqs.remove(r)
+            reqs.append(r)
     save_requests(reqs, path)
 
 
