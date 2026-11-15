@@ -683,6 +683,28 @@ class ChromeMenuTest(unittest.TestCase):
         self.assertEqual(menu.chrome_task_short_name({"url": "https://a.com/"}),
                          "a.com")
 
+    def test_failed_buttons_carry_retry_and_cancel(self):
+        """失败列表按钮（2026-11-15 UX）：每条 [🔁重试] [🗑取消]，带完整
+        task_id 而非序号——序号在按钮存活期内会漂移，ID 不会。"""
+        tasks = [{"task_id": "abcd1234ef", "url": "https://a.com/x.zip",
+                  "status": "FAILED", "error": "boom"}]
+        rows = menu.chrome_failed_buttons(tasks)
+        actions = [menu.parse_menu_data(b.data)[0] for row in rows for b in row]
+        self.assertEqual(actions[:2], ["chrome_retry", "chrome_cancel"])
+        # retry/cancel 带同一任务的完整 ID
+        _a1, arg_retry = menu.parse_menu_data(rows[0][0].data)
+        _a2, arg_cancel = menu.parse_menu_data(rows[0][1].data)
+        self.assertEqual(arg_retry, "abcd1234ef")
+        self.assertEqual(arg_cancel, "abcd1234ef")
+        self.assertIn("🔁", rows[0][0].text)
+        self.assertIn("x.zip", rows[0][0].text)
+        # 页脚：刷新失败列表 + 在途任务
+        self.assertEqual(actions[2:], ["chrome_failed", "chrome_tasks"])
+
+    def test_failed_actions_registered(self):
+        for action in ("chrome_retry", "chrome_failed"):
+            self.assertIn(action, config.MENU_ACTIONS)
+
 
 class ChromeMenuFlowTest(unittest.IsolatedAsyncioTestCase):
     """菜单动作：任务视图渲染 + 点 🛑 真的写出取消请求。"""

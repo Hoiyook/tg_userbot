@@ -325,6 +325,33 @@ def chrome_task_short_name(task, limit=20):
     return tail[:limit]
 
 
+def chrome_failed_buttons(tasks):
+    """失败列表（/chrome_failed）按钮：每条 [🔁重试] [🗑取消] + 刷新。
+
+    与 chrome_menu_buttons 同款纪律——**直接带完整 task_id**（不是序号）：
+    一次点击、无序号漂移；回调经 handle_menu_action 的 chrome_retry /
+    chrome_cancel 动作（终态复核共用 retry_request_for / request_cancel）。
+    callback data = m:chrome_retry:<32hex>（46 字节，Telegram ≤64 内）。
+    """
+    rows = []
+    for task in tasks:
+        tid = str(task.get("task_id") or "")
+        if not tid:
+            continue
+        rows.append([
+            Button.inline(
+                f"🔁 {tid[:8]} {chrome_task_short_name(task)}",
+                encode_menu_data("chrome_retry", tid)),
+            Button.inline("🗑 取消",
+                          encode_menu_data("chrome_cancel", tid)),
+        ])
+    rows.append([
+        Button.inline("🔄 刷新失败列表", encode_menu_data("chrome_failed")),
+        Button.inline("🌐 在途任务", encode_menu_data("chrome_tasks")),
+    ])
+    return rows
+
+
 def caption_filter_menu_buttons():
     """Caption 清洗视图：查看/添加/删除/测试/恢复默认/清空 + 返回。"""
     return [

@@ -604,6 +604,19 @@ async def handle_menu_action(action, arg, event):
     if action == "chrome_cancel":
         _ok, message = chrome_client.request_cancel(arg or "")
         return f"{message}{_chrome_body_sep()}", _chrome_view_buttons()
+    if action == "chrome_retry":
+        # 失败列表 🔁 按钮（带完整 task_id）：复核+IPC 与 /chrome_retry
+        # 共用 retry_request_for；原地给出最新失败列表，可连续操作
+        ok, message = chrome_client.retry_request_for(arg or "")
+        failed = chrome_client.failed_tasks(
+            menu.chrome_agent_load_tasks())
+        return message, menu.chrome_failed_buttons(failed)
+    if action == "chrome_failed":
+        # 🔄 刷新失败列表按钮
+        failed = chrome_client.failed_tasks(
+            menu.chrome_agent_load_tasks())
+        return (chrome_client.failed_text(failed),
+                menu.chrome_failed_buttons(failed))
     if action == "chrome_status":
         return await chrome_client.status_view(), _chrome_view_buttons()
     if action == "chrome_start":

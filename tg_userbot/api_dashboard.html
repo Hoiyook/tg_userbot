@@ -1024,7 +1024,16 @@ async function runCmdDirect(cmd) {
   try {
     const d = await api("/api/cmd", {method:"POST", body: JSON.stringify({cmd})});
     showResult(!!d.ok, d.text || d.error || "");
+    if (d.ok) refreshActiveView();   // 即时刷新（不等 2s SSE）：消除"点了没反应"感
   } catch (e) { showResult(false, String(e)); }
+}
+
+/* 操作成功后的即时刷新：当前渠道四段视图 + 全局队列/失败 + Chrome 页签，
+   各自 try 包裹（元素不在当前页签的函数内部自有兜底） */
+function refreshActiveView() {
+  try { loadQueueDetail(true); } catch (e) {}
+  try { loadQueuesAll(); } catch (e) {}
+  try { loadChrome(); } catch (e) {}
 }
 
 // 轮询退避（2026-11-05 审计）：fetch 失败（后端重启/网络抖动）时把主
@@ -1400,10 +1409,11 @@ function _qdSec(title, icon, items, renderExtra) {
       ? '<div class="chips" style="margin-top:4px">' +
         it.hint.split("｜").map(c => {
           const cmd = c.trim();
-          // 取消类操作是终态不可逆——执行前确认（防误触）
-          const isCancel = /cancel/i.test(cmd);
+          // 取消/删除类操作不可逆——执行前确认（防误触；2026-11-15
+          // del 并入：/x del、/bili del 与 cancel 同样删得掉任务）
+          const isCancel = /cancel|del/i.test(cmd);
           const onclick = isCancel
-            ? 'if(confirm(\'确认取消该任务？\'))runCmdDirect(\'' +
+            ? 'if(confirm(\'确认删除/取消？此操作不可恢复\'))runCmdDirect(\'' +
               esc(cmd).replace(/'/g, "\'") + '\')'
             : 'runCmdDirect(\'' + esc(cmd).replace(/'/g, "\'") + '\')';
           return '<span class="chip mini" onclick="' + onclick +
@@ -1498,7 +1508,10 @@ function renderProblems(problems) {
       : "到期待放行");
     if (p.next_in == null && p.status === "FAILED") meta.push("需人工处置");
     const hint = p.hint
-      ? '<span class="chip mini" onclick="runCmdDirect(\'' +
+      ? '<span class="chip mini" onclick="' +
+        (/cancel|del/i.test(p.hint)
+          ? 'if(confirm(\'确认删除/取消？此操作不可恢复\'))' : '')
+        + 'runCmdDirect(\'' +
         esc(p.hint).replace(/'/g, "\\'") + '\')">⚡ ' + esc(p.hint) + '</span>'
       : "";
     const err = p.error

@@ -136,18 +136,64 @@ def resolve_owner_id(my_id):
 # 文本构建（纯函数）
 # ------------------------------------------------------------
 
-def submit_text(task_id, url, label=None, download_subdir=None):
+def submit_text(task_id, url, label=None, download_subdir=None,
+                queue_note=None, dup_note=None):
     label_line = f"标注：{label}\n" if label else ""
     subdir = chrome_agent.safe_subdir(download_subdir)
     dir_line = f"子目录：{subdir}\n" if subdir else ""
+    queue_line = f"\n⏱ {queue_note}" if queue_note else ""
+    dup_line = f"\n{dup_note}" if dup_note else ""
     return (
         f"{CHROME_TEXT_PREFIX} 下载任务已提交\n\n"
         f"任务 ID：{task_id[:8]}\n"
         f"{label_line}"
         f"{dir_line}"
-        f"URL：{url}\n\n"
+        f"URL：{url}{queue_line}{dup_line}\n\n"
         "完成后会在此通知结果。"
     )
+
+
+def duplicate_url_note(url, path=None):
+    """同 URL 曾成功下载过 → 返回提醒文案（否则 None）。
+
+    判重台账（requests 里 notified+SUCCESS 记录）的**提交端反馈**——此前
+    重复提交只会默默重下，owner 无感知。提醒不拦截：确实要重下的场景
+    （文件丢失/换目录）不受影响；误提交用回执里的取消指引撤掉即可。
+    """
+    try:
+        reqs = load_requests(path)
+    except Exception:
+        return None
+    hit = None
+    for r in reqs:
+        if (r.get("url") == url and r.get("notified_at")
+                and str(r.get("outcome")) == "SUCCESS"
+                and (hit is None
+                     or str(r.get("notified_at")) > str(hit.get("notified_at")))):
+            hit = r
+    if hit is None:
+        return None
+    fn = str(hit.get("filename") or "")
+    return (f"⚠️ 提醒：该链接已于 {hit.get('notified_at')} 成功下载过"
+            + (f"（{fn[:40]}）" if fn else "")
+            + "，请确认是否要重复下载")
+
+
+def queue_position_note(task_id, path=None):
+    """提交瞬间的排队位置（Agent 串行：RUNNING/PENDING/RETRY_WAIT 都占通道）。
+
+    本任务此刻通常还没进 tasks 文件（Agent 认领周期 ~1s），计数排除
+    本 task_id 以防它已被认领导致多算一位。"""
+    try:
+        tasks = chrome_agent.load_tasks(CHROME_TASKS_FILE) or []
+    except Exception:
+        return None
+    others = [t for t in tasks if t.get("task_id") != task_id]
+    ahead = sum(1 for t in others
+                if t.get("status") in ("PENDING", "RETRY_WAIT"))
+    if any(t.get("status") == "RUNNING" for t in others):
+        return f"排队第 {ahead + 1} 位" + (f"（前面还有 {ahead} 个）" if ahead else "")
+    return "Agent 空闲，即将开始下载"
 
 
 def not_running_text():
@@ -366,34 +412,18 @@ def retry_ok_text(task):
 async def _handle_retry(event, arg):
     """`/chrome_retry <序号|ID前缀>`：FAILED → PENDING（原地重排）。
 
-    直接改 chrome_tasks.json（原子写）；Agent 在跑时无需重启——认领循环
-    每圈读文件。任务不在 FAILED 状态（已完成/在途/不存在）时如实拒绝，
-    绝不改判终态（§14：SUCCESS 不重下）。"""
+    解析与复核、IPC 写入全部在 retry_request_for（与 bot 🔁 按钮共用）；
+    这里只负责序号/前缀寻址与回复。"""
     tasks = chrome_agent.load_tasks(CHROME_TASKS_FILE)
     task, err = resolve_retry_target(tasks, arg)
     if err:
         await event.reply(err)
         return
-    if str(task.get("status")).upper() not in ("FAILED", "RETRY_WAIT"):
-        await event.reply(
-            f"{CHROME_TEXT_PREFIX} ℹ️ 该任务不是失败状态"
-            f"（当前 {task.get('status')}），无需重试。")
-        return
-    # retry 走**请求文件 IPC**（2026-11-14 修复）：chrome_tasks.json 是
-    # Agent 独占写（内存权威，循环内不重读）——此前直接改文件，Agent
-    # 内存不知道且会被 save 覆盖，"重试成功但永不执行"（生产实测）。
-    # 同时清除该任务的挂起取消请求（用户取消过又重试的场景）。
-    retry_ok = request_retry(task.get("task_id"),
-                             url=task.get("url"))
-    if not retry_ok:
-        await event.reply(
-            f"{CHROME_TEXT_PREFIX} ❌ 重试请求写入失败，请重试。")
-        return
-    remove_cancellation(task.get("task_id"))
-    logger.info(
-        f"执行命令：/chrome_retry（{str(task.get('task_id'))[:8]} 已提交重试）")
-    await event.reply(retry_ok_text(task))
-    logger.info(f"执行命令：/chrome_retry（{str(task.get('task_id'))[:8]}）")
+    ok, msg = retry_request_for(task.get("task_id"))
+    await event.reply(msg)
+    if ok:
+        logger.info(
+            f"执行命令：/chrome_retry（{str(task.get('task_id'))[:8]}）")
 
 
 
@@ -796,6 +826,36 @@ def request_retry(task_id, url=None, path=None):
         return False
 
 
+def retry_request_for(task_id):
+    """按完整 task_id 提交重试：终态复核 + IPC 写 + 回执文案。
+
+    `/chrome_retry`（先经 resolve_retry_target 把序号/前缀解析成 task_id）
+    与 bot 失败列表的 🔁 按钮（直接带完整 task_id）共用——终态复核、写
+    失败处理、回执文案必须两边一致（与 request_cancel 同款纪律，否则
+    迟早只改一边）。旧消息上的按钮点下时任务状态可能已变（已被自动
+    重试成功/已被取消），复核保证如实回话，绝不假装成功（§14）。
+    返回 (ok, 回执文案)。
+    """
+    task = chrome_agent.get_task(
+        chrome_agent.load_tasks(CHROME_TASKS_FILE), task_id)
+    if task is None:
+        return False, "❌ 任务已不存在，请刷新失败列表。"
+    if str(task.get("status")).upper() not in ("FAILED", "RETRY_WAIT"):
+        return False, (
+            f"{CHROME_TEXT_PREFIX} ℹ️ 该任务不是失败状态"
+            f"（当前 {task.get('status')}），无需重试。")
+    # retry 走**请求文件 IPC**（2026-11-14 修复）：chrome_tasks.json 是
+    # Agent 独占写（内存权威，循环内不重读）——直接改文件会被 Agent 的
+    # save 覆盖。同时清除该任务的挂起取消请求（用户取消过又重试的场景）。
+    if not request_retry(task.get("task_id"), url=task.get("url")):
+        return False, (
+            f"{CHROME_TEXT_PREFIX} ❌ 重试请求写入失败，请重试。")
+    remove_cancellation(task.get("task_id"))
+    logger.info(
+        f"Chrome 重试请求已提交：{str(task.get('task_id'))[:8]}")
+    return True, retry_ok_text(task)
+
+
 def add_cancellation(task_id, path=None, now=None):
     """登记一条取消请求；返回「请求是否确实在盘上」。
 
@@ -1048,6 +1108,7 @@ async def handle_chrome_command(event, cmd_text, owner_id, sender_id=None):
 async def _handle_chrome_command_inner(event, cmd_text, owner_id,
                                        sender=None):
     """子命令分派主体（异常由 handle_chrome_command 兜底）。"""
+    from . import menu  # 函数内引用：menu 顶层不依赖本模块，避免环
     match = _CHROME_CMD_RE.fullmatch(cmd_text.strip())
     if not match:
         await event.reply(
@@ -1079,8 +1140,11 @@ async def _handle_chrome_command_inner(event, cmd_text, owner_id,
         return True
 
     if sub == "chrome_tasks":
-        await event.reply(tasks_text(
-            chrome_agent.load_tasks(CHROME_TASKS_FILE)))
+        tasks_now = chrome_agent.load_tasks(CHROME_TASKS_FILE)
+        items = cancelable_tasks(tasks_now)
+        await event.reply(
+            tasks_text(tasks_now),
+            buttons=menu.chrome_menu_buttons(items))
         logger.info("执行命令：/chrome_tasks")
         return True
 
@@ -1089,8 +1153,11 @@ async def _handle_chrome_command_inner(event, cmd_text, owner_id,
         return True
 
     if sub == "chrome_failed":
-        await event.reply(failed_text(
-            chrome_agent.load_tasks(CHROME_TASKS_FILE)))
+        tasks_now = chrome_agent.load_tasks(CHROME_TASKS_FILE)
+        items = failed_tasks(tasks_now)
+        await event.reply(
+            failed_text(tasks_now),
+            buttons=menu.chrome_failed_buttons(items))
         logger.info("执行命令：/chrome_failed")
         return True
 
@@ -1130,7 +1197,10 @@ async def _handle_chrome_command_inner(event, cmd_text, owner_id,
             f"{CHROME_TEXT_PREFIX}\n❌ 任务提交失败：任务状态无法保存"
             f"（{type(e).__name__}），请稍后重试。")
         return True
-    await event.reply(submit_text(task_id, url, label, download_subdir))
+    await event.reply(submit_text(
+        task_id, url, label, download_subdir,
+        queue_note=queue_position_note(task_id),
+        dup_note=duplicate_url_note(url)))
     logger.info(
         f"执行命令：/chrome {url}（task {task_id[:8]}"
         f"{'，标注 ' + label if label else ''}"

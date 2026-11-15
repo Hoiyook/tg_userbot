@@ -722,7 +722,7 @@ MENU_ACTIONS = (
     # Chrome 任务（/chrome_tasks 的只读视图 + 每条任务一个 🛑 取消按钮）
     # 外加 Agent 启停与状态（此前只在命令面板里，按钮菜单够不着）
     "chrome_tasks", "chrome_cancel", "chrome_start", "chrome_stop",
-    "chrome_status",
+    "chrome_status", "chrome_failed", "chrome_retry",
     # 115 解压回传（/115x 的菜单视图 + 暂停/恢复领取）
     "extract", "extract_stop", "extract_start",
     # 标签监听：视图 / 增删改 / 立即扫描 / 周期 / 总开关 + 添加向导的

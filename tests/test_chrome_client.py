@@ -546,6 +546,154 @@ class NotifyScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("notified_at", rec)
 
 
+class RetryRequestForTest(unittest.TestCase):
+    """retry_request_for：bot 🔁 按钮与 /chrome_retry 共用的复核+IPC。
+
+    旧消息上的按钮点下时任务状态可能已变（自动重试成功/已取消）——
+    复核保证如实回话，绝不假装成功（§14）。"""
+
+    def setUp(self):
+        self.tasks_path = os.path.join(_TMP, "chrome_tasks_retryfor.json")
+        self.retry_path = os.path.join(_TMP, "chrome_retry_retryfor.json")
+        self.cancel_path = os.path.join(_TMP, "chrome_cancel_retryfor.json")
+        for p in (self.tasks_path, self.retry_path, self.cancel_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+    def tearDown(self):
+        for p in (self.tasks_path, self.retry_path, self.cancel_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+    def _seed_task(self, status):
+        task = chrome_agent.create_task("https://a.com/1.zip", "t1")
+        task["status"] = status
+        chrome_agent.save_tasks([task], self.tasks_path)
+        return task
+
+    def _call(self):
+        with mock.patch.object(chrome_client, "CHROME_TASKS_FILE",
+                               self.tasks_path), \
+                mock.patch.object(chrome_client, "CHROME_RETRY_REQUESTS_FILE",
+                                  self.retry_path), \
+                mock.patch.object(chrome_client, "CHROME_CANCEL_REQUESTS_FILE",
+                                  self.cancel_path):
+            return chrome_client.retry_request_for("t1")
+
+    def test_missing_task_reports_honestly(self):
+        chrome_agent.save_tasks([], self.tasks_path)
+        ok, msg = self._call()
+        self.assertFalse(ok)
+        self.assertIn("已不存在", msg)
+
+    def test_success_task_refuses_retry(self):
+        self._seed_task("SUCCESS")
+        ok, msg = self._call()
+        self.assertFalse(ok)
+        self.assertIn("无需重试", msg)
+        self.assertEqual(chrome_client.load_retry_requests(self.retry_path), [])
+
+    def test_failed_task_accepts_retry_and_clears_cancel(self):
+        self._seed_task("FAILED")
+        # 预置一个挂起取消请求（用户取消过又想重试的场景）
+        chrome_client.add_cancellation("t1", path=self.cancel_path)
+        ok, msg = self._call()
+        self.assertTrue(ok)
+        self.assertIn("重新排队", msg)
+        retried = chrome_client.load_retry_requests(self.retry_path)
+        self.assertEqual([r["task_id"] for r in retried], ["t1"])
+        # 挂起取消请求已被清除（否则 Agent 应用重试后又被旧取消打回）
+        self.assertEqual(chrome_client.load_cancellations(self.cancel_path), [])
+
+    def test_retry_wait_task_accepts_retry(self):
+        self._seed_task("RETRY_WAIT")
+        ok, msg = self._call()
+        self.assertTrue(ok)
+        self.assertIn("重新排队", msg)
+
+
+class SubmitFeedbackTest(unittest.TestCase):
+    """提交回执增强（2026-11-15 UX）：排队位置 + 同 URL 已下载提醒。"""
+
+    def setUp(self):
+        self.tasks_path = os.path.join(_TMP, "chrome_tasks_submit.json")
+        self.requests_path = os.path.join(_TMP, "chrome_requests_submit.json")
+        for p in (self.tasks_path, self.requests_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+    def tearDown(self):
+        for p in (self.tasks_path, self.requests_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+    def test_submit_text_appends_queue_and_dup_notes(self):
+        text = chrome_client.submit_text(
+            "abcd1234" * 4, "https://a.com/1.zip",
+            queue_note="排队第 2 位（前面还有 1 个）",
+            dup_note="⚠️ 提醒：已下载过")
+        self.assertIn("排队第 2 位", text)
+        self.assertIn("⚠️ 提醒：已下载过", text)
+
+    def test_duplicate_url_note_requires_notified_success(self):
+        chrome_client.add_request("t1", "https://a.com/dup.zip",
+                                  user_id=1, chat_id=1, message_id=1,
+                                  path=self.requests_path)
+        # 未通知 → 不提醒（任务在途/失败都不算下载过）
+        self.assertIsNone(chrome_client.duplicate_url_note(
+            "https://a.com/dup.zip", path=self.requests_path))
+        chrome_client.mark_notified("t1", path=self.path_or_default(),
+                                    outcome="FAILED")
+        self.assertIsNone(chrome_client.duplicate_url_note(
+            "https://a.com/dup.zip", path=self.requests_path))
+        chrome_client.mark_notified("t1", path=self.path_or_default(),
+                                    outcome="SUCCESS", filename="1.zip")
+        note = chrome_client.duplicate_url_note(
+            "https://a.com/dup.zip", path=self.requests_path)
+        self.assertIsNotNone(note)
+        self.assertIn("1.zip", note)
+        self.assertIn("成功下载过", note)
+
+    def test_duplicate_url_note_picks_freshest(self):
+        chrome_client.add_request("old", "https://a.com/dup.zip",
+                                  user_id=1, chat_id=1, message_id=1,
+                                  path=self.requests_path)
+        chrome_client.mark_notified("old", outcome="SUCCESS",
+                                    filename="旧文件.zip",
+                                    path=self.requests_path,
+                                    now=_dt(2026, 11, 1, 10, 0, 0))
+        chrome_client.add_request("new", "https://a.com/dup.zip",
+                                  user_id=1, chat_id=1, message_id=2,
+                                  path=self.requests_path)
+        chrome_client.mark_notified("new", outcome="SUCCESS",
+                                    filename="新文件.zip",
+                                    path=self.requests_path,
+                                    now=_dt(2026, 11, 15, 21, 9, 48))
+        note = chrome_client.duplicate_url_note(
+            "https://a.com/dup.zip", path=self.requests_path)
+        self.assertIn("新文件.zip", note)
+
+    def path_or_default(self):
+        return self.requests_path
+
+    def test_queue_position_note_running_and_idle(self):
+        task = chrome_agent.create_task("https://a.com/0.zip", "t0")
+        chrome_agent.save_tasks([task], self.tasks_path)
+        with mock.patch.object(chrome_client, "CHROME_TASKS_FILE",
+                               self.tasks_path):
+            # 无 RUNNING → Agent 空闲
+            self.assertIn("Agent 空闲", chrome_client.queue_position_note("t1"))
+            task["status"] = "RUNNING"
+            chrome_agent.save_tasks([task], self.tasks_path)
+            self.assertIn("排队第 1 位",
+                          chrome_client.queue_position_note("t1"))
+            # 本任务已被认领（task_id 出现在 tasks 里）不多算
+            task2 = chrome_agent.create_task("https://a.com/9.zip", "t9")
+            chrome_agent.save_tasks([task, task2], self.tasks_path)
+            self.assertIn("排队第 1 位",
+                          chrome_client.queue_position_note("t9"))
+
+
 class ChromeLabelParseTest(unittest.IsolatedAsyncioTestCase):
     """/chrome <#标注> <URL>：标注拼在原文件名前（空格分隔）。"""
 
