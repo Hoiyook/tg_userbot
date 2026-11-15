@@ -20,6 +20,8 @@ DISK_WARN_FREE_GB = 50     # 磁盘剩余低于此值（GB）→ 每日维护告
                            # 没有全局预警）
 EVENTS_TRIM_MAX = 30000    # 与 TASK_EVENTS_MAX_EVENTS 同源（台账封顶）
 LISTENER_DONE_RETENTION_DAYS = 90   # 监听任务 SUCCESS/DISMISSED 保留天数
+ISSUES_DOC_REVIEW_DAYS = 90  # 典型问题库整理周期（docs/典型问题库.md）——
+                             # 超期未整理在每日维护报告喊一声（保鲜触发器）
 
 
 def backup_db(out_dir, keep=BACKUP_KEEP, now=None):
@@ -221,6 +223,26 @@ def daily_maintenance():
                     if "_notify_mod" in dir() else None)
     except Exception as e:
         logger.warning(f"💾 磁盘预警失败（不影响维护）：{e}")
+
+    # ⑤.5 问题库保鲜提醒（2026-11-16）：docs/典型问题库.md 是"复发时
+    #    追加"的承诺——承诺没有触发机制就是空头支票（P8 模式在文档层的
+    #    翻版）。超 ISSUES_DOC_REVIEW_DAYS 天未整理就在维护报告喊一声。
+    try:
+        reviewed = runtime_db.get_schema_meta("issues_doc_reviewed_at")
+        if reviewed:
+            age = int((time.time() - int(reviewed)) // 86400)
+            if age >= ISSUES_DOC_REVIEW_DAYS:
+                report.append((
+                    "⚠️", f"典型问题库已 {age} 天未整理"
+                    "（docs/典型问题库.md——复发缺陷对照八大模式补充）"))
+                bad.append("问题库超期未整理")
+            else:
+                report.append(("✅", f"问题库保鲜：{age} 天前整理过"))
+        else:
+            report.append(("⚠️", "问题库整理日期未登记"
+                           "（docs/典型问题库.md 首次整理待登记）"))
+    except Exception as e:
+        logger.warning(f"📚 问题库保鲜提醒失败（不影响维护）：{e}")
 
     # ⑥ 维护报告（一条 TG：N4）——报告自身失败绝不影响主流程
     try:

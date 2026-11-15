@@ -55,7 +55,7 @@ class DashboardJsSyntaxTest(unittest.TestCase):
 
 
 class DashboardJsStateFlagGuardTest(unittest.TestCase):
-    """P2 控制：SSE 连接标志语义——断开必须清 _sseOK。
+    """P8 控制：SSE 连接状态可观测——断开必须清 _sseOK。
 
     冻结假状态模式（57f9a06 修复）：标志只置不清 → batch 轮询兜底被
     跳过 → 页面停在旧数据上给 owner 看假状态。此断言钉住三件事：
@@ -90,7 +90,7 @@ class DashboardJsStateFlagGuardTest(unittest.TestCase):
 
 
 class DashboardActionWhitelistGuardTest(unittest.TestCase):
-    """P4 控制（双入口漂移）：hint 命令模板必须指向真实注册的命令。
+    """P3 控制（双入口漂移）：hint 命令模板必须指向真实注册的命令。
 
     x/pixiv 的 hint 曾因注释过时（『站点侧没有重试命令』）长期缺失，
     而 /x retry 早已存在——面板弱于 bot。此断言钉住四段视图 hint
