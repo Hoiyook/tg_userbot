@@ -2138,6 +2138,29 @@ class QueueDetailTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(hit)
         self.assertIn("ChannelPrivateError", hit[0]["error"])
 
+    async def test_x_pixiv_failed_have_retry_and_del_hints(self):
+        """面板/bot 对齐（2026-11-15）：/x retry、/pixiv retry、/xx del
+        子命令早已存在，失败条目必须带操作按钮——此前 _qd_taskdomain
+        注释称"站点侧没有重试命令（x/pixiv）"是过时信息。"""
+        from tg_userbot import runtime_db
+        runtime_db.XN_TASKS.enqueue("xuser1", label="X 失败任务")
+        runtime_db.XN_TASKS.fail("xuser1", "rate limited", max_attempts=1)
+        runtime_db.XI_TASKS.enqueue("pixivuser1", label="Pixiv 失败任务")
+        runtime_db.XI_TASKS.fail("pixivuser1", "login expired",
+                                 max_attempts=1)
+        status, dx = await self._get_detail("x")
+        self.assertTrue(dx["ok"])
+        fx = [i for i in dx["failed"] if i.get("label") == "X 失败任务"]
+        self.assertEqual(len(fx), 1)
+        self.assertIn("/x retry ", fx[0]["hint"])
+        self.assertIn("｜/x del ", fx[0]["hint"])
+        status, dp = await self._get_detail("pixiv")
+        self.assertTrue(dp["ok"])
+        fp = [i for i in dp["failed"] if i.get("label") == "Pixiv 失败任务"]
+        self.assertEqual(len(fp), 1)
+        self.assertIn("/pixiv retry ", fp[0]["hint"])
+        self.assertIn("｜/pixiv del ", fp[0]["hint"])
+
     async def test_unknown_domain_400(self):
         status, data = await self._get_detail("nope")
         self.assertEqual(status, 400)
@@ -2181,7 +2204,10 @@ class QueueDetailAllDomainsTest(unittest.IsolatedAsyncioTestCase):
 
 class ChromeQueueDetailUrlTest(unittest.IsolatedAsyncioTestCase):
     """Chrome 渠道队列条目带 url 字段（前端渲染可点超链接）+ 失败条目
-    双操作 hint（重试+取消）。owner 要求：失败列表链接可点 + 取消按钮。"""
+    双操作 hint（重试+取消）。owner 要求：失败列表链接可点 + 取消按钮。
+
+    2026-11-15 面板/bot 对齐：RETRY_WAIT 与 /chrome_failed 同类（失败
+    待重试桶，带双操作+退避倒计时），不再混入"排队中"。"""
 
     async def asyncSetUp(self):
         self._td = tempfile.mkdtemp(dir=_TMP)
@@ -2197,22 +2223,44 @@ class ChromeQueueDetailUrlTest(unittest.IsolatedAsyncioTestCase):
              "url": "https://www.iwara.tv/video/xyz1",
              "filename": None, "error": "iwara UI 复刻失败：no-gear",
              "updated_at": "2026-11-13 20:00:00"},
+            {"task_id": "beef5678" + "0" * 24, "status": "RETRY_WAIT",
+             "url": "https://www.iwara.tv/video/retry9",
+             "filename": None, "error": "浏览器取消下载",
+             "attempts": 1, "next_retry_at": time.time() + 90,
+             "updated_at": "2026-11-15 21:07:42"},
         ]
         chrome_agent.save_tasks(self._test_tasks, config.CHROME_TASKS_FILE)
         self.addCleanup(lambda: chrome_agent.save_tasks(
             self._saved_tasks, config.CHROME_TASKS_FILE))
 
-    async def test_failed_entry_has_url_and_dual_actions(self):
+    async def _get(self):
         client = make_client()
         await client.start_server()
         try:
             resp = await client.get("/api/queue_detail?domain=chrome")
-            data = await resp.json()
+            return await resp.json()
         finally:
             await client.close()
+
+    async def test_failed_entry_has_url_and_dual_actions(self):
+        data = await self._get()
         self.assertTrue(data["ok"])
-        hit = [i for i in data["failed"] if "iwara" in (i.get("url") or "")]
+        hit = [i for i in data["failed"] if "xyz1" in (i.get("url") or "")]
         self.assertEqual(len(hit), 1)
         self.assertEqual(hit[0]["url"], "https://www.iwara.tv/video/xyz1")
         self.assertIn("/chrome_retry abcd1234", hit[0]["hint"])
         self.assertIn("/chrome_cancel abcd1234", hit[0]["hint"])
+
+    async def test_retry_wait_in_failed_bucket_with_countdown(self):
+        data = await self._get()
+        self.assertTrue(data["ok"])
+        # RETRY_WAIT 进失败桶（对齐 /chrome_failed），不在排队中
+        hit = [i for i in data["failed"] if "retry9" in (i.get("url") or "")]
+        self.assertEqual(len(hit), 1)
+        self.assertIn("/chrome_retry beef5678", hit[0]["hint"])
+        self.assertIn("/chrome_cancel beef5678", hit[0]["hint"])
+        self.assertIsNotNone(hit[0]["next_in"])
+        self.assertLessEqual(hit[0]["next_in"], 90)
+        self.assertEqual(hit[0]["attempts"], 1)
+        self.assertFalse(any("retry9" in (i.get("url") or "")
+                             for i in data["pending"]))

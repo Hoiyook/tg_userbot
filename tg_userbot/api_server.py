@@ -1467,8 +1467,8 @@ def _qd_taskdomain(domain, label_key, retry_cmd=None, del_cmd=None):
     """TaskDomain 三兄弟（bili/x/pixiv）通用：list 全量按 status 分桶。
 
     list 按 id 升序（老→新）→ done 取尾部（最新完成的在最后）。
-    retry_cmd/del_cmd：失败条目的操作命令模板（{key} 占位）——站点侧
-    没有重试命令（x/pixiv）就传 None 不出按钮。"""
+    retry_cmd/del_cmd：失败条目的操作命令模板（{key} 占位）；站点侧
+    确实没有对应命令的渠道传 None 不出按钮。"""
     out = {"running": [], "pending": [], "failed": [], "done": []}
     for status, bucket in (("PROCESSING", "running"), ("PENDING", "pending"),
                            ("FAILED", "failed")):
@@ -1657,8 +1657,10 @@ async def _qd_chrome():
     from . import config as _config
     out = {"running": [], "pending": [], "failed": [], "done": []}
     tasks = chrome_agent.load_tasks(_config.CHROME_TASKS_FILE) or []
+    # RETRY_WAIT 与 bot /chrome_failed 同类（失败待重试，2026-11-15 对齐）：
+    # 此前归"排队中"无操作入口，owner 看着它干等——bot 侧却可重试/取消
     buckets = {"RUNNING": "running", "PENDING": "pending",
-               "RETRY_WAIT": "pending", "FAILED": "failed",
+               "RETRY_WAIT": "failed", "FAILED": "failed",
                "SUCCESS": "done"}
     # 实时下载进度（chrome_progress.json，Agent 独占写 1s 节流）：单在途
     prog = None
@@ -1671,21 +1673,27 @@ async def _qd_chrome():
     except (OSError, ValueError):
         pass
     for t in reversed(tasks):          # 新任务在前
-        bucket = buckets.get(str(t.get("status")).upper())
-        if bucket is None:
+        status = str(t.get("status")).upper()
+        bucket = buckets.get(status)
+        if bucket is None:             # CANCELLED 等无对应桶的状态跳过
             continue
         tid8 = str(t.get("task_id") or "")[:8]
-        # 失败条目双操作：重试 + 取消（2026-11-13 owner 要求）
+        # 失败条目双操作：重试 + 取消（2026-11-13 owner 要求；RETRY_WAIT
+        # 同样放行——bot failed_tasks/request_cancel 均支持）
         hint = (f"/chrome_retry {tid8}｜/chrome_cancel {tid8}"
                 if bucket == "failed" else None)
+        # RETRY_WAIT 带退避倒计时（与 TaskDomain 三兄弟同款渲染）
+        next_in = None
+        if status == "RETRY_WAIT" and t.get("next_retry_at"):
+            next_in = max(0, int(t["next_retry_at"] - time.time()))
         # RUNNING 条目带实时下载进度（received/total → MB 读数）
-        sub = str(t.get("status")) if bucket == "pending" else None
+        sub = None
         if bucket == "running" and prog:
             sub = (f"{prog.get('received', 0) / 1048576:.0f}/"
                    f"{prog.get('total', 0) / 1048576:.0f}MB")
         item = _qd_item(t.get("filename") or t.get("url"),
-                        sub=sub,
-                        error=t.get("error"), hint=hint,
+                        sub=sub, attempts=t.get("attempts"),
+                        error=t.get("error"), hint=hint, next_in=next_in,
                         url=t.get("url"))
         if bucket == "done":
             item["when"] = _qd_when(t.get("updated_at"))
@@ -1738,12 +1746,15 @@ async def _qd_bili():
                           "/bili del {key}")
 
 
+# x/pixiv 的 retry/del 子命令早已存在（/x retry <id|all> 等）——2026-11-15
+# 补齐面板操作按钮（此前注释称"站点侧没有重试命令"是过时信息）
 async def _qd_x():
-    return _qd_taskdomain(_td_x(), "url")
+    return _qd_taskdomain(_td_x(), "url", "/x retry {key}", "/x del {key}")
 
 
 async def _qd_pixiv():
-    return _qd_taskdomain(_td_pixiv(), "url")
+    return _qd_taskdomain(_td_pixiv(), "url", "/pixiv retry {key}",
+                          "/pixiv del {key}")
 
 
 _QUEUE_DETAIL_PROVIDER = {
