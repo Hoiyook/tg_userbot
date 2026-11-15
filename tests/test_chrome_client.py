@@ -25,6 +25,7 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 from tg_userbot import chrome_agent  # noqa: E402
 from tg_userbot import chrome_client  # noqa: E402
 from tg_userbot import config  # noqa: E402
+from tg_userbot import history  # noqa: E402
 
 
 class ChromeCommandParseTest(unittest.TestCase):
@@ -468,6 +469,48 @@ class NotifyScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已取消", sent[0][1])
         self.assertIn("用户主动取消", sent[0][1])
         rec = chrome_client.get_request("t3", path=self.requests_path)
+        self.assertIn("notified_at", rec)
+
+    async def test_requeued_task_notifies_again(self):
+        """重排队自愈（2026-11-15）：旧周期 notified_at 不得吞掉新一轮终态。
+
+        11-14/15 三条 SUCCESS 漏记台账的根因——重试把任务送回 PENDING
+        再跑成功后，请求记录里上一轮的通知标记让 notify 循环整个跳过
+        （不通知、不写台账）。自愈：任务回非终态即清上一轮标记，新一轮
+        终态正常通知。
+        """
+        self._seed()
+        sent = []
+
+        async def fake_send(chat_id, text):
+            sent.append((chat_id, text))
+
+        with mock.patch.object(chrome_client, "CHROME_TASKS_FILE",
+                               self.tasks_path), \
+                mock.patch.object(chrome_client, "CHROME_REQUESTS_FILE",
+                                  self.requests_path), \
+                mock.patch.object(chrome_client, "send_owner_message",
+                                  fake_send), \
+                mock.patch.object(history, "DOWNLOAD_HISTORY_FILE",
+                                  os.path.join(_TMP, "hist_selfheal.txt")):
+            await chrome_client.notify_pending_results()  # 第一轮 SUCCESS
+            self.assertEqual(len(sent), 1)
+            # 用户重试 → agent 把任务送回 PENDING（apply_retrials 的效果）
+            tasks = chrome_agent.load_tasks(self.tasks_path)
+            tasks[0]["status"] = "PENDING"
+            tasks[0]["attempts"] = 0
+            tasks[0]["error"] = None
+            chrome_agent.save_tasks(tasks, self.tasks_path)
+            await chrome_client.notify_pending_results()  # 非终态 → 自愈清标
+            rec = chrome_client.get_request("t1", path=self.requests_path)
+            self.assertNotIn("notified_at", rec)
+            # 重跑成功 → 新一轮 SUCCESS 必须再次通知
+            chrome_agent.finish_success(tasks[0], "1.zip", 8192)
+            chrome_agent.save_tasks(tasks, self.tasks_path)
+            await chrome_client.notify_pending_results()
+        self.assertEqual(len(sent), 2)
+        self.assertIn("8192", sent[1][1])
+        rec = chrome_client.get_request("t1", path=self.requests_path)
         self.assertIn("notified_at", rec)
 
 

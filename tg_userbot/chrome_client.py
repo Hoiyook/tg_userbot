@@ -826,6 +826,25 @@ def mark_notified(task_id, path=None, outcome=None, filename=None):
     save_requests(reqs, path)
 
 
+def clear_notified(task_id, path=None):
+    """清掉已通知标记（2026-11-15 漏记根因修复）。
+
+    重试/重排队把任务送回非终态再跑时，上一轮周期的 notified_at 会让
+    notify_pending_results 把新一轮终态整个跳过——不通知、不写台账
+    （11-14/15 三条 SUCCESS 漏记、9-24 九条同类漏记皆此根因）。任务
+    回到非终态即视为上一轮已失效，标记随之清除。返回是否真的清了。
+    """
+    reqs = load_requests(path)
+    changed = False
+    for r in reqs:
+        if (r.get("task_id") == task_id
+                and r.pop("notified_at", None) is not None):
+            changed = True
+    if changed:
+        save_requests(reqs, path)
+    return changed
+
+
 # ------------------------------------------------------------
 # 命令流（规格 12-16）
 # ------------------------------------------------------------
@@ -1129,7 +1148,17 @@ async def notify_pending_results():
     """扫描终态任务，按映射逐条通知并打 notified 标记（幂等，可重复调用）。"""
     tasks = chrome_agent.load_tasks(CHROME_TASKS_FILE)
     for task in tasks:
-        if task.get("status") not in chrome_agent.TERMINAL_STATUSES:
+        status = task.get("status")
+        if status not in chrome_agent.TERMINAL_STATUSES:
+            # 重排队自愈（2026-11-15）：重试/重扫把任务送回非终态后，
+            # 上一轮周期的 notified_at 会让新一轮终态被整个跳过（不通知、
+            # 不记台账）——回到非终态即清上一轮标记，见 clear_notified。
+            rec = get_request(task["task_id"])
+            if rec and rec.get("notified_at"):
+                clear_notified(task["task_id"])
+                logger.info(
+                    f"🔔 Chrome 任务 [{task['task_id'][:8]}] 回到非终态"
+                    f"（{status}），已清上一轮通知标记")
             continue
         rec = get_request(task["task_id"])
         if not rec or rec.get("notified_at"):
@@ -1138,7 +1167,7 @@ async def notify_pending_results():
             await send_owner_message(rec.get("chat_id"), result_text(task))
             # 台账全覆盖（2026-11-07 梳理）：SUCCESS 均记录——
             # iwara 用专 kind；其余 chrome 下载（普通网页媒体）记 chrome
-            if task.get("status") == "SUCCESS":
+            if status == "SUCCESS":
                 from .history import append_history
                 from datetime import datetime as _dt
                 is_iwara = "iwara" in str(rec.get("url") or "").lower()
