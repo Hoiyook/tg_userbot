@@ -96,6 +96,15 @@ async def resolve_best_download_url(cdp, video_id, target_id, timeout=40):
         result = await cdp.command("Runtime.evaluate", {
             "expression": expr, "awaitPromise": True, "returnByValue": True},
             session_id=session_id, timeout=timeout)
+    except RuntimeError as e:
+        # -32601 Method not found：会话已失效（页面被 CF 盾刷新/提前崩溃
+        # 关闭后，Chrome 对失效 session 上的一切方法都回 not found）——
+        # 给 owner 一句可行动的话，而不是一串协议错误码（2026-11-16）。
+        if "-32601" in str(e):
+            raise RuntimeError(
+                "页面会话已失效（页面可能被 Cloudflare 刷新或提前关闭），"
+                "自动重试通常可解") from e
+        raise
     finally:
         try:
             await cdp.command("Target.detachFromTarget", {

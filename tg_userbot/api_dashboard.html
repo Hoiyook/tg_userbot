@@ -153,6 +153,10 @@
 </style>
 </head>
 <body>
+<div id="connBanner" style="display:none;background:var(--red-bg);color:var(--red);
+  font-size:12px;text-align:center;padding:6px 10px;position:sticky;top:0;z-index:99">
+  ⚠️ 连接已断开——页面数据可能过期，正在自动重连…
+</div>
 <header>
   <span class="dot" id="dot"></span>
   <span id="ver" style="font-size:11px;color:var(--tx3)"></span>
@@ -1530,9 +1534,18 @@ function _applyBatch(data) {
   return refresh();
 }
 
+function _connBanner(show) {
+  const b = document.getElementById("connBanner");
+  if (b) b.style.display = show ? "block" : "none";
+}
+
 function _startSSE() {
   // SSE 推送（2026-11-07）：服务器每 2s 推全量数据，页面零轮询。
-  // EventSource 自带断线重连——onerror 期间由 batch 轮询兜底
+  // EventSource 自带断线重连——onerror 期间由 batch 轮询兜底。
+  // 2026-11-16 修复：_sseOK 此前只在 onopen 置 true、断开不清——SSE
+  // 断连后 batch 轮询兜底被跳过（if (!_sseOK) 不成立），页面冻结在
+  // 旧数据上（owner 实测：RETRY_WAIT 早变 SUCCESS，页面还挂着旧状态）。
+  // 现在：断开即清标志+亮断连横幅，重连成功即撤。
   try {
     const es = new EventSource("/api/sse" +
       (TOK() ? "?token=" + encodeURIComponent(TOK()) : ""));
@@ -1540,7 +1553,11 @@ function _startSSE() {
       const d = JSON.parse(ev.data);
       if (d.ok) { _BATCH = d.data; refresh(); }
     };
-    es.onerror = () => { /* EventSource 自动重连；主轮询退避兜底 */ };
+    es.onopen = () => { window._sseOK = true; _connBanner(false); };
+    es.onerror = () => {
+      window._sseOK = false;      // 让 batch 轮询兜底接管（此前缺这行）
+      _connBanner(true);
+    };
     return es;
   } catch (e) { return null; }
 }
@@ -1556,7 +1573,8 @@ async function _refreshLoop() {
         "/api/links", "/api/commands"];
       const d = await api("/api/batch?paths=" +
         encodeURIComponent(paths.join(",")));
-      if (d.ok) { _BATCH = d.data; await refresh(); _pollMs = 2000; }
+      if (d.ok) { _BATCH = d.data; await refresh(); _pollMs = 2000;
+                  _connBanner(false); }   // 兜底在更新数据，不算"过期"
       else { _pollMs = Math.min(_pollMs * 2, 30000); }
     } catch (e) { _BATCH = {}; _pollMs = Math.min(_pollMs * 2, 30000); }
     for (const job of [loadQueuesAll, loadQueueDetail, loadExtractState,
@@ -1641,8 +1659,7 @@ async function refreshAll() {
   }, {passive: true});
 })();
 _refreshLoop();
-window._sse = _startSSE();
-if (window._sse) window._sse.onopen = () => { window._sseOK = true; };
+window._sse = _startSSE();   // onopen/onerror 已在 _startSSE 内设置（含断连横幅）
 setInterval(loadBackup, 60000);
 setInterval(loadChrome, 5000);
 refresh();

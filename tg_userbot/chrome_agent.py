@@ -677,8 +677,12 @@ async def run_download_attempt(cdp, url, download_dir, timeout,
     # 先在页面上下文解析最高画质 download 直链，再导航触发下载事件
     from .iwara import extract_iwara_video_id
     video_id = extract_iwara_video_id(url)
+    # target_id 预置 None（2026-11-16）：下载 tab 打开失败时 finally 引用
+    # 未赋值变量会抛 UnboundLocalError（生产实测「local variable
+    # 'target_id' referenced before assignment」把真实失败吞成另一条错误）
+    target_id = None
     if video_id:
-        target_id = await cdp.open_tab(url)
+        page_tab = await cdp.open_tab(url)
         import asyncio as _a
         try:
             await _a.sleep(6)   # 等页面/登录态就绪
@@ -688,10 +692,21 @@ async def run_download_attempt(cdp, url, download_dir, timeout,
         old_sub = (task or {}).get("download_subdir") or ""
         try:
             dl_url, title, quality, author, date = (
-                await resolve_best_download_url(cdp, video_id, target_id))
+                await resolve_best_download_url(cdp, video_id, page_tab))
         except Exception as e:
             logger.warning(f"🧲 iwara 直链解析失败：{e}")
+            try:
+                await cdp.close_tab(page_tab)
+            except Exception:
+                pass
             return False, None, None, f"iwara 直链解析失败：{e}"
+        # 页面使命完成（直链已到手）：立即关闭页面 tab——此前解析完留着
+        # 不管、另开新 tab 下载，每个 iwara 任务泄漏一个 tab（agent 启动
+        # 时「关闭遗留 iwara 标签页」清的就是这些），运行期一直累积
+        try:
+            await cdp.close_tab(page_tab)
+        except Exception:
+            pass
         logger.info(f"🌐 iwara 最高画质 {quality}，转下载直链")
         # 命名规约（2026-10-04 用户要求）：作者名做子目录，日期+标题做
         # 文件名前缀。task 在手即直接改记录（subdir 决定落盘目录，label
@@ -779,10 +794,11 @@ async def run_download_attempt(cdp, url, download_dir, timeout,
         clear_progress(guid=guid, task_id=(task or {}).get("task_id"))
         if cancel_task is not None and not cancel_task.done():
             cancel_task.cancel()
-        try:
-            await cdp.close_tab(target_id)
-        except Exception:
-            pass
+        if target_id is not None:   # 下载 tab 打开失败时无 tab 可关
+            try:
+                await cdp.close_tab(target_id)
+            except Exception:
+                pass
 
 
 # ------------------------------------------------------------
