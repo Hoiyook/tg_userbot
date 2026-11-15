@@ -352,6 +352,12 @@ def _submit(arg):
                 "增量去重——已在 archive 的作品不重下。进度 /pixiv 查看")
     row = runtime_db.XI_TASKS.get(key) or {}
     st, rid = row.get("status", "?"), row.get("id", "?")
+    if st == "DONE":
+        # 增量重扫（2026-11-14 owner 追更需求）：DONE 的作者/画师
+        # 重新入队 = 拉取新作品（gallery-dl/archive 去重保证不重下）
+        runtime_db.XI_TASKS.requeue(key)
+        return (f"🎨 已重新排队增量拉取：{label[:40]}\n"
+                "增量去重——新作品才下载，进度 /")
     if st == "FAILED":
         return f"⏭️ 该画师已在队列且失败过（#{rid}）——/pixiv retry {rid} 重投"
     return f"⏭️ 该画师已在队列中（#{rid}，{st}）——跑完自动继续下一条"

@@ -4242,6 +4242,24 @@ class TaskDomain:
 
         return _write(do, f"失败 {self.what}")
 
+    def requeue(self, key, now=None):
+        """任意非在途状态 → PENDING（2026-11-14 增量重扫用）。
+
+        与 retry 的区别：retry 只认 FAILED；requeue 接受 DONE/CANCELLED/
+        FAILED 任何终态——X/Pixiv 作者的重复提交语义 = 增量拉新作品
+        （gallery-dl/archive 去重保证不重下），追更入口。"""
+        now = _now(now)
+
+        def do(conn):
+            cur = _execute(conn, f"UPDATE {self.table} SET status=?, "
+                           "attempts=0, next_retry_at=NULL, "
+                           "lease_until=NULL, updated_at=? "
+                           f"WHERE {self.key}=? AND status IN (?,?)",
+                           (self.PENDING, now, str(key), self.DONE,
+                            self.FAILED))
+            return cur.rowcount
+        return _write(do, f"requeue {self.table} {key}")
+
     def retry(self, key=None, now=None):
         """FAILED → PENDING（key=None 重投全部）。返回重投条数。"""
         now = _now(now)
