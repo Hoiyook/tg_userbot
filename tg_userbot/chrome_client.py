@@ -331,6 +331,51 @@ def cancel_usage_text():
             "也可以直接给任务 ID：/chrome_cancel a1b2c3d4（不受列表变动影响）。")
 
 
+def _url_key(url):
+    """失败聚合的 URL 归一化键：iwara 视频页取 video_id（同一视频的
+    不同 slug 形态 /video/<id>/<slug> 与 /video/<id> 视为同一目标），
+    其余 URL 去掉 query 精确匹配。"""
+    try:
+        from .iwara import extract_iwara_video_id
+        vid = extract_iwara_video_id(str(url or ""))
+    except Exception:
+        vid = None
+    if vid:
+        return f"iwara:{vid}"
+    return str(url or "").split("?")[0]
+
+
+def superseded_failures(tasks):
+    """「已被同 URL 更晚的成功下载取代」的失败任务 id 集合。
+
+    失败（FAILED/RETRY_WAIT）是终态，任务记录保留在 200 条窗口里——
+    同一 URL 后来重新提交并成功了，旧失败仍会占着失败列表前排还带
+    操作按钮（生产实测：42 天前失败的 kafka-chewy，同 URL 后来成功
+    下载过 7 次，失败桶至今挂着 3 条僵尸）。这类失败已无处置价值：
+    目标内容拿到了，重试只会重复下载。/chrome_failed 与面板失败桶
+    共用本过滤（与 failed_tasks 同款纪律——两边只改一边迟早漂移）。
+    """
+    latest_success = {}   # url_key -> 最晚 SUCCESS 的 updated_at
+    for t in tasks:
+        if str(t.get("status")).upper() != "SUCCESS" or not t.get("updated_at"):
+            continue
+        key = _url_key(t.get("url"))
+        if not key:
+            continue
+        ua = str(t["updated_at"])
+        if key not in latest_success or ua > latest_success[key]:
+            latest_success[key] = ua
+    out = set()
+    for t in tasks:
+        if str(t.get("status")).upper() not in ("FAILED", "RETRY_WAIT"):
+            continue
+        key = _url_key(t.get("url"))
+        ua = str(t.get("updated_at") or "")
+        if key and key in latest_success and latest_success[key] > ua:
+            out.add(t.get("task_id"))
+    return out
+
+
 def failed_tasks(tasks, limit=15):
     """可手动重试的任务（FAILED + RETRY_WAIT 退避中），/chrome_failed 与
     /chrome_retry 共用列表——序号寻址两边必须出自同一函数（与
@@ -338,9 +383,13 @@ def failed_tasks(tasks, limit=15):
 
     2026-11-13 扩展：RETRY_WAIT（退避等待自动重试中）也允许手动立即
     重试——手动 retry 语义 = 清退避立即跑（生产实测：退避中的任务点
-    retry 被"没有失败任务的 ID"拒绝，owner 困惑）。"""
+    retry 被"没有失败任务的 ID"拒绝，owner 困惑）。
+
+    2026-11-16 过滤：已被同 URL 更晚成功取代的失败不再展示（见
+    superseded_failures——42 天僵尸失败占前排的根因）。"""
     retryable = [t for t in tasks
-                 if str(t.get("status")).upper() in ("FAILED", "RETRY_WAIT")]
+                 if str(t.get("status")).upper() in ("FAILED", "RETRY_WAIT")
+                 and t.get("task_id") not in superseded_failures(tasks)]
     # 分两段：字符串时间组（正常）按时间降序（字典序=时间序），异形垫底
     # ——混合 key 排序会 TypeError 或错序，分组处理最直白
     normal = [t for t in retryable

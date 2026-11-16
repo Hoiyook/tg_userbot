@@ -546,6 +546,77 @@ class NotifyScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("notified_at", rec)
 
 
+class SupersededFailuresTest(unittest.TestCase):
+    """已被同 URL 更晚成功取代的失败不再进失败列表（2026-11-16）。
+
+    生产实例：42 天前失败的 kafka-chewy（3 条 FAILED 僵尸），同 URL
+    后来成功下载过 7 次，失败桶至今挂着还带操作按钮——owner 在面板
+    看到同 URL「既成功又在失败队列」，无法分辨哪条是活的。"""
+
+    def setUp(self):
+        self.tasks_path = os.path.join(_TMP, "chrome_tasks_superseded.json")
+        if os.path.exists(self.tasks_path):
+            os.remove(self.tasks_path)
+
+    def tearDown(self):
+        if os.path.exists(self.tasks_path):
+            os.remove(self.tasks_path)
+
+    def _seed(self):
+        """复刻生产现场：42 天前失败 ×3（两种 slug 形态）+ 之后成功 ×1。"""
+        return [
+            {"task_id": "failaaaa", "status": "FAILED",
+             "url": "https://www.iwara.tv/video/VID123/kafka-chewy",
+             "updated_at": "2026-10-04 02:32:52", "error": "boom"},
+            {"task_id": "failbbbb", "status": "FAILED",
+             "url": "https://www.iwara.tv/video/VID123",
+             "updated_at": "2026-10-04 02:29:54", "error": "boom"},
+            {"task_id": "failcccc", "status": "RETRY_WAIT",
+             "url": "https://www.iwara.tv/video/VID123/slug-x",
+             "updated_at": "2026-10-04 02:27:36", "error": "boom"},
+            {"task_id": "okaaaaaa", "status": "SUCCESS",
+             "url": "https://www.iwara.tv/video/VID123/kafka-chewy",
+             "updated_at": "2026-10-05 00:39:44", "filename": "kafka.mp4"},
+        ]
+
+    def test_superseded_failures_hidden_from_failed_tasks(self):
+        tasks = self._seed()
+        superseded = chrome_client.superseded_failures(tasks)
+        self.assertEqual(superseded,
+                         {"failaaaa", "failbbbb", "failcccc"},
+                         "slug 变体必须归并为同一视频聚合")
+        items = chrome_client.failed_tasks(tasks)
+        self.assertEqual([t["task_id"] for t in items], [],
+                         "已被成功取代的失败不应出现在 /chrome_failed")
+
+    def test_fresh_failure_still_listed(self):
+        tasks = self._seed()
+        # 成功之后又有一次新失败（另一 URL）——需要处置，必须展示
+        tasks.append({"task_id": "faildddd", "status": "FAILED",
+                      "url": "https://a.com/other.zip",
+                      "updated_at": "2026-11-16 08:00:00", "error": "boom"})
+        items = chrome_client.failed_tasks(tasks)
+        self.assertEqual([t["task_id"] for t in items], ["faildddd"])
+
+    def test_failure_newer_than_success_still_listed(self):
+        """成功早于失败：成功后又有一次失败——是新问题，不得隐藏。"""
+        tasks = self._seed()
+        tasks.append({"task_id": "faileeee", "status": "FAILED",
+                      "url": "https://www.iwara.tv/video/VID123",
+                      "updated_at": "2026-11-16 09:00:00", "error": "新失败"})
+        superseded = chrome_client.superseded_failures(tasks)
+        self.assertNotIn("faileeee", superseded)
+        items = chrome_client.failed_tasks(tasks)
+        self.assertEqual([t["task_id"] for t in items], ["faileeee"])
+
+    def test_cancelled_success_does_not_supersede(self):
+        """只有 SUCCESS 取代失败；CANCELLED 不算（放弃≠拿到内容）。"""
+        tasks = self._seed()
+        tasks[3]["status"] = "CANCELLED"
+        superseded = chrome_client.superseded_failures(tasks)
+        self.assertEqual(superseded, set())
+
+
 class RetryRequestForTest(unittest.TestCase):
     """retry_request_for：bot 🔁 按钮与 /chrome_retry 共用的复核+IPC。
 

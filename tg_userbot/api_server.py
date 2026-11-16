@@ -1654,6 +1654,7 @@ async def _qd_listener():
 
 async def _qd_chrome():
     from . import chrome_agent
+    from . import chrome_client
     from . import config as _config
     out = {"running": [], "pending": [], "failed": [], "done": []}
     tasks = chrome_agent.load_tasks(_config.CHROME_TASKS_FILE) or []
@@ -1672,10 +1673,15 @@ async def _qd_chrome():
             prog = items[-1]
     except (OSError, ValueError):
         pass
+    # 已被同 URL 更晚成功取代的失败不再展示（与 /chrome_failed 共源：
+    # chrome_client.superseded_failures——42 天僵尸失败占前排的根因）
+    superseded = chrome_client.superseded_failures(tasks)
     for t in reversed(tasks):          # 新任务在前
         status = str(t.get("status")).upper()
         bucket = buckets.get(status)
         if bucket is None:             # CANCELLED 等无对应桶的状态跳过
+            continue
+        if bucket == "failed" and t.get("task_id") in superseded:
             continue
         tid8 = str(t.get("task_id") or "")[:8]
         # 失败条目双操作：重试 + 取消（2026-11-13 owner 要求；RETRY_WAIT
@@ -1695,8 +1701,19 @@ async def _qd_chrome():
                         sub=sub, attempts=t.get("attempts"),
                         error=t.get("error"), hint=hint, next_in=next_in,
                         url=t.get("url"))
-        if bucket == "done":
-            item["when"] = _qd_when(t.get("updated_at"))
+        if bucket in ("done", "failed"):
+            # chrome tasks 的 updated_at 是字符串时间（_qd_when 只认
+            # epoch——此前 done/failed 桶的 when 因此一直是 None）
+            ua = t.get("updated_at")
+            if isinstance(ua, str) and ua:
+                try:
+                    item["when"] = time.strftime(
+                        "%m-%d %H:%M",
+                        time.strptime(ua[:19], "%Y-%m-%d %H:%M:%S"))
+                except ValueError:
+                    item["when"] = None
+            else:
+                item["when"] = _qd_when(ua)
         if len(out[bucket]) >= _QD_LIMIT:
             continue
         out[bucket].append(item)

@@ -2228,6 +2228,15 @@ class ChromeQueueDetailUrlTest(unittest.IsolatedAsyncioTestCase):
              "filename": None, "error": "浏览器取消下载",
              "attempts": 1, "next_retry_at": time.time() + 90,
              "updated_at": "2026-11-15 21:07:42"},
+            # 僵尸失败：同 URL（slug 变体）随后已成功——必须被过滤
+            {"task_id": "deadbeef" + "0" * 24, "status": "FAILED",
+             "url": "https://www.iwara.tv/video/zombie1/old-slug",
+             "filename": None, "error": "旧失败",
+             "updated_at": "2026-10-04 02:32:52"},
+            {"task_id": "freshok1" + "0" * 24, "status": "SUCCESS",
+             "url": "https://www.iwara.tv/video/zombie1",
+             "filename": "zombie.mp4", "size_bytes": 1024,
+             "updated_at": "2026-10-05 00:39:44"},
         ]
         chrome_agent.save_tasks(self._test_tasks, config.CHROME_TASKS_FILE)
         self.addCleanup(lambda: chrome_agent.save_tasks(
@@ -2264,3 +2273,16 @@ class ChromeQueueDetailUrlTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hit[0]["attempts"], 1)
         self.assertFalse(any("retry9" in (i.get("url") or "")
                              for i in data["pending"]))
+
+    async def test_superseded_failure_hidden_and_when_shown(self):
+        """被同 URL 更晚成功取代的失败不进失败桶（2026-11-16）；存活的
+        失败条目带失败时间 when（owner 分辨僵尸与新失败）。"""
+        data = await self._get()
+        self.assertTrue(data["ok"])
+        self.assertFalse(
+            any("zombie1" in (i.get("url") or "") for i in data["failed"]),
+            "已被成功取代的僵尸失败不应出现在失败桶")
+        # 存活的失败条目带 when
+        hit = [i for i in data["failed"] if "xyz1" in (i.get("url") or "")]
+        self.assertEqual(len(hit), 1)
+        self.assertIsNotNone(hit[0].get("when"))
