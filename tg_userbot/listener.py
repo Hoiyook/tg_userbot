@@ -349,13 +349,28 @@ def _config_path():
 
 
 def save_listen_config() -> bool:
-    """把 state 里的监听配置原子写盘；失败仅告警（绝不影响运行）。"""
+    """把 state 里的监听配置持久化；失败仅告警（绝不影响运行）。
+
+    真相源是 DB 的 listener_rules 表（schema v24，2026-11-16）——
+    listen.json 曾是唯一真相源，被测试进程覆写成 [] 后规则全丢、停摆
+    6 天且不可恢复。现在：规则 write-through 落表（表 = state 镜像），
+    JSON 同步导出仅作人可读快照/手改入口（启动时表非空则表覆盖内存，
+    手改 JSON 须 /listen reload 显式导入才生效）。任一层写失败都只
+    告警——另一层仍有完整副本，规则不再有单点。
+    """
     global _LAST_CONFIG_MTIME
+    rules = [normalize_rule(r) for r in state.LISTEN_RULES]
+    # ① DB 真相源（不可用时告警，JSON 层仍导出——双写互为冗余）
+    try:
+        runtime_db._rules_replace(rules)
+    except Exception as e:
+        logger.warning(f"保存标签监听规则到 DB 失败（JSON 层仍会导出）：{e}")
+    # ② JSON 导出（人可读快照；损坏文件曾被当真相源，如今只是副本）
     path = _config_path()
     payload = {
         "enabled": bool(state.LISTEN_ENABLED),
         "interval_minutes": int(state.LISTEN_INTERVAL_MINUTES),
-        "listeners": [normalize_rule(r) for r in state.LISTEN_RULES],
+        "listeners": rules,
     }
     tmp_path = path + ".tmp"
     try:
@@ -372,7 +387,7 @@ def save_listen_config() -> bool:
             _LAST_CONFIG_MTIME = 0.0
         return True
     except Exception as e:
-        logger.warning(f"保存标签监听配置失败（不影响运行）：{e}")
+        logger.warning(f"导出标签监听配置 JSON 失败（不影响运行）：{e}")
         try:
             os.remove(tmp_path)
         except Exception:
@@ -410,14 +425,46 @@ def _apply_config(data) -> int:
 
 
 def load_listen_config() -> int:
-    """启动时载入 listen.json，返回生效的规则条数。
+    """启动时载入监听配置，返回生效的规则条数。
 
-    文件缺失 → 空规则 + 默认开关；JSON 损坏 → 记日志后用空配置（绝不抛）。
+    真相源优先级（schema v24 起）：**DB listener_rules 表 > listen.json**。
+    表非空 → 表覆盖内存（JSON 只是导出物，被任何进程写坏/清空都不再丢
+    规则——2026-11-16 停摆 6 天事故的根治）；表空 + JSON 非空 → 一次性
+    导入旧部署的规则并落表；两层都空才是全新空配置。JSON 损坏不抛——
+    还有 DB 层兜着。
     """
     global _LAST_CONFIG_MTIME
     state.LISTEN_ENABLED = True
     state.LISTEN_INTERVAL_MINUTES = config.LISTEN_DEFAULT_INTERVAL_MINUTES
     state.LISTEN_RULES = []
+    # ① DB 真相源
+    db_rules = []
+    db_ok = False
+    try:
+        db_rules = runtime_db.rules_load()
+        db_ok = True
+    except Exception as e:
+        logger.warning(f"读 DB 监听规则失败（回落 JSON 层）：{e}")
+    if db_ok and db_rules:
+        n = _apply_config({
+            "enabled": True,
+            "interval_minutes": config.LISTEN_DEFAULT_INTERVAL_MINUTES,
+            "listeners": db_rules,
+        })
+        logger.info(f"📡 监听规则自 DB 装载 {n} 条（listen.json 为导出物）")
+        # JSON 层与 DB 不一致（如被外部清空）→ 用 DB 覆写回导出物
+        try:
+            with open(_config_path(), "r", encoding="utf-8") as f:
+                jn = len(json.load(f).get("listeners") or [])
+        except Exception:
+            jn = -1
+        if jn != n:
+            logger.warning(
+                f"📡 listen.json 与 DB 不一致（JSON {jn} 条 / DB {n} 条）"
+                "——以 DB 为准覆写导出物")
+            save_listen_config()
+        return n
+    # ② JSON 层（首次升级导入，或 DB 不可用时的回落）
     try:
         with open(_config_path(), "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -428,12 +475,21 @@ def load_listen_config() -> int:
     except Exception as e:
         logger.warning(f"读取标签监听配置失败，改用空配置：{e}")
         return 0
-    # 记下「已知内容」的 mtime：下一轮扫描的 reload 只在文件真被外部改过时才读
     try:
         _LAST_CONFIG_MTIME = os.path.getmtime(_config_path())
     except OSError:
         _LAST_CONFIG_MTIME = 0.0
-    return _apply_config(data)
+    n = _apply_config(data)
+    # 首次升级导入：JSON 有规则而 DB 为空 → 落表（此后 DB 是真相源）
+    if n and db_ok:
+        try:
+            runtime_db._rules_replace(
+                [normalize_rule(r) for r in state.LISTEN_RULES])
+            logger.info(f"📡 监听规则已自 JSON 导入 DB（{n} 条）——"
+                        "listen.json 降级为导出物")
+        except Exception as e:
+            logger.warning(f"监听规则导入 DB 失败（下次启动会重试）：{e}")
+    return n
 
 
 def reload_listen_config() -> bool:
@@ -441,8 +497,11 @@ def reload_listen_config() -> bool:
 
     只在文件 mtime 变了才读，且**解析成功才替换内存态**——一只半截/损坏的
     文件绝不能把正在生效的规则清空：清空后用户下一次点任何按钮都会把空规则
-    保存回文件，规则就真的没了。失败保持当前配置并记下 mtime（避免每轮扫描
-    反复读同一个坏文件）。返回是否真的重新载入了配置。
+    保存回文件，规则就真的没了（DB 层兜底后此事故的恢复成本已降为一次
+    重启，但防线保留）。载入成功即 write-through 落表——手改 JSON 视为
+    显式导入（v24 起 JSON 是导出物，只有真正解析成功才回写 DB）。失败
+    保持当前配置并记下 mtime（避免每轮扫描反复读同一个坏文件）。
+    返回是否真的重新载入了配置。
     """
     global _LAST_CONFIG_MTIME
     path = _config_path()
@@ -463,6 +522,12 @@ def reload_listen_config() -> bool:
         return False
     _LAST_CONFIG_MTIME = mtime
     count = _apply_config(data)
+    # 显式导入语义：JSON 被人改过且解析成功 → 新内存态落 DB（保持镜像）
+    try:
+        runtime_db._rules_replace(
+            [normalize_rule(r) for r in state.LISTEN_RULES])
+    except Exception as e:
+        logger.warning(f"重载的监听规则落 DB 失败（下次保存会重试）：{e}")
     logger.info(f"📡 标签监听配置已重新载入：{count} 条规则")
     return True
 

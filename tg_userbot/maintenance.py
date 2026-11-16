@@ -224,6 +224,36 @@ def daily_maintenance():
     except Exception as e:
         logger.warning(f"💾 磁盘预警失败（不影响维护）：{e}")
 
+    # ⑤.4 监听规则完整性哨兵（2026-11-16 事故）：规则曾在 JSON 单点时代
+    #    被测试进程清空、停摆 6 天无人知（"规则 0 条"只是一行 INFO）。现在
+    #    DB 是真相源——但"清零"仍可能是**合法状态**（用户自己删光了规则），
+    #    所以只在「DB 有规则但内存为空」或「三层计数不一致」时告警。
+    try:
+        from . import listener as _listener
+        db_n = runtime_db.rules_count()
+        mem_n = len(getattr(_listener.state, "LISTEN_RULES", []) or [])
+        json_n = None
+        try:
+            import json as _json
+            with open(config.LISTEN_CONFIG_FILE, encoding="utf-8") as _f:
+                json_n = len(_json.load(_f).get("listeners") or [])
+        except Exception:
+            pass
+        if db_n and mem_n == 0:
+            report.append(("❌", f"监听规则异常：DB 有 {db_n} 条但内存 0 条"
+                           "（进程异常态——重启恢复）"))
+            bad.append("监听规则内存态丢失")
+        elif db_n is not None and json_n is not None and not (
+                db_n == mem_n == json_n):
+            report.append(("⚠️", f"监听规则三层不一致：DB {db_n} / 内存 "
+                           f"{mem_n} / JSON {json_n}（下次保存自动对齐）"))
+        elif db_n == 0 and mem_n == 0:
+            report.append(("✅", "监听规则：0 条（无监听——如需开启用 /listen_add）"))
+        else:
+            report.append(("✅", f"监听规则：{db_n if db_n is not None else mem_n} 条"))
+    except Exception as e:
+        logger.warning(f"📡 监听规则哨兵失败（不影响维护）：{e}")
+
     # ⑤.5 问题库保鲜提醒（2026-11-16）：docs/典型问题库.md 是"复发时
     #    追加"的承诺——承诺没有触发机制就是空头支票（P8 模式在文档层的
     #    翻版）。超 ISSUES_DOC_REVIEW_DAYS 天未整理就在维护报告喊一声。

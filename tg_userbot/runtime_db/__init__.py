@@ -527,6 +527,11 @@ def migrate() -> int:
     if version < 23:
         # v22 → v23：新增 api_requests（分享提交幂等台账）。纯建表。
         logger.info("🗄 Runtime DB 迁移：v23（+ api_requests 分享幂等）")
+    if version < 24:
+        # v23 → v24：新增 listener_rules（监听规则持久层）。纯建表；旧
+        # listen.json 由 listener.load_listen_config 的启动导入负责
+        # （表空 + JSON 非空 → 一次性导入）。
+        logger.info("🗄 Runtime DB 迁移：v24（+ listener_rules 监听规则持久层）")
     if version != target:
         set_schema_meta("schema_version", target)
         logger.info(f"🗄 Runtime DB schema 版本：{version or '（无）'} → {target}")
@@ -4502,3 +4507,60 @@ def api_request_prune(now=None, keep=None):
         return cur.rowcount
 
     return _write(do, "分享幂等台账裁剪")
+
+
+# ============================================================
+# 标签监听规则持久层（listener_rules，schema v24，2026-11-16）。
+# listen.json 曾是唯一真相源：被测试进程（或任何持有空内存态的进程）
+# save_listen_config 覆写成 [] 后规则全丢、停摆 6 天且不可恢复。入库后：
+#   * 运行期 write-through：state 规则变更全量重写本表（规则 ≤ 十几条，
+#     全量重写与 JSON 同成本，语义最简单——表永远是 state 的精确镜像）；
+#   * 启动装载规则见 listener.load_listen_config：表空 + JSON 非空 →
+#     导入；表非空 → 表覆盖内存（JSON 只是导出物，手改 JSON 要用
+#     /listen import 显式导入——文档与命令帮助里写清）。
+# ============================================================
+def _rules_replace(rules, now=None):
+    """全量重写规则表（state 镜像语义）。rules 为 normalize_rule 形态列表。"""
+    ts = _now(now)
+
+    def do(conn):
+        cur = _execute(conn, "DELETE FROM listener_rules")
+        for i, rule in enumerate(rules, 1):
+            _execute(
+                conn,
+                "INSERT INTO listener_rules (idx, rule, updated_at) "
+                "VALUES (?, ?, ?)",
+                (i, json.dumps(rule, ensure_ascii=False), ts))
+        return cur.rowcount
+
+    _write(do, "监听规则落库")
+
+
+def rules_load():
+    """读全部规则（idx 升序）。表空返回 []；行损坏跳过该行（不抛）。"""
+    def do(conn):
+        out = []
+        for row in conn.execute(
+                "SELECT rule FROM listener_rules ORDER BY idx"):
+            try:
+                r = json.loads(row[0])
+                if isinstance(r, dict):
+                    out.append(r)
+            except ValueError:
+                continue
+        return out
+
+    try:
+        return _read(do, "读监听规则") or []
+    except Exception:
+        return []
+
+
+def rules_count():
+    """规则行数（哨兵与日志用；DB 不可用返回 None——调用方按未知处理）。"""
+    try:
+        return _read(lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM listener_rules").fetchone()[0],
+            "数监听规则")
+    except Exception:
+        return None

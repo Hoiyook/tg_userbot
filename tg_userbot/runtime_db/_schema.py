@@ -519,4 +519,20 @@ _SCHEMA = (
         created_at INTEGER NOT NULL
     )
     """,
+    # v24：标签监听规则持久层（2026-11-16）。listen.json 曾是唯一真相源，
+    # 被测试进程清空后规则全丢、评论区跟进停摆 6 天且不可恢复（靠 follow
+    # 表反推才重建）。规则入库后 JSON 降级为导入/导出接口：
+    #   * 启动装载：表空 + JSON 非空 → 一次性导入（旧部署升级路径）；
+    #   * 运行期：state 变更 write-through 落表，JSON 同步导出（人可读/
+    #     手改入口不变）；启动时表非空 → **表覆盖内存**（JSON 只是导出物）。
+    #   * 任何进程再把规则清空，DB 里的行还在——恢复 = 一次 SELECT。
+    # rule JSON 装 normalize_rule 的完整形态（含 exclude_ext/source_name
+    # 等可选字段，round-trip 无损）；idx 决定 /listen list 的序号顺序。
+    """CREATE TABLE IF NOT EXISTS listener_rules (
+        idx        INTEGER NOT NULL,       -- 规则序号（1 起，/listen 的 N）
+        rule       TEXT NOT NULL,          -- normalize_rule 形态 JSON
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (idx)
+    )
+    """,
 )
