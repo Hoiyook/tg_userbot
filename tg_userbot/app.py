@@ -1634,14 +1634,11 @@ async def main():
     done_notify.load_config()
     dedup.load_dedup_config()
     caption_filter.load_caption_filter_config()
-    listener.load_listen_config()
-    sql_templates.load_sql_templates()
-    cmd_templates.load_cmd_templates()
-    memo.load_memo()
-    shell.load_shell_cwd()
     # Runtime DB：业务状态层（SQLite）。**必须在队列/去重索引装载之前
     # 就绪**——load_queue_any / dedup.load_index 依它选 DB 或文件模式；
     # 也必须在登录前就绪。初始化失败只降级，绝不让 userbot 起不来。
+    # v24 起还必须先于 load_listen_config：listener_rules 表是监听规则
+    # 的真相源（JSON 是导出物），装载要从表里读。
     if runtime_db.init_db():
         state.RUNTIME_DB_READY = True
         migrated = listener.migrate_legacy_state()
@@ -1659,6 +1656,9 @@ async def main():
             "🗄 Runtime DB 不可用：标签监听不启动，队列/历史/去重索引回落"
             "文件持久化（其余功能不受影响）"
         )
+    # 监听规则装载：DB 就绪之后（v24 起 listener_rules 表是真相源；
+    # DB 不可用时函数内部自行回落 JSON 层）。
+    listener.load_listen_config()
     loaded = dedup.load_index()
     logger.info(f"🛡 去重索引已载入：{loaded} 条")
     state.WHITELIST_CHATS = whitelist.load_whitelist()
