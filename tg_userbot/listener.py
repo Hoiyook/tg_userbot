@@ -360,9 +360,16 @@ def save_listen_config() -> bool:
     """
     global _LAST_CONFIG_MTIME
     rules = [normalize_rule(r) for r in state.LISTEN_RULES]
-    # ① DB 真相源（不可用时告警，JSON 层仍导出——双写互为冗余）
+    # ① DB 真相源（不可用时告警，JSON 层仍导出——双写互为冗余）。
+    # interval/enabled 一并落 schema_meta——它们不属于规则表，但同样曾是
+    # JSON 单点（v24 首版只入库规则，装载分支回退默认周期 1440，把 owner
+    # 设的 30 分钟静默改掉了——生产实测 2026-11-16 11:54）。
     try:
         runtime_db._rules_replace(rules)
+        runtime_db.set_schema_meta("listen_interval_minutes",
+                                   str(int(state.LISTEN_INTERVAL_MINUTES)))
+        runtime_db.set_schema_meta(
+            "listen_enabled", "1" if state.LISTEN_ENABLED else "0")
     except Exception as e:
         logger.warning(f"保存标签监听规则到 DB 失败（JSON 层仍会导出）：{e}")
     # ② JSON 导出（人可读快照；损坏文件曾被当真相源，如今只是副本）
@@ -446,9 +453,32 @@ def load_listen_config() -> int:
     except Exception as e:
         logger.warning(f"读 DB 监听规则失败（回落 JSON 层）：{e}")
     if db_ok and db_rules:
+        # interval/enabled 不在规则表里——从 schema_meta 恢复（save 时落）；
+        # 缺失（首次升级）回落 JSON 层的值，再缺失才用默认。直接用默认会把
+        # owner 设好的 30 分钟静默改成 1440（生产实测）。
+        try:
+            meta_iv = runtime_db.get_schema_meta("listen_interval_minutes")
+        except Exception:
+            meta_iv = None
+        try:
+            meta_en = runtime_db.get_schema_meta("listen_enabled")
+        except Exception:
+            meta_en = None
+        json_iv = None
+        json_en = None
+        try:
+            with open(_config_path(), "r", encoding="utf-8") as f:
+                _jd = json.load(f)
+            json_iv = _jd.get("interval_minutes")
+            json_en = _jd.get("enabled")
+        except Exception:
+            pass
+        iv = int(meta_iv) if meta_iv else (
+            int(json_iv) if json_iv else config.LISTEN_DEFAULT_INTERVAL_MINUTES)
+        en = (meta_en == "1") if meta_en is not None else bool(json_en)
         n = _apply_config({
-            "enabled": True,
-            "interval_minutes": config.LISTEN_DEFAULT_INTERVAL_MINUTES,
+            "enabled": en,
+            "interval_minutes": iv,
             "listeners": db_rules,
         })
         logger.info(f"📡 监听规则自 DB 装载 {n} 条（listen.json 为导出物）")
