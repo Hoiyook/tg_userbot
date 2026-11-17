@@ -1493,6 +1493,26 @@ def _qd_taskdomain(domain, label_key, retry_cmd=None, del_cmd=None):
     return out
 
 
+def _qd_media_link(r):
+    """媒体队列条目的原消息链接（优先级：频道原帖 > 来源链接 > 无）。
+
+    origin_chat_id/origin_msg_id 是评论/转发副本的**频道原帖**定位
+    （/retry 视图 ↪ 按钮同源）；source_link 是入队时的来源链接。两者
+    都是 t.me 形态可点；收藏夹私聊无公开链接则返回 None（前端不渲染
+    链接，只显示文本）。"""
+    link = None
+    oc, om = r.get("origin_chat_id"), r.get("origin_msg_id")
+    try:
+        oc_i = int(oc) if oc is not None else None
+        if oc_i is not None and oc_i < -1000000000 and om:
+            link = f"https://t.me/c/{str(oc_i).replace('-100', '', 1)}/{om}"
+    except (TypeError, ValueError):
+        pass
+    if not link:
+        link = r.get("source_link")
+    return link
+
+
 async def _qd_media():
     from . import state as _state
     out = {"running": [], "pending": [], "failed": [], "done": []}
@@ -1503,7 +1523,8 @@ async def _qd_media():
     for r in tasks:
         item = _qd_item(r.get("name") or r.get("final_name") or r.get("url"),
                         sub=r.get("platform") or r.get("kind"),
-                        attempts=r.get("attempts"))
+                        attempts=r.get("attempts"),
+                        url=_qd_media_link(r))
         (out["running"] if r.get("id") in executing
          else out["pending"]).append(item)
     now = time.time()
@@ -1512,7 +1533,8 @@ async def _qd_media():
         out["failed"].append(_qd_item(
             r.get("name") or r.get("url"), sub="待自动重放（/retry 可见可重投）",
             attempts=r.get("attempts"),
-            next_in=(max(0, int(nra - now)) if nra else None)))
+            next_in=(max(0, int(nra - now)) if nra else None),
+            url=_qd_media_link(r)))
     # recent_events 的 rec 是"payload 平铺"形状（label 在顶层，无 payload 键）
     for e in runtime_db_recent_events("SUCCESS", _QD_DONE_LIMIT):
         out["done"].append(_qd_item(

@@ -2122,6 +2122,8 @@ class QueueDetailTest(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(fail["next_in"], 300)
             # 失败桶文案指向活队列：/retry 必须真的能看到这些条目
             self.assertIn("/retry", fail["sub"])
+            # 原消息链接（2026-11-17）：记录带频道原帖快照时 url 可点
+            self.assertIsNone(fail["url"])   # 该夹具无 origin/source_link
         finally:
             _state.QUEUE["tasks"] = []
             _state.QUEUE["retry"] = []
@@ -2153,6 +2155,35 @@ class QueueDetailTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("/retry", hist[0]["sub"])
         finally:
             pass  # 事件表独立测试库，无需清理
+
+    async def test_media_entries_carry_origin_link(self):
+        """媒体队列条目带原消息链接（2026-11-17 owner 要求：面板可点回源）。
+
+        优先级：频道原帖快照（origin_chat_id/origin_msg_id，评论/转发副本
+        的真正出处）> source_link（入队时来源链接）。无定位字段（收藏夹
+        私聊）url 为 None，前端不渲染链接。"""
+        from tg_userbot import state as _state
+        _state.QUEUE["tasks"] = [
+            {"id": "withorig1", "platform": "media", "name": "带原帖任务",
+             "origin_chat_id": -1001719225045, "origin_msg_id": 28574},
+            {"id": "withsrc02", "platform": "media", "name": "带来源任务",
+             "source_link": "https://t.me/c/1719225045/28999"},
+            {"id": "nolink003", "platform": "media", "name": "私聊任务"},
+        ]
+        _state.EXECUTING.add("withorig1")
+        try:
+            status, data = await self._get_detail("media")
+            self.assertTrue(data["ok"])
+            run = data["running"][0]
+            self.assertEqual(run["url"],
+                             "https://t.me/c/1719225045/28574")
+            pend = data["pending"][0]
+            self.assertEqual(pend["url"],
+                             "https://t.me/c/1719225045/28999")
+            self.assertIsNone(data["pending"][1]["url"])
+        finally:
+            _state.QUEUE["tasks"] = []
+            _state.EXECUTING.discard("withorig1")
 
     async def test_listener_failed_surfaces_error(self):
         from tg_userbot import runtime_db
