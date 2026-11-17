@@ -1126,6 +1126,28 @@ class ApplyCancellationsTest(unittest.TestCase):
             chrome_agent.apply_cancellations([task], self.path), [])
         self.assertEqual(task["status"], "PENDING")
 
+    def test_cancel_persisted_when_no_claimable_task(self):
+        """队列全终态时取消必须落盘（2026-11-17 owner 实测事故）。
+
+        事故链：process_pending_tasks 每圈 apply_cancellations（内存改+打
+        日志）→ claim_next 为 None 直接 break（无 save_tasks）→ 主循环
+        trim 无新增终态也不 save → 取消只活在内存+日志里，chrome_tasks.json
+        永远是 FAILED，面板读文件照常显示失败任务。此处钉住：取消发生
+        即返回非空，调用方据此落盘。"""
+        bad = _task("k9")
+        for _ in range(3):
+            chrome_agent.start_attempt(bad)
+        chrome_agent.fail_attempt(bad, "超时", retries=3, wait_seconds=0)
+        ok = _task("k10")
+        chrome_agent.finish_success(ok, "b.zip", 1)
+        tasks = [bad, ok]          # 一个 FAILED + 一个 SUCCESS，无 PENDING
+        self._write(["k9"])
+        cancelled = chrome_agent.apply_cancellations(tasks, self.path)
+        self.assertEqual(cancelled, ["k9"],
+                         "全终态队列里 FAILED 的取消也必须生效（返回非空"
+                         "驱动调用方 save_tasks）")
+        self.assertEqual(bad["status"], "CANCELLED")
+
     def test_repeat_apply_is_idempotent(self):
         """请求文件是 append-only，同一 id 会被反复读到——不能重复改写终态。"""
         task = _task("k7")

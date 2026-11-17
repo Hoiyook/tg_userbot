@@ -1210,8 +1210,13 @@ async def process_pending_tasks(cdp, tasks, tasks_path, download_dir,
     processed = 0
     counted = set()
     while not (stop_event and stop_event.is_set()):
-        # 排队/等待重试的任务：认领前先落取消，取消过的绝不会被领起来
-        apply_cancellations(tasks, cancel_path)
+        # 排队/等待重试的任务：认领前先落取消，取消过的绝不会被领起来。
+        # **取消必须立刻落盘**：这里改的是内存列表，claim_next 为 None 时
+        # 本函数 break 返回、主循环也没有其它 save 点（trim 无新增终态返回
+        # False）——不落盘的话取消只活在内存+日志里，面板读文件永远看到
+        # FAILED（2026-11-17 owner 实测：回执"已标记取消"但看板不消失）。
+        if apply_cancellations(tasks, cancel_path):
+            save_tasks(tasks, tasks_path)
         task = claim_next(tasks)
         if task is None:
             break
@@ -1337,7 +1342,10 @@ async def agent_main():
                     await asyncio.sleep(CHROME_CDP_RECONNECT_DELAY_SECONDS)
                     continue
             claim_new_requests(tasks, CHROME_REQUESTS_FILE)
-            apply_retrials(tasks, CHROME_RETRY_REQUESTS_FILE)
+            # 重试改判同理须立刻落盘（PENDING 后 process_pending_tasks 的
+            # start_attempt 会 save，但若改判后没有可执行任务同样漏盘）
+            if apply_retrials(tasks, CHROME_RETRY_REQUESTS_FILE):
+                save_tasks(tasks, CHROME_TASKS_FILE)
             await process_pending_tasks(
                 client, tasks, CHROME_TASKS_FILE, CHROME_DOWNLOAD_DIR,
                 CHROME_DOWNLOAD_TIMEOUT, CHROME_DOWNLOAD_RETRIES,
