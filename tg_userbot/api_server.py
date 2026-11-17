@@ -1918,35 +1918,53 @@ async def _queue_problems():
             ("Pixiv", runtime_db.XI_TASKS.list(status="FAILED", limit=5),
              lambda r: r.get("label") or r["url"]),
         )
-        for name, rows, labeler in domains:
+        for name, rows, labeler, cmd in (
+                ("B站", runtime_db.BILI_TASKS.list(status="FAILED", limit=5),
+                 lambda r: r.get("label") or r["url"], "bili"),
+                ("X", runtime_db.XN_TASKS.list(status="FAILED", limit=5),
+                 lambda r: r.get("label") or r["url"], "x"),
+                ("Pixiv", runtime_db.XI_TASKS.list(status="FAILED", limit=5),
+                 lambda r: r.get("label") or r["url"], "pixiv")):
             for r in rows:
                 _add(name, labeler(r), "FAILED", r.get("attempts"),
-                     r.get("next_retry_at"), None, r.get("error"),
-                     url=r.get("url"))
+                     r.get("next_retry_at"),
+                     f"/{cmd} retry {r.get('id')}｜/{cmd} del {r.get('id')}",
+                     r.get("error"), url=r.get("url"))
     except Exception:
         pass
-    for name, fn, key in (("wnacg 漫画", "list_wnacg_tasks", "title"),
-                          ("asmr 音声", "list_asmr_tasks", "rj"),
-                          ("解压回传", "list_extract_tasks", "id")):
+    # hint 寻址键与 bot 子命令逐一对照（/wnacg retry <aid>、/asmr retry
+    # <RJ号>、/115x retry <id>——语义与 bot 完全一致，不发明新命令）
+    for name, fn, key, cmd, addr in (
+            ("wnacg 漫画", "list_wnacg_tasks", "title", "wnacg", "aid"),
+            ("asmr 音声", "list_asmr_tasks", "rj", "asmr", "rj"),
+            # 115x：FAILED 状态当前无写入路径（失败走 postpone 退避或
+            # terminate 终结）——列 TERMINAL（需人工的重投对象，/115x retry
+            # 支持的三态之一）才算有效待办
+            ("解压回传", "list_extract_tasks", "archive_name", "115x", "id")):
         try:
             from . import runtime_db
-            for r in getattr(runtime_db, fn)(status="FAILED", limit=5):
+            status = ("TERMINAL" if name == "解压回传" else "FAILED")
+            for r in getattr(runtime_db, fn)(status=status, limit=5):
                 # asmr RJ 号有稳定公开页；wnacg（域名常换）/解压（115 本地
                 # 目录）没有稳定 URL——不硬塞（owner 2026-11-17 定档）
                 url = (f"https://asmr.one/work/RJ{r.get('rj')}"
                        if name == "asmr 音声" and r.get("rj") else None)
+                addr_id = r.get(addr)
+                hint = (f"/{cmd} retry {addr_id}｜/{cmd} del {addr_id}"
+                        if addr_id is not None else None)
                 _add(name, r.get(key) or r.get("aid")
                      or r.get("archive_name") or "?", "FAILED",
                      r.get("attempts"),
-                     r.get("next_retry_at"), None, r.get("error"), url=url)
+                     r.get("next_retry_at"), hint, r.get("error"), url=url)
         except Exception:
             pass
     try:
         from . import runtime_db
         for r in runtime_db.list_pawchive_posts(status="FAILED", limit=5):
             _add("pawchive", r.get("title") or r.get("post_id") or "?",
-                 "FAILED", r.get("attempts"), None, None,
-                 r.get("last_error"), url=r.get("post_url"))
+                 "FAILED", r.get("attempts"), None,
+                 f"/paw_retry {r.get('id')}", r.get("last_error"),
+                 url=r.get("post_url"))
     except Exception:
         pass
     return problems

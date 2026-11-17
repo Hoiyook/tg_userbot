@@ -2008,7 +2008,78 @@ class QueuesProblemsTest(unittest.IsolatedAsyncioTestCase):
         lis = next(q for q in data["queues"] if q["name"] == "标签监听")
         self.assertEqual(lis["pending"], 1)
 
-    async def test_problems_media_label_and_url(self):
+    async def test_problems_hints_match_bot_commands(self):
+        """失败与重试的处置按钮语义与 bot 一致（2026-11-17 owner 要求）。
+
+        逐渠道对照 bot 子命令（寻址键各渠道不同，绝不发明新命令）：
+        bili/x/pixiv → /xx retry|del <id>；wnacg → <aid>；asmr → <RJ号>；
+        115x → <id>；pawchive → /paw_retry <行id>（bot 无单帖取消命令，
+        不给取消按钮——语义对齐而非硬加）。hint 命令必须在注册表里
+        （/api/cmd 白名单可执行）。"""
+        from tg_userbot import runtime_db, command_registry
+        reg = {c.name for c in command_registry.ALL}
+        # 各渠道造一条 FAILED（pawchive/extract 按无专用函数的实况直写 SQL，
+        # 与 test_ops_report 同款惯例）
+        runtime_db.BILI_TASKS.enqueue("https://bili/test", label="b")
+        runtime_db.BILI_TASKS.fail("https://bili/test", "e", max_attempts=1)
+        runtime_db.XN_TASKS.enqueue("xuser", label="x")
+        runtime_db.XN_TASKS.fail("xuser", "e", max_attempts=1)
+        runtime_db.XI_TASKS.enqueue("pixuser", label="p")
+        runtime_db.XI_TASKS.fail("pixuser", "e", max_attempts=1)
+        runtime_db.enqueue_wnacg_task(424242, title="w")
+        runtime_db.fail_wnacg_task(424242, error="e", max_attempts=1)
+        runtime_db.enqueue_asmr_task(424243, title="a")
+        runtime_db.fail_asmr_task(424243, error="e", max_attempts=1)
+        runtime_db.enqueue_extract_tasks("/115open/画集", [("a.zip", 100)])
+        runtime_db._write(lambda c: runtime_db._execute(
+            c, "UPDATE extract_tasks SET status='TERMINAL', error='需密码' "
+               "WHERE archive_name='a.zip'"), "造解压终态")
+        created, _skipped = runtime_db.enqueue_pawchive_posts(
+            "pawchive", "c1", "作者甲",
+            [{"post_id": "pp1", "title": "paw 失败帖",
+              "published": "2026-10-01",
+              "post_url": "https://pawchive.pw/pp1", "subdir": "作者甲",
+              "files": [], "ext_links": []}])
+        runtime_db._write(lambda c: runtime_db._execute(
+            c, "UPDATE pawchive_posts SET status='FAILED', "
+               "last_error='站点死链' WHERE post_id='pp1'"), "造 paw 失败")
+        client = make_client()
+        await client.start_server()
+        try:
+            resp = await client.get("/api/queues")
+            data = await resp.json()
+        finally:
+            await client.close()
+        by_where = {}
+        for p in data.get("problems", []):
+            by_where.setdefault(p.get("where"), []).append(p)
+        expect = {
+            "B站": ("/bili retry ", "/bili del "),
+            "X": ("/x retry ", "/x del "),
+            "Pixiv": ("/pixiv retry ", "/pixiv del "),
+            "wnacg 漫画": ("/wnacg retry ", "/wnacg del "),
+            "asmr 音声": ("/asmr retry ", "/asmr del "),
+            "解压回传": ("/115x retry ", "/115x del "),
+            "pawchive": ("/paw_retry ", None),
+        }
+        for where, (retry_cmd, del_cmd) in expect.items():
+            rows = by_where.get(where) or []
+            assert rows, f"{where} 没有出现在 problems"
+            hint = rows[0].get("hint") or ""
+            self.assertTrue(hint.startswith(retry_cmd),
+                            f"{where} hint={hint!r} 不以 {retry_cmd!r} 开头")
+            head = hint.split("｜")[0].split()[0].lstrip("/")
+            self.assertIn(head, reg, f"{where} 的命令 /{head} 未注册")
+            if del_cmd is None:
+                self.assertNotIn("del", hint,
+                                 f"{where} bot 无取消命令，不得硬加取消按钮")
+            else:
+                self.assertIn(del_cmd, hint)
+                dhead = del_cmd.lstrip("/").split()[0]
+                self.assertIn(dhead, reg)
+        # pawchive 条目带帖子页链接
+        paw = (by_where.get("pawchive") or [{}])[0]
+        self.assertEqual(paw.get("url"), "https://pawchive.pw/pp1")
         """失败与重试（全链路）的链接可得性（2026-11-17 owner 要求）。
 
         ① 媒体条目 label 用 final_name（此前兜底到 task_id，owner 看到
