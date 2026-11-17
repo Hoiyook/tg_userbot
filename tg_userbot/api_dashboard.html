@@ -1511,12 +1511,24 @@ function renderProblems(problems) {
           : p.next_in + "秒") + "后自动重试"
       : "到期待放行");
     if (p.next_in == null && p.status === "FAILED") meta.push("需人工处置");
+    // hint 与四段视图同款：按 "｜" 拆成多个独立按钮（重试/取消分开点，
+    // 各自执行各自确认），删除类单独 confirm；单命令（如 /paw_retry 163）
+    // 照常一个按钮。2026-11-17：此前整串一个 chip——owner 分不清点下去
+    // 到底是重试还是删除。
     const hint = p.hint
-      ? '<span class="chip mini" onclick="' +
-        (/cancel|del/i.test(p.hint)
-          ? 'if(confirm(\'确认删除/取消？此操作不可恢复\'))' : '')
-        + 'runCmdDirect(\'' +
-        esc(p.hint).replace(/'/g, "\\'") + '\')">⚡ ' + esc(p.hint) + '</span>'
+      ? '<div class="chips" style="margin-top:4px">' +
+        p.hint.split("｜").map(c => {
+          const cmd = c.trim();
+          const needConfirm = /cancel|del/i.test(cmd);
+          const onclick = (needConfirm
+            ? 'if(confirm(\'确认删除/取消？此操作不可恢复\'))' : '')
+            + 'runCmdDirect(\'' + esc(cmd).replace(/'/g, "\\'") + '\')';
+          const label = /retry/i.test(cmd) ? "🔁 " + cmd
+            : needConfirm ? "🗑 " + cmd
+            : "⚡ " + cmd;
+          return '<span class="chip mini" onclick="' + onclick +
+            '">' + label + '</span>';
+        }).join("") + '</div>'
       : "";
     const err = p.error
       ? '<div class="dt" style="color:var(--amber)">' + esc(p.error) + '</div>'
