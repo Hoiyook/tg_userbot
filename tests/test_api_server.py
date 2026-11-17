@@ -2008,6 +2008,45 @@ class QueuesProblemsTest(unittest.IsolatedAsyncioTestCase):
         lis = next(q for q in data["queues"] if q["name"] == "标签监听")
         self.assertEqual(lis["pending"], 1)
 
+    async def test_problems_media_label_and_url(self):
+        """失败与重试（全链路）的链接可得性（2026-11-17 owner 要求）。
+
+        ① 媒体条目 label 用 final_name（此前兜底到 task_id，owner 看到
+           一串十六进制）；② 有原帖/来源链接的条目带 url 字段，前端渲染
+           可点超链接；③ 没有定位数据的渠道（wnacg/解压）url=None 不硬塞。
+        """
+        from tg_userbot import state as _state
+        _state.QUEUE["retry"] = [
+            {"id": "withorig01", "kind": "media",
+             "final_name": "26-07-05 #Emisa 16期.mp4",
+             "origin_chat_id": -1001719225045, "origin_msg_id": 40713,
+             "attempts": 1, "next_retry_at": time.time() + 60},
+            {"id": "nolink002", "kind": "media",
+             "final_name": "收藏夹直发任务.mp4",
+             "attempts": 1, "next_retry_at": time.time() + 60},
+        ]
+        try:
+            client = make_client()
+            await client.start_server()
+            try:
+                resp = await client.get("/api/queues")
+                data = await resp.json()
+            finally:
+                await client.close()
+            media = [p for p in data.get("problems", [])
+                     if p.get("where") == "媒体队列"]
+            self.assertEqual(len(media), 2)
+            hit = next(p for p in media if p["label"].startswith("26-07-05"))
+            self.assertEqual(hit["url"], "https://t.me/c/1719225045/40713")
+            self.assertEqual(hit["status"], "RETRY")
+            nolink = next(p for p in media
+                          if p["label"] == "收藏夹直发任务.mp4")
+            self.assertIsNone(nolink["url"], "无定位数据不硬塞链接")
+            self.assertNotIn("withorig01", hit["label"],
+                             "label 不得是 task_id（截图事故）")
+        finally:
+            _state.QUEUE["retry"] = []
+
     async def test_problems_listens_failed_with_hint(self):
         """两类失败给不同处置 hint：源已消失 → del（重试无用）；
         其它（如无权限）→ retry。"""

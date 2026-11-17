@@ -1854,7 +1854,7 @@ async def _queue_problems():
     problems = []
 
     def _add(where, label, status, attempts=None, next_retry_at=None,
-             hint=None, error=None):
+             hint=None, error=None, url=None):
         now = _time.time()
         problems.append({
             "where": where, "label": str(label)[:52], "status": status,
@@ -1862,17 +1862,25 @@ async def _queue_problems():
             "next_in": (max(0, int(next_retry_at - now))
                         if next_retry_at else None),
             "hint": hint, "error": (str(error)[:80] if error else None),
+            # 原消息链接（2026-11-17）：有就给（前端渲染可点超链接），
+            # 没有就 None——绝不硬塞不可点的伪链接
+            "url": (str(url) if url else None),
         })
 
-    # ① 主队列 retry 榜（内存）——含退避剩余
+    # ① 主队列 retry 榜（内存）——含退避剩余。label 与 /retry 列表同款
+    # 优先级（final_name 是 media 任务的真实文件名——截图曾显示 task_id
+    # 是因为取了不存在的 name 字段兜底到 id）；url 带原帖/来源链接
     try:
         from . import state as _state
         async with _state.QUEUE_LOCK:
             retry = list(_state.QUEUE.get("retry", []))
         for r in retry[:10]:
-            _add("媒体队列", r.get("name") or r.get("url") or r.get("id", "?"),
+            _add("媒体队列",
+                 (r.get("final_name") or r.get("name") or r.get("label")
+                  or r.get("url") or r.get("id", "?")),
                  "RETRY", r.get("attempts"), r.get("next_retry_at"),
-                 "/retry 或 /queue del")
+                 "/retry 或 /queue del",
+                 url=_qd_media_link(r))
     except Exception:
         pass
 
@@ -1888,12 +1896,14 @@ async def _queue_problems():
             hint = (f"/listen_failed del {t['id']}" if gone
                     else f"/listen_retry {t['id']}")
             _add("标签监听", f"#{t['id']} {_task_label_of(t)}", "FAILED",
-                 t.get("attempts"), None, hint, t.get("last_error"))
+                 t.get("attempts"), None, hint, t.get("last_error"),
+                 url=_listener_msg_link(t))
         for t in runtime_db.list_listener_tasks(
                 status="FORWARDED", limit=5):
             _add("标签监听", f"#{t['id']} {_task_label_of(t)}",
                  "FORWARDED(对账补建中)", t.get("attempts"),
-                 t.get("next_retry_at"), None, t.get("last_error"))
+                 t.get("next_retry_at"), None, t.get("last_error"),
+                 url=_listener_msg_link(t))
     except Exception:
         pass
 
@@ -1911,7 +1921,8 @@ async def _queue_problems():
         for name, rows, labeler in domains:
             for r in rows:
                 _add(name, labeler(r), "FAILED", r.get("attempts"),
-                     r.get("next_retry_at"), None, r.get("error"))
+                     r.get("next_retry_at"), None, r.get("error"),
+                     url=r.get("url"))
     except Exception:
         pass
     for name, fn, key in (("wnacg 漫画", "list_wnacg_tasks", "title"),
@@ -1920,10 +1931,14 @@ async def _queue_problems():
         try:
             from . import runtime_db
             for r in getattr(runtime_db, fn)(status="FAILED", limit=5):
+                # asmr RJ 号有稳定公开页；wnacg（域名常换）/解压（115 本地
+                # 目录）没有稳定 URL——不硬塞（owner 2026-11-17 定档）
+                url = (f"https://asmr.one/work/RJ{r.get('rj')}"
+                       if name == "asmr 音声" and r.get("rj") else None)
                 _add(name, r.get(key) or r.get("aid")
                      or r.get("archive_name") or "?", "FAILED",
                      r.get("attempts"),
-                     r.get("next_retry_at"), None, r.get("error"))
+                     r.get("next_retry_at"), None, r.get("error"), url=url)
         except Exception:
             pass
     try:
@@ -1931,10 +1946,22 @@ async def _queue_problems():
         for r in runtime_db.list_pawchive_posts(status="FAILED", limit=5):
             _add("pawchive", r.get("title") or r.get("post_id") or "?",
                  "FAILED", r.get("attempts"), None, None,
-                 r.get("last_error"))
+                 r.get("last_error"), url=r.get("post_url"))
     except Exception:
         pass
     return problems
+
+
+def _listener_msg_link(t):
+    """listener 任务 → 源消息 t.me 链接（频道/超群可点；私聊/无 id None）。"""
+    chat, msg = t.get("source_chat_id"), t.get("message_id")
+    try:
+        chat_i, msg_i = int(chat), int(msg)
+    except (TypeError, ValueError):
+        return None
+    if chat_i < -1000000000 and msg_i > 0:
+        return f"https://t.me/c/{str(chat_i).replace('-100', '', 1)}/{msg_i}"
+    return None
 
 
 def _task_label_of(t):
