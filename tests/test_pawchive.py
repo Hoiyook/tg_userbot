@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 import time
+import asyncio
 import unittest
 from unittest import mock
 
@@ -21,6 +22,7 @@ os.environ["TG_SAVE_FOLDER"] = _TMP
 
 from tg_userbot import config  # noqa: E402
 from tg_userbot import runtime_db  # noqa: E402
+from tg_userbot import notify as pawchive_notify  # noqa: E402
 from tg_userbot import pawchive  # noqa: E402
 
 
@@ -1105,3 +1107,102 @@ class CreatorUrlDirectTest(unittest.TestCase):
         self.assertIsNone(pawchive.plan_from_creator_url("Azur Lane BBC"))
         self.assertIsNone(pawchive.plan_from_creator_url(
             "https://mega.nz/file/x"))
+
+
+class CatchUpScanTest(unittest.TestCase):
+    """追新扫描（方案 A，2026-11-17 owner 定档）：回填只重查已收录帖，
+    作者新发的帖子靠 _catch_up_scan 的轻量枚举收录。
+
+    风控预算：known_ids 增量早停——无新帖 1~2 页请求即停（fetch_creator_posts
+    既有机制），有新帖才全量分页。失败安全：追新炸了只日志，返回 (0,0)
+    不影响回填结果。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="catchup_", dir=_TMP)
+        self._p = mock.patch.object(
+            config, "RUNTIME_DB_FILE", os.path.join(self.dir, "db.sqlite"))
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        runtime_db.close_db()
+        self.addCleanup(runtime_db.close_db)
+        self.assertTrue(runtime_db.init_db())
+        self.creator = {"service": "patreon", "id": "777", "name": "作者A"}
+        # 预置 1 条已收录帖
+        runtime_db.enqueue_pawchive_posts("patreon", "777", "作者A", [{
+            "post_id": "p1", "title": "旧帖", "published": "2026-10-01",
+            "post_url": "u1", "subdir": "s1", "files": [], "ext_links": [],
+        }])
+
+    def _post(self, pid, published="2026-11-10"):
+        return {"id": pid, "title": f"帖{pid}", "published": published,
+                "file": {"path": f"/data/{pid}/f.mp4", "name": "f.mp4"}}
+
+    def test_no_new_posts_creates_nothing(self):
+        """站点只有已知帖 → 增量早停，created=0，表里不增行。"""
+        with mock.patch.object(
+                pawchive, "fetch_creator_posts",
+                return_value=[self._post("p1")]) as fp:
+            created, fetched = asyncio.run(
+                pawchive._catch_up_scan(self.creator))
+        self.assertEqual((created, fetched), (0, 1))
+        # known_ids 传入（增量早停判定源）
+        self.assertEqual(fp.call_args.kwargs.get("known_ids"), {"p1"})
+        self.assertEqual(
+            len(runtime_db.list_pawchive_posts(limit=50)), 1, "无新行")
+
+    def test_new_post_is_enqueued_pending(self):
+        """站点出现新帖 → 落库 PENDING，worker 自然收割。"""
+        with mock.patch.object(
+                pawchive, "fetch_creator_posts",
+                return_value=[self._post("p2"), self._post("p1")]):
+            created, fetched = asyncio.run(
+                pawchive._catch_up_scan(self.creator))
+        self.assertEqual((created, fetched), (1, 2))
+        row = next(r for r in runtime_db.list_pawchive_posts(limit=50)
+                   if r["post_id"] == "p2")
+        self.assertEqual(row["status"], "PENDING")
+
+    def test_fetch_failure_is_safe(self):
+        """追新炸了返回 (0,0)——回填结果不受影响，下轮重试。"""
+        with mock.patch.object(pawchive, "fetch_creator_posts",
+                               side_effect=RuntimeError("站点抖动")):
+            created, fetched = asyncio.run(
+                pawchive._catch_up_scan(self.creator))
+        self.assertEqual((created, fetched), (0, 0))
+
+    def test_backfill_summary_appends_catchup_line(self):
+        """backfill_author 完成通知含追新扫描行（新帖收录对 owner 可见）。
+
+        summary 在后台 _run 组装并经 notify_user 推送（同步回执只是
+        "开始回填"），所以断言对象是通知文本。"""
+        import asyncio as _aio
+        saved_rules = (pawchive.state.PAW_SCAN_RUNNING,
+                       pawchive.state.PAW_SCAN_PROGRESS)
+        try:
+            with mock.patch.object(
+                    pawchive.runtime_db, "posts_for_backfill",
+                    return_value=[{"id": 1, "post_id": "p1",
+                                   "creator_id": 777, "service": "patreon",
+                                   "status": "COMPLETED",
+                                   "creator_name": "作者A"}]), \
+                 mock.patch.object(pawchive, "parse_creator_ref",
+                                   return_value=("作者A", 777)), \
+                 mock.patch.object(pawchive, "_catch_up_scan",
+                                   return_value=(2, 30)), \
+                 mock.patch.object(pawchive, "BACKFILL_THROTTLE_SECONDS", 0), \
+                 mock.patch.object(pawchive_notify, "notify_user") as nu:
+                async def _drive():
+                    out = await pawchive.backfill_author("作者A")
+                    for t in list(pawchive._SPAWNED_SCANS):
+                        try:
+                            await t
+                        except Exception:
+                            pass
+                    return out, nu
+                out, nu = _aio.run(_drive())
+            self.assertIn("开始回填", out)
+            pushed = "".join(str(c.args[0]) for c in nu.call_args_list)
+            self.assertIn("追新扫描：新收录 2 帖", pushed)
+        finally:
+            (pawchive.state.PAW_SCAN_RUNNING,
+             pawchive.state.PAW_SCAN_PROGRESS) = saved_rules

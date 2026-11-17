@@ -375,6 +375,47 @@ def _backfill_pool():
     return _BACKFILL_POOL
 
 
+async def _catch_up_scan(creator):
+    """轻量追新扫描（方案 A，2026-11-17 owner 定档）：回填只重查已收录
+    帖，作者**新发的帖子**靠这里收录。
+
+    known_ids 预载 + 增量早停——无新帖时 1~2 页请求即停，风控预算与回填
+    本身同量级；有新帖时全量分页拉全，enqueue_pawchive_posts 帖级幂等落
+    库，新帖自动 PENDING 由 worker 收割。不对比收藏（追加语义只关心新帖
+    落库，收藏范围判定是 /paw_plan 的职责）、不覆盖 PAW_LAST_SCAN（那是
+    用户视角的最近一次扫描）。
+
+    返回 (created, fetched)；异常安全——追新失败不影响回填结果，只日志。
+    creator: {"service", "id", "name"}（回填循环里已有的解析形态）。
+    """
+    try:
+        cookie = config.PAWCHIVE_COOKIE or None
+        known_ids = await asyncio.to_thread(
+            runtime_db.pawchive_known_post_ids,
+            creator["service"], str(creator["id"]))
+        posts = await asyncio.to_thread(
+            fetch_creator_posts, creator["service"], creator["id"], cookie,
+            known_ids=known_ids)
+        if not posts:
+            return 0, 0
+        # 无 Cookie → 收藏对比缺省（scope 语义是 /paw_plan 的事，追新只
+        # 负责把新帖收进来）
+        records = build_scan_records(creator, posts, None, scope="notfaved")
+        created, _skipped = runtime_db.enqueue_pawchive_posts(
+            creator["service"], str(creator["id"]),
+            creator.get("name") or f"{creator['service']}/{creator['id']}",
+            records, scan_batch=time.strftime("%Y-%m-%d %H:%M:%S"))
+        if created:
+            logger.info(
+                f"🐾 追新扫描：{creator.get('name')} 新收录 {created} 帖"
+                f"（拉取 {len(posts)}），worker 将自动收割")
+        return created, len(posts)
+    except Exception as e:
+        logger.warning(
+            f"🐾 追新扫描失败（不影响回填结果，下轮重试）：{e}")
+        return 0, 0
+
+
 async def backfill_author(name, months=None):
     """回填一个作者的存量帖。返回回执文案（完成后 notify）。
 
@@ -486,12 +527,22 @@ async def backfill_author(name, months=None):
                                            runtime_db.PAW_POST_PROCESSING):
                         runtime_db.reopen_pawchive_post(r["id"])
                 await asyncio.sleep(BACKFILL_THROTTLE_SECONDS)
+            # 追新扫描（方案 A）：回填只重查已知帖，作者新发的帖子靠
+            # 这次轻量枚举收录（known_ids 增量早停，无新帖 1~2 页即停）
+            caught_new, fetched_n = await _catch_up_scan({
+                "service": rows[0]["service"],
+                "id": rows[0]["creator_id"],
+                "name": rows[0]["creator_name"],
+            })
             summary = (
                 f"🐾 回填完成：{rows[0]['creator_name']}\n"
                 f"检查 {len(rows)} 帖｜站点已无 {gone} 帖"
                 + (f"｜拉取失败 {fetch_failed} 帖" if fetch_failed else "")
                 + f"\n补录新附件 {added_total} 个（涉及 {posts_touched} 帖，"
-                "已重开入队只下新增）")
+                "已重开入队只下新增）"
+                + (f"\n🆕 追新扫描：新收录 {caught_new} 帖"
+                   f"（拉取 {fetched_n}）" if caught_new else
+                   f"\n追新扫描：无新帖（拉取 {fetched_n}）"))
             if added_total:
                 summary += "\nworker 将自动补下，完成进度看 /paw progress"
         except asyncio.CancelledError:
