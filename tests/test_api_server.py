@@ -2120,10 +2120,39 @@ class QueueDetailTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fail["label"], "退避中的任务")
             self.assertIsNotNone(fail["next_in"])
             self.assertLessEqual(fail["next_in"], 300)
+            # 失败桶文案指向活队列：/retry 必须真的能看到这些条目
+            self.assertIn("/retry", fail["sub"])
         finally:
             _state.QUEUE["tasks"] = []
             _state.QUEUE["retry"] = []
             _state.EXECUTING.discard("run0001")
+
+    async def test_media_history_failed_not_in_failed_bucket(self):
+        """历史 FAILED 事件不得进失败桶（2026-11-17 owner 实测误导）。
+
+        失败→已被手动删除/重放清走的任务在 download_events 里留 FAILED
+        台账——它们不是活任务，/retry 里根本没有。此前面板把它们挂进
+        失败桶还标"终态失败（/retry 可重投）"，owner 照着去 /retry 一条
+        都看不到（本测试钉住：历史失败只出现在已完成桶且带"历史"标注）。"""
+        from tg_userbot import stats
+        from tg_userbot import runtime_db as rdb
+        import time as _time
+        from tg_userbot import state as _state
+        _state.QUEUE["tasks"] = []
+        _state.QUEUE["retry"] = []
+        stats.emit_event("FAILED", task_id="dead0000", label="已删除的任务")
+        try:
+            status, data = await self._get_detail("media")
+            self.assertTrue(data["ok"])
+            self.assertEqual(
+                [i for i in data["failed"] if i.get("label") == "已删除的任务"],
+                [], "历史 FAILED 事件不得进失败桶")
+            hist = [i for i in data["done"] if i.get("label") == "已删除的任务"]
+            self.assertEqual(len(hist), 1)
+            self.assertIn("历史失败", hist[0]["sub"])
+            self.assertNotIn("/retry", hist[0]["sub"])
+        finally:
+            pass  # 事件表独立测试库，无需清理
 
     async def test_listener_failed_surfaces_error(self):
         from tg_userbot import runtime_db

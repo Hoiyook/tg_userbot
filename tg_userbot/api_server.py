@@ -1510,17 +1510,21 @@ async def _qd_media():
     for r in retry[:_QD_LIMIT]:
         nra = r.get("next_retry_at")
         out["failed"].append(_qd_item(
-            r.get("name") or r.get("url"), sub="待自动重放",
+            r.get("name") or r.get("url"), sub="待自动重放（/retry 可见可重投）",
             attempts=r.get("attempts"),
             next_in=(max(0, int(nra - now)) if nra else None)))
     # recent_events 的 rec 是"payload 平铺"形状（label 在顶层，无 payload 键）
     for e in runtime_db_recent_events("SUCCESS", _QD_DONE_LIMIT):
         out["done"].append(_qd_item(
             e.get("label") or e.get("id"), when=_qd_when(e.get("ts"))))
+    # 历史 FAILED 是台账（已离开队列：重放成功后被删/手动删除/其它），不是
+    # 活任务——进"已完成"桶会误导 owner 拿 /retry 去重投根本不存在的任务
+    # （2026-11-17 实测：失败→已删，面板却挂"终态失败 /retry 可重投"）。
+    # 失败桶只放活队列的 retry 区（上面的循环），这里以"历史"标注区分。
     for e in runtime_db_recent_events("FAILED", _QD_DONE_LIMIT):
-        out["failed"].append(_qd_item(
+        out["done"].append(_qd_item(
             e.get("label") or e.get("id"),
-            sub="终态失败（/retry 可重投）",
+            sub="历史失败（已离开队列，非待重试）",
             when=_qd_when(e.get("ts"))))
     return out
 
