@@ -1857,7 +1857,7 @@ async def _queue_problems():
              hint=None, error=None, url=None):
         now = _time.time()
         problems.append({
-            "where": where, "label": str(label)[:52], "status": status,
+            "where": where, "label": str(label), "status": status,
             "attempts": attempts,
             "next_in": (max(0, int(next_retry_at - now))
                         if next_retry_at else None),

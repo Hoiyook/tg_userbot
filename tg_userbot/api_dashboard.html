@@ -1521,9 +1521,16 @@ function renderProblems(problems) {
     const err = p.error
       ? '<div class="dt" style="color:var(--amber)">' + esc(p.error) + '</div>'
       : "";
-    return '<div class="qrow"><div class="info"><div class="nm">' +
+    // 原消息链接（2026-11-17）：有 url 就渲染可点超链接；label 完整
+    // 展示（nm.wrap 不截断——owner 要求文字展示全）
+    const labelHtml = p.url
+      ? '<a href="' + esc(p.url) + '" target="_blank" rel="noopener" ' +
+        'style="color:var(--blue);text-decoration:underline">' +
+        esc(p.label) + '</a>'
+      : esc(p.label);
+    return '<div class="qrow"><div class="info"><div class="nm wrap">' +
       '<span class="tag t-wait">' + esc(p.where) + '</span> ' +
-      esc(p.label) + ' ' + stTag(p.status) +
+      labelHtml + ' ' + stTag(p.status) +
       '</div><div class="dt">' + esc(meta.join(" · ")) + '</div>' + err +
       (hint ? '<div class="chips" style="margin-top:4px">' + hint + '</div>' : "") +
       '</div></div>';
