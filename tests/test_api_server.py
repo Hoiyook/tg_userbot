@@ -360,6 +360,26 @@ class ActionTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_pd_notify_forwards_and_guards(self):
+        """pd_daemon 巡检告警转发（2026-11-18）：白名单内、走统一通知出口、
+        空文本 400。"""
+        from tg_userbot import notify
+        with mock.patch.object(notify, "notify_user") as nu:
+            client = make_client()
+            await client.start_server()
+            try:
+                data = await _post_json(client, "/api/action/pd_notify",
+                                        {"text": "缺 5/11 个文件，已自动续传"})
+                self.assertTrue(data["ok"])
+                nu.assert_called_once()
+                self.assertIn("🔌", nu.call_args.args[0])
+                # 空文本 400
+                resp = await client.post("/api/action/pd_notify",
+                                         json={"text": "  "})
+                self.assertEqual(resp.status, 400)
+            finally:
+                await client.close()
+
     async def test_clean_action_calls_cleanup(self):
         from tg_userbot import cleanup
         with mock.patch.object(cleanup, "clean_temp_files", return_value=3):

@@ -89,6 +89,7 @@ ACTION_WHITELIST = {
     "chrome_start": "启动 Chrome Agent",
     "chrome_stop": "停止 Chrome Agent（Chrome 保持运行）",
     "chrome_cancel": "取消一个 Chrome 任务（body: {\"id\": 序号或task_id}）",
+    "pd_notify": "pd_daemon 巡检告警转发（body: {\"text\": …}）",
     # Pawchive / B站
     "paw_pause": "Pawchive 暂停下载 worker",
     "paw_resume": "Pawchive 恢复下载 worker",
@@ -1285,6 +1286,16 @@ async def handle_action(request):
             ok, msg = chrome_client.request_cancel(task_id)
             return _json({"ok": bool(ok), "routed": "chrome_cancel",
                           "message": msg})
+        if name == "pd_notify":
+            # pd_daemon 完整性巡检的告警转发（本机 daemon 专属：续传/完成
+            # 提醒走统一通知出口）。文本长度收口，防 daemon 侧异常刷屏。
+            text = str(body.get("text") or "").strip()
+            if not text:
+                return _json({"ok": False, "error": "缺少通知文本"}, 400)
+            from . import notify
+            await notify.notify_user("🔌 " + text[:2000])
+            return _json({"ok": True, "routed": "pd_notify",
+                          "message": "已转发"})
 
         # ── Pawchive / B站 / CD2 / 健康 ─────────────────────
         if name == "paw_pause":
