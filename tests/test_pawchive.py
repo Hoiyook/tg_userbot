@@ -1147,8 +1147,27 @@ class CatchUpScanTest(unittest.TestCase):
         self.assertEqual((created, fetched), (0, 1))
         # known_ids 传入（增量早停判定源）
         self.assertEqual(fp.call_args.kwargs.get("known_ids"), {"p1"})
+        # 时间边界（2026-11-18 owner）：until_date = 今天 - 3*31 天
+        import datetime as _dt
+        expect_until = (_dt.date.today()
+                        - _dt.timedelta(days=3 * 31)).isoformat()
+        self.assertEqual(fp.call_args.kwargs.get("until_date"), expect_until)
         self.assertEqual(
             len(runtime_db.list_pawchive_posts(limit=50)), 1, "无新行")
+
+    def test_old_post_outside_months_is_filtered(self):
+        """边界外（>3 个月）的"新帖"不落库——owner 不要太久以前的作品。"""
+        old_post = self._post("p_old", published="2025-01-01")
+        new_post = self._post("p_new", published="2026-11-10")
+        with mock.patch.object(
+                pawchive, "fetch_creator_posts",
+                return_value=[old_post, new_post]):
+            created, fetched = asyncio.run(
+                pawchive._catch_up_scan(self.creator))
+        self.assertEqual(created, 1, "只有边界内的新帖落库")
+        ids = {r["post_id"] for r in runtime_db.list_pawchive_posts(limit=50)}
+        self.assertIn("p_new", ids)
+        self.assertNotIn("p_old", ids)
 
     def test_new_post_is_enqueued_pending(self):
         """站点出现新帖 → 落库 PENDING，worker 自然收割。"""

@@ -385,6 +385,10 @@ async def _catch_up_scan(creator):
     落库，收藏范围判定是 /paw_plan 的职责）、不覆盖 PAW_LAST_SCAN（那是
     用户视角的最近一次扫描）。
 
+    时间边界：只收最近 PAWB_MONTHS_LIMIT（3）个月发布的帖（owner
+    2026-11-18：太久以前的作品不一定要）——fetch 侧 until_date 页内即停、
+    落库侧 since 过滤双保险。
+
     返回 (created, fetched)；异常安全——追新失败不影响回填结果，只日志。
     creator: {"service", "id", "name"}（回填循环里已有的解析形态）。
     """
@@ -393,14 +397,22 @@ async def _catch_up_scan(creator):
         known_ids = await asyncio.to_thread(
             runtime_db.pawchive_known_post_ids,
             creator["service"], str(creator["id"]))
+        # 时间边界（2026-11-18 owner：太久以前的作品不一定要）——与回填
+        # 同款默认 3 个月：fetch 侧 until_date 页内即停（请求省到底）+
+        # 落库侧 since 过滤（双保险，防 API 倒序抖动漏拦）
+        import datetime as _dt
+        until = (_dt.date.today()
+                 - _dt.timedelta(days=int(PAWB_MONTHS_LIMIT) * 31)
+                 ).isoformat()
         posts = await asyncio.to_thread(
             fetch_creator_posts, creator["service"], creator["id"], cookie,
-            known_ids=known_ids)
+            known_ids=known_ids, until_date=until)
         if not posts:
             return 0, 0
         # 无 Cookie → 收藏对比缺省（scope 语义是 /paw_plan 的事，追新只
         # 负责把新帖收进来）
-        records = build_scan_records(creator, posts, None, scope="notfaved")
+        records = build_scan_records(creator, posts, None, scope="notfaved",
+                                     since=until)
         created, _skipped = runtime_db.enqueue_pawchive_posts(
             creator["service"], str(creator["id"]),
             creator.get("name") or f"{creator['service']}/{creator['id']}",
