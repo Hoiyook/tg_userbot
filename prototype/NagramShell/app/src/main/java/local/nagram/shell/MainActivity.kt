@@ -625,7 +625,43 @@ fun SpoolDetailScreen(onClose: () -> Unit, version: Int, onChanged: () -> Unit) 
         ) {
             Text("📥 分享记录",
                  fontWeight = FontWeight.Bold, fontSize = 16.sp)
-            TextButton(onClose) { Text("完成") }
+            Row {
+                // 导出（2026-11-19 owner）：全部记录拼可读文本走系统分享
+                // 面板——SharedPreferences 卸载即失，导出是留存手段
+                val exportCtx = LocalContext.current
+                TextButton(onClick = {
+                    val text = buildString {
+                        appendLine("📥 Nagram Shell 分享记录")
+                        appendLine("导出时间：${java.text.SimpleDateFormat(
+                            "yyyy-MM-dd HH:mm",
+                            java.util.Locale.getDefault()
+                        ).format(java.util.Date())}")
+                        appendLine()
+                        val all = Prefs.spoolAll(exportCtx)
+                        val pending = all.filter { it.relayedAt == null }
+                        val relayed = all.filter { it.relayedAt != null }
+                            .sortedByDescending { it.relayedAt }
+                        appendLine("== 排队中（${pending.size}）==")
+                        for (it2 in pending) appendLine("⏳ ${it2.text}")
+                        appendLine()
+                        appendLine("== 已转交 bot（${relayed.size}）==")
+                        val fmt = java.text.SimpleDateFormat(
+                            "yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
+                        for (it2 in relayed) appendLine(
+                            "✅ ${fmt.format(java.util.Date((it2.relayedAt ?: 0) * 1000))} ${it2.text}")
+                    }
+                    val send = android.content.Intent(
+                        android.content.Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(android.content.Intent.EXTRA_TEXT, text)
+                        putExtra(android.content.Intent.EXTRA_TITLE,
+                                 "Nagram Shell 分享记录")
+                    }
+                    exportCtx.startActivity(
+                        android.content.Intent.createChooser(send, "导出分享记录"))
+                }) { Text("📤 导出") }
+                TextButton(onClose) { Text("完成") }
+            }
         }
         Text(
             "排队 ${pending.size}/200 · 已转交 ${relayed.size}。" +
