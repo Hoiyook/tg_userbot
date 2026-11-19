@@ -32,6 +32,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.ui.text.font.FontWeight
@@ -108,6 +111,9 @@ fun App() {
     val ctx = LocalContext.current
     var configured by rememberSaveable { mutableStateOf(Prefs.configured(ctx)) }
     var editing by rememberSaveable { mutableStateOf(false) }
+    // 离线暂存明细页（2026-11-18 owner：要能看见排队里有什么）
+    var showSpool by rememberSaveable { mutableStateOf(false) }
+    var spoolVersion by rememberSaveable { mutableIntStateOf(0) }   // 删除条目后 +1 触发重读
     var spoolNote by remember { mutableStateOf("") }
     var tab by rememberSaveable { mutableStateOf("panel") }
     var flushTrigger by remember { mutableIntStateOf(0) }
@@ -139,6 +145,15 @@ fun App() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    // 离线暂存明细（2026-11-18 owner：要能看见排队里有什么）
+    if (showSpool) {
+        SpoolDetailScreen(
+            onClose = { showSpool = false },
+            version = spoolVersion,
+            onChanged = { spoolVersion++ },
+        )
+        return
+    }
     // 未配置：先全屏走配置页（配好才出现双页签）
     if (!configured || editing) {
         ConfigScreen(
@@ -161,12 +176,14 @@ fun App() {
                 tab == "scripts" -> ScriptsScreen()
                 Prefs.httpConfigured(ctx) -> DashboardScreen(
                     onEdit = { editing = true },
+                    onOpenSpool = { showSpool = true },
                     spoolNote = spoolNote,
                 )
                 // 只配了 Telegram 通道（服务器地址选填）：没有可加载的
                 // 看板地址，绝不能拿空 URL 去 loadUrl（会摔在错误页）
                 else -> TelegramOnlyScreen(
                     onEdit = { editing = true },
+                    onOpenSpool = { showSpool = true },
                     spoolNote = spoolNote,
                 )
             }
@@ -211,7 +228,8 @@ fun TabItem(label: String, selected: Boolean, modifier: Modifier,
 }
 
 @Composable
-fun TelegramOnlyScreen(onEdit: () -> Unit, spoolNote: String) {
+fun TelegramOnlyScreen(onEdit: () -> Unit, onOpenSpool: () -> Unit,
+                       spoolNote: String) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -237,7 +255,9 @@ fun TelegramOnlyScreen(onEdit: () -> Unit, spoolNote: String) {
         }
         if (spoolNote.isNotEmpty()) {
             Spacer(Modifier.height(12.dp))
-            Text(spoolNote, color = Color(0xFFB45309), fontSize = 14.sp)
+            Text(spoolNote + "（点击查看）",
+                 color = Color(0xFFB45309), fontSize = 14.sp,
+                 modifier = Modifier.clickable { onOpenSpool() })
         }
         Spacer(Modifier.height(20.dp))
         Text(
@@ -398,7 +418,8 @@ private fun ConfigCard(title: String, desc: String,
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun DashboardScreen(onEdit: () -> Unit, spoolNote: String) {
+fun DashboardScreen(onEdit: () -> Unit, onOpenSpool: () -> Unit,
+                    spoolNote: String) {
     val ctx = LocalContext.current
     var base by remember { mutableStateOf(Prefs.resolveCached(ctx)) }
     val token = Prefs.token(ctx)
@@ -526,10 +547,11 @@ fun DashboardScreen(onEdit: () -> Unit, spoolNote: String) {
         }
         if (spoolNote.isNotEmpty()) {
             Text(
-                spoolNote,
+                spoolNote + "（点击查看）",
                 color = Color(0xFFB45309), fontSize = 12.sp,
                 modifier = Modifier
                     .fillMaxWidth()
+                    .clickable { onOpenSpool() }
                     .padding(top = 44.dp)
                     .background(Color(0xFFFEF3C7))
                     .padding(horizontal = 14.dp, vertical = 6.dp),
@@ -561,5 +583,77 @@ private class TokenBridge(private val ctx: android.content.Context) {
     @JavascriptInterface
     fun saveToken(token: String) {
         if (token.isNotBlank()) Prefs.saveToken(ctx, token)
+    }
+}
+
+/**
+ * 离线暂存明细（2026-11-18 owner：要能看见排队里有什么）。
+ *
+ * 每条：文本前 60 字 + 🗑 删除；删除即从 spool 移除（该条不再补投）。
+ * version 变化触发重读（删除后列表刷新）。
+ */
+@Composable
+fun SpoolDetailScreen(onClose: () -> Unit, version: Int, onChanged: () -> Unit) {
+    val ctx = LocalContext.current
+    // version 变化（含首次进入）才重读 spool；删除是同步操作，直接本地过滤
+    var items by remember(version) {
+        mutableStateOf(Prefs.spoolAll(ctx))
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .background(BgApp)
+            .padding(16.dp),
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("📥 离线暂存（${items.size}/200）",
+                 fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            TextButton(onClick = onClose) { Text("完成") }
+        }
+        Text(
+            "两条通道都不通时分享会暂存在这里，回到 app 自动补投；" +
+                "🗑 移除 = 放弃该条不再补投",
+            color = InkMut, fontSize = 12.sp, lineHeight = 17.sp,
+        )
+        Spacer(Modifier.height(8.dp))
+        if (items.isEmpty()) {
+            Spacer(Modifier.height(24.dp))
+            Text("暂存为空——没有待补投的分享",
+                 color = InkMut, fontSize = 14.sp)
+            return@Column
+        }
+        // 200 条上限 × 轻量卡片，普通 Column+verticalScroll 足够——
+        // 不用 LazyColumn（LazyListScope 非 composable 上下文，条目内
+        // Card/Row 会编译报错；引入 items DSL 反而绕）
+        Column(
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.verticalScroll(rememberScrollState()),
+        ) {
+            for (item in items) {
+                Card(colors = CardDefaults.cardColors(containerColor = CardWhite)) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            item.text.take(60) +
+                                if (item.text.length > 60) "…" else "",
+                            fontSize = 13.sp, lineHeight = 18.sp,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = {
+                            Prefs.spoolRemove(ctx, item.id)
+                            onChanged()   // version+1 → remember(version) 重读 spool
+                        }) { Text("🗑") }
+                    }
+                }
+            }
+        }
     }
 }

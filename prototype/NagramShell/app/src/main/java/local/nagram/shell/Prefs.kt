@@ -30,7 +30,7 @@ object Prefs {
     private const val KEY_CHAT_ID = "chat_id"
     private const val KEY_SPOOL = "spool"
     private const val KEY_SPOOL_BACKUP = "spool_backup"
-    private const val SPOOL_MAX = 100
+    private const val SPOOL_MAX = 200   // 2026-11-18 owner：100 不够用
 
     private fun sp(ctx: Context) = ctx.getSharedPreferences(NAME, 0)
 
@@ -143,7 +143,7 @@ object Prefs {
         sp(ctx).edit().putString(KEY_SPOOL, arr.toString()).apply()
     }
 
-    /** 暂存一条；spool 满（100 条）返回 false，调用方必须如实告知用户。 */
+    /** 暂存一条；spool 满（200 条）返回 false，调用方必须如实告知用户。 */
     @Synchronized
     fun spoolAdd(ctx: Context, text: String, id: String): Boolean {
         val (items, _) = readSpool(ctx)
