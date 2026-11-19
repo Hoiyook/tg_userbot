@@ -92,8 +92,7 @@ fun ShareScreen(sharedText: String) {
     var submitted by rememberSaveable { mutableStateOf(false) }
     var message by remember { mutableStateOf("提交中…") }
     var ok by remember { mutableStateOf<Boolean?>(null) }
-    var offline by remember { mutableStateOf(false) }
-    var viaTelegram by remember { mutableStateOf(false) }
+
 
     LaunchedEffect(sharedText, requestId) {
         if (submitted) return@LaunchedEffect
@@ -104,35 +103,15 @@ fun ShareScreen(sharedText: String) {
             ok = false
             return@LaunchedEffect
         }
-        if (!Prefs.configured(ctx)) {
-            val saved = Prefs.spoolAdd(ctx, sharedText, requestId)
-            ok = false
-            offline = saved   // 暂存失败时标题必须是「未受理」，不能谎报已暂存
-            message = if (saved) {
-                "尚未配置服务器——内容已暂存，配置后会自动补投"
-            } else {
-                "离线暂存已满（100 条），本次未保存——请先配置服务器"
-            }
-            return@LaunchedEffect
-        }
-        val r = withContext(Dispatchers.IO) {
-            Api.enqueue(ctx, sharedText, requestId)
-        }
-        ok = r.ok
-        offline = r.offline
-        viaTelegram = r.viaTelegram
-        message = when {
-            r.ok -> r.message
-            r.offline -> {
-                val saved = Prefs.spoolAdd(ctx, sharedText, requestId)
-                offline = saved
-                if (saved) {
-                    "后端暂时不可达——已暂存，回到 app 会自动补投"
-                } else {
-                    "后端暂时不可达，且离线暂存已满（100 条）——本次未保存"
-                }
-            }
-            else -> r.message
+        // 新语义（2026-11-19 owner）：分享一律先入本地暂存区（不区分网络
+        // 状态），app 主动扫描逐条发送——成功转"已转交"，失败留排队区等
+        // 下轮。无网时内容也不丢，语义统一不再分直转/暂存两条路径。
+        val saved = Prefs.spoolAdd(ctx, sharedText, requestId)
+        ok = saved
+        message = if (saved) {
+            "📥 已入暂存队列（app 会自动发送给 bot）"
+        } else {
+            "暂存写入失败——请检查存储空间后重试"
         }
     }
 
@@ -149,9 +128,8 @@ fun ShareScreen(sharedText: String) {
                 ok == null -> "分享到下载器"
                 // Telegram 通道的 200 只代表 Bot API 收下了，不代表
                 // userbot 已处理；HTTP 通道才是同步受理
-                ok == true -> if (viaTelegram) "✅ 已转交" else "✅ 已受理"
-                offline -> "⏳ 已暂存"
-                else -> "❌ 未受理"
+                ok == true -> "📥 已入暂存队列"
+                else -> "❌ 暂存写入失败"
             },
             color = InkStrong,
             fontSize = 26.sp,
@@ -174,7 +152,7 @@ fun ShareScreen(sharedText: String) {
         Spacer(Modifier.height(14.dp))
         Text(
             text = message,
-            color = if (offline) Color(0xFFB45309) else InkMut,
+            color = InkMut,
             fontSize = 15.sp,
         )
         Spacer(Modifier.height(24.dp))

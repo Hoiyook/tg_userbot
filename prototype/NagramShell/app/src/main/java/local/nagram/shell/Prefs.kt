@@ -35,7 +35,7 @@ object Prefs {
     private const val KEY_CHAT_ID = "chat_id"
     private const val KEY_SPOOL = "spool"
     private const val KEY_SPOOL_BACKUP = "spool_backup"
-    private const val SPOOL_MAX = 200   // 2026-11-18 owner：100 不够用
+    // 上限全去（2026-11-19 owner：不限数量）——排队与历史都无上限
 
     private fun sp(ctx: Context) = ctx.getSharedPreferences(NAME, 0)
 
@@ -152,20 +152,16 @@ object Prefs {
         sp(ctx).edit().putString(KEY_SPOOL, arr.toString()).apply()
     }
 
-    /** 暂存一条；排队区满（200 条）返回 false，调用方必须如实告知用户。
-     *
-     * 已转交记录区滚动保留 100 条（2026-11-19 owner：分享历史可见），
-     * 超限从最老的开始淘汰——它只承载"已转交"的展示，丢旧不丢任务。 */
+    /** 暂存一条（无上限——排队与历史都不限量，2026-11-19 owner）。 */
     @Synchronized
     fun spoolAdd(ctx: Context, text: String, id: String): Boolean {
         val (items, _) = readSpool(ctx)
-        if (items.count { it.relayedAt == null } >= SPOOL_MAX) return false
         items.add(0, SpoolItem(id, text))   // 新条目在排队区最前（明细页倒序展示）
         writeSpool(ctx, items)
         return true
     }
 
-    /** 补投成功：转排队 → 已转交（打时间戳保留为历史），滚动淘汰老记录。 */
+    /** 补投成功：转排队 → 已转交（打时间戳保留为历史），无上限。 */
     @Synchronized
     fun spoolMarkRelayed(ctx: Context, id: String) {
         val (items, _) = readSpool(ctx)
@@ -174,8 +170,7 @@ object Prefs {
             if (it.id == id && it.relayedAt == null)
                 it.copy(relayedAt = now) else it
         }
-        val relayed = out.filter { it.relayedAt != null }.take(100)
-        writeSpool(ctx, out.filter { it.relayedAt == null } + relayed)
+        writeSpool(ctx, out)
     }
 
     /** 已转交记录数（明细页计数用）。 */
