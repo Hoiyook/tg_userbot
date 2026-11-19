@@ -173,6 +173,11 @@ fun App() {
     Column(Modifier.fillMaxSize().background(BgApp).statusBarsPadding()) {
         Box(Modifier.weight(1f)) {
             when {
+                tab == "spool" -> SpoolDetailScreen(
+                    onClose = { tab = "panel" },
+                    version = spoolVersion,
+                    onChanged = { spoolVersion++ },
+                )
                 tab == "scripts" -> ScriptsScreen()
                 Prefs.httpConfigured(ctx) -> DashboardScreen(
                     onEdit = { editing = true },
@@ -200,6 +205,9 @@ fun App() {
             }
             TabItem("🛠 脚本", tab == "scripts", Modifier.weight(1f)) {
                 tab = "scripts"
+            }
+            TabItem("📥 暂存", tab == "spool", Modifier.weight(1f)) {
+                tab = "spool"
             }
         }
     }
