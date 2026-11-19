@@ -90,6 +90,8 @@ ACTION_WHITELIST = {
     "chrome_stop": "停止 Chrome Agent（Chrome 保持运行）",
     "chrome_cancel": "取消一个 Chrome 任务（body: {\"id\": 序号或task_id}）",
     "pd_notify": "pd_daemon 巡检告警转发（body: {\"text\": …}）",
+    "pd_extract_on": "pixeldrain 自动解压开（下载完自动解压压缩包）",
+    "pd_extract_off": "pixeldrain 自动解压关（默认，压缩包原样保留）",
     # Pawchive / B站
     "paw_pause": "Pawchive 暂停下载 worker",
     "paw_resume": "Pawchive 恢复下载 worker",
@@ -1286,6 +1288,24 @@ async def handle_action(request):
             ok, msg = chrome_client.request_cancel(task_id)
             return _json({"ok": bool(ok), "routed": "chrome_cancel",
                           "message": msg})
+        if name in ("pd_extract_on", "pd_extract_off"):
+            # pixeldrain 自动解压开关（2026-11-18 owner：默认关，需要时开）
+            # 开关本体 = ~/.pd_state/extract_on（daemon 巡检每 5 分钟读它）
+            import os as _os
+            switch = _os.path.expanduser("~/.pd_state/extract_on")
+            if name == "pd_extract_on":
+                open(switch, "w").close()
+                msg = "🗜 pixeldrain 自动解压已开启——下载完成自动解压压缩包"
+            else:
+                try:
+                    _os.remove(switch)
+                except FileNotFoundError:
+                    pass
+                msg = "pixeldrain 自动解压已关闭（默认）——压缩包原样保留"
+            from . import notify as _notify
+            await _notify.notify_user("🔌 " + msg)
+            return _json({"ok": True, "routed": name, "message": msg})
+
         if name == "pd_notify":
             # pd_daemon 完整性巡检的告警转发（本机 daemon 专属：续传/完成
             # 提醒走统一通知出口）。文本长度收口，防 daemon 侧异常刷屏。
