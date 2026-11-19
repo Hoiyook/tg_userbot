@@ -442,6 +442,11 @@ PAWCHIVE_ZIP_MAX_MEMBER_BYTES = 8 * 1024 ** 3
 PAWCHIVE_ZIP_MAX_RATIO = 200
 
 PAWCHIVE_EXTRACT_ARCHIVES = True
+# 自动解压总开关（2026-11-19 owner：所有渠道默认关闭，开时再打开）。
+# 开关本体 = AUTO_EXTRACT_FILE 存在即开（pd/daemon/pawchive 共用同一文件，
+# 一个开关管全部渠道的自动解压）。默认无文件 = 全部关闭。
+AUTO_EXTRACT_FILE = os.path.join(RUNTIME_DIR, "extract_on")
+AUTO_EXTRACT_ON = lambda: os.path.exists(AUTO_EXTRACT_FILE)
 PAWCHIVE_EXTRACT_TIMEOUT_SECONDS = 3600
 PAWCHIVE_MILESTONE_POSTS = 50
 # --- 评论跟进（2026-09-12）---

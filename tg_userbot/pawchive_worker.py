@@ -597,6 +597,7 @@ async def _download_post_files(post, files):
                 # 成功后删压缩包；解压产物随 CD2 一并备份到 115
                 fname_l = (f["filename"] or "").lower()
                 if (config.PAWCHIVE_EXTRACT_ARCHIVES
+                        and config.AUTO_EXTRACT_ON()
                         and fname_l.endswith((".zip", ".rar", ".7z"))):
                     target = _target_path(post, f["filename"])
                     try:

@@ -1289,19 +1289,18 @@ async def handle_action(request):
             return _json({"ok": bool(ok), "routed": "chrome_cancel",
                           "message": msg})
         if name in ("pd_extract_on", "pd_extract_off"):
-            # pixeldrain 自动解压开关（2026-11-18 owner：默认关，需要时开）
-            # 开关本体 = ~/.pd_state/extract_on（daemon 巡检每 5 分钟读它）
-            import os as _os
-            switch = _os.path.expanduser("~/.pd_state/extract_on")
+            # 自动解压总开关（2026-11-19 owner：全渠道默认关，需要时开）——
+            # 开关本体 = config.AUTO_EXTRACT_FILE（pd daemon / pawchive 共用）
+            switch = config.AUTO_EXTRACT_FILE
             if name == "pd_extract_on":
                 open(switch, "w").close()
-                msg = "🗜 pixeldrain 自动解压已开启——下载完成自动解压压缩包"
+                msg = "🗜 自动解压已开启（全渠道）——下载完成自动解压压缩包"
             else:
                 try:
-                    _os.remove(switch)
+                    os.remove(switch)
                 except FileNotFoundError:
                     pass
-                msg = "pixeldrain 自动解压已关闭（默认）——压缩包原样保留"
+                msg = "自动解压已关闭（默认）——压缩包原样保留"
             from . import notify as _notify
             await _notify.notify_user("🔌 " + msg)
             return _json({"ok": True, "routed": name, "message": msg})
