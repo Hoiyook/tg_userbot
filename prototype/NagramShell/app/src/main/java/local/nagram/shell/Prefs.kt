@@ -4,8 +4,13 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** 一条离线待补投的分享：id 是服务端幂等键，重投必须复用同一 id。 */
-data class SpoolItem(val id: String, val text: String)
+/** 一条分享记录：id 是服务端幂等键，重投必须复用同一 id。
+ *
+ * relayedAt 非空 = 已转交给 bot（转交时刻 epoch 秒）——记录保留作为
+ * 分享历史（2026-11-19 owner：要能看到哪些已转交、哪些在排队）；
+ * 为空 = 仍在排队等待补投。 */
+data class SpoolItem(val id: String, val text: String,
+                     val relayedAt: Long? = null)
 
 /**
  * 壳 app 的全部本地状态：服务器地址 / token / Telegram 中转配置 / 离线补投暂存。
@@ -116,8 +121,10 @@ object Prefs {
                 is JSONObject -> {
                     val id = v.optString("id")
                     val text = v.optString("text")
+                    val relayed = if (v.has("relayed_at"))
+                        v.optLong("relayed_at") else null
                     if (id.isNotEmpty()) {
-                        out.add(SpoolItem(id, text))
+                        out.add(SpoolItem(id, text, relayed))
                     } else {
                         out.add(SpoolItem(newSpoolId(), text))
                         migrated = true
@@ -138,20 +145,48 @@ object Prefs {
     private fun writeSpool(ctx: Context, items: List<SpoolItem>) {
         val arr = JSONArray()
         items.forEach {
-            arr.put(JSONObject().put("id", it.id).put("text", it.text))
+            val o = JSONObject().put("id", it.id).put("text", it.text)
+            it.relayedAt?.let { t -> o.put("relayed_at", t) }
+            arr.put(o)
         }
         sp(ctx).edit().putString(KEY_SPOOL, arr.toString()).apply()
     }
 
-    /** 暂存一条；spool 满（200 条）返回 false，调用方必须如实告知用户。 */
+    /** 暂存一条；排队区满（200 条）返回 false，调用方必须如实告知用户。
+     *
+     * 已转交记录区滚动保留 100 条（2026-11-19 owner：分享历史可见），
+     * 超限从最老的开始淘汰——它只承载"已转交"的展示，丢旧不丢任务。 */
     @Synchronized
     fun spoolAdd(ctx: Context, text: String, id: String): Boolean {
         val (items, _) = readSpool(ctx)
-        if (items.size >= SPOOL_MAX) return false
-        items.add(SpoolItem(id, text))
+        if (items.count { it.relayedAt == null } >= SPOOL_MAX) return false
+        items.add(0, SpoolItem(id, text))   // 新条目在排队区最前（明细页倒序展示）
         writeSpool(ctx, items)
         return true
     }
+
+    /** 补投成功：转排队 → 已转交（打时间戳保留为历史），滚动淘汰老记录。 */
+    @Synchronized
+    fun spoolMarkRelayed(ctx: Context, id: String) {
+        val (items, _) = readSpool(ctx)
+        val now = System.currentTimeMillis() / 1000
+        val out = items.map {
+            if (it.id == id && it.relayedAt == null)
+                it.copy(relayedAt = now) else it
+        }
+        val relayed = out.filter { it.relayedAt != null }.take(100)
+        writeSpool(ctx, out.filter { it.relayedAt == null } + relayed)
+    }
+
+    /** 已转交记录数（明细页计数用）。 */
+    @Synchronized
+    fun spoolRelayedCount(ctx: Context): Int =
+        readSpool(ctx).first.count { it.relayedAt != null }
+
+    /** 仍在排队的条目（补投循环用——只重投 relayedAt 为空的）。 */
+    @Synchronized
+    fun spoolRelayedPending(ctx: Context): List<SpoolItem> =
+        readSpool(ctx).first.filter { it.relayedAt == null }
 
     @Synchronized
     fun spoolAll(ctx: Context): List<SpoolItem> {

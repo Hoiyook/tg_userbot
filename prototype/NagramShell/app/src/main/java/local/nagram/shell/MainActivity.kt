@@ -607,6 +607,9 @@ fun SpoolDetailScreen(onClose: () -> Unit, version: Int, onChanged: () -> Unit) 
     var items by remember(version) {
         mutableStateOf(Prefs.spoolAll(ctx))
     }
+    val pending = items.filter { it.relayedAt == null }
+    val relayed = items.filter { it.relayedAt != null }
+        .sortedByDescending { it.relayedAt }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -620,48 +623,75 @@ fun SpoolDetailScreen(onClose: () -> Unit, version: Int, onChanged: () -> Unit) 
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("📥 离线暂存（${items.size}/200）",
+            Text("📥 分享记录",
                  fontWeight = FontWeight.Bold, fontSize = 16.sp)
-            TextButton(onClick = onClose) { Text("完成") }
+            TextButton(onClose) { Text("完成") }
         }
         Text(
-            "两条通道都不通时分享会暂存在这里，回到 app 自动补投；" +
-                "🗑 移除 = 放弃该条不再补投",
+            "排队 ${pending.size}/200 · 已转交 ${relayed.size}。" +
+                "排队中的在有网时自动补投；🗑 移除 = 放弃该条",
             color = InkMut, fontSize = 12.sp, lineHeight = 17.sp,
         )
         Spacer(Modifier.height(8.dp))
         if (items.isEmpty()) {
             Spacer(Modifier.height(24.dp))
-            Text("暂存为空——没有待补投的分享",
+            Text("还没有分享记录——任意 app 里点「分享」→ 选「存到下载器」",
                  color = InkMut, fontSize = 14.sp)
             return@Column
         }
-        // 200 条上限 × 轻量卡片，普通 Column+verticalScroll 足够——
-        // 不用 LazyColumn（LazyListScope 非 composable 上下文，条目内
-        // Card/Row 会编译报错；引入 items DSL 反而绕）
-        Column(
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-            modifier = Modifier.verticalScroll(rememberScrollState()),
+        // 排队区
+        if (pending.isNotEmpty()) {
+            Text("⏳ 排队中（${pending.size}）",
+                 fontWeight = FontWeight.Bold, fontSize = 13.sp,
+                 color = Color(0xFFB45309))
+            Spacer(Modifier.height(4.dp))
+            for (item in pending) {
+                SpoolRecordRow(item, relayed = false, onChanged = onChanged)
+            }
+            Spacer(Modifier.height(10.dp))
+        }
+        // 已转交区（历史记录）
+        if (relayed.isNotEmpty()) {
+            Text("✅ 已转交 bot（${relayed.size}）",
+                 fontWeight = FontWeight.Bold, fontSize = 13.sp,
+                 color = Color(0xFF16A34A))
+            Spacer(Modifier.height(4.dp))
+            for (item in relayed) {
+                SpoolRecordRow(item, relayed = true, onChanged = onChanged)
+            }
+        }
+    }
+}
+
+@Composable
+fun SpoolRecordRow(item: SpoolItem, relayed: Boolean, onChanged: () -> Unit) {
+    val ctx = LocalContext.current
+    Card(colors = CardDefaults.cardColors(containerColor = CardWhite)) {
+        Row(
+            Modifier.fillMaxWidth().padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            for (item in items) {
-                Card(colors = CardDefaults.cardColors(containerColor = CardWhite)) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            item.text.take(60) +
-                                if (item.text.length > 60) "…" else "",
-                            fontSize = 13.sp, lineHeight = 18.sp,
-                            modifier = Modifier.weight(1f),
-                        )
-                        TextButton(onClick = {
-                            Prefs.spoolRemove(ctx, item.id)
-                            onChanged()   // version+1 → remember(version) 重读 spool
-                        }) { Text("🗑") }
-                    }
+            Column(Modifier.weight(1f)) {
+                Text(
+                    item.text.take(60) +
+                        if (item.text.length > 60) "…" else "",
+                    fontSize = 13.sp, lineHeight = 18.sp,
+                )
+                if (relayed) {
+                    val t = item.relayedAt ?: 0L
+                    Text(
+                        "✅ 已转交 " + java.text.SimpleDateFormat(
+                            "MM-dd HH:mm",
+                            java.util.Locale.getDefault()
+                        ).format(java.util.Date(t * 1000)),
+                        fontSize = 11.sp, color = Color(0xFF16A34A),
+                    )
                 }
             }
+            TextButton(onClick = {
+                Prefs.spoolRemove(ctx, item.id)
+                onChanged()   // version+1 → remember(version) 重读 spool
+            }) { Text("🗑") }
         }
     }
 }

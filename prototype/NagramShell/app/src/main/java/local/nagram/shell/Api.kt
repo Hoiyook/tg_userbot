@@ -233,19 +233,22 @@ object Api {
         }
     }
 
-    /** 把离线暂存的分享逐条补投；成功/永久失败移出 spool。 */
+    /** 把离线暂存的分享逐条补投；成功转"已转交"历史（不删，owner 要看
+     * 分享记录）；永久失败（配置错等不可恢复）移出并计数。排队中的继续等
+     * 下轮补投。 */
     fun flushSpool(ctx: android.content.Context): FlushResult {
         var dropped = 0
         for (item in Prefs.spoolAll(ctx)) {
+            if (item.relayedAt != null) continue   // 已转交历史，跳过
             val r = enqueue(ctx, item.text, item.id)
             when {
-                r.ok -> Prefs.spoolRemove(ctx, item.id)
+                r.ok -> Prefs.spoolMarkRelayed(ctx, item.id)
                 r.permanent -> {
                     Prefs.spoolRemove(ctx, item.id)
                     dropped++
                 }
             }
         }
-        return FlushResult(Prefs.spoolAll(ctx).size, dropped)
+        return FlushResult(Prefs.spoolRelayedPending(ctx).size, dropped)
     }
 }
