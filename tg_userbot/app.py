@@ -1952,6 +1952,8 @@ async def main():
         # Pawchive 定期 backfill：所有已扫作者轮巡回填（对账三层挡重复，
         # 串行+节流防风控），让位人工扫描
         pawb_task = asyncio.create_task(pawchive.backfill_loop())
+        # 扫描失败自动重试循环（2026-11-19 owner：失败不要每次人工重发）
+        paw_retry_task = asyncio.create_task(pawchive._scan_retry_loop())
     # Pawchive worker（帖子生命周期 → Chrome Agent 批量下载）
     pawchive_worker_task = None
     if state.RUNTIME_DB_READY:

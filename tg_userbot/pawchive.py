@@ -1525,6 +1525,79 @@ def _scan_stage(stage):
     return cb
 
 
+# 扫描失败自动重试队列（2026-11-19 owner：不要每次人工重发）。
+# JSON 持久化（重启不丢），指数退避 10m→30m→90m，最多 3 次；重试仍失败
+# 则通知放弃（下轮轮巡的 backfill 也会再覆盖到该作者的存量帖）。
+_RETRY_FILE = os.path.join(config.RUNTIME_DIR, "paw_scan_retry.json")
+_RETRY_MAX = 3
+_RETRY_DELAYS = [600, 1800, 5400]
+
+
+def _load_retry_queue():
+    try:
+        with open(_RETRY_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_retry_queue(q):
+    tmp = _RETRY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(q, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, _RETRY_FILE)
+
+
+def _enqueue_scan_retry(creator, scope, since, reason):
+    """扫描失败入重试队列；超过上限返回 False（调用方通知放弃）。"""
+    q = _load_retry_queue()
+    label = _creator_label(creator)
+    prev = next((r for r in q if r.get("label") == label), None)
+    attempts = (prev.get("attempts", 0) + 1) if prev else 1
+    if attempts > _RETRY_MAX:
+        q = [r for r in q if r.get("label") != label]
+        _save_retry_queue(q)
+        return False
+    delay = _RETRY_DELAYS[min(attempts - 1, len(_RETRY_DELAYS) - 1)]
+    entry = {"label": label, "attempts": attempts,
+             "next_at": time.time() + delay,
+             "creator": creator, "scope": scope, "since": since,
+             "reason": str(reason)[:120]}
+    q = [r for r in q if r.get("label") != label] + [entry]
+    _save_retry_queue(q)
+    return True
+
+
+async def _scan_retry_loop():
+    """扫描失败重试循环（每 60s 醒一次，到期的逐个重扫——串行，不与人工
+    扫描并发：撞锁时跳过本轮，队列保留下轮再试）。"""
+    logger.info("🐾 扫描失败重试循环已启动"
+                f"（最多 {_RETRY_MAX} 次，退避 10m→30m→90m）")
+    while True:
+        await asyncio.sleep(60)
+        try:
+            q = _load_retry_queue()
+            now = time.time()
+            due = [r for r in q if r.get("next_at", 0) <= now]
+            for r in due:
+                if state.PAW_SCAN_RUNNING is not None:
+                    break   # 人工扫描进行中——整轮让位，下轮再试
+                q = _load_retry_queue()
+                cur = next((x for x in q if x.get("label") == r["label"]), None)
+                if cur is None or cur.get("next_at", 0) > time.time():
+                    continue   # 队列已变（新失败覆盖/已成功清出）
+                logger.info(f"🐾 扫描重试 {r['attempts']}/{_RETRY_MAX}："
+                            f"{r['label']}")
+                await _scan_and_notify(r["creator"], r.get("scope") or
+                                       "notfaved", r.get("since"))
+                # _scan_and_notify 成功后自己清队列？不——由 _notify_scan
+                # 失败时入队/成功时移除。这里扫完检查：成功（队列无此
+                # label）则不打扰；仍失败（attempts+1 已写回）继续退避。
+        except Exception as e:
+            logger.warning(f"🐾 扫描重试循环异常（忽略）：{e}")
+
+
 async def _scan_and_notify(creator, scope, since=None):
     """扫描主体：帖子分页 + 收藏对比 + 落库。异常只通知，不炸后台。"""
     label = _creator_label(creator)
@@ -1585,20 +1658,28 @@ async def _scan_and_notify(creator, scope, since=None):
         if not cookie:
             summary += "\n⚠️ 未配置 Cookie，本次按全部帖子处理（无法对比收藏）"
         await notify_user(summary)
+        # 扫描成功：清掉该作者的失败重试条目（若有）
+        q = [r for r in _load_retry_queue() if r.get("label") != label]
+        _save_retry_queue(q)
     except Exception as e:
         logger.exception(f"🐾 Pawchive 扫描失败：{label}")
-        # 站点抖动（超时/403/DDoS-Guard 拦截）给出「等会重试即可」的定性，
-        # 并提示 cookie 无辜——2026-10-05 生产实测：站点挂 6 分钟，owner
-        # 连按 cookie 按钮以为配置坏了
         msg = str(e)
-        if "timed out" in msg or "403" in msg or "timeout" in msg.lower():
+        # 自动重试（2026-11-19 owner：不要每次人工重发）——入重试队列，
+        # 指数退避 10m→30m→90m，最多 3 次；重试仍失败则通知放弃
+        will_retry = _enqueue_scan_retry(creator, scope, since, msg)
+        retry_note = ("\n🔁 已入自动重试队列（10 分钟后第一次重试，"
+                      "最多 3 次）" if will_retry else
+                      "\n❌ 自动重试 3 次仍失败——放弃本次（下轮回填轮巡"
+                      "会再覆盖该作者）")
+        if "timed out" in msg or "403" in msg or "timeout" in msg.lower() \
+                or "handshake" in msg.lower():
             await notify_user(
                 f"❌ Pawchive 扫描失败（{label}）：站点临时不可达\n\n"
-                f"原因：{msg[:120]}\n"
-                "已自动重试 4 次仍超时——pawchive.pw 的防护层抖动，"
-                "**稍等几分钟重发 /paw plan 即可**（cookie 无需改动）。")
+                f"原因：{msg[:120]}{retry_note}\n"
+                "（pawchive.pw 的防护层抖动，cookie 无需改动）")
         else:
-            await notify_user(f"❌ Pawchive 扫描失败（{label}）：{e}")
+            await notify_user(f"❌ Pawchive 扫描失败（{label}）：{e}"
+                              f"{retry_note}")
     finally:
         state.PAW_SCAN_RUNNING = None
         state.PAW_SCAN_PROGRESS = {}
