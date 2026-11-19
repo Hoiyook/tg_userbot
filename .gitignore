@@ -23,5 +23,15 @@ logs/
 .zcode/
 ScriptRunner/.gradle/
 ScriptRunner/app/build/
+prototype/NagramShell/.gradle/
+prototype/NagramShell/app/build/
+prototype/NagramShell/.idea/
+prototype/NagramShell/local.properties
 ScriptRunner/build/
 ScriptRunner/local.properties
+
+# gradle 运行时再生的其它噪声（2026-11-19）
+prototype/NagramShell/build/
+prototype/NagramShell/app/libs/
+prototype/NagramShell/.kotlin/
+prototype/ScriptRunner/
