@@ -448,8 +448,7 @@ async def backfill_author(name, months=None):
     if state.PAW_SCAN_RUNNING is not None:
         # 撞锁 → 自动排队（单待办位）：记下作者，锁释放后自动执行
         pending, displaced = enqueue_plan_pending(label)
-        tip = (f"\n⚠️ 原待办「{displaced}」被本次覆盖（单待办位）"
-               if displaced and displaced != pending else "")
+        tip = f"\n{displaced}" if displaced else ""
         return (f"{TEXT_PREFIX}\n⏳ 已有扫描/回填在进行"
                 f"（{state.PAW_SCAN_RUNNING}）\n"
                 f"📌 已排队：扫描结束后自动执行「{pending}」的回填{tip}")
@@ -615,47 +614,72 @@ def _load_pawb_state():
 
 
 _PLAN_PENDING_FILE = os.path.join(config.RUNTIME_DIR, "paw_plan_pending.json")
+_PLAN_PENDING_MAX = 50   # FIFO 队列上限（防异常刷屏；正常远达不到）
 
 
-def _load_plan_pending() -> str:
-    """启动恢复待办位（2026-11-05 审计：排队在内存态曾因重启蒸发——
-    bili 侧实测 4 条排队全丢后，同款教训在此补齐）。"""
+def _load_plan_pending() -> list:
+    """启动恢复待办队列（FIFO，2026-11-19 owner：解耦——发送方只入队，
+    消费方空闲逐个取，绝不覆盖）。
+
+    兼容迁移：旧版单待办位是 JSON 字符串（单个名字）→ 就地转成单元素
+    列表（2026-11-17 事故：4 条连续 /paw_plan 后发覆盖先发，3 条静默
+    丢弃——单待办位对批量提交不友好，结构性缺陷）。"""
     try:
         with open(_PLAN_PENDING_FILE, "r", encoding="utf-8") as f:
-            return str(json.load(f) or "").strip()
+            data = json.load(f)
     except Exception:
-        return ""
+        return []
+    if isinstance(data, str):
+        data = [data.strip()] if data.strip() else []
+    if not isinstance(data, list):
+        return []
+    return [str(x).strip() for x in data if str(x).strip()]
 
 
-def _save_plan_pending(name):
+def _save_plan_pending(queue):
     try:
         tmp = _PLAN_PENDING_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(name, f, ensure_ascii=False)
+            json.dump(queue, f, ensure_ascii=False)
         os.replace(tmp, _PLAN_PENDING_FILE)
     except Exception as e:
-        logger.warning(f"🐾 pawchive 待办位落盘失败：{e}")
+        logger.warning(f"🐾 pawchive 待办队列落盘失败：{e}")
 
 
 def enqueue_plan_pending(name):
-    """撞锁时把 /paw_plan 作者记入单待办位（后写覆盖先写，被覆盖者
-    由调用方在回执里提示）。持久化到 runtime/paw_plan_pending.json，
-    重启不丢。返回 (生效名, 被覆盖名)。"""
+    """撞锁时把 /paw_plan 作者追加进 FIFO 待办队列（**绝不覆盖**——
+    2026-11-17 事故根因：单待办位后写覆盖先写，4 条连续 plan 丢 3 条）。
+    持久化到 runtime/paw_plan_pending.json，重启不丢。
+    返回 (生效名, 队列位置文案)。"""
     name = str(name or "").strip()
-    displaced = getattr(state, "PAW_PLAN_PENDING", "") or ""
     state.PAW_PLAN_PENDING = name
-    _save_plan_pending(name)
-    return name, displaced
+    q = _load_plan_pending()
+    q.append(name)
+    if len(q) > _PLAN_PENDING_MAX:
+        dropped = len(q) - _PLAN_PENDING_MAX
+        q = q[-_PLAN_PENDING_MAX:]
+        _save_plan_pending(q)
+        return name, f"队列超上限淘汰 {dropped} 条"
+    _save_plan_pending(q)
+    pos = len(q)   # 队列位置（含本次）
+    return name, f"已排队（第 {pos} 位）"
 
 
-state.PAW_PLAN_PENDING = _load_plan_pending()   # 启动恢复（重启不丢）
+state.PAW_PLAN_QUEUE = _load_plan_pending()   # 启动恢复（重启不丢）
+# 兼容垫片：旧代码读 PAW_PLAN_PENDING 单名——取队列头（不动队列）
+state.PAW_PLAN_PENDING = state.PAW_PLAN_QUEUE[0] if state.PAW_PLAN_QUEUE else ""
 
 
 def take_plan_pending() -> str:
-    """取走待办作者（取后清空并落盘；无则空串）。"""
-    name = getattr(state, "PAW_PLAN_PENDING", "") or ""
-    state.PAW_PLAN_PENDING = ""
-    _save_plan_pending("")
+    """取走队头作者（FIFO；无则空串）。"""
+    q = state.PAW_PLAN_QUEUE or _load_plan_pending()
+    if not q:
+        state.PAW_PLAN_PENDING = ""
+        return ""
+    name = q.pop(0)
+    state.PAW_PLAN_QUEUE = q
+    state.PAW_PLAN_PENDING = q[0] if q else ""
+    _save_plan_pending(q)
     return name
 
 
@@ -1501,8 +1525,7 @@ async def start_scan(creator, scope="notfaved", since=None):
     if state.PAW_SCAN_RUNNING is not None:
         label = _creator_label(creator)
         pending, displaced = enqueue_plan_pending(label)
-        tip = (f"\n⚠️ 原待办「{displaced}」被本次覆盖（单待办位）"
-               if displaced and displaced != pending else "")
+        tip = f"\n{displaced}" if displaced else ""
         return (f"⏳ 已有扫描在进行（{state.PAW_SCAN_RUNNING}）\n"
                 f"📌 已排队：结束后自动执行「{label}」{tip}")
     state.PAW_SCAN_RUNNING = _creator_label(creator)
@@ -2934,8 +2957,7 @@ async def _reply_plan(event, arg):
         # 撞锁 → 自动排队：把参数记下，锁释放后按 /paw_plan 真实链路执行
         name = (arg or "").strip()
         pending, displaced = enqueue_plan_pending(name)
-        tip = (f"\n⚠️ 原待办「{displaced}」被本次覆盖（单待办位）"
-               if displaced and displaced != pending else "")
+        tip = f"\n{displaced}" if displaced else ""
         name = pending
         await event.reply(
             f"{TEXT_PREFIX}\n⏳ 已有扫描在进行（{state.PAW_SCAN_RUNNING}）\n"

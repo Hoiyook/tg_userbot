@@ -949,14 +949,31 @@ class BackfillScheduleTest(unittest.TestCase):
 
 
 class PlanPendingTest(unittest.TestCase):
-    """撞锁自动排队：入位/取走。"""
+    """撞锁自动排队：FIFO 队列入队/取走（2026-11-19 owner：绝不覆盖）。
+
+    背景（2026-11-17 事故）：单待办位后写覆盖先写——4 条连续 /paw_plan
+    只剩最后 1 条，前 3 条静默丢弃。FIFO 后发送方只入队，消费方空闲
+    逐个取。"""
 
     def setUp(self):
-        self._saved = pawchive.state.PAW_PLAN_PENDING
+        # 队列文件 patch 到临时路径（真实 runtime 的待办文件绝不能被测试碰）
+        self._saved_file = pawchive._PLAN_PENDING_FILE
+        self._file = os.path.join(_TMP, "paw_plan_pending_test.json")
+        if os.path.exists(self._file):
+            os.remove(self._file)
+        self._pf = mock.patch.object(pawchive, "_PLAN_PENDING_FILE",
+                                     self._file)
+        self._pf.start()
+        self.addCleanup(self._pf.stop)
+        self._saved = (pawchive.state.PAW_PLAN_PENDING,
+                       pawchive.state.PAW_PLAN_QUEUE)
         pawchive.state.PAW_PLAN_PENDING = ""
+        pawchive.state.PAW_PLAN_QUEUE = []
 
     def tearDown(self):
-        pawchive.state.PAW_PLAN_PENDING = self._saved
+        self._pf.stop()
+        (pawchive.state.PAW_PLAN_PENDING,
+         pawchive.state.PAW_PLAN_QUEUE) = self._saved
 
     def test_backfill_collision_enqueues(self):
         from tg_userbot import state
@@ -973,13 +990,33 @@ class PlanPendingTest(unittest.TestCase):
             import asyncio
             out = asyncio.run(pawchive.backfill_author("作者A"))
         self.assertIn("已排队", out)
-        self.assertIn("作者A", pawchive.state.PAW_PLAN_PENDING)
+        q = pawchive._load_plan_pending()
+        self.assertIn("作者A", q, "撞锁入 FIFO 队列")
         ct.assert_not_called()   # 撞锁时不该启动后台任务
 
-    def test_take_clears(self):
-        pawchive.enqueue_plan_pending("作者B")
+    def test_batch_submits_never_overwrite(self):
+        """4 条连续 plan 全部入队——2026-11-17 事故的精确回归（旧单待办
+        位只留最后 1 条）。"""
+        for name in ("作者A", "作者B", "作者C", "作者D"):
+            pawchive.enqueue_plan_pending(name)
+        q = pawchive._load_plan_pending()
+        self.assertEqual(q, ["作者A", "作者B", "作者C", "作者D"],
+                         "FIFO：4 条全部保留、顺序不乱")
+
+    def test_take_is_fifo(self):
+        for name in ("作者A", "作者B", "作者C"):
+            pawchive.enqueue_plan_pending(name)
+        self.assertEqual(pawchive.take_plan_pending(), "作者A")
         self.assertEqual(pawchive.take_plan_pending(), "作者B")
+        self.assertEqual(pawchive.take_plan_pending(), "作者C")
         self.assertEqual(pawchive.take_plan_pending(), "")
+
+    def test_legacy_single_name_migrates(self):
+        """旧单待办位文件（JSON 字符串）→ 启动迁移成单元素列表。"""
+        import json as _json
+        _json.dump("旧作者", open(pawchive._PLAN_PENDING_FILE, "w"))
+        q = pawchive._load_plan_pending()
+        self.assertEqual(q, ["旧作者"])
 
 
 class RefreshOnMissTest(unittest.TestCase):
