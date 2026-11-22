@@ -26,7 +26,9 @@ from . import state
 from .log import logger
 
 TEXT_PREFIX = "📥"
-_REPLAY_SCAN_MESSAGES = 100     # 每次回放最多回看的消息数
+_REPLAY_SCAN_MESSAGES = 3000    # 每次回放最多回看的消息数（2026-11-19 扩：
+                                # bot 对话被进度/面板消息高频刷屏，100 条
+                                # 窗口在刷屏下会罩不住真实断连窗口）
 _REPLAY_LOOP_SECONDS = 300.0    # 周期回放（兜住重连缺口）
 _OK_MARK = "✅"
 _FAIL_MARK = "❌"
