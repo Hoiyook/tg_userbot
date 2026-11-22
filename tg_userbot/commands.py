@@ -808,9 +808,16 @@ async def _handle_command_inner(event, cmd_text):
         return True
 
     if cmd_text.startswith("/cmdq"):
-        # 指令台账查询：成功/失败/待执行
+        # 指令台账查询：成功/失败/待执行/待确认/confirm
         logger.info(f"执行命令：{cmd_text[:60]}")
         arg = cmd_text.split(None, 1)[1] if len(cmd_text.split()) > 1 else ""
+        if arg.startswith("confirm"):
+            tid = arg.split(None, 1)[1].strip() if len(arg.split(None, 1)) > 1 else ""
+            await _reply(event, await cmdq.confirm_cmd(tid))
+            return True
+        if arg == "待确认":
+            await _reply(event, await cmdq.list_confirm())
+            return True
         await _reply(event, cmdq.status_reply(arg))
         return True
 

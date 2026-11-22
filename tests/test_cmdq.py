@@ -109,8 +109,11 @@ class ReplayFlowTest(_DbCase):
         self.addCleanup(lambda: self._h.stop())
 
     def test_replay_executes_pending_commands(self):
-        msgs = [_Msg(10, "/paw_plan 作者"), _Msg(11, "闲聊"),
-                _Msg(12, "/wnacg 123 作者")]
+        """回放执行幂等安全命令（查询类）；写操作命令转 CONFIRM 待人工
+        （2026-11-22 事故：历史 /pd /retry 被回放重放——pixeldrain 重下、
+        wnacg 重投）。"""
+        msgs = [_Msg(10, "/stats"), _Msg(11, "闲聊"),
+                _Msg(12, "/paw_plan 作者"), _Msg(13, "/wnacg 123 作者")]
         cli = _Cli(msgs)
         state.client = cli
         state.bot_client = None
@@ -120,16 +123,19 @@ class ReplayFlowTest(_DbCase):
         async def run():
             return await cmdq.replay_chat("me")
         res = asyncio.run(run())
-        self.assertEqual(res["found"], 2)
-        self.assertEqual(res["executed"], 2)
-        self.assertEqual(sorted(self.executed),
-                         ["/paw_plan 作者", "/wnacg 123 作者"])
+        self.assertEqual(res["found"], 3)
+        self.assertEqual(res["executed"], 1, "只有幂等安全的 /stats 自动执行")
+        self.assertEqual(self.executed, ["/stats"])
+        # 写操作命令转 CONFIRM（待人工 /cmdq confirm）
+        conf = [r for r in runtime_db.list_cmd_ledger(
+                    status=runtime_db.CMD_CONFIRM, limit=10)]
+        self.assertEqual(len(conf), 2, "写操作命令应转 CONFIRM")
         # 水位线推进到最后一条（含非指令）
-        self.assertEqual(runtime_db.get_cmd_cursor(_chat_key("me")), 12)
-        # 再跑一遍：水位线后无新消息，不重复执行
+        self.assertEqual(runtime_db.get_cmd_cursor(_chat_key("me")), 13)
+        # 再跑一遍：水位线后无新消息，CONFIRM 不再重放
         res2 = asyncio.run(run())
         self.assertEqual(res2["found"], 0)
-        self.assertEqual(len(self.executed), 2, "恰好一次，不重复")
+        self.assertEqual(len(self.executed), 1, "恰好一次，不重复")
 
     def test_replay_stale_skipped(self):
         runtime_db.record_cmd("me", 5, "/旧指令", now=time.time() - 8 * 86400)

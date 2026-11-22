@@ -3871,6 +3871,7 @@ CMD_RUNNING = "RUNNING"
 CMD_SUCCESS = "SUCCESS"
 CMD_FAILED = "FAILED"
 CMD_STALE = "STALE"       # 离线太久（超期保护）跳过未执行
+CMD_CONFIRM = "CONFIRM"   # 回放拦截的写操作命令——待人工 /cmdq confirm 执行
 
 
 
@@ -3928,6 +3929,15 @@ def get_cmd_status(chat_id, msg_id):
         c, "SELECT * FROM cmd_ledger WHERE chat_id=? AND msg_id=?",
         (_cmd_chat_key(chat_id), int(msg_id))).fetchone(), "查指令状态")
     return _row_to_cmd_ledger(row)
+
+
+def get_cmd_ledger_row(row_id):
+    """按台账自增 id 取一行（/cmdq confirm 人工确认执行用）。"""
+    def do(conn):
+        row = _execute(conn, "SELECT * FROM cmd_ledger WHERE id=?",
+                       (int(row_id),)).fetchone()
+        return dict(row) if row is not None else None
+    return _read(do, "读指令台账行")
 
 
 def list_cmd_ledger(status=None, limit=30):

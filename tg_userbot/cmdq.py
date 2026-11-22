@@ -75,6 +75,20 @@ class ReplayEvent:
 APP_RELAY_MARKER = "🛰 "   # 与 api_server.APP_RELAY_MARKER 同值（避免环 import）
 
 
+# 回放需人工确认的写操作命令（2026-11-22 事故：历史 /pd /retry_all 被
+# 回放重放执行——pixeldrain 目录从头重下、wnacg 任务重投）。查询/状态类
+# 不在清单（幂等无害，回放直接跑）。
+_REPLAY_WRITE_COMMANDS = {
+    "pd", "pd_start", "retry", "retry_all", "retry_del",
+    "queue_del", "x", "pixiv", "wnacg", "asmr", "115x", "dyu",
+    "chrome", "paw_plan", "paw_retry", "listen_add", "listen_del",
+    "wl_add", "wl_del", "clean", "cookie", "bili_cookie", "cookie_set",
+    "memo_add", "memo_del", "sql", "sqlt", "sqlt_add", "sqlt_del",
+    "sh", "restart", "up", "extract", "thread", "dedup",
+    "del", "pdclean", "cd2", "listen_interval", "caption_filter",
+}
+
+
 def is_app_relay_text(text):
     """🛰 app 中转消息（套壳 app 分享直达）：「🛰 <request_id> <原文>」。"""
     return str(text or "").strip().startswith(APP_RELAY_MARKER)
@@ -162,6 +176,16 @@ async def execute_ledger_row(row, stale_days=None):
         await _mark(chat_id, msg_id, _STALE_MARK)
         logger.info(f"📥 回放跳过（过期）：{cmd_text[:40]}")
         return runtime_db.CMD_STALE
+    # 写操作命令回放拦截（2026-11-22 事故：回放窗口扩到 3000 后把历史
+    # /pd /retry 全部重放——pixeldrain 目录从头重下 + wnacg 重投）。
+    # 回放只自动执行幂等安全命令；写操作标 CONFIRM 待人工 /cmdq 确认。
+    head = cmd_text.strip().split()[0].lstrip("/").split("@")[0].lower() \
+        if cmd_text.strip() else ""
+    if head in _REPLAY_WRITE_COMMANDS:
+        runtime_db.finish_cmd(chat_id, msg_id, runtime_db.CMD_CONFIRM)
+        await _mark(chat_id, msg_id, "⏸")
+        logger.info(f"📥 回放拦截写操作命令（待 /cmdq 确认）：{cmd_text[:40]}")
+        return runtime_db.CMD_CONFIRM
     from . import commands
     ev = ReplayEvent(chat_id, msg_id, cmd_text)
     try:
@@ -355,7 +379,8 @@ def status_reply(arg):
     by_zh = {"成功": "SUCCESS", "失败": "FAILED", "待执行": "PENDING",
              "全部": None}
     status = by_zh.get(q, by_zh.get(arg.strip(), None))
-    if q and status is None and q not in ("", "全部", "成功", "失败", "待执行"):
+    if q and status is None and q not in ("", "全部", "成功", "失败",
+                                          "待执行", "待确认"):
         return (f"{TEXT_PREFIX} 用法：/cmdq [成功|失败|待执行|全部]\n"
                 "（默认看最近全部）")
     try:
@@ -373,3 +398,30 @@ def status_reply(arg):
         lines.append(f"{ts} {_STATUS_ZH.get(r['status'], r['status'])}"
                      f"｜{r['cmd_text'][:40]}{err}")
     return "\n".join(lines)[:3900] or f"{TEXT_PREFIX} 台账为空"
+
+
+async def confirm_cmd(arg):
+    """/cmdq confirm <id>：人工确认执行一条 CONFIRM 状态的回放拦截命令。"""
+    tid = str(arg or "").strip()
+    if not tid.isdigit():
+        return (f"{TEXT_PREFIX} 用法：/cmdq confirm <台账id>\n"
+                f"（/cmdq 待确认 列出被拦截的命令）")
+    row = runtime_db.get_cmd_ledger_row(int(tid))
+    if row is None or row.get("status") != runtime_db.CMD_CONFIRM:
+        return f"{TEXT_PREFIX} 台账 #{tid} 不是待确认状态（/cmdq 待确认 查看）"
+    st = await execute_ledger_row(row, stale_days=9999)  # 已人工确认，豁免过期
+    icon = {"SUCCESS": "✅", "FAILED": "❌", "STALE": "⏭"}.get(st, str(st))
+    return f"{TEXT_PREFIX} #{tid} 人工确认执行 → {icon} {str(row.get('cmd_text'))[:40]}"
+
+
+async def list_confirm():
+    """/cmdq 待确认：列出全部 CONFIRM 状态的拦截命令。"""
+    rows = runtime_db.list_cmd_ledger(status=runtime_db.CMD_CONFIRM, limit=30)
+    if not rows:
+        return f"{TEXT_PREFIX} 没有待确认的回放拦截命令"
+    lines = [f"{TEXT_PREFIX} 待确认的写操作命令（/cmdq confirm <id> 执行）", ""]
+    for r in rows:
+        import time as _t
+        when = _t.strftime("%m-%d %H:%M", _t.localtime(r["received_at"]))
+        lines.append(f"  #{r['id']} {when}｜{str(r['cmd_text'])[:44]}")
+    return "\n".join(lines)
