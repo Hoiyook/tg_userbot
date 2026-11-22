@@ -70,6 +70,14 @@ class ReplayEvent:
 # ============================================================
 # 判定：文本是不是指令（以已注册指令名打头）
 # ============================================================
+APP_RELAY_MARKER = "🛰 "   # 与 api_server.APP_RELAY_MARKER 同值（避免环 import）
+
+
+def is_app_relay_text(text):
+    """🛰 app 中转消息（套壳 app 分享直达）：「🛰 <request_id> <原文>」。"""
+    return str(text or "").strip().startswith(APP_RELAY_MARKER)
+
+
 def is_command_text(text):
     q = str(text or "").strip()
     if not q.startswith("/"):
@@ -107,9 +115,31 @@ async def _mark(chat_id, msg_id, emoji):
 # 执行一条已入账指令
 # ============================================================
 async def execute_ledger_row(row, stale_days=None):
-    """执行台账里一条 PENDING 指令；终态落账 + 标记。返回终态。"""
-    stale_days = stale_days or int(getattr(config, "CMDQ_STALE_DAYS", 7))
+    """台账行执行（指令 → handle_command；🛰 中转 → handle_app_relay）。"""
     chat_id, msg_id, cmd_text = row["chat_id"], row["msg_id"], row["cmd_text"]
+    stale_days = stale_days or int(getattr(config, "CMDQ_STALE_DAYS", 7))
+    text = cmd_text
+    # 🛰 app 中转（2026-11-22 补盲区）：重放走同一 handle_app_relay——
+    # 断连窗口的 app 分享此前是回放盲区（6 条实测丢失）。过期保护同指令。
+    if is_app_relay_text(text):
+        from . import api_server as _api
+        from . import state as _state
+        if _state.client is None:
+            return runtime_db.CMD_PENDING   # 主客户端未就绪，留待下轮
+        if time.time() - float(row["received_at"] or 0) > stale_days * 86400:
+            runtime_db.finish_cmd(chat_id, msg_id, runtime_db.CMD_STALE,
+                                  error=f"离线超过 {stale_days} 天，跳过未执行")
+            await _mark(chat_id, msg_id, _STALE_MARK)
+            logger.info(f"📥 回放跳过（过期 🛰）：{text[:40]}")
+            return runtime_db.CMD_STALE
+        runtime_db.finish_cmd(chat_id, msg_id, runtime_db.CMD_RUNNING)
+        payload = text.strip()[len(APP_RELAY_MARKER):].strip()
+        await _api.handle_app_relay(payload)
+        runtime_db.finish_cmd(chat_id, msg_id, runtime_db.CMD_SUCCESS)
+        await _mark(chat_id, msg_id, "✅")
+        logger.info(f"📥 回放受理 🛰 中转：{payload[:48]}")
+        return runtime_db.CMD_SUCCESS
+    """执行台账里一条 PENDING 指令；终态落账 + 标记。返回终态。"""
     if time.time() - float(row["received_at"] or 0) > stale_days * 86400:
         runtime_db.finish_cmd(chat_id, msg_id, runtime_db.CMD_STALE,
                               error=f"离线超过 {stale_days} 天，跳过未执行")
@@ -172,7 +202,11 @@ async def replay_chat(chat_id, execute=True):
     pending_rows = []
     for m in msgs:
         text = (m.message or "").strip()
-        if is_command_text(text):
+        # 🛰 app 中转消息（2026-11-22 补盲区）：实时链路有专门分支处理，
+        # 回放链路此前只认 / 指令——断连窗口的 app 分享静默丢失（6 条
+        # 实测）。入账 + 重放走同一 handle_app_relay。
+        is_relay = is_app_relay_text(text)
+        if is_command_text(text) or is_relay:
             res["found"] += 1
             if runtime_db.record_cmd(chat_id, m.id, text):
                 pending_rows.append((chat_id, m.id))
