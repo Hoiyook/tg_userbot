@@ -122,7 +122,7 @@ async def execute_ledger_row(row, stale_days=None):
     # 🛰 app 中转（2026-11-22 补盲区）：重放走同一 handle_app_relay——
     # 断连窗口的 app 分享此前是回放盲区（6 条实测丢失）。过期保护同指令。
     if is_app_relay_text(text):
-        from . import api_server as _api
+        from . import routing as _routing
         from . import state as _state
         if _state.client is None:
             return runtime_db.CMD_PENDING   # 主客户端未就绪，留待下轮
@@ -134,10 +134,24 @@ async def execute_ledger_row(row, stale_days=None):
             return runtime_db.CMD_STALE
         runtime_db.finish_cmd(chat_id, msg_id, runtime_db.CMD_RUNNING)
         payload = text.strip()[len(APP_RELAY_MARKER):].strip()
-        await _api.handle_app_relay(payload)
+        # request_id 前缀分离（与 api_server._split_relay_payload 同规则，
+        # 独立实现避免 import 入口模块——架构守卫）
+        parts = payload.split(" ", 2)
+        request_id = None
+        body = payload
+        if (len(parts) >= 2 and len(parts[0]) == 32
+                and all(c in "0123456789abcdefABCDEF" for c in parts[0])):
+            request_id, body = parts[0], parts[1]
+        decision = _routing.classify(body, allow=_routing.SURFACE_API)
+        if not decision.handled:
+            result = {"ok": False, "routed": None}
+        else:
+            res = await _routing.execute(decision, surface="app")
+            result = {"ok": bool(res.ok), "routed": res.kind}
         runtime_db.finish_cmd(chat_id, msg_id, runtime_db.CMD_SUCCESS)
-        await _mark(chat_id, msg_id, "✅")
-        logger.info(f"📥 回放受理 🛰 中转：{payload[:48]}")
+        await _mark(chat_id, msg_id, "✅" if result.get("ok") else "❌")
+        logger.info(f"📥 回放受理 🛰 中转：{payload[:48]} → "
+                    f"{result.get('routed') or '未识别'}")
         return runtime_db.CMD_SUCCESS
     """执行台账里一条 PENDING 指令；终态落账 + 标记。返回终态。"""
     if time.time() - float(row["received_at"] or 0) > stale_days * 86400:
@@ -231,8 +245,13 @@ async def replay_chat(chat_id, execute=True):
 async def replay_all(execute=True):
     """全部入口聊天回放。返回聚合结果与失败明细。"""
     chats = []
+    if getattr(state, "BOT_ID", None):
+        # bot 对话的 peer = BOT_ID（主客户端视角私聊的对方是 bot）——
+        # 此前用 MY_ID 会读成收藏夹（自己跟自己），水位线错位且永远扫
+        # 不到 🛰 中转消息（2026-11-22 6 条 app 分享丢失的根因之一）
+        chats.append(int(state.BOT_ID))
     if state.MY_ID:
-        chats.append(int(state.MY_ID))          # bot 对话
+        chats.append(int(state.MY_ID))          # 收藏夹
     chats.append("me")                          # 收藏夹
     for spec in getattr(config, "CMDQ_EXTRA_INTAKES", ()) or ():
         chats.append(spec)                      # 频道等（resolve 由调用方做）
