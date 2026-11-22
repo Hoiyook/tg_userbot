@@ -355,6 +355,14 @@ class _WnacgWorker(SerialTaskWorker):
         self.poll_seconds = 5.0
         self.idle_sleep = float(getattr(config, "WNACG_THROTTLE_SECONDS",
                                         10.0))
+        # 周期租约回收（2026-11-22 哨兵告警的根修）：运行期领走的任务若
+        # worker 卡死/异常退出，租约过期后 5 分钟内由框架回收回 PENDING——
+        # 此前只有启动时 recover_startup 一次，运行期幽灵 PROCESSING
+        # 永久卡死（哨兵每 30 分钟喊一次没人理）
+        self.recover_seconds = 300.0
+
+    def recover_periodic(self):
+        runtime_db.recover_expired_wnacg_tasks()
 
     def claim(self):
         return runtime_db.claim_next_wnacg_task()
