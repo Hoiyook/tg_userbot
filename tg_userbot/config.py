@@ -1682,7 +1682,7 @@ EXTRACT_RECOVER_SECONDS = 600       # 运行期过期租约回收扫描周期
 # （dl*.wn01.download）走代理反而不通、直连可用——两级分流是硬要求。
 # 站点明示每日下载限额：串行 + 节流。zip 落 115 云下载目录进 /115x 解压管线。
 WNACG_BASE = "https://www.wnacg.com"
-WNACG_REMOTE_DIR = "/115open/漫画"   # /wnacg <链接> [作者] → 漫画[/<作者>]/
+WNACG_REMOTE_DIR = "/Volumes/V1/wnacg"   # /wnacg <链接> [作者] → wnacg[/<作者>]/（2026-11-23 owner：改本地 V1）
 WNACG_THROTTLE_SECONDS = 10.0          # 相邻两次下载间隔（尊重每日限额）
 WNACG_FETCH_TIMEOUT_SECONDS = 25       # HTML 解析超时
 # 重试额度统一说明（2026-10-29）：有限档一律 5 次

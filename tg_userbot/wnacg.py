@@ -234,34 +234,47 @@ async def _process_task(task):
             raise
     runtime_db.update_wnacg_task(aid, size_bytes=size)
 
-    # ③ 落 115：同名同尺寸已在 → 跳拷贝；否则写挂载等 CD2 上传
+    # ③ 落盘（2026-11-23 owner：改本地 V1/wnacg，不再经 115）：
+    # 本地目录 → 直接落盘即完成（无需 CD2 上传/对账）；115 路径 → 原挂载
+    # 上传流程保留（兼容可能的回切）
     from .extract_worker import mount_of
     remote_dir = _remote_dir_for(task)
     mount_dir = mount_of(remote_dir)
-    if mount_dir is None:
+    local_dest = str(remote_dir).startswith("/Volumes/") and mount_dir is None
+    if mount_dir is None and not local_dest:
         raise RuntimeError(f"挂载不可用：{remote_dir}"
                            "（CD2/挂载死了，稍后自动重试）")
     # 作者子目录可能不存在：挂载 mkdir 即 CD2 建远端目录——必须先建，
     # 后续 gRPC 列目录/上传对账才有处可查（首跑实测教训）
     os.makedirs(mount_dir, exist_ok=True)
-    remote_now = await asyncio.to_thread(
-        _remote_size_blocking, task["filename"], remote_dir)
-    if remote_now != size:
-        target = os.path.join(mount_dir, task["filename"])
+    if local_dest:
+        # 本地直落：目标即 remote_dir（V1 本地卷，copy 完即到位）
+        target = os.path.join(remote_dir, task["filename"])
         await asyncio.to_thread(_copy_with_progress, local, target)
-        got = await _wait_remote_size(task["filename"], size, remote_dir)
-        if got is None:
-            raise RuntimeError("115 上传超时（CD2 未在时限内传完），稍后重试")
+        got = os.path.getsize(target) if os.path.exists(target) else None
+        if got != size:
+            raise RuntimeError("本地落盘校验失败（大小不符），稍后重试")
+    else:
+        remote_now = await asyncio.to_thread(
+            _remote_size_blocking, task["filename"], remote_dir)
+        if remote_now != size:
+            target = os.path.join(mount_dir, task["filename"])
+            await asyncio.to_thread(_copy_with_progress, local, target)
+            got = await _wait_remote_size(task["filename"], size, remote_dir)
+            if got is None:
+                raise RuntimeError("115 上传超时（CD2 未在时限内传完），稍后重试")
     try:
         os.remove(local)
     except OSError:
         pass
 
-    # ④ 进 /115x 解压管线（解压 → 回传 → 对账 → 通知全复用）
-    ins, _skip = runtime_db.enqueue_extract_tasks(
-        remote_dir, [(task["filename"], size)])
-    if not ins:
-        logger.info(f"📖 [aid {aid}] 解压任务已存在（幂等跳过）")
+    # ④ 解压管线：本地落盘（/Volumes）跳过——extract worker 只认 /115open
+    # 路径，本地 zip 由用户自行解压（或后续做本地解压支持）；115 路径照旧
+    if not local_dest:
+        ins, _skip = runtime_db.enqueue_extract_tasks(
+            remote_dir, [(task["filename"], size)])
+        if not ins:
+            logger.info(f"📖 [aid {aid}] 解压任务已存在（幂等跳过）")
     return {"size": size, "title": task.get("title") or info["title"]}
 
 
