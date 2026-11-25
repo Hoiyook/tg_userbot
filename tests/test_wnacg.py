@@ -244,6 +244,58 @@ class WorkerFlowTest(_DbCase):
         self.assertTrue(any(r["archive_name"] == "x.zip"
                             for r in extracts))
 
+    def test_cbz_name(self):
+        self.assertEqual(wnacg._cbz_name("abc.zip"), "abc.cbz")
+        self.assertEqual(wnacg._cbz_name("a.b.ZIP"), "a.b.cbz")
+        self.assertEqual(wnacg._cbz_name("noext"), "noext.cbz")
+
+    async def test_local_dest_lands_cbz_without_115(self):
+        """本地落盘（非 /115open 路径）：真实 copy 成 .cbz、不进解压管线、
+        通知如实（owner 2026-11-23：wnacg 放 V1/wnacg + zip 改 cbz）。
+
+        该分支此前零覆盖——mount_of 被本类的 _patch_net 恒替换成假挂载，
+        只测得到 115 路径；上线版的 os.makedirs(None) 当场就炸却没被
+        发现。这里不 mock mount_of / _copy_with_progress。"""
+        dest = tempfile.mkdtemp(prefix="wnacg_local_", dir=_TMP)
+        size = 300
+        local_zip = os.path.join(self.staging, "x.zip")
+        with open(local_zip, "wb") as f:
+            f.write(b"z" * size)
+        info = {"title": "T", "zip_url": "https://dl/x.zip",
+                "filename": "x.zip"}
+
+        def fake_download(url, dest_, expected=None):
+            shutil.copyfile(local_zip, dest_)
+            return size
+
+        with mock.patch.object(config, "WNACG_REMOTE_DIR", dest), \
+             mock.patch.object(wnacg, "fetch_album_info_blocking",
+                               return_value=info), \
+             mock.patch.object(wnacg, "download_zip_blocking",
+                               side_effect=fake_download):
+            runtime_db.enqueue_wnacg_task(800)
+            task = runtime_db.claim_next_wnacg_task()
+            await wnacg._run_one(task)
+            row = runtime_db.get_wnacg_task(800)
+            self.assertEqual(row["status"], runtime_db.WNACG_DONE,
+                             row.get("error") or "")
+            self.assertEqual(row["filename"], "x.cbz")
+            landed = os.path.join(dest, "x.cbz")
+            self.assertTrue(os.path.isfile(landed), "必须真实落盘")
+            self.assertEqual(os.path.getsize(landed), size)
+            self.assertFalse(os.path.exists(os.path.join(dest, "x.zip")))
+            self.assertFalse(any(r["archive_name"] in ("x.zip", "x.cbz")
+                                 for r in runtime_db.list_extract_tasks(
+                                     limit=20)),
+                             "本地落盘不进 /115x 解压管线")
+            self.assertFalse(os.path.exists(local_zip), "暂存已清")
+            # 同名同尺寸已在 → 跳拷贝（重试不重写好文件）
+            with open(landed, "wb") as f:
+                f.write(b"y" * size)
+            await wnacg._run_one(task)
+            with open(landed, "rb") as f:
+                self.assertEqual(f.read(1), b"y", "已存在的文件不得被重写")
+
     def test_transient_postpone_does_not_burn_attempts(self):
         runtime_db.enqueue_wnacg_task(700)
         runtime_db.claim_next_wnacg_task()
