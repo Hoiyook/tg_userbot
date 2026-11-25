@@ -1314,3 +1314,83 @@ class ScanRetryQueueTest(unittest.TestCase):
         import json as _json
         _json.dump(q, open(pawchive._RETRY_FILE, "w"))
         self.assertEqual(self._queue(), [])
+
+
+class BackfillEtaTest(unittest.TestCase):
+    """ETA 永久锚死修复（2026-11-23）：loop_started 重锚 + 全局位次醒次。
+
+    事故：起点 11-02 后 23 天，面板『下一批预计 11-03 已逾期』而轮巡
+    11-25 还在正常执行——ETA 与真实进度脱钩 3 周。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="paw_eta_", dir=_TMP)
+        self._pf = mock.patch.object(
+            pawchive, "_PLAN_PENDING_FILE",
+            os.path.join(self.dir, "pending.json"))
+        self._pf.start()
+        self.addCleanup(self._pf.stop)
+        # state 文件：起点 = 23 天前（旧锚点），游标 22（8 轮已跑）
+        old_start = time.time() - 23 * 86400
+        import json as _json
+        _json.dump({"cursor": 22, "loop_started": old_start},
+                   open(os.path.join(self.dir, "state.json"), "w"))
+        self._sp = mock.patch.object(
+            pawchive, "_pawb_state_path",
+            return_value=os.path.join(self.dir, "state.json"))
+        self._sp.start()
+        self.addCleanup(self._sp.stop)
+        # 43 个作者（cursor 22 → 下一批是第 23~25 位）
+        creators = [{"creator_id": str(i), "creator_name": f"c{i}",
+                     "posts": 10} for i in range(43)]
+        self._lc = mock.patch.object(pawchive, "list_scanned_creators",
+                                     return_value=creators)
+        self._lc.start()
+        self.addCleanup(self._lc.stop)
+        # 最近实际执行记录：1 小时前跑过一轮——下一批预计 = 上次 + 6h
+        # （滚动预告，不再锚死 11-02 的旧起点）
+        import time as _t
+        self._hist_file = os.path.join(self.dir, "pawb_history.jsonl")
+        os.makedirs(os.path.dirname(self._hist_file), exist_ok=True)
+        self._last_ts = _t.time() - 1 * 3600
+        self._hf = mock.patch.object(
+            pawchive, "PAWB_HISTORY_FILE", self._hist_file)
+        self._hf.start()
+        self.addCleanup(self._hf.stop)
+        with open(self._hist_file, "w") as f:
+            f.write(_json.dumps({"ts": self._last_ts, "author_count": 3,
+                                 "summary": "回填 3 作者", "cursor": 22})
+                    + "\n")
+
+    def tearDown(self):
+        self._sp.stop()
+        self._hf.stop()
+        self._lc.stop()
+
+    def test_next_batch_eta_is_in_future(self):
+        """cursor=22、起点 23 天前 → 下一批 ETA 必须在未来（不锚死旧起点）。"""
+        overview = pawchive.backfill_status_overview()
+        batch = overview["next_batch"]
+        import sys as _s, time as _tm
+        print("DEBUG now:", _tm.strftime("%m-%d %H:%M:%S", _tm.localtime()),
+              "last_run_at:", overview["current"]["last_run_at"],
+              "| etas:", [b["eta"] for b in batch],
+              "| expected:", _tm.strftime("%m-%d %H:%M:%S",
+                  _tm.localtime(self._last_ts + 6*3600)), file=_s.stderr)
+        self.assertEqual(len(batch), 3)
+        now = time.time()
+        # 批内三作者同批同时回填 → 前两条 ETA 相同（base+6h），第三条
+        # 是 base+12h（下一批顺延一醒）；关键契约：ETA 随 last_run 滚动，
+        # 不锚死 11-02 旧起点
+        self.assertEqual(batch[0]["eta"], batch[1]["eta"])
+        self.assertEqual(batch[0]["eta"],
+                         time.strftime("%m-%d %H:%M",
+                                       time.localtime(self._last_ts + 6*3600)),
+                         "ETA 应滚动（=上次执行+6h）")
+        self.assertFalse(overview["current"]["deferred"],
+                         "刚跑完轮巡不应报顺延")
+
+    def test_first_batch_names_match_cursor(self):
+        overview = pawchive.backfill_status_overview()
+        names = [b["name"] for b in overview["next_batch"]]
+        self.assertEqual(names, ["c22", "c23", "c24"],
+                         "下一批应从游标 22 起连续取 3 个")

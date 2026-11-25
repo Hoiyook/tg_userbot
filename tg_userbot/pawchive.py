@@ -778,20 +778,29 @@ def backfill_status_overview() -> dict:
     per = int(PAWB_MAX_AUTHORS_PER_ROUND)
     wake_h = 6
     now = time.time()
+    hist = read_backfill_history(50)
+    last_run = hist[0] if hist else None
+    # 基准锚点（2026-11-23 修复）：起点随每轮实际执行重锚（backfill_loop
+    # done>0 时写 loop_started=now）；历史遗留（起点从未重锚的旧状态）取
+    # 最近实际执行时间兜底——两者取较晚者，ETA 不再锚死在过去（面板实测
+    # 『下一批 11-03 已逾期』而实际 11-25 还在跑）
+    base = started
+    if last_run and last_run.get("ts", 0) > base:
+        base = last_run["ts"]
     next_batch = []
     if creators:
         for i in range(min(per, len(creators))):
             c = creators[(cursor + i) % len(creators)]
-            wake_idx = i // per
-            eta = (started or now) + (wake_idx + 1) * wake_h * 3600
+            # 全局醒次：cursor=22 → 下一批是 22//3+1=第 8 醒（相对基准）
+            wake_idx = (cursor + i) // per
+            eta = base + (wake_idx - cursor // per + 1) * wake_h * 3600
             next_batch.append({
                 "name": c.get("creator_name") or "",
                 "posts": int(c.get("posts") or 0),
                 "eta": time.strftime("%m-%d %H:%M", time.localtime(eta)),
                 "overdue": eta < now,
             })
-    hist = read_backfill_history(50)
-    last_run = hist[0] if hist else None
+    # （hist/last_run 已提前到循环前供基准计算）
     last_run_at = (time.strftime("%m-%d %H:%M", time.localtime(last_run["ts"]))
                    if last_run else "")
     # 顺延判定：首批预计已逾期，且最近 6h 内没有实际执行记录
@@ -881,7 +890,8 @@ def backfill_schedule_text():
     for i in range(len(creators)):
         pos = (cursor + i) % len(creators)
         c = creators[pos]
-        wake_idx = i // per + 1
+        # 全局位次的醒次（与 overview 同公式；起点已随轮次滚动）
+        wake_idx = (cursor + i) // per + 1
         eta = started + wake_idx * wake_h * 3600
         rows.append((eta, c, i == 0))
     rows.sort(key=lambda r: r[0])
@@ -931,7 +941,11 @@ async def backfill_loop():
                 done, text, next_cursor = result
                 log_backfill_round(done, text, next_cursor)
                 if done:
-                    st.update({"cursor": next_cursor})
+                    # 重锚循环起点（2026-11-23 ETA 修复）：起点随每轮实际
+                    # 执行滚动——否则 ETA 公式（起点+醒次×6h）永久锚死在
+                    # 首次启动时刻（面板实测：23 天后预计时间全在过去）
+                    st.update({"cursor": next_cursor,
+                               "loop_started": time.time()})
                     _save_pawb_state(st)
                     logger.info(f"🐾 定期 backfill 本轮 {done} 作者：{text[:80]}")
             except asyncio.CancelledError:
