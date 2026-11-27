@@ -423,7 +423,9 @@ async def _catch_up_scan(creator):
                  ).isoformat()
         posts = await asyncio.to_thread(
             fetch_creator_posts, creator["service"], creator["id"], cookie,
-            known_ids=known_ids, until_date=until)
+            known_ids=known_ids, until_date=until,
+            progress=lambda detail, post_date=None: _scan_stage("追新扫描")(
+                detail, post_date))
         if not posts:
             return 0, 0
         # 无 Cookie → 收藏对比缺省（scope 语义是 /paw_plan 的事，追新只
@@ -506,7 +508,8 @@ async def backfill_author(name, months=None):
             for r in rows:
                 done += 1
                 _scan_stage("回填详情")(
-                    f"{done}/{len(rows)}｜新增 {added_total}")
+                    f"{done}/{len(rows)}｜新增 {added_total}",
+                    post_date=r.get("published") or "")
                 if done % 25 == 0:
                     logger.info(
                         f"🐾 回填进度 {done}/{len(rows)}："
@@ -1013,6 +1016,19 @@ def backfill_status_overview() -> dict:
             "next": pos < per,
         })
     authors.sort(key=lambda a: a["pos"])
+    # 当前执行（2026-11-27 owner：面板去掉「执行计划」文本，改实时列表）
+    prog = dict(state.PAW_SCAN_PROGRESS or {})
+    run_started = float(prog.get("started") or 0)
+    running = {
+        "active": state.PAW_SCAN_RUNNING is not None,
+        "label": state.PAW_SCAN_RUNNING or "",
+        "stage": prog.get("stage") or "",
+        "detail": prog.get("detail") or "",
+        "post_date": prog.get("post_date") or "",
+        "elapsed_s": (int(time.monotonic() - run_started)
+                      if state.PAW_SCAN_RUNNING is not None
+                      and run_started else 0),
+    }
     return {
         "current": {
             "cursor": cursor,
@@ -1028,6 +1044,7 @@ def backfill_status_overview() -> dict:
         },
         "next_batch": next_batch,
         "authors": authors,
+        "running": running,
         "history": hist,
     }
 
@@ -1422,7 +1439,13 @@ def fetch_creator_posts(service, creator_id, cookie=None, progress=None,
             f"/posts?o={offset}", cookie=cookie, timeout=90, deadline=60)
         posts.extend(page)
         if progress:
-            progress(f"已拉取 {len(posts)} 条")
+            # 第二参数 = 本页最后一帖的发布日期（面板「当前执行」显示
+            # 执行到哪一帖）；老回调只收一个参数，TypeError 时退回单参
+            _d = (page[-1].get("published") or "")[:10] if page else None
+            try:
+                progress(f"已拉取 {len(posts)} 条", _d)
+            except TypeError:
+                progress(f"已拉取 {len(posts)} 条")
         # since 边界：本页出现早于 until_date 的帖子（API 倒序 → 之后全是
         # 更老的）即停，但**本页中晚于边界的数据已收下**，不丢
         if until_date and page and any(
@@ -1828,9 +1851,15 @@ async def start_scan(creator, scope="notfaved", since=None):
 
 def _scan_stage(stage):
     """扫描进度回调工厂：各阶段更新 state.PAW_SCAN_PROGRESS（线程池里跑，
-    只做字典赋值无锁安全）。detail 为空串表示只切阶段。"""
-    def cb(detail=""):
-        state.PAW_SCAN_PROGRESS.update({"stage": stage, "detail": detail})
+    只做字典赋值无锁安全）。detail 为空串表示只切阶段。
+
+    post_date：当前处理到的帖子发布日期（2026-11-27 owner：面板「当前
+    执行」要显示"执行到哪一帖"，只有回填逐帖阶段拿得到，其它阶段不传。"""
+    def cb(detail="", post_date=None):
+        upd = {"stage": stage, "detail": detail}
+        if post_date is not None:
+            upd["post_date"] = str(post_date)[:10]
+        state.PAW_SCAN_PROGRESS.update(upd)
     return cb
 
 

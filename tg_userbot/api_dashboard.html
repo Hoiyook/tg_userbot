@@ -323,11 +323,12 @@
       回填第一顺位，循环立即唤醒先跑他，其余作者顺序不变。
       上次执行带 ≈ 的，是首次启用表格时按历史游标推算的（之后为实测）。</div>
     <div id="pawAuthors"><div class="note">加载中…</div></div>
-    <h2>执行计划（/paw schedule 同源）</h2>
-    <div class="note">每 6h 醒一次 × 每次最多 3 个作者；人工扫描进行时该轮让位顺延。
-      与 /paw_schedule 完全同一份数据（单一真相源）。</div>
-    <div class="out" id="pawSched" style="display:block">加载中…</div>
-    <div class="note" style="margin-top:12px">/paw backfill &lt;作者&gt; 可插队立即回填。</div>
+    <h2>当前执行</h2>
+    <div class="note">实时进度：作者 / 本次已执行时长 / 当前执行到的帖子日期。
+      为空表示当前没有扫描或回填在跑（每 6h 醒一次 × 每次最多 3 个作者）。</div>
+    <div id="pawRunning"><div class="note">加载中…</div></div>
+    <div class="note" style="margin-top:12px">/paw backfill &lt;作者&gt; 可插队立即回填；
+      /paw schedule 看文字版执行计划。</div>
   </section>
 
   <!-- ── 指令中心 ──────────────────────── -->
@@ -756,13 +757,6 @@ async function loadStats(days) {
     showLong("ledger", d.ok ? d.text : (d.error || "读取失败"));
   } catch (e) { showLong("ledger", "❌ " + e); }
 }
-async function loadPawSchedule() {
-  showLong("pawSched", "加载中…");
-  try {
-    const d = await api("/api/paw_schedule");
-    showLong("pawSched", d.ok ? d.text : (d.error || "读取失败"));
-  } catch (e) { showLong("pawSched", "❌ " + e); }
-}
 async function loadHistory() {
   // 渠道分类（2026-11-05 owner）：媒体/B站/X/iwara 各自列表
   const targets = [["hist-media", null, "还没有媒体下载记录"],
@@ -888,9 +882,35 @@ async function loadPawBackfill() {
         + '（撞人工扫描或重启）——游标没丢，下轮自动补</span>' : '') +
       '</div></div>';
     document.getElementById("pawAuthors").innerHTML = renderPawAuthors(d.authors || []);
+    document.getElementById("pawRunning").innerHTML = renderPawRunning(d.running || {});
   } catch (e) {
     document.getElementById("pawCur").innerHTML = '<div class="note">❌ ' + e + '</div>';
   }
+}
+
+// 当前执行（2026-11-27）：作者 / 本次已执行时长 / 执行到的帖子日期
+function fmtDur(sec) {
+  sec = Math.max(0, sec | 0);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60),
+        s = sec % 60;
+  if (h) return h + "h" + String(m).padStart(2, "0") + "m";
+  if (m) return m + "m" + String(s).padStart(2, "0") + "s";
+  return s + "s";
+}
+function renderPawRunning(r) {
+  if (!r.active) {
+    return '<div class="note" style="margin:0">💤 当前没有扫描/回填在跑</div>';
+  }
+  const head = '<div class="ptab hd" style="grid-template-columns:1.6fr .8fr .9fr">'
+    + '<div>作者 / 阶段</div><div>已执行</div><div>当前帖日期</div></div>';
+  const stage = [r.stage, r.detail].filter(Boolean).join(" · ");
+  const row = '<div class="ptab" style="grid-template-columns:1.6fr .8fr .9fr">'
+    + '<div class="nm wrap">' + esc(r.label || "—")
+    + (stage ? '<div class="dt">' + esc(stage) + '</div>' : "") + '</div>'
+    + '<div class="cell">' + fmtDur(r.elapsed_s) + '</div>'
+    + '<div class="cell">' + (r.post_date ? esc(r.post_date) : "—") + '</div>'
+    + '</div>';
+  return head + row;
 }
 
 // 作者回填情况表（2026-11-27）：作者 / 上次执行成功 / 最新帖子 / 执行
@@ -1035,7 +1055,6 @@ document.querySelectorAll("nav div").forEach(t => t.onclick = () => {
   if (t.dataset.p === "p-cmds") loadCmds();
   if (t.dataset.p === "p-gum") loadGum();
   if (t.dataset.p === "p-pd") loadPD();
-  if (t.dataset.p === "p-paw") loadPawSchedule();
   window.scrollTo(0, 0);
 });
 async function loadBackup() {
@@ -1653,7 +1672,7 @@ async function _refreshLoop() {
     } catch (e) { _BATCH = {}; _pollMs = Math.min(_pollMs * 2, 30000); }
     for (const job of [loadQueuesAll, loadQueueDetail, loadExtractState,
                        loadChrome, loadBackup, loadPastes, loadLinks,
-                       loadHistory, loadPawSchedule, loadPawBackfill,
+                       loadHistory, loadPawBackfill,
                        loadPD, loadCmds]) {
       try { await job(); } catch (e) { /* 主轮询已计退避 */ }
     }
@@ -1674,7 +1693,7 @@ let _curDays = 1;
 async function refreshAll() {
   const jobs = [refresh(), loadStats(_curDays), loadHistory(),
                 loadQueuesAll(), loadQueueDetail(), loadChrome(), loadBackup(),
-                loadPastes(), loadLinks(), loadPawSchedule(),
+                loadPastes(), loadLinks(),
                 loadPawBackfill(), loadPD(), loadCmds()];
   await Promise.allSettled(jobs);
   markRefreshed();

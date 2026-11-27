@@ -1586,3 +1586,38 @@ class PawAuthorTableTest(unittest.TestCase):
         self.assertIn("找不到", msg)
         self.assertEqual(pawchive._load_priority(), [])
 
+    def test_running_block_reports_stage_elapsed_and_post_date(self):
+        """当前执行（2026-11-27）：面板实时列表要拿到作者/已执行时长/
+        执行到的帖子日期。"""
+        from tg_userbot import state
+        state.PAW_SCAN_RUNNING = "回填 c0（最近 3 个月）"
+        state.PAW_SCAN_PROGRESS = {
+            "started": time.monotonic() - 125,
+            "stage": "回填详情", "detail": "23/152｜新增 0",
+            "post_date": "2026-11-13",
+        }
+        self.addCleanup(setattr, state, "PAW_SCAN_RUNNING", None)
+        self.addCleanup(setattr, state, "PAW_SCAN_PROGRESS", {})
+        r = pawchive.backfill_status_overview()["running"]
+        self.assertTrue(r["active"])
+        self.assertIn("c0", r["label"])
+        self.assertGreaterEqual(r["elapsed_s"], 120)
+        self.assertEqual(r["post_date"], "2026-11-13")
+        self.assertIn("回填详情", r["stage"])
+
+    def test_running_block_idle(self):
+        overview = pawchive.backfill_status_overview()
+        self.assertFalse(overview["running"]["active"])
+        self.assertEqual(overview["running"]["elapsed_s"], 0)
+
+    def test_scan_stage_carries_post_date(self):
+        from tg_userbot import state
+        state.PAW_SCAN_PROGRESS = {}
+        self.addCleanup(setattr, state, "PAW_SCAN_PROGRESS", {})
+        pawchive._scan_stage("回填详情")("3/10", "2026-11-13T20:51:15")
+        self.assertEqual(state.PAW_SCAN_PROGRESS["post_date"], "2026-11-13")
+        # 不传日期时不清掉已有值（阶段切换不该把日期抹成空）
+        pawchive._scan_stage("追新扫描")("已拉取 50 条")
+        self.assertEqual(state.PAW_SCAN_PROGRESS["post_date"], "2026-11-13")
+        self.assertEqual(state.PAW_SCAN_PROGRESS["stage"], "追新扫描")
+

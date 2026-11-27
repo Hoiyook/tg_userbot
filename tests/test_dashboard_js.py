@@ -119,6 +119,29 @@ class DashboardBuildCheckGuardTest(unittest.TestCase):
                       "——防刷新死循环")
 
 
+class PawRunningPanelTest(unittest.TestCase):
+    """回填页「当前执行」列表（2026-11-27 owner）：删掉执行计划文本区，
+    换实时列表——作者 / 本次已执行时长 / 当前执行到的帖子日期。"""
+
+    def setUp(self):
+        self.js = open(_HTML, encoding="utf-8").read()
+
+    def test_schedule_text_block_removed(self):
+        self.assertNotIn("执行计划（/paw schedule 同源）", self.js,
+                         "执行计划文本区应已删除")
+        self.assertNotIn('id="pawSched"', self.js)
+        self.assertNotIn("loadPawSchedule", self.js,
+                         "残留调用会抛错（元素已不存在）")
+
+    def test_running_list_rendered(self):
+        self.assertIn('id="pawRunning"', self.js)
+        self.assertIn("renderPawRunning", self.js)
+        for label in ("作者 / 阶段", "已执行", "当前帖日期"):
+            self.assertIn(label, self.js, f"缺列：{label}")
+        self.assertIn("r.post_date", self.js, "必须渲染帖子日期")
+        self.assertIn("fmtDur(r.elapsed_s)", self.js, "必须渲染已执行时长")
+
+
 class ServiceWorkerCacheGuardTest(unittest.TestCase):
     """P4 控制（陈旧缓存）：SW 绝不能缓存看板 HTML。
 

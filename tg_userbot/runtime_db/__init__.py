@@ -1755,11 +1755,12 @@ def posts_for_backfill(creator_name=None, creator_id=None,
             since = d.isoformat()
         if creator_id is not None:
             sql = ("SELECT id, post_id, creator_id, service, status, "
-                   "creator_name FROM pawchive_posts WHERE creator_id = ?")
+                   "creator_name, published FROM pawchive_posts "
+                   "WHERE creator_id = ?")
             args = [str(creator_id)]
         else:
             sql = ("SELECT id, post_id, creator_id, service, status, "
-                   "creator_name FROM pawchive_posts "
+                   "creator_name, published FROM pawchive_posts "
                    "WHERE creator_name = ? COLLATE NOCASE")
             args = [str(creator_name or "").strip()]
         if since:
@@ -1769,7 +1770,9 @@ def posts_for_backfill(creator_name=None, creator_id=None,
         sql += " ORDER BY id DESC"
         rows = _execute(conn, sql, args).fetchall()
         return [{"id": r[0], "post_id": r[1], "creator_id": r[2],
-                 "service": r[3], "status": r[4], "creator_name": r[5]}
+                 "service": r[3], "status": r[4], "creator_name": r[5],
+                 # published：面板「当前执行」显示执行到哪一帖的日期
+                 "published": r[6] or ""}
                 for r in rows]
 
     return _read(do, "列出回填目标帖")
