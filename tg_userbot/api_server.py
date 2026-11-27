@@ -98,6 +98,8 @@ ACTION_WHITELIST = {
     "paw_resume": "Pawchive 恢复下载 worker",
     "paw_status": "Pawchive 状态视图",
     "pawb_run": "把作者提到回填第一顺位并立即唤醒（body: {\"id\": 作者id或名字}）",
+    "pawq_top": "待扫描队列条目置顶（body: {\"pos\": 位次} 或 {\"name\": …}）",
+    "pawq_del": "待扫描队列移除条目（body: {\"pos\": 位次} 或 {\"name\": …}）",
     "bili_status": "B站 下载状态视图",
     # CD2 / 健康
     "cd2_start": "启动 CloudDrive2（慢操作，最多 ~30s）",
@@ -1356,6 +1358,17 @@ async def handle_action(request):
             from . import pawchive
             return _json({"ok": True, "routed": "paw_status",
                           "message": pawchive.status_text()})
+        if name in ("pawq_top", "pawq_del"):
+            from . import pawchive
+            ref = body.get("pos") if body.get("pos") is not None \
+                else (body.get("name") or body.get("arg"))
+            if ref is None or str(ref).strip() == "":
+                return _json({"ok": False, "error": "缺少 pos 或 name"}, 400)
+            fn = (pawchive.promote_plan_pending
+                  if name == "pawq_top" else pawchive.remove_plan_pending)
+            ok, msg = fn(ref)
+            return _json({"ok": bool(ok), "routed": name, "message": msg},
+                         200 if ok else 404)
         if name == "pawb_run":
             # 面板「执行」：作者提到回填第一顺位 + 立即唤醒循环
             from . import pawchive

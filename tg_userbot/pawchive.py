@@ -809,6 +809,11 @@ def enqueue_plan_pending(name):
     name = str(name or "").strip()
     state.PAW_PLAN_PENDING = name
     q = [x for x in _load_plan_pending() if str(x).strip()]  # 顺带清历史垃圾
+    if name and name in q:
+        # 重复提交不重复入队（2026-11-27：面板要展示位次，重复条目会骗人）
+        pos = q.index(name) + 1
+        _save_plan_pending(q)
+        return name, f"已在待扫描队列第 {pos} 位（不重复入队）"
     if not name:
         # 空作者名不入队（2026-11-27 实测：裸 /paw_plan 撞锁后把 "" 塞
         # 进 FIFO，白耗一次锁释放的 kick）
@@ -844,6 +849,57 @@ def take_plan_pending() -> str:
     state.PAW_PLAN_PENDING = q[0] if q else ""
     _save_plan_pending(q)
     return name
+
+
+def plan_queue_view():
+    """待扫描队列（面板展示用）：FIFO 位次 + 作者名。"""
+    q = [str(x).strip() for x in _load_plan_pending() if str(x).strip()]
+    return [{"pos": i + 1, "name": n} for i, n in enumerate(q)]
+
+
+def _queue_set(q):
+    state.PAW_PLAN_QUEUE = q
+    state.PAW_PLAN_PENDING = q[0] if q else ""
+    _save_plan_pending(q)
+
+
+def _queue_index(ref, q):
+    """ref 可以是 1-based 位次（数字）或作者名。返回下标或 None。"""
+    s = str(ref or "").strip()
+    if s.isdigit():
+        i = int(s) - 1
+        return i if 0 <= i < len(q) else None
+    for i, n in enumerate(q):
+        if n == s:
+            return i
+    return None
+
+
+def remove_plan_pending(ref):
+    """从待扫描队列移除一条（位次或名字）。返回 (ok, 文案)。"""
+    q = [str(x).strip() for x in _load_plan_pending() if str(x).strip()]
+    if not q:
+        return False, "待扫描队列是空的"
+    i = _queue_index(ref, q)
+    if i is None:
+        return False, f"队列里没有「{ref}」"
+    name = q.pop(i)
+    _queue_set(q)
+    return True, f"已从待扫描队列移除「{name}」（剩 {len(q)} 位）"
+
+
+def promote_plan_pending(ref):
+    """把队列条目提到队头（下一位就扫它）。返回 (ok, 文案)。"""
+    q = [str(x).strip() for x in _load_plan_pending() if str(x).strip()]
+    if not q:
+        return False, "待扫描队列是空的"
+    i = _queue_index(ref, q)
+    if i is None:
+        return False, f"队列里没有「{ref}」"
+    name = q.pop(i)
+    q.insert(0, name)
+    _queue_set(q)
+    return True, f"已把「{name}」提到队头（下一位扫描）"
 
 
 async def _kick_plan_pending():
@@ -1284,6 +1340,7 @@ def backfill_status_overview() -> dict:
         "next_batch": next_batch,
         "authors": authors,
         "running": running,
+        "plan_queue": plan_queue_view(),
         "history": hist,
     }
 

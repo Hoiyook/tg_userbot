@@ -1030,6 +1030,40 @@ class PlanPendingTest(unittest.TestCase):
         self.assertEqual(pawchive.take_plan_pending(), "作者B")
         self.assertEqual(pawchive._load_plan_pending(), [])
 
+    def test_queue_view_dedupe_top_and_remove(self):
+        """面板待扫描队列（2026-11-27）：位次视图 / 重复不入队 / 置顶 / 移除。"""
+        p1, note1 = pawchive.enqueue_plan_pending("作者A")
+        p2, note2 = pawchive.enqueue_plan_pending("作者B")
+        self.assertIn("第 1 位", note1)
+        self.assertIn("第 2 位", note2)
+        # 重复提交：不重复入队，回报已在位次
+        p3, note3 = pawchive.enqueue_plan_pending("作者A")
+        self.assertEqual(p3, "作者A")
+        self.assertIn("已在待扫描队列第 1 位", note3)
+        self.assertEqual(pawchive.plan_queue_view(),
+                         [{"pos": 1, "name": "作者A"},
+                          {"pos": 2, "name": "作者B"}])
+        # 置顶
+        ok, msg = pawchive.promote_plan_pending("作者B")
+        self.assertTrue(ok)
+        self.assertIn("队头", msg)
+        self.assertEqual([x["name"] for x in pawchive.plan_queue_view()],
+                         ["作者B", "作者A"])
+        # 按位次移除
+        ok, msg = pawchive.remove_plan_pending(1)
+        self.assertTrue(ok)
+        self.assertEqual([x["name"] for x in pawchive.plan_queue_view()],
+                         ["作者A"])
+        # 不存在
+        ok, msg = pawchive.remove_plan_pending("不存在")
+        self.assertFalse(ok)
+        self.assertIn("没有", msg)
+        # 空队列
+        pawchive.remove_plan_pending("作者A")
+        ok, msg = pawchive.promote_plan_pending(1)
+        self.assertFalse(ok)
+        self.assertIn("空", msg)
+
     def test_legacy_single_name_migrates(self):
         """旧单待办位文件（JSON 字符串）→ 启动迁移成单元素列表。"""
         import json as _json

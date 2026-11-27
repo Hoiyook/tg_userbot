@@ -327,6 +327,10 @@
     <div class="note">实时进度：作者 / 本次已执行时长 / 当前执行到的帖子日期。
       为空表示当前没有扫描或回填在跑（每 3h 醒一次 × 每次最多 3 个作者）。</div>
     <div id="pawRunning"><div class="note">加载中…</div></div>
+    <h2>待扫描队列</h2>
+    <div class="note">/paw_plan 撞上正在跑的扫描时进这个 FIFO 队列（先来先扫，
+      结束后自动接力；同一作者重复提交只留一条）。「置顶」= 下一个就扫它。</div>
+    <div id="pawQueue"><div class="note">加载中…</div></div>
     <div class="note" style="margin-top:12px">/paw backfill &lt;作者&gt; 可插队立即回填；
       /paw schedule 看文字版执行计划。</div>
   </section>
@@ -883,9 +887,38 @@ async function loadPawBackfill() {
       '</div></div>';
     document.getElementById("pawAuthors").innerHTML = renderPawAuthors(d.authors || []);
     document.getElementById("pawRunning").innerHTML = renderPawRunning(d.running || {});
+    document.getElementById("pawQueue").innerHTML = renderPawQueue(d.plan_queue || []);
   } catch (e) {
     document.getElementById("pawCur").innerHTML = '<div class="note">❌ ' + e + '</div>';
   }
+}
+
+// 待扫描队列（2026-11-27）：FIFO 位次 + 置顶/移除
+function renderPawQueue(rows) {
+  if (!rows.length) {
+    return '<div class="note" style="margin:0">📭 队列空——没有等待扫描的作者</div>';
+  }
+  const head = '<div class="ptab hd" style="grid-template-columns:auto 1fr auto auto">'
+    + '<div>位次</div><div>作者</div><div></div><div></div></div>';
+  const body = rows.map(q =>
+    '<div class="ptab" style="grid-template-columns:auto 1fr auto auto">'
+    + '<div class="cell">#' + q.pos + '</div>'
+    + '<div class="nm wrap">' + esc(q.name) + '</div>'
+    + '<div><button class="mini" onclick="pawQueueOp(\'pawq_top\',' + q.pos
+    + ')">置顶</button></div>'
+    + '<div><button class="mini" onclick="pawQueueOp(\'pawq_del\',' + q.pos
+    + ')">移除</button></div>'
+    + '</div>').join("");
+  return head + body;
+}
+
+async function pawQueueOp(op, pos) {
+  try {
+    const d = await api("/api/action/" + op, {method:"POST",
+      body: JSON.stringify({pos: pos})});
+    showResult(!!d.ok, d.message || d.error || "");
+    loadPawBackfill();
+  } catch (e) { showResult(false, String(e)); }
 }
 
 // 当前执行（2026-11-27）：作者 / 本次已执行时长 / 执行到的帖子日期
