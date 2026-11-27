@@ -3687,9 +3687,11 @@ def claim_next_asmr_task(now=None, lease_seconds=900):
             (ASMR_PENDING, now)).fetchone()
         if row is None:
             return None
+        # error 一并清掉（2026-11-27：重试中的任务还挂着上一轮的
+        # TimeoutError，面板/状态视图会把它当当前故障读）
         cur = _execute(
             conn, "UPDATE asmr_tasks SET status=?, lease_until=?, "
-            "updated_at=? WHERE rj=? AND status=?",
+            "updated_at=?, error=NULL WHERE rj=? AND status=?",
             (ASMR_PROCESSING, now + int(lease_seconds), now,
              row["rj"], ASMR_PENDING))
         if not cur.rowcount:
