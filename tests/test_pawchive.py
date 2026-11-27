@@ -768,9 +768,12 @@ class DupNameGuardTest(_DbTestCase):
             async def run():
                 return {"id": "p", "attachments": []}
             fetch_side_effect = run
+        # fetch_creator_posts 返回空 → 全部走详情路径（列表 diff 不联网）
         with mock.patch.object(
                 pawchive, "fetch_post_detail",
                 side_effect=fetch_side_effect), \
+                mock.patch.object(pawchive, "fetch_creator_posts",
+                                  lambda *a, **k: []), \
                 mock.patch.object(pawchive.asyncio, "sleep",
                                   mock.AsyncMock()):
             reply = await pawchive.backfill_author(ref)
@@ -933,7 +936,7 @@ class BackfillScheduleTest(unittest.TestCase):
         self.assertIn("回填执行计划", text)
         self.assertIn("甲", text)
         self.assertIn("下一批", text)
-        self.assertIn("每 6h 醒一次", text)
+        self.assertIn(f"每 {pawchive.PAWB_WAKE_HOURS}h 醒一次", text)
 
     def test_schedule_empty_db(self):
         from tg_userbot import pawchive as paw
@@ -1014,7 +1017,7 @@ class PlanPendingTest(unittest.TestCase):
     def test_empty_name_not_enqueued_and_junk_drained(self):
         """裸 /paw_plan 不往 FIFO 塞空串；历史空串垃圾一次 take 清完
         （2026-11-27 实测：空条目白耗一次锁释放的 kick，真作者卡到
-        下一轮 6h 回填才轮到）。"""
+        下一轮回填才轮到）。"""
         import json as _json
         _json.dump(["作者A", "", " ", "作者B"], open(
             pawchive._PLAN_PENDING_FILE, "w"))
@@ -1323,6 +1326,8 @@ class CatchUpScanTest(unittest.TestCase):
                                    return_value=("作者A", 777)), \
                  mock.patch.object(pawchive, "_catch_up_scan",
                                    return_value=(2, 30)), \
+                 mock.patch.object(pawchive, "fetch_creator_posts",
+                                   lambda *a, **k: []), \
                  mock.patch.object(pawchive, "BACKFILL_THROTTLE_SECONDS", 0), \
                  mock.patch.object(pawchive_notify, "notify_user") as nu:
                 async def _drive():
@@ -1430,7 +1435,7 @@ class BackfillEtaTest(unittest.TestCase):
                                      return_value=creators)
         self._lc.start()
         self.addCleanup(self._lc.stop)
-        # 最近实际执行记录：1 小时前跑过一轮——下一批预计 = 上次 + 6h
+        # 最近实际执行记录：1 小时前跑过一轮——下一批预计 = 上次 + 一个醒次
         # （滚动预告，不再锚死 11-02 的旧起点）
         import time as _t
         self._hist_file = os.path.join(self.dir, "pawb_history.jsonl")
@@ -1462,14 +1467,17 @@ class BackfillEtaTest(unittest.TestCase):
                   _tm.localtime(self._last_ts + 6*3600)), file=_s.stderr)
         self.assertEqual(len(batch), 3)
         now = time.time()
-        # 批内三作者同批同时回填 → 前两条 ETA 相同（base+6h），第三条
+        # 批内三作者同批同时回填 → 前两条 ETA 相同（base+1 醒次），第三条
         # 是 base+12h（下一批顺延一醒）；关键契约：ETA 随 last_run 滚动，
         # 不锚死 11-02 旧起点
         self.assertEqual(batch[0]["eta"], batch[1]["eta"])
         self.assertEqual(batch[0]["eta"],
-                         time.strftime("%m-%d %H:%M",
-                                       time.localtime(self._last_ts + 6*3600)),
-                         "ETA 应滚动（=上次执行+6h）")
+                         time.strftime(
+                             "%m-%d %H:%M",
+                             time.localtime(
+                                 self._last_ts
+                                 + pawchive.PAWB_WAKE_HOURS * 3600)),
+                         "ETA 应滚动（=上次执行+一个醒次）")
         self.assertFalse(overview["current"]["deferred"],
                          "刚跑完轮巡不应报顺延")
 
@@ -1620,4 +1628,116 @@ class PawAuthorTableTest(unittest.TestCase):
         pawchive._scan_stage("追新扫描")("已拉取 50 条")
         self.assertEqual(state.PAW_SCAN_PROGRESS["post_date"], "2026-11-13")
         self.assertEqual(state.PAW_SCAN_PROGRESS["stage"], "追新扫描")
+
+
+class ListDiffResumeTest(unittest.TestCase):
+    """列表 diff + 断点续跑 + 3h 节奏（2026-11-27 owner 批的优化）。
+
+    背景实测：详情路径 10~16s/帖（站点慢），96 帖 22 分钟；列表接口与
+    详情接口的附件集合逐帖一致（灰度 3 作者 × 12 帖 = 36/36 相同）。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="paw_ld_", dir=_TMP)
+        self._res = mock.patch.object(
+            pawchive, "_resume_path",
+            return_value=os.path.join(self.dir, "resume.json"))
+        self._res.start()
+        self.addCleanup(self._res.stop)
+        self._catch = mock.patch.object(
+            pawchive, "_catch_up_scan",
+            new=mock.AsyncMock(return_value=(0, 0)))
+        self._catch.start()
+        self.addCleanup(self._catch.stop)
+        self._sleep = mock.patch.object(
+            pawchive.asyncio, "sleep", new=mock.AsyncMock())
+        self._sleep.start()
+        self.addCleanup(self._sleep.stop)
+
+    def _run_author(self, rows, list_posts, detail=None, db_files=None):
+        from tg_userbot import state
+
+        async def drive():
+            state.PAW_SCAN_RUNNING = None
+            state.PAW_SCAN_PROGRESS = {}
+            with mock.patch.object(pawchive.runtime_db,
+                                   "posts_for_backfill",
+                                   return_value=rows), \
+                 mock.patch.object(pawchive.runtime_db,
+                                   "list_pawchive_files",
+                                   return_value=list(db_files or [])), \
+                 mock.patch.object(pawchive.runtime_db,
+                                   "add_missing_pawchive_files",
+                                   return_value=1) as add, \
+                 mock.patch.object(pawchive.runtime_db,
+                                   "reopen_pawchive_post"), \
+                 mock.patch.object(pawchive, "fetch_creator_posts",
+                                   lambda *a, **k: list_posts), \
+                 mock.patch.object(pawchive, "fetch_post_detail",
+                                   side_effect=detail or AssertionError(
+                                       "列表 diff 命中时不该拉详情")) as det:
+                await pawchive.backfill_author("作者A#1")
+                for t in list(pawchive._SPAWNED_SCANS):
+                    await t
+            return add, det
+
+        return asyncio.run(drive())
+
+    def test_list_diff_skips_detail_entirely(self):
+        """列表里已有附件的帖 → 一次详情都不拉。"""
+        rows = [{"id": 11, "post_id": "p1", "creator_id": 1,
+                 "service": "patreon", "status": "COMPLETED",
+                 "creator_name": "作者A", "published": "2026-11-01"}]
+        list_posts = [{"id": "p1", "attachments": [
+            {"name": "a.rar", "path": "/x/aa"}], "file": {}}]
+        add, det = self._run_author(rows, list_posts)
+        det.assert_not_called()
+        add.assert_called_once()
+        self.assertEqual(add.call_args[0][1][0]["filename"], "a.rar")
+
+    def test_list_empty_but_db_has_files_falls_back_to_detail(self):
+        """列表没附件、库里却有文件 → 拉详情确认（deferred 兜底）。"""
+        rows = [{"id": 12, "post_id": "p2", "creator_id": 1,
+                 "service": "patreon", "status": "COMPLETED",
+                 "creator_name": "作者A", "published": "2026-11-02"}]
+        list_posts = [{"id": "p2", "attachments": [], "file": {}}]
+        add, det = self._run_author(
+            rows, list_posts, db_files=[{"filename": "old.rar"}],
+            detail=lambda *a, **k: {"id": "p2", "file": {
+                "name": "new.rar", "path": "/y/bb"}})
+        det.assert_called_once()
+        self.assertEqual(add.call_args[0][1][0]["filename"], "new.rar")
+
+    def test_resume_skips_done_and_clears_on_success(self):
+        """断点续跑：已完成的帖不再处理；跑完清断点。"""
+        pawchive._mark_resume("1", "p1")
+        self.assertEqual(pawchive._load_resume("1"), {"p1"})
+        rows = [{"id": 13, "post_id": "p1", "creator_id": 1,
+                 "service": "patreon", "status": "COMPLETED",
+                 "creator_name": "作者A", "published": "2026-11-01"},
+                {"id": 14, "post_id": "p2", "creator_id": 1,
+                 "service": "patreon", "status": "COMPLETED",
+                 "creator_name": "作者A", "published": "2026-11-02"}]
+        list_posts = [{"id": "p1", "attachments": [
+            {"name": "a.rar", "path": "/x/aa"}], "file": {}},
+            {"id": "p2", "attachments": [
+                {"name": "b.rar", "path": "/x/bb"}], "file": {}}]
+        add, det = self._run_author(rows, list_posts)
+        det.assert_not_called()
+        # 只处理 p2（p1 在断点里被跳过）
+        self.assertEqual(add.call_count, 1)
+        self.assertEqual(add.call_args[0][0], 14)
+        self.assertEqual(pawchive._load_resume("1"), set(),
+                         "成功跑完必须清断点")
+
+    def test_resume_expires(self):
+        pawchive._mark_resume("1", "p1")
+        data = json.load(open(pawchive._resume_path()))
+        data["1"]["ts"] = time.time() - pawchive.PAWB_RESUME_TTL - 10
+        json.dump(data, open(pawchive._resume_path(), "w"))
+        self.assertEqual(pawchive._load_resume("1"), set(), "过期断点不续跑")
+
+    def test_wake_interval_is_3h(self):
+        self.assertEqual(pawchive.PAWB_WAKE_HOURS, 3)
+        # 44 作者 × 每轮 3 → 15 个醒次 × 3h = 45h 一圈
+        self.assertEqual(pawchive.PAWB_ROUND_HOURS, 45)
 

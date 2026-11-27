@@ -2404,6 +2404,8 @@ class BackfillRunTest(unittest.IsolatedAsyncioTestCase):
             def fake_fetch(service, cid, pid, cookie=None):   # 同步：to_thread 调用
                 return detail
             with mock.patch.object(pawchive, "fetch_post_detail", fake_fetch), \
+                    mock.patch.object(pawchive, "fetch_creator_posts",
+                                      lambda *a, **k: []), \
                     mock.patch.object(pawchive.asyncio, "sleep",
                                       mock.AsyncMock()):
                 msg = await pawchive.backfill_author("MofuMochii")
@@ -2423,6 +2425,8 @@ class BackfillRunTest(unittest.IsolatedAsyncioTestCase):
             def fake_fetch(service, cid, pid, cookie=None):
                 raise RuntimeError("HTTP 404")
             with mock.patch.object(pawchive, "fetch_post_detail", fake_fetch), \
+                    mock.patch.object(pawchive, "fetch_creator_posts",
+                                      lambda *a, **k: []), \
                     mock.patch.object(pawchive.asyncio, "sleep",
                                       mock.AsyncMock()):
                 await pawchive.backfill_author("MofuMochii")

@@ -387,8 +387,11 @@ def _backfill_pool():
     global _BACKFILL_POOL
     if _BACKFILL_POOL is None:
         import concurrent.futures
+        # 3 路（2026-11-27）：与 PAWB_DETAIL_CONCURRENCY 对齐——详情兜底
+        # 路径 gather 3 个，池子只有 2 就有一个白排队
         _BACKFILL_POOL = concurrent.futures.ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="paw-backfill")
+            max_workers=PAWB_DETAIL_CONCURRENCY,
+            thread_name_prefix="paw-backfill")
     return _BACKFILL_POOL
 
 
@@ -496,68 +499,149 @@ async def backfill_author(name, months=None):
     state.PAW_SCAN_RUNNING = f"回填 {rows[0]['creator_name']}（{scope_txt}）"
     state.PAW_SCAN_PROGRESS = {
         "started": time.monotonic(), "stage": "回填详情", "detail": "0/0"}
+    try:
+        _run_done_event().clear()    # 清上一轮残留，等待方必须等本轮
+    except Exception:
+        pass
 
     async def _notify(text):
         from . import notify
         await notify.notify_user(text)
 
+    def _files_of(d):
+        """详情/列表项 → 文件条目（两接口同构，2026-11-27 灰度验证过）。"""
+        out = [_file_entry(a) for a in (d.get("attachments") or [])
+               if a and (a.get("path") or a.get("temp_url"))]
+        fmain = d.get("file") or {}
+        if fmain.get("path") and not any(
+                a.get("path") == fmain["path"]
+                for a in (d.get("attachments") or [])):
+            out.insert(0, _file_entry({
+                "path": fmain["path"],
+                "name": fmain.get("name") or os.path.basename(fmain["path"]),
+            }))
+        return out
+
+    async def _detail_files(r):
+        """拉单帖详情取文件集（列表 diff 兜底）；瞬时失败轮内快重试 1 次。"""
+        last = None
+        for attempt in range(2):
+            try:
+                await _detail_throttle()
+                detail = await asyncio.get_event_loop().run_in_executor(
+                    _backfill_pool(), fetch_post_detail,
+                    r["service"], r["creator_id"], r["post_id"],
+                    config.PAWCHIVE_COOKIE or None)
+                d = detail[0] if isinstance(detail, list) else detail
+                return _files_of(d), None
+            except Exception as e:
+                last = e
+                if "404" in str(e):
+                    break
+                if attempt == 0:
+                    await asyncio.sleep(BACKFILL_THROTTLE_SECONDS)
+        return None, last
+
+    def _apply(r, files):
+        """差异落库：只补新增附件 + 必要时重开入队。返回 (新增数, 涉及?)。"""
+        existing = {f["filename"] for f in
+                    runtime_db.list_pawchive_files(r["id"])}
+        missing = [f for f in files if f["filename"] not in existing]
+        if not missing:
+            return 0, False
+        added = runtime_db.add_missing_pawchive_files(r["id"], missing)
+        if r["status"] not in (runtime_db.PAW_POST_PENDING,
+                               runtime_db.PAW_POST_PROCESSING):
+            runtime_db.reopen_pawchive_post(r["id"])
+        return added, True
+
     async def _run():
         added_total = posts_touched = gone = fetch_failed = 0
-        done = 0
+        skipped = 0
+        todo = rows
+        cid = str(rows[0]["creator_id"])
+        t_start = time.monotonic()
         try:
-            for r in rows:
-                done += 1
-                _scan_stage("回填详情")(
-                    f"{done}/{len(rows)}｜新增 {added_total}",
-                    post_date=r.get("published") or "")
-                if done % 25 == 0:
-                    logger.info(
-                        f"🐾 回填进度 {done}/{len(rows)}："
-                        f"新增 {added_total}，站点已无 {gone}，"
-                        f"拉取失败 {fetch_failed}")
+            # ── ① 列表 diff 预取（2026-11-27）：一次翻完 3 个月窗口的列表
+            # （通常 2~4 页），按帖算文件集——绝大多数帖就此判完，不必逐帖
+            # 拉详情（详情路径实测 10~16s/帖）。列表拉不动就整体降级回详情。
+            list_map = None
+            if PAWB_LIST_DIFF and months:
                 try:
-                    detail = await asyncio.get_event_loop(
-                    ).run_in_executor(
-                        _backfill_pool(), fetch_post_detail,
-                        r["service"], r["creator_id"], r["post_id"],
-                        config.PAWCHIVE_COOKIE or None)
+                    _scan_stage("拉取列表")("翻页中…")
+                    import datetime as _dt
+                    since_ = (_dt.date.today()
+                              - _dt.timedelta(days=int(months) * 31)
+                              ).isoformat()
+                    lst = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: fetch_creator_posts(
+                            rows[0]["service"], cid,
+                            config.PAWCHIVE_COOKIE or None,
+                            known_ids=None, until_date=since_))
+                    list_map = {str(p.get("id")): p for p in (lst or [])}
+                    logger.info(f"🐾 列表 diff 预取 {len(list_map)} 帖"
+                                f"（{rows[0]['creator_name']}）")
                 except Exception as e:
-                    # 404 = 站点侧已无此帖；其余（429/超时/断网）只是本轮
-                    # 没拉到——混在一起会把限流误报成「站点已无」
-                    if "404" in str(e):
-                        gone += 1
+                    logger.warning(f"🐾 列表预取失败，降级逐帖详情：{e}")
+            # ── ② 断点续跑：上次被重启/让位打断 → 24h 内接着跑
+            done_ids = _load_resume(cid)
+            todo = [r for r in rows if str(r["post_id"]) not in done_ids]
+            skipped = len(rows) - len(todo)
+            if skipped:
+                logger.info(f"🐾 断点续跑 {rows[0]['creator_name']}："
+                            f"跳过已完成 {skipped} 帖")
+            total = len(rows)
+            need_detail = []
+            # ── ③ 列表路径：本地对比，零请求
+            for i, r in enumerate(todo, 1):
+                _scan_stage("回填详情")(
+                    f"{skipped + i}/{total}｜新增 {added_total}",
+                    post_date=r.get("published") or "")
+                if (skipped + i) % 25 == 0:
+                    logger.info(
+                        f"🐾 回填进度 {skipped + i}/{total}："
+                        f"新增 {added_total}，站点已无 {gone}，"
+                        f"拉取失败 {fetch_failed}，跳过 {skipped}，"
+                        f"{time.monotonic() - t_start:.0f}s")
+                lp = list_map.get(str(r["post_id"])) if list_map else None
+                if lp is not None:
+                    files = _files_of(lp)
+                    # 列表里没附件但库里已有文件 → 站点可能省略了
+                    # deferred，拉详情确认；库里也没有 → 本来无附件，跳过
+                    if not files and runtime_db.list_pawchive_files(r["id"]):
+                        need_detail.append(r)
                     else:
-                        fetch_failed += 1
-                        logger.warning(
-                            f"🐾 回填拉取失败 {r['post_id']}："
-                            f"{str(e)[:80]}")
-                    await asyncio.sleep(BACKFILL_THROTTLE_SECONDS)
-                    continue
-                d = detail[0] if isinstance(detail, list) else detail
-                files = [_file_entry(a) for a in (d.get("attachments") or [])
-                         if a and (a.get("path") or a.get("temp_url"))]
-                fmain = d.get("file") or {}
-                if fmain.get("path") and not any(
-                        a.get("path") == fmain["path"]
-                        for a in (d.get("attachments") or [])):
-                    files.insert(0, _file_entry({
-                        "path": fmain["path"],
-                        "name": fmain.get("name")
-                        or os.path.basename(fmain["path"]),
-                    }))
-                existing = {f["filename"] for f in
-                            runtime_db.list_pawchive_files(r["id"])}
-                missing = [f for f in files
-                           if f["filename"] not in existing]
-                if missing:
-                    added = runtime_db.add_missing_pawchive_files(
-                        r["id"], missing)
-                    added_total += added
-                    posts_touched += 1
-                    if r["status"] not in (runtime_db.PAW_POST_PENDING,
-                                           runtime_db.PAW_POST_PROCESSING):
-                        runtime_db.reopen_pawchive_post(r["id"])
-                await asyncio.sleep(BACKFILL_THROTTLE_SECONDS)
+                        added, touched = _apply(r, files)
+                        added_total += added
+                        posts_touched += bool(touched)
+                        _mark_resume(cid, r["post_id"])
+                else:
+                    need_detail.append(r)
+            # ── ④ 详情兜底：并发 3（全局最小间隔 2.5s/请求，429 退避）
+            if need_detail:
+                _scan_stage("详情兜底")(f"{len(need_detail)} 帖待确认")
+                for i in range(0, len(need_detail), PAWB_DETAIL_CONCURRENCY):
+                    chunk = need_detail[i:i + PAWB_DETAIL_CONCURRENCY]
+                    results = await asyncio.gather(
+                        *[_detail_files(r) for r in chunk])
+                    for r, (files, err) in zip(chunk, results):
+                        if files is None:
+                            if err is not None and "404" in str(err):
+                                gone += 1
+                            else:
+                                fetch_failed += 1
+                                logger.warning(
+                                    f"🐾 回填拉取失败 {r['post_id']}："
+                                    f"{str(err)[:80]}")
+                            _mark_resume(cid, r["post_id"])
+                            continue
+                        added, touched = _apply(r, files)
+                        added_total += added
+                        posts_touched += bool(touched)
+                        _mark_resume(cid, r["post_id"])
+                    _scan_stage("详情兜底")(
+                        f"{min(i + len(chunk), len(need_detail))}/"
+                        f"{len(need_detail)}｜新增 {added_total}")
             # 追新扫描（方案 A）：回填只重查已知帖，作者新发的帖子靠
             # 这次轻量枚举收录（known_ids 增量早停，无新帖 1~2 页即停）
             caught_new, fetched_n = await _catch_up_scan({
@@ -567,9 +651,13 @@ async def backfill_author(name, months=None):
             })
             # 面板「作者回填情况」的最近执行时间（成功跑完才记）
             record_author_backfill(rows[0]["creator_id"])
+            _clear_resume(rows[0]["creator_id"])   # 跑完清断点
+            _mode = ("列表 diff" if list_map is not None else "逐帖详情")
             summary = (
-                f"🐾 回填完成：{rows[0]['creator_name']}\n"
-                f"检查 {len(rows)} 帖｜站点已无 {gone} 帖"
+                f"🐾 回填完成：{rows[0]['creator_name']}（{_mode}）\n"
+                f"检查 {len(rows)} 帖"
+                + (f"（断点跳过 {skipped}）" if skipped else "")
+                + f"｜站点已无 {gone} 帖"
                 + (f"｜拉取失败 {fetch_failed} 帖" if fetch_failed else "")
                 + f"\n补录新附件 {added_total} 个（涉及 {posts_touched} 帖，"
                 "已重开入队只下新增）"
@@ -582,10 +670,12 @@ async def backfill_author(name, months=None):
             raise
         except Exception as e:
             logger.exception(f"🐾 回填异常：{label}")
-            summary = f"❌ 回填异常（已处理到第 {done}/{len(rows)} 帖）：{e}"
+            summary = (f"❌ 回填异常（已处理 {skipped + len(todo)}"
+                       f"/{len(rows)} 帖）：{e}")
         finally:
             state.PAW_SCAN_RUNNING = None
             state.PAW_SCAN_PROGRESS = {}
+            _run_done_event().set()      # 精确唤醒等待方（替代 60s 轮询）
             await _kick_plan_pending()
         try:
             await _notify(summary)
@@ -613,11 +703,20 @@ async def backfill_author(name, months=None):
 # PAWB_MAX_AUTHORS_PER_ROUND，且让位人工扫描（PAW_SCAN_RUNNING）。
 # ============================================================
 PAWB_STATE_FILE = "pawb_state.json"
-PAWB_ROUND_HOURS = 72            # 全量作者一轮的周期
+PAWB_WAKE_HOURS = 3              # 醒次间隔（owner 2026-11-27：6h → 3h，
+                                 # 全量一圈 90h → 45h）
+PAWB_ROUND_HOURS = 45            # 全量作者一轮的周期（= ceil(n/per)*wake）
 PAWB_MAX_AUTHORS_PER_ROUND = 3   # 单轮最多处理作者数（每轮只啃一点）
 PAWB_MONTHS_LIMIT = 3            # 回填只回填最近 N 个月（owner 2026-11-03：
                                  # 不做全量扫描；None = 不限）
-PAWB_POST_GAP = 2.5              # 帖间节流（与手动 backfill 同款）
+PAWB_POST_GAP = 2.5              # 帖间最小间隔（见 _gap_sleep：是"间隔"
+                                 # 不是"追加等待"——请求本身耗时会抵扣）
+# 列表 diff（2026-11-27 owner 批）：列表接口实测与详情接口附件集合逐帖
+# 一致（灰度 3 作者 × 12 帖），回填不必逐帖拉详情——翻 2~3 页列表对比
+# 库内文件即可。only-if-diff：列表里没附件/没这帖的才回退拉详情。
+PAWB_LIST_DIFF = True
+PAWB_DETAIL_CONCURRENCY = 3      # 详情兜底路径的并发（站点风控下保守 3）
+PAWB_RESUME_TTL = 24 * 3600      # 断点续跑有效期（超时/换作者重来）
 
 
 def _pawb_state_path():
@@ -740,6 +839,111 @@ async def _kick_plan_pending():
         await backfill_author(name)
     except Exception as e:
         logger.exception(f"🐾 待办自动回填失败：{e}")
+
+
+# ---- 回填断点续跑（2026-11-27）：重启/让位打断后不从头再来 ----
+# 文件 runtime/pawb_resume.json：{creator_id: {"ts":…, "done":[post_id,…]}}
+# 只保留最近 5 个作者；成功跑完即清。24h 过期（换天窗口可能已变）。
+_PAWB_RESUME_FILE = os.path.join(config.RUNTIME_DIR, "pawb_resume.json")
+
+
+def _resume_path():
+    return _PAWB_RESUME_FILE
+
+
+def _load_resume(creator_id) -> set:
+    try:
+        with open(_resume_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return set()
+    rec = (data or {}).get(str(creator_id)) or {}
+    if not rec or time.time() - float(rec.get("ts") or 0) > PAWB_RESUME_TTL:
+        return set()
+    return {str(x) for x in (rec.get("done") or [])}
+
+
+def _save_resume_map(data):
+    try:
+        os.makedirs(config.RUNTIME_DIR, exist_ok=True)
+        # 只留最近 5 个作者（按 ts）
+        items = sorted((data or {}).items(),
+                       key=lambda kv: float((kv[1] or {}).get("ts") or 0),
+                       reverse=True)[:5]
+        tmp = _resume_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(dict(items), f, ensure_ascii=False)
+        os.replace(tmp, _resume_path())
+    except Exception as e:
+        logger.warning(f"🐾 回填写断点失败（不影响回填）：{e}")
+
+
+def _mark_resume(creator_id, post_id):
+    try:
+        with open(_resume_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    cid = str(creator_id)
+    rec = data.get(cid) or {"ts": time.time(), "done": []}
+    rec["ts"] = time.time()
+    done = set(rec.get("done") or [])
+    done.add(str(post_id))
+    rec["done"] = sorted(done)
+    data[cid] = rec
+    _save_resume_map(data)
+
+
+def _clear_resume(creator_id):
+    try:
+        with open(_resume_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    if data.pop(str(creator_id), None) is not None:
+        _save_resume_map(data)
+
+
+_PAW_LAST_REQ = 0.0
+
+
+async def _detail_throttle():
+    """请求级**最小间隔**（不是追加等待）：距上次请求不足 2.5s 才补差。
+
+    2026-11-27：原来每帖固定 sleep 2.5s，而请求本身已 7~13s——白烧 20%。
+    并发 3 路时也守住 1 请求/2.5s 的总速率（站点风控）。"""
+    global _PAW_LAST_REQ
+    wait = BACKFILL_THROTTLE_SECONDS - (time.monotonic() - _PAW_LAST_REQ)
+    if wait > 0:
+        await asyncio.sleep(min(wait, BACKFILL_THROTTLE_SECONDS))
+    _PAW_LAST_REQ = time.monotonic()
+
+
+# ---- 回填完成事件（2026-11-27）：替代 60s 轮询 ----
+_PAW_RUN_DONE = None
+_PAW_RUN_DONE_LOOP = None
+
+
+def _run_done_event():
+    """一次回填跑完时 set；调用方 wait 它而不是每 60s 轮询。"""
+    global _PAW_RUN_DONE, _PAW_RUN_DONE_LOOP
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if _PAW_RUN_DONE is None or (
+            loop is not None and _PAW_RUN_DONE_LOOP is not loop):
+        _PAW_RUN_DONE = asyncio.Event()
+        _PAW_RUN_DONE_LOOP = loop
+    return _PAW_RUN_DONE
+
+
+async def _wait_run_done(timeout=4 * 3600):
+    """等当前回填跑完（超时兜底，防单作者卡死整轮）。"""
+    try:
+        await asyncio.wait_for(_run_done_event().wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning("🐾 等回填完成超时（4h），继续下一作者")
 
 
 def _save_pawb_state(st):
@@ -964,7 +1168,7 @@ def backfill_status_overview() -> dict:
     cursor = int(st.get("cursor", 0)) % max(len(creators), 1)
     started = float(st.get("loop_started", 0) or 0)
     per = int(PAWB_MAX_AUTHORS_PER_ROUND)
-    wake_h = 6
+    wake_h = PAWB_WAKE_HOURS
     now = time.time()
     hist = read_backfill_history(50)
     last_run = hist[0] if hist else None
@@ -994,7 +1198,8 @@ def backfill_status_overview() -> dict:
     # 顺延判定：首批预计已逾期，且最近 6h 内没有实际执行记录
     # （被让位/重启顺延了——如实报告，而不是干巴巴「已逾期」）
     deferred = bool(next_batch and next_batch[0].get("overdue")
-                    and not (last_run and last_run.get("ts", 0) > now - 6 * 3600))
+                    and not (last_run and last_run.get("ts", 0)
+                         > now - PAWB_WAKE_HOURS * 3600))
     # 作者表格（2026-11-27）：全部作者 × 上次执行成功 × 最新帖子 ×
     # 距下一批的位次（pos=0 即下一批；面板按 pos 升序展示）
     last_map = _seed_author_last(creators)
@@ -1077,11 +1282,11 @@ async def backfill_round(start_index=0):
         summaries.append(out.strip().splitlines()[0][:60])
         # 等本作者的后台 _run 真正完成再判下一个（2026-11-07 吞吐修复：
         # author1 刚派发后台、author2 立即让位——每轮实际只处理 1 个，
-        # 比设计的 3 个慢 3 倍）。上限 4h 防单作者卡死整轮
-        for _ in range(240):
-            if state.PAW_SCAN_RUNNING is None:
-                break
-            await asyncio.sleep(60)
+        # 比设计的 3 个慢 3 倍）。2026-11-27：60s 轮询改事件等待（小作者
+        # 30s 跑完却干等 60s，一轮白耗 3~4 分钟）；4h 超时兜底仍在。
+        # 只有真在跑才等（mock/早退时 PAW_SCAN_RUNNING 是 None，等会空挂）
+        if "开始回填" in out and state.PAW_SCAN_RUNNING is not None:
+            await _wait_run_done()
         await asyncio.sleep(10)   # 作者间隔
     next_cursor = (start_index + done) % max(len(creators), 1)
     return done, "\n".join(summaries), next_cursor
@@ -1105,7 +1310,7 @@ def backfill_schedule_text():
         # 循环刚启动还没写过状态：以进程内已知值兜底（首醒在 6h 后）
         started = time.time()
     per = int(PAWB_MAX_AUTHORS_PER_ROUND)
-    wake_h = 6
+    wake_h = PAWB_WAKE_HOURS
     now = time.time()
     lines = [f"{TEXT_PREFIX} 回填执行计划（{len(creators)} 作者，"
              f"全量一轮 ≈{math.ceil(len(creators) / per) * wake_h}h）", ""]
@@ -1129,13 +1334,13 @@ def backfill_schedule_text():
         lines.append(f"… 另 {len(rows) - 20} 个作者按序轮转（每 {wake_h}h "
                      f"推进 {per} 个）")
     lines.append("")
-    lines.append("节奏：每 6h 醒一次 × 每次 3 作者；人工扫描进行时该轮让位顺延；"
+    lines.append(f"节奏：每 {PAWB_WAKE_HOURS}h 醒一次 × 每次 3 作者；人工扫描进行时该轮让位顺延；"
                  "游标重启不丢。/paw backfill <作者> 可插队立即回填")
     return "\n".join(lines)[:3900]
 
 
 async def backfill_loop():
-    """定期轮巡循环（每 6h 醒一次，全量一轮摊到 72h）。"""
+    """定期轮巡循环（每 PAWB_WAKE_HOURS 小时醒一次，全量轮一圈 = 作者数/3 次醒）。"""
     logger.info("🐾 定期 backfill 循环已启动"
                 f"（全量一轮 {PAWB_ROUND_HOURS}h，每次醒最多 "
                 f"{PAWB_MAX_AUTHORS_PER_ROUND} 个作者）")
@@ -1151,7 +1356,7 @@ async def backfill_loop():
         while True:
             # 重启快醒（2026-11-03）：首次醒只等 5 分钟——重启不该把 6h
             # 的醒次往后推（此前重启一次吞掉一个醒次，看板「已逾期」的
-            # 根因之一）；后续醒次仍每 6h。面板「执行」压队头会 set 事件，
+            # 根因之一）；后续醒次按 PAWB_WAKE_HOURS。面板「执行」set 事件，
             # 这里立即醒（2026-11-27：插队不能等满 6h）。
             ev = _pawb_wake_event()
             try:
@@ -1160,7 +1365,7 @@ async def backfill_loop():
                 logger.info("🐾 回填循环被插队唤醒（面板「执行」）")
             except asyncio.TimeoutError:
                 pass
-            delay = 6 * 3600
+            delay = PAWB_WAKE_HOURS * 3600
             try:
                 st = _load_pawb_state()
                 creators_now = list_scanned_creators()
@@ -1188,8 +1393,8 @@ async def backfill_loop():
                     # （撞锁让位时条目已塞回队头，同样 10 分钟后重试）
                     delay = 600
                     continue
-                # 全量摊销：每 6h 醒，一轮 72h=12 次醒；每次最多 3 作者
-                # 38 作者 → 约 2.2 天转完一圈
+                # 全量摊销：每 PAWB_WAKE_HOURS 小时醒一次，每次最多 3 作者
+                # 44 作者 → 15 次醒 ≈ 45h 转完一圈
                 result = await backfill_round(st.get("cursor", 0))
                 done, text, next_cursor = result
                 log_backfill_round(done, text, next_cursor)
@@ -1234,10 +1439,8 @@ async def _backfill_priority_one(item):
         q.insert(0, item)
         _save_priority(q)
         return 0, first
-    for _ in range(240):
-        if state.PAW_SCAN_RUNNING is None:
-            break
-        await asyncio.sleep(60)
+    if "开始回填" in out and state.PAW_SCAN_RUNNING is not None:
+        await _wait_run_done()
     return 1, first
 
 def author_progress_text(name):
