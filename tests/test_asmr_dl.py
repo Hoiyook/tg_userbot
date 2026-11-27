@@ -721,3 +721,45 @@ class OrphanSocketCleanupTest(unittest.TestCase):
         """fetch 超时路径必须调用清理（防只改一处漏另一处）。"""
         src = open("tg_userbot/asmr_dl.py", encoding="utf-8").read()
         self.assertIn("_kill_orphan_sockets()", src)
+
+
+class StagingReuseTest(_AsmrDbTestCase):
+    """拷贝被打断转重试后，staging 里已对账完的文件直接补拷贝，
+    不重新下载（2026-11-28：挂载冻结 900s 一弃，20MB 就白拉一遍）。"""
+
+    def test_complete_staging_file_skips_download(self):
+        from tg_userbot import task_worker
+        info = {"title": "T", "circle": "C", "source_id": "",
+                "files": [{"path": "a.wav", "size": 10, "url": "u"}]}
+        task = {"rj": 999003, "title": "T", "only_filter": ""}
+        runtime_db.enqueue_asmr_task(999003, title="T", circle="",
+                                     total_files=0, size_bytes=0)
+        stage_root = tempfile.mkdtemp(prefix="asmr_stage_", dir=_TMP)
+        self.addCleanup(shutil.rmtree, stage_root, ignore_errors=True)
+        # 只在 _process_task 执行期间把 RUNTIME_DIR 指向 stage_root
+        #（runtime_db 的 DB path 在 init 时已固定，不受影响）
+        staging_a = os.path.join(stage_root, "asmr", "999003", "a.wav")
+        os.makedirs(os.path.dirname(staging_a), exist_ok=True)
+        with open(staging_a, "wb") as f:
+            f.write(b"1234567890")     # 与 API size 一致
+
+        async def fake_dl(*a, **k):
+            raise AssertionError("staging 已有对账文件，不该再下载")
+
+        async def fake_cp(*a, **k):
+            return 10
+
+        with mock.patch.object(asmr_dl, "fetch_work_info_blocking",
+                               return_value=info), \
+                mock.patch.object(task_worker, "download_with_watchdog",
+                                  new=fake_dl), \
+                mock.patch.object(task_worker, "copy_with_watchdog",
+                                  new=fake_cp), \
+                mock.patch.object(config, "RUNTIME_DIR", stage_root), \
+                mock.patch("tg_userbot.extract_worker.mount_of",
+                           return_value=self.dir), \
+                mock.patch.object(config, "ASMR_THROTTLE_SECONDS", 0.0), \
+                mock.patch.object(asmr_dl, "_wait_remote_file",
+                                  new=mock.AsyncMock(return_value=True)):
+            out = asyncio.run(asmr_dl._process_task(task))
+        self.assertEqual(out["files"], 1)

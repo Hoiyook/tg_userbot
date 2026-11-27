@@ -408,6 +408,7 @@ async def _process_task(task):
     from .task_worker import copy_with_watchdog, download_with_watchdog
 
     done = 0
+    reused = 0
     for f in files:
         target = os.path.join(mount_dir, f["path"])
         if os.path.isfile(target) and os.path.getsize(target) == f["size"]:
@@ -419,11 +420,19 @@ async def _process_task(task):
         _CURRENT.update({"rj": rj, "title": info["title"], "stage":
                          f"{done + 1}/{len(files)}"
                          f" {os.path.basename(f['path'])[:32]}"})
-        await download_with_watchdog(
-            f["url"], local, f["size"],
-            check=float(getattr(config, "ASMR_DL_CHECK_SECONDS", 30)),
-            stall=float(getattr(config, "ASMR_DL_STALL_SECONDS", 240)),
-            download_fn=download_file_blocking, label=f"🎧 RJ{rj}")
+        # staging 复用（2026-11-28）：拷贝被挂载冻结打断转重试后，已下完
+        # 的文件还在 staging（大小对账过的）——直接跳过下载只补拷贝，
+        # 别把 20MB 从头再拉一遍（CDN 慢时那是 5 分钟）
+        if os.path.isfile(local) and os.path.getsize(local) == f["size"]:
+            reused += 1
+            logger.info(f"🎧 [RJ{rj}] staging 复用："
+                        f"{os.path.basename(f['path'])[:40]}（跳过下载）")
+        else:
+            await download_with_watchdog(
+                f["url"], local, f["size"],
+                check=float(getattr(config, "ASMR_DL_CHECK_SECONDS", 30)),
+                stall=float(getattr(config, "ASMR_DL_STALL_SECONDS", 240)),
+                download_fn=download_file_blocking, label=f"🎧 RJ{rj}")
         await copy_with_watchdog(
             local, target, f["size"],
             check=float(getattr(config, "ASMR_COPY_CHECK_SECONDS", 60)),
