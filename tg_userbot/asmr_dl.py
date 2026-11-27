@@ -331,6 +331,38 @@ def _copy_file(src, dst):
             fo.write(b)
 
 
+def _kill_orphan_sockets():
+    """强制关掉本进程到 socks 代理端口的 ESTABLISHED 连接。
+
+    弃线程后 socket 还握在被弃线程手里，进程退出前不会释放；Hiddify
+    侧对僵尸会话没有超时，累积后新握手越来越慢。直接 close() 让内核发
+    FIN——被弃线程的 recv 会立刻弹错退出，代理侧会话也清掉。"""
+    import socket as _s
+    import subprocess as _sp
+    try:
+        pid = os.getpid()
+        out = _sp.run(
+            ["lsof", "-a", "-nP", f"-p{pid}", "-iTCP:12334",
+             "-sTCP:ESTABLISHED", "-Fpn"],
+            capture_output=True, text=True, timeout=10)
+        fds = [ln.strip()[1:] for ln in out.stdout.splitlines()
+               if ln.startswith("f")]
+        n = 0
+        for fd_s in fds:
+            try:
+                fd = int(fd_s)
+                sock = _s.socket(fileno=fd)   # 复制引用，不接管所有权
+                sock.shutdown(_s.SHUT_RDWR)
+                sock.close()                  # 只关复制出的描述符
+                n += 1
+            except (OSError, ValueError):
+                continue
+        if n:
+            logger.info(f"🎧 已清 {n} 条挂死的代理隧道（弃线程遗留）")
+    except Exception as e:
+        logger.warning(f"🎧 清理代理隧道失败（忽略）：{e}")
+
+
 async def _process_task(task):
     """处理一部：拉文件树 → 逐文件下载（幂等跳过已就位）→ 拷挂载 → 续租。"""
     rj = task["rj"]
@@ -344,6 +376,11 @@ async def _process_task(task):
             asyncio.to_thread(fetch_work_info_blocking, rj),
             timeout=fetch_budget)
     except asyncio.TimeoutError:
+        # 弃线程前先清代理隧道（2026-11-27 深挖：每次失败轮泄漏 1 条
+        # ESTABLISHED 的 socks 连接，Hiddify 侧会话数累积到 200+ 后新
+        # 握手开始挂——12 轮失败正好 12 条，是因果不是巧合）。把本线程
+        # 打开的到 12334 的 socket 强制 close，别等泄漏的线程自己松手。
+        _kill_orphan_sockets()
         raise TimeoutError(
             f"拉文件树超过 {int(fetch_budget)}s 无响应"
             "（代理/DNS 挂死），弃线程转重试")
