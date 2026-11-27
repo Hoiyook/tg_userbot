@@ -1316,6 +1316,7 @@ class CatchUpScanTest(unittest.TestCase):
         saved_rules = (pawchive.state.PAW_SCAN_RUNNING,
                        pawchive.state.PAW_SCAN_PROGRESS)
         try:
+            # 列表为空也算"列表可用"（走零请求追新）——直接给追新结果
             with mock.patch.object(
                     pawchive.runtime_db, "posts_for_backfill",
                     return_value=[{"id": 1, "post_id": "p1",
@@ -1325,6 +1326,8 @@ class CatchUpScanTest(unittest.TestCase):
                  mock.patch.object(pawchive, "parse_creator_ref",
                                    return_value=("作者A", 777)), \
                  mock.patch.object(pawchive, "_catch_up_scan",
+                                   return_value=(2, 30)), \
+                 mock.patch.object(pawchive, "_catch_up_from_list",
                                    return_value=(2, 30)), \
                  mock.patch.object(pawchive, "fetch_creator_posts",
                                    lambda *a, **k: []), \

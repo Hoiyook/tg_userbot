@@ -395,6 +395,30 @@ def _backfill_pool():
     return _BACKFILL_POOL
 
 
+def _catch_up_from_list(creator, posts, since):
+    """追新扫描的"零请求"版本：复用回填刚拉的列表（2026-11-27）。
+
+    列表 diff 已经把 3 个月窗口翻全了，再让 _catch_up_scan 重拉一遍纯属
+    重复请求（站点慢时那一趟要几分钟）。这里只做落库：帖级幂等，
+    新帖自动 PENDING。返回 (created, fetched)。"""
+    if not posts:
+        return 0, 0
+    try:
+        records = build_scan_records(creator, posts, None, scope="notfaved",
+                                     since=since)
+        created, _skipped = runtime_db.enqueue_pawchive_posts(
+            creator["service"], str(creator["id"]),
+            creator.get("name") or f"{creator['service']}/{creator['id']}",
+            records, scan_batch=time.strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception as e:
+        logger.warning(f"🐾 追新（复用列表）失败：{e}")
+        return 0, len(posts)
+    if created:
+        logger.info(f"🐾 追新（复用列表）：{creator.get('name') or ''} "
+                    f"新收录 {created} 帖（拉取 {len(posts)}）")
+    return created, len(posts)
+
+
 async def _catch_up_scan(creator):
     """轻量追新扫描（方案 A，2026-11-17 owner 定档）：回填只重查已收录
     帖，作者**新发的帖子**靠这里收录。
@@ -644,11 +668,21 @@ async def backfill_author(name, months=None):
                         f"{len(need_detail)}｜新增 {added_total}")
             # 追新扫描（方案 A）：回填只重查已知帖，作者新发的帖子靠
             # 这次轻量枚举收录（known_ids 增量早停，无新帖 1~2 页即停）
-            caught_new, fetched_n = await _catch_up_scan({
+            _creator = {
                 "service": rows[0]["service"],
                 "id": rows[0]["creator_id"],
                 "name": rows[0]["creator_name"],
-            })
+            }
+            if list_map is not None:
+                # 列表已经把 3 个月窗口翻全 → 直接落库，不再二次联网
+                import datetime as _dt2
+                _since = (_dt2.date.today()
+                          - _dt2.timedelta(days=int(months or 3) * 31)
+                          ).isoformat()
+                caught_new, fetched_n = _catch_up_from_list(
+                    _creator, list(list_map.values()), _since)
+            else:
+                caught_new, fetched_n = await _catch_up_scan(_creator)
             # 面板「作者回填情况」的最近执行时间（成功跑完才记）
             record_author_backfill(rows[0]["creator_id"])
             _clear_resume(rows[0]["creator_id"])   # 跑完清断点
