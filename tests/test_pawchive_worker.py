@@ -157,6 +157,44 @@ class PrecheckTest(_WorkerDbTestCase):
         self.assertEqual((dead, repaired), (set(), {}))
 
 
+class RateLimitPolicyTest(unittest.TestCase):
+    """站点限流规则（2026-11-27 实读 403 页面原文）：≤1 请求/秒、≤5 并发、
+    可识别 UA。此前是 10 并发 + "Mozilla/5.0" 伪浏览器 UA → 被拦。"""
+
+    def test_policy_constants(self):
+        self.assertEqual(worker.PAWCHIVE_DL_MAX_CONCURRENT, 5)
+        self.assertEqual(worker.PAWCHIVE_DL_MIN_INTERVAL, 1.0)
+
+    def test_ua_is_identifiable_not_browser(self):
+        ua = worker.PAWCHIVE_DL_UA
+        self.assertFalse(ua.startswith("Mozilla"), "不许伪装浏览器")
+        self.assertIn("tg-userbot", ua)
+        self.assertIn("github.com/Hoiyook/tg_userbot", ua,
+                      "站点要求'便于联系'的标识")
+
+    def test_rate_limit_page_detection(self):
+        class _R:
+            def __init__(self, code, text=""):
+                self.status_code, self.text = code, text
+        body = ("Are you a bot or using download tools? Please show respect "
+                "and use reasonable rate limits with downloading")
+        self.assertTrue(worker._is_rate_limit_page(_R(403, body)))
+        self.assertTrue(worker._is_rate_limit_page(_R(429)))
+        # 普通 403（真禁止）/404 不按限流处理
+        self.assertFalse(worker._is_rate_limit_page(_R(403, "forbidden")))
+        self.assertFalse(worker._is_rate_limit_page(_R(404)))
+
+    def test_rate_limit_sets_global_cooldown(self):
+        self.addCleanup(setattr, worker, "_DL_PAUSE_UNTIL", 0.0)
+        self.addCleanup(setattr, worker, "_DL_LAST_REQ", 0.0)
+        worker._dl_note_rate_limit(30)
+        before = worker._DL_PAUSE_UNTIL
+        self.assertGreater(before, time.monotonic())
+        worker._dl_note_rate_limit(5)
+        self.assertGreaterEqual(worker._DL_PAUSE_UNTIL, before,
+                                "冷却只延长不缩短")
+
+
 class LegacyRequeueTest(_WorkerDbTestCase):
 
     async def test_submitted_requeued_for_builtin(self):
@@ -375,10 +413,17 @@ class RateLimitTest(_WorkerDbTestCase):
                 lambda c, t: None)
         self.assertEqual(result[0], "failed")
         self.assertIn("429", result[2])
-        # 429 每次等满 60s；12 次硬上限内不消耗无进展额度
-        self.assertEqual(sleeps, [60.0] * 12)
-        self.assertTrue(any(s == config.PAWCHIVE_429_WAIT_SECONDS
-                            for s in sleeps), "429 应等满 60s")
+        # 429 每次等满 60s；12 次硬上限内不消耗无进展额度。
+        # 2026-11-27 起还有"站点闸门"的其它 sleep（并发/1rps 预占）混在
+        # 同一个 time.sleep 里，只断言"足够的 60s 级等待"。
+        # 2026-11-27 起 429 不再单文件 sleep，而是设全局冷却、由闸门在
+        # 下一次取槽时统一等待（所有下载一起停）——所以首次尝试没有长等待
+        long_waits = [s for s in sleeps if s >= 55]
+        self.assertGreaterEqual(len(long_waits), 11)
+        self.assertTrue(any(abs(s - config.PAWCHIVE_429_WAIT_SECONDS) < 6
+                            for s in long_waits), "429 应等满 60s")
+        self.assertGreater(worker._DL_PAUSE_UNTIL, 0,
+                           "429 必须设置全局冷却（不是只睡自己）")
 
     async def test_429_auto_requeue_sweep(self):
         """纯 429 失败帖：扫描自动重投；attempts 超限的不动。"""

@@ -51,6 +51,76 @@ _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # 站点侧死链的失败标记（单一事实源在 runtime_db，retry 重投据此跳过死链）
 _MISSING_MARK = runtime_db.PAW_DEAD_LINK_MARK
 _DEAD_STATUS = (404, 410)
+
+# 站点明示的下载规则（2026-11-27 实读 403 页面原文）：
+#   "no more than 1 request per second, and 5 active downloads, along with
+#    an identifiable user agent, preferably with a way to contact you.
+#    Excessive downloading or pretending to be a browser will result in a block."
+# 违反 → 403/429 拦截页（不是死链）。这里硬化三条：并发 5、1 请求/秒、
+# UA 可识别（带仓库地址当联系方式，绝不伪装浏览器）。
+PAWCHIVE_DL_MAX_CONCURRENT = 5
+PAWCHIVE_DL_MIN_INTERVAL = 1.0
+PAWCHIVE_DL_UA = ("tg-userbot/2 (personal archive fetcher; "
+                  "+https://github.com/Hoiyook/tg_userbot)")
+
+_DL_SEM = None           # threading.Semaphore(5)：下载在 to_thread 里跑
+_DL_LOCK = None
+_DL_LAST_REQ = 0.0
+_DL_PAUSE_UNTIL = 0.0    # 撞限流后的全局冷却截止（所有下载一起停）
+
+
+def _dl_state():
+    global _DL_SEM, _DL_LOCK
+    if _DL_SEM is None:
+        import threading
+        _DL_SEM = threading.Semaphore(PAWCHIVE_DL_MAX_CONCURRENT)
+        _DL_LOCK = threading.Lock()
+    return _DL_SEM, _DL_LOCK
+
+
+def _dl_acquire():
+    """取一个下载槽 + 守住 1 请求/秒 + 撞限流后的全局冷却。"""
+    global _DL_LAST_REQ
+    sem, lock = _dl_state()
+    sem.acquire()
+    with lock:
+        now = time.monotonic()
+        wait = max(0.0, _DL_PAUSE_UNTIL - now,
+                   _DL_LAST_REQ + PAWCHIVE_DL_MIN_INTERVAL - now)
+        _DL_LAST_REQ = now + wait      # 预占：并发进来的下一个还要再等
+    if wait > 0:
+        time.sleep(min(wait, 120.0))
+
+
+def _dl_release():
+    sem, _ = _dl_state()
+    try:
+        sem.release()
+    except Exception:
+        pass
+
+
+def _dl_note_rate_limit(seconds):
+    """撞限流：所有下载一起冷却（站点要求 1 rps/5 并发，不是单文件的事）。"""
+    global _DL_PAUSE_UNTIL
+    _, lock = _dl_state()
+    with lock:
+        _DL_PAUSE_UNTIL = max(_DL_PAUSE_UNTIL,
+                              time.monotonic() + float(seconds))
+
+
+def _is_rate_limit_page(resp) -> bool:
+    """403/429 是不是站点的限流拦截页（不是死链、不是真禁止）。"""
+    if resp.status_code not in (403, 429):
+        return False
+    if resp.status_code == 429:
+        return True
+    try:
+        body = resp.text[:400].lower()
+    except Exception:
+        return False
+    return ("rate limit" in body or "are you a bot" in body
+            or "download tools" in body)
 # 单文件重试策略（2026-09-15 深夜 CDN 断流爆发后强化）：
 #   _DOWNLOAD_ATTEMPTS = 无进展尝试的上限（连续 3 次一无所获才判 failed）
 #   _DOWNLOAD_TOTAL_CAP = 总尝试硬上限（有进展的断流不计入上限，但防死循环）
@@ -198,17 +268,25 @@ def recover_expired():
 # 死链预检（HTTP 在线程池跑，DB 写留在事件循环线程）
 # ============================================================
 def _head_status(url, timeout=15):
-    """HEAD 探测直链，返回 HTTP 状态码；网络异常返回 None（不预判）。"""
+    """HEAD 探测直链，返回 HTTP 状态码；网络异常返回 None（不预判）。
+
+    HEAD 也是站点的请求，必须过同一闸门（2026-11-27：死链预检 8 路并发
+    会自己把限流拉满——站点规则是 1 请求/秒、5 并发）。"""
+    _dl_acquire()
     try:
         req = urllib.request.Request(url, method="HEAD")
-        req.add_header("User-Agent", "Mozilla/5.0 tg-userbot-pawchive")
+        req.add_header("User-Agent", PAWCHIVE_DL_UA)
         with _DIRECT_OPENER.open(req, timeout=timeout) as r:
             return r.status
     except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            _dl_note_rate_limit(config.PAWCHIVE_429_WAIT_SECONDS)
         return e.code
     except Exception as e:
         # 异常不判死（临时网络抖动交给下载重试），但类型要可见
         return "ERR:" + type(e).__name__
+    finally:
+        _dl_release()
 
 
 def _repair_url(url, filename):
@@ -366,7 +444,7 @@ def _fetch_thumbnails(targets):
             return
         try:
             req = urllib.request.Request(thumb)
-            req.add_header("User-Agent", "Mozilla/5.0 tg-userbot-pawchive")
+            req.add_header("User-Agent", PAWCHIVE_DL_UA)
             with urllib.request.urlopen(req, timeout=30) as r:
                 if r.status != 200:
                     return
@@ -446,16 +524,21 @@ def _target_path(post, filename):
 
 def _head_alive(url):
     """直连 HEAD：返回 (status, content_length)；异常返回 (None, None)。"""
+    _dl_acquire()
     try:
         req = urllib.request.Request(url, method="HEAD")
-        req.add_header("User-Agent", "Mozilla/5.0 tg-userbot-pawchive")
+        req.add_header("User-Agent", PAWCHIVE_DL_UA)
         with _DIRECT_OPENER.open(req, timeout=15) as r:
             n = r.headers.get("Content-Length")
             return r.status, (int(n) if n else None)
     except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            _dl_note_rate_limit(config.PAWCHIVE_429_WAIT_SECONDS)
         return e.code, None
     except Exception:
         return None, None
+    finally:
+        _dl_release()
 
 
 def _download_one(post, f, progress):
@@ -486,28 +569,42 @@ def _download_one(post, f, progress):
         exc = None        # except as e 在块尾会被删除——捕获到变量再判定
         rate_limited = False
         try:
-            headers = {"User-Agent": "Mozilla/5.0 tg-userbot-pawchive"}
+            headers = {"User-Agent": PAWCHIVE_DL_UA}
             if offset:
                 headers["Range"] = f"bytes={offset}-"
-            # trust_env=False：环境/系统代理（socks5）会让 httpx 直接不可用
-            with httpx.Client(
-                    timeout=httpx.Timeout(config.DOWNLOAD_IDLE_TIMEOUT),
-                    trust_env=False, follow_redirects=True) as client:
-                with client.stream("GET", f["url"], headers=headers) as resp:
-                    if resp.status_code in _DEAD_STATUS:
-                        return ("dead", None, f"HTTP {resp.status_code}")
-                    resp.raise_for_status()
-                    if offset and resp.status_code != 206:
-                        offset = 0   # 服务端不支持 Range，从头下
-                    length = resp.headers.get("Content-Length")
-                    total = offset + (int(length) if length else 0)
-                    got = offset
-                    mode = "ab" if offset else "wb"
-                    with open(part, mode) as fh:
-                        for chunk in resp.iter_bytes(256 * 1024):
-                            fh.write(chunk)
-                            got += len(chunk)
-                            progress(got, total)
+            # 站点规则闸门：≤5 并发 + ≤1 请求/秒 + 限流全局冷却
+            _dl_acquire()
+            try:
+                # trust_env=False：环境/系统代理（socks5）会让 httpx 直接不可用
+                with httpx.Client(
+                        timeout=httpx.Timeout(config.DOWNLOAD_IDLE_TIMEOUT),
+                        trust_env=False, follow_redirects=True) as client:
+                    with client.stream("GET", f["url"],
+                                       headers=headers) as resp:
+                        if resp.status_code in _DEAD_STATUS:
+                            return ("dead", None, f"HTTP {resp.status_code}")
+                        if _is_rate_limit_page(resp):
+                            # 站点的限流拦截页（403 带 "rate limits" 文案
+                            # 或 429）：全局冷却，不算失败、不判死链
+                            _dl_note_rate_limit(
+                                config.PAWCHIVE_429_WAIT_SECONDS)
+                            raise httpx.HTTPStatusError(
+                                "rate-limited", request=resp.request,
+                                response=resp)
+                        resp.raise_for_status()
+                        if offset and resp.status_code != 206:
+                            offset = 0   # 服务端不支持 Range，从头下
+                        length = resp.headers.get("Content-Length")
+                        total = offset + (int(length) if length else 0)
+                        got = offset
+                        mode = "ab" if offset else "wb"
+                        with open(part, mode) as fh:
+                            for chunk in resp.iter_bytes(256 * 1024):
+                                fh.write(chunk)
+                                got += len(chunk)
+                                progress(got, total)
+            finally:
+                _dl_release()
             size = os.path.getsize(part)
             if total and size != total:
                 raise IOError(f"大小不符 got={size} expect={total}")
@@ -532,11 +629,13 @@ def _download_one(post, f, progress):
         rate_limited = rate_limited or (
             exc is not None and "429" in str(exc))
         if rate_limited:
-            # 429 限流：不消耗额度，等满 60s（服务端要求的节奏）
+            # 限流（429 / 站点 403 拦截页）：不消耗额度，全局冷却让所有
+            # 下载一起停 60s（站点要求 1 请求/秒，不是单文件的事）
+            _dl_note_rate_limit(config.PAWCHIVE_429_WAIT_SECONDS)
             logger.warning(
-                f"🐾 限流（429），{config.PAWCHIVE_429_WAIT_SECONDS}s 后"
-                f"断点续传：{f['filename']}")
-            time.sleep(float(config.PAWCHIVE_429_WAIT_SECONDS))
+                f"🐾 限流（站点限速 1rps/5并发），"
+                f"{config.PAWCHIVE_429_WAIT_SECONDS}s 后断点续传："
+                f"{f['filename']}")
         elif progressed:
             # 有进账的断流：不消耗重试额度，退避后从断点继续——
             # 大视频在抖动 CDN 上就是这样一段段搬完的
