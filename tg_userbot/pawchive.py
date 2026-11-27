@@ -655,7 +655,12 @@ def enqueue_plan_pending(name):
     返回 (生效名, 队列位置文案)。"""
     name = str(name or "").strip()
     state.PAW_PLAN_PENDING = name
-    q = _load_plan_pending()
+    q = [x for x in _load_plan_pending() if str(x).strip()]  # 顺带清历史垃圾
+    if not name:
+        # 空作者名不入队（2026-11-27 实测：裸 /paw_plan 撞锁后把 "" 塞
+        # 进 FIFO，白耗一次锁释放的 kick）
+        _save_plan_pending(q)
+        return "", "空作者名不入队"
     q.append(name)
     if len(q) > _PLAN_PENDING_MAX:
         dropped = len(q) - _PLAN_PENDING_MAX
@@ -673,12 +678,15 @@ state.PAW_PLAN_PENDING = state.PAW_PLAN_QUEUE[0] if state.PAW_PLAN_QUEUE else ""
 
 
 def take_plan_pending() -> str:
-    """取走队头作者（FIFO；无则空串）。"""
+    """取走队头作者（FIFO；无则空串）。历史遗留的空串垃圾顺带清掉——
+    每次锁释放的 kick 只有一发，不能被垃圾条目白耗。"""
     q = state.PAW_PLAN_QUEUE or _load_plan_pending()
-    if not q:
-        state.PAW_PLAN_PENDING = ""
-        return ""
-    name = q.pop(0)
+    name = ""
+    while q:
+        head = q.pop(0)
+        if str(head).strip():
+            name = str(head).strip()
+            break
     state.PAW_PLAN_QUEUE = q
     state.PAW_PLAN_PENDING = q[0] if q else ""
     _save_plan_pending(q)
@@ -1128,8 +1136,9 @@ async def backfill_loop():
                 if forced:
                     # 优先队列：单跑该作者、不推进游标（其余作者顺序不变）
                     done, text = await _backfill_priority_one(forced)
-                    log_backfill_round(done, text, st.get("cursor", 0))
                     if done:
+                        # 真跑过才记历史（让位重试每 10 分钟一发，别刷屏）
+                        log_backfill_round(done, text, st.get("cursor", 0))
                         # 插队作者恰是下一批队头 → 游标顺手 +1（10 分钟后
                         # 的常规轮次不重复啃他）
                         creators = list_scanned_creators()
@@ -3211,6 +3220,15 @@ async def _reply_plan(event, arg):
     if state.PAW_SCAN_RUNNING is not None:
         # 撞锁 → 自动排队：把参数记下，锁释放后按 /paw_plan 真实链路执行
         name = (arg or "").strip()
+        if not name:
+            # 裸指令撞锁：给用法提示，别把空串塞进 FIFO（2026-11-27 实测
+            # 空条目白耗一次锁释放的 kick）
+            await event.reply(
+                f"{TEXT_PREFIX}\n用法：/paw plan <作者名|名字#id|数字id> [all]"
+                "\n　　/paw plan <…> since <YYYY-MM-DD> [all]"
+                "\n重名作者用 名字#id 或纯数字 id 指定（候选见提示）",
+                link_preview=False)
+            return
         pending, displaced = enqueue_plan_pending(name)
         tip = f"\n{displaced}" if displaced else ""
         name = pending

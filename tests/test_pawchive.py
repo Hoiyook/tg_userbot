@@ -1011,6 +1011,22 @@ class PlanPendingTest(unittest.TestCase):
         self.assertEqual(pawchive.take_plan_pending(), "作者C")
         self.assertEqual(pawchive.take_plan_pending(), "")
 
+    def test_empty_name_not_enqueued_and_junk_drained(self):
+        """裸 /paw_plan 不往 FIFO 塞空串；历史空串垃圾一次 take 清完
+        （2026-11-27 实测：空条目白耗一次锁释放的 kick，真作者卡到
+        下一轮 6h 回填才轮到）。"""
+        import json as _json
+        _json.dump(["作者A", "", " ", "作者B"], open(
+            pawchive._PLAN_PENDING_FILE, "w"))
+        pending, displaced = pawchive.enqueue_plan_pending("")
+        self.assertEqual(pending, "")
+        self.assertEqual(displaced, "空作者名不入队")
+        # 一次 take 直接穿过垃圾拿到真作者，垃圾顺带清盘
+        pawchive.state.PAW_PLAN_QUEUE = pawchive._load_plan_pending()
+        self.assertEqual(pawchive.take_plan_pending(), "作者A")
+        self.assertEqual(pawchive.take_plan_pending(), "作者B")
+        self.assertEqual(pawchive._load_plan_pending(), [])
+
     def test_legacy_single_name_migrates(self):
         """旧单待办位文件（JSON 字符串）→ 启动迁移成单元素列表。"""
         import json as _json
