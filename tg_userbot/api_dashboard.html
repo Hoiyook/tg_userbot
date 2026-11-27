@@ -478,6 +478,11 @@
 </div>
 
 <script>
+// 本页的构建号（服务端注入 git short hash）。SSE 重连 / 周期核对
+// /api/version 的 commit 与此不符 → 服务端已部署新版，页面自动刷新
+// （2026-11-27 owner 实测：SSE 会自动重连但 HTML 永远停在打开时的
+// 版本，重启部署 3 次面板还显示旧布局）。
+const APP_BUILD = "__BUILD_COMMIT__";
 (() => {
   const p = new URLSearchParams(location.search);
   if (p.get("token")) localStorage.setItem("nagram_token", p.get("token"));
@@ -1583,9 +1588,11 @@ function _applyBatch(data) {
   return refresh();
 }
 
-function _connBanner(show) {
+function _connBanner(show, msg) {
   const b = document.getElementById("connBanner");
-  if (b) b.style.display = show ? "block" : "none";
+  if (!b) return;
+  if (msg) b.textContent = msg;
+  b.style.display = show ? "block" : "none";
 }
 
 function _startSSE() {
@@ -1602,7 +1609,7 @@ function _startSSE() {
       const d = JSON.parse(ev.data);
       if (d.ok) { _BATCH = d.data; refresh(); }
     };
-    es.onopen = () => { window._sseOK = true; _connBanner(false); };
+    es.onopen = () => { window._sseOK = true; _connBanner(false); checkBuild(); };
     es.onerror = () => {
       window._sseOK = false;      // 让 batch 轮询兜底接管（此前缺这行）
       _connBanner(true);
@@ -1610,6 +1617,24 @@ function _startSSE() {
     return es;
   } catch (e) { return null; }
 }
+
+// 构建号核对（2026-11-27）：SSE 每次重连（=服务端刚重启过）+ 每 10 分钟
+// 拉 /api/version，commit 变了 → 面板 HTML 是旧版，自动整页刷新。
+// 双边任一为空（git 不可用/旧缓存页）不刷——防刷新死循环。
+let _buildChecking = false;
+async function checkBuild() {
+  if (_buildChecking || !APP_BUILD) return;
+  _buildChecking = true;
+  try {
+    const v = await api("/api/version");
+    if (v.ok && v.commit && v.commit !== APP_BUILD) {
+      _connBanner(true, "面板有新版（" + v.commit + "），正在刷新…");
+      setTimeout(() => location.reload(), 800);
+    }
+  } catch (e) { /* 版本接口失败静默——下轮再试 */ }
+  finally { _buildChecking = false; }
+}
+setInterval(checkBuild, 10 * 60 * 1000);
 
 async function _refreshLoop() {
   // batch 轮询兜底（SSE 未建/断开时接管；SSE 在跑时本循环空转）

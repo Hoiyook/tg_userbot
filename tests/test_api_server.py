@@ -1621,6 +1621,48 @@ class PwaAssetsTest(unittest.IsolatedAsyncioTestCase):
             await client.close()
 
 
+class DashboardBuildInjectTest(unittest.IsolatedAsyncioTestCase):
+    """看板构建号注入（2026-11-27）：HTML 带真实 git short hash、
+    /api/version 的 commit 与之同源——前端据此自刷新（面板停在旧版的
+    根因：SSE 会重连但 HTML 从不重载）。"""
+
+    async def test_dashboard_has_real_commit_and_no_placeholder(self):
+        from tg_userbot import api_server
+        client = make_client()
+        await client.start_server()
+        try:
+            resp = await client.get("/")
+            body = await resp.text()
+            self.assertEqual(resp.headers.get("Cache-Control"), "no-store")
+            self.assertIn('APP_BUILD = "', body, "构建号必须已注入")
+            self.assertNotIn("__BUILD_COMMIT__", body,
+                              "占位符不得漏注入（前端对空值不刷新）")
+            ver = await (await client.get("/api/version")).json()
+        finally:
+            await client.close()
+        self.assertTrue(ver["ok"])
+        self.assertIn("commit", ver, "版本接口必须带 commit 字段")
+        if ver["commit"]:
+            self.assertIn(f'APP_BUILD = "{ver["commit"]}"', body,
+                          "页面构建号与 /api/version.commit 必须同源一致")
+
+    async def test_git_unavailable_injects_empty_no_loop(self):
+        """git 失败 → 注入空串（前端防死循环不刷新），而不是 500。"""
+        from tg_userbot import api_server
+        with mock.patch.object(api_server, "_git_short", return_value=""):
+            client = make_client()
+            await client.start_server()
+            try:
+                resp = await client.get("/")
+                body = await resp.text()
+                self.assertEqual(resp.status, 200)
+                ver = await (await client.get("/api/version")).json()
+            finally:
+                await client.close()
+        self.assertEqual(ver["commit"], "")
+        self.assertIn('APP_BUILD = ""', body)
+
+
 class PawBackfillEndpointTest(unittest.IsolatedAsyncioTestCase):
     """/api/paw_backfill：三段式数据源（当前/下一批/历史）全 mock。"""
 

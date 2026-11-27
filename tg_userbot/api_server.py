@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -750,11 +751,34 @@ async def _dispatch_link_text_inner(text: str, surface: str) -> dict:
 
 # ── HTTP 处理器 ──────────────────────────────────────────────
 
+def _git_short():
+    """当前构建号（git short hash，进程内缓存——部署必经 run.sh restart，
+    缓存生命周期=进程生命周期）。失败返回 ""（前端对空值不动作）。"""
+    global _GIT_COMMIT
+    if _GIT_COMMIT is None:
+        try:
+            d = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            _GIT_COMMIT = d.stdout.strip()[:12] if d.returncode == 0 else ""
+        except Exception:
+            _GIT_COMMIT = ""
+    return _GIT_COMMIT
+
+
+_GIT_COMMIT = None
+
+
 async def handle_dashboard(request):
     try:
         html = _DASHBOARD_PATH.read_text(encoding="utf-8")
     except OSError as e:
         return _json({"ok": False, "error": f"看板页面缺失：{e}"}, 500)
+    # 构建号注入（2026-11-27）：页面 JS 拿它与 /api/version 的 commit 对
+    # 比，SSE 重连发现不一致 → 自动整页刷新。SSE 会自动重连但 HTML 停在
+    # 打开时的版本——重启部署 3 次，owner 面板仍显示旧布局的根因。
+    html = html.replace("__BUILD_COMMIT__", _git_short())
     # no-store：看板随仓库更新，WebView（尤其壳 app 内）绝不许拿旧缓存——
     # 否则「后端改了 UI、手机还显示旧版」会变成玄学问题
     return web.Response(text=html, content_type="text/html", charset="utf-8",
@@ -1130,8 +1154,10 @@ async def _batch_data(paths):
 
 
 async def handle_version(request):
-    """看板/后端版本一致性核对（SW 缓存错版本时肉眼可判）。"""
-    import subprocess
+    """看板/后端版本一致性核对（SW 缓存错版本时肉眼可判）。
+
+    commit：与 handle_dashboard 注入页面的构建号同源（_git_short）——
+    前端 checkBuild 对比两者，不一致自动整页刷新（2026-11-27）。"""
     ver = "v2.24"
     try:
         d = subprocess.run(
@@ -1142,7 +1168,7 @@ async def handle_version(request):
             ver += " (" + d.stdout.strip()[:12] + ")"
     except Exception:
         pass
-    return _json({"ok": True, "version": ver})
+    return _json({"ok": True, "version": ver, "commit": _git_short()})
 
 
 def _recent_rate(window_s=60):

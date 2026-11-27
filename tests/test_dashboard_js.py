@@ -89,6 +89,34 @@ class DashboardJsStateFlagGuardTest(unittest.TestCase):
             "runCmdDirect 成功路径必须调 refreshActiveView")
 
 
+class DashboardBuildCheckGuardTest(unittest.TestCase):
+    """P3 控制（面板自刷新）：SSE 会自动重连但 HTML 停在打开时的版本——
+    重启部署后 owner 面板仍显示旧布局（2026-11-27 实测）。断言钉住
+    自刷新链路三环：构建号注入位、SSE 重连核对、不一致自动 reload。"""
+
+    def setUp(self):
+        self.js = open(_HTML, encoding="utf-8").read()
+
+    def test_build_placeholder_present(self):
+        self.assertIn('APP_BUILD = "__BUILD_COMMIT__"',
+                      self.js, "页面必须带构建号注入位（服务端替换）")
+
+    def test_sse_reconnect_triggers_build_check(self):
+        self.assertRegex(
+            self.js, r"onopen[^{]*\{[^}]*checkBuild\(\)",
+            "SSE 每次重连（=服务端刚重启）必须核对构建号")
+
+    def test_mismatch_reloads_with_both_sides_guarded(self):
+        self.assertIn("location.reload()", self.js,
+                      "构建号不一致必须整页刷新")
+        self.assertRegex(
+            self.js, r"v\.commit\s*&&\s*v\.commit\s*!==\s*APP_BUILD",
+            "只有服务端 commit 非空且与页面不一致才刷新")
+        self.assertIn("if (_buildChecking || !APP_BUILD) return;",
+                      self.js, "页面构建号为空（旧缓存页/git 失败）不得刷"
+                      "——防刷新死循环")
+
+
 class DashboardActionWhitelistGuardTest(unittest.TestCase):
     """P3 控制（双入口漂移）：hint 命令模板必须指向真实注册的命令。
 
