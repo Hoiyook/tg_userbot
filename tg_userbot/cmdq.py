@@ -88,6 +88,25 @@ _REPLAY_WRITE_COMMANDS = {
     "del", "pdclean", "cd2", "listen_interval", "caption_filter",
 }
 
+# 新鲜度豁免（2026-11-27 owner：今早重启间隙发的 /paw_plan 被当历史回放
+# 静默拦截，"没跑也找不到"）。消息发出距今 ≤ 该窗口的写指令 = 用户此刻
+# 的真实意图（重启/断连间隙漏处理的），回放直接补执行；更老的才拦。
+_REPLAY_FRESH_SECONDS = 15 * 60
+
+
+def msg_age_seconds(m):
+    """回放消息的年龄（秒）；无日期返回 None（按陈旧处理——安全默认）。"""
+    d = getattr(m, "date", None)
+    if d is None:
+        return None
+    try:
+        from datetime import datetime, timezone
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - d).total_seconds())
+    except Exception:
+        return None
+
 
 def is_app_relay_text(text):
     """🛰 app 中转消息（套壳 app 分享直达）：「🛰 <request_id> <原文>」。"""
@@ -130,8 +149,14 @@ async def _mark(chat_id, msg_id, emoji):
 # ============================================================
 # 执行一条已入账指令
 # ============================================================
-async def execute_ledger_row(row, stale_days=None):
-    """台账行执行（指令 → handle_command；🛰 中转 → handle_app_relay）。"""
+async def execute_ledger_row(row, stale_days=None, confirmed=False,
+                             msg_age=None):
+    """台账行执行（指令 → handle_command；🛰 中转 → handle_app_relay）。
+
+    confirmed=True：人工 /cmdq confirm 已批准——写操作拦截旁路（2026-11-27
+    修复：此前 confirm 再执行仍撞拦截，闸门只进不出，被拦命令永远放不
+    出来）。msg_age：消息发出年龄（秒），≤ _REPLAY_FRESH_SECONDS 的写
+    指令是重启间隙漏掉的现发指令，直接补执行不拦。"""
     chat_id, msg_id, cmd_text = row["chat_id"], row["msg_id"], row["cmd_text"]
     stale_days = stale_days or int(getattr(config, "CMDQ_STALE_DAYS", 7))
     text = cmd_text
@@ -179,13 +204,23 @@ async def execute_ledger_row(row, stale_days=None):
     # 写操作命令回放拦截（2026-11-22 事故：回放窗口扩到 3000 后把历史
     # /pd /retry 全部重放——pixeldrain 目录从头重下 + wnacg 重投）。
     # 回放只自动执行幂等安全命令；写操作标 CONFIRM 待人工 /cmdq 确认。
+    # 两个旁路（2026-11-27）：
+    #   * confirmed=True —— /cmdq confirm 已人工批准，必须放行执行；
+    #   * 消息发出 ≤15 分钟 —— 重启/断连间隙漏掉的现发指令（owner 实测
+    #     09:25 发 /paw_plan 09:26 被回放静默拦截），是当前意图不是历史
+    #     误重放，补执行并如实回执。
     head = cmd_text.strip().split()[0].lstrip("/").split("@")[0].lower() \
         if cmd_text.strip() else ""
-    if head in _REPLAY_WRITE_COMMANDS:
+    fresh = (msg_age is not None
+             and msg_age <= _REPLAY_FRESH_SECONDS)
+    if head in _REPLAY_WRITE_COMMANDS and not (confirmed or fresh):
         runtime_db.finish_cmd(chat_id, msg_id, runtime_db.CMD_CONFIRM)
         await _mark(chat_id, msg_id, "⏸")
         logger.info(f"📥 回放拦截写操作命令（待 /cmdq 确认）：{cmd_text[:40]}")
         return runtime_db.CMD_CONFIRM
+    if head in _REPLAY_WRITE_COMMANDS and not confirmed:
+        logger.info(f"📥 写指令为刚发出（{msg_age:.0f}s 前），回放补执行："
+                    f"{cmd_text[:40]}")
     from . import commands
     ev = ReplayEvent(chat_id, msg_id, cmd_text)
     try:
@@ -236,7 +271,7 @@ async def replay_chat(chat_id, execute=True):
                                  min_id=cursor, reverse=True)
     msgs = [m for m in (got or []) if m is not None and m.id > cursor]
     res = {"scanned": len(msgs), "found": 0, "executed": 0,
-           "failed": 0, "stale": 0}
+           "failed": 0, "stale": 0, "parked": 0}
     if not msgs:
         return res
     pending_rows = []
@@ -249,22 +284,38 @@ async def replay_chat(chat_id, execute=True):
         if is_command_text(text) or is_relay:
             res["found"] += 1
             if runtime_db.record_cmd(chat_id, m.id, text):
-                pending_rows.append((chat_id, m.id))
+                pending_rows.append((chat_id, m.id, msg_age_seconds(m)))
                 await _mark(chat_id, m.id, _QUEUED_MARK)
         # 水位线对每条消息推进（指令与否；成功失败无关——不卡队列）
         runtime_db.advance_cmd_cursor(chat_id, m.id)
     if not execute:
         return res
-    for chat_id_, msg_id_ in pending_rows:
+    parked = []
+    for chat_id_, msg_id_, age_ in pending_rows:
         row = runtime_db.get_cmd_status(chat_id_, msg_id_)
         if row and row["status"] == runtime_db.CMD_PENDING:
-            st = await execute_ledger_row(row)
+            st = await execute_ledger_row(row, msg_age=age_)
             if st == runtime_db.CMD_SUCCESS:
                 res["executed"] += 1
             elif st == runtime_db.CMD_FAILED:
                 res["failed"] += 1
             elif st == runtime_db.CMD_STALE:
                 res["stale"] += 1
+            elif st == runtime_db.CMD_CONFIRM:
+                res["parked"] += 1
+                parked.append(row)
+    # 拦截必须可见（2026-11-27 owner：今早 4 条 /paw_plan 被静默拦成 ⏸，
+    # "没跑也找不到"）。一次性列出本轮被拦命令与放行方式。
+    if parked:
+        try:
+            from . import notify
+            lines = ["⏸ 回放拦截写操作指令（防历史重放误执行）", ""]
+            for r in parked[:10]:
+                lines.append(f"  #{r['id']}｜{str(r['cmd_text'])[:44]}")
+            lines += ["", "查看：/cmdq 待确认　放行：/cmdq confirm <编号>"]
+            await notify.notify_user("\n".join(lines))
+        except Exception as e:
+            logger.warning(f"📥 拦截通知发送失败（不影响回放）：{e}")
     return res
 
 
@@ -281,7 +332,8 @@ async def replay_all(execute=True):
     chats.append("me")                          # 收藏夹
     for spec in getattr(config, "CMDQ_EXTRA_INTAKES", ()) or ():
         chats.append(spec)                      # 频道等（resolve 由调用方做）
-    total = {"scanned": 0, "found": 0, "executed": 0, "failed": 0, "stale": 0}
+    total = {"scanned": 0, "found": 0, "executed": 0, "failed": 0,
+             "stale": 0, "parked": 0}
     fails = []
     for chat in chats:
         try:
@@ -409,7 +461,10 @@ async def confirm_cmd(arg):
     row = runtime_db.get_cmd_ledger_row(int(tid))
     if row is None or row.get("status") != runtime_db.CMD_CONFIRM:
         return f"{TEXT_PREFIX} 台账 #{tid} 不是待确认状态（/cmdq 待确认 查看）"
-    st = await execute_ledger_row(row, stale_days=9999)  # 已人工确认，豁免过期
+    # confirmed=True 旁路写操作拦截（2026-11-27 修复：此前这里再次撞上
+    # 拦截 → 状态原地打回 CONFIRM，闸门只进不出，人工确认永远放不了行）
+    st = await execute_ledger_row(row, stale_days=9999,
+                                  confirmed=True)  # 已人工确认，豁免过期
     icon = {"SUCCESS": "✅", "FAILED": "❌", "STALE": "⏭"}.get(st, str(st))
     return f"{TEXT_PREFIX} #{tid} 人工确认执行 → {icon} {str(row.get('cmd_text'))[:40]}"
 

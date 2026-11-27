@@ -1130,11 +1130,20 @@ async def backfill_loop():
                     done, text = await _backfill_priority_one(forced)
                     log_backfill_round(done, text, st.get("cursor", 0))
                     if done:
+                        # 插队作者恰是下一批队头 → 游标顺手 +1（10 分钟后
+                        # 的常规轮次不重复啃他）
+                        creators = list_scanned_creators()
+                        cur = int(st.get("cursor", 0)) % max(len(creators), 1)
+                        if (creators and str(
+                                creators[cur].get("creator_id"))
+                                == str(forced.get("id"))):
+                            st["cursor"] = (cur + 1) % len(creators)
                         st["loop_started"] = time.time()
                         _save_pawb_state(st)
                         logger.info(f"🐾 插队回填完成：{text[:80]}")
-                    else:
-                        delay = 600   # 撞锁让位 → 10 分钟后再试（别等 6h）
+                    # 插队是加塞：短醒 10 分钟接着跑常规轮次，不吞 6h 节奏
+                    # （撞锁让位时条目已塞回队头，同样 10 分钟后重试）
+                    delay = 600
                     continue
                 # 全量摊销：每 6h 醒，一轮 72h=12 次醒；每次最多 3 作者
                 # 38 作者 → 约 2.2 天转完一圈

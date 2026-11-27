@@ -70,9 +70,10 @@ class CommandTextTest(unittest.TestCase):
 
 
 class _Msg:
-    def __init__(self, mid, text):
+    def __init__(self, mid, text, date=None):
         self.id = mid
         self.message = text
+        self.date = date
 
 
 class _Cli:
@@ -95,6 +96,12 @@ class ReplayFlowTest(_DbCase):
         self._mark = mock.patch.object(cmdq, "_mark", new=mock.AsyncMock())
         self._mark.start()
         self.addCleanup(self._mark.stop)
+        # 拦截通知（2026-11-27）必须可测且不触网
+        from tg_userbot import notify as _notify
+        self._ntf = mock.patch.object(
+            _notify, "notify_user", new=mock.AsyncMock())
+        self._notify_mock = self._ntf.start()
+        self.addCleanup(self._ntf.stop)
 
         async def fake_handle(event, cmd_text):
             self.executed.append(cmd_text)
@@ -145,6 +152,68 @@ class ReplayFlowTest(_DbCase):
         self.assertEqual(runtime_db.get_cmd_status("me", 5)["status"],
                          runtime_db.CMD_STALE)
         self.assertEqual(self.executed, [], "过期指令不执行")
+
+    def test_fresh_write_command_executes_via_replay(self):
+        """重启/断连间隙漏掉的现发指令（≤15 分钟）：写操作补执行不拦
+        （2026-11-27 owner 实测：09:25 发 /paw_plan，09:26 回放静默拦成
+        ⏸——"没跑也找不到"）；更老的写指令仍拦，但必须发 TG 通知。"""
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        msgs = [_Msg(20, "/paw_plan 作者",
+                     date=now - timedelta(seconds=120)),
+                _Msg(21, "/pd https://pixeldrain.com/l/陈年旧链",
+                     date=now - timedelta(days=2))]
+        cli = _Cli(msgs)
+        state.client = cli
+        state.bot_client = None
+        state.MY_ID = None
+        self.addCleanup(setattr, state, "client", None)
+
+        async def run():
+            return await cmdq.replay_chat("me")
+        res = asyncio.run(run())
+        self.assertEqual(res["executed"], 1, "刚发的指令直接补执行")
+        self.assertEqual(res["parked"], 1, "两天前的写指令仍然拦")
+        self.assertEqual(self.executed, ["/paw_plan 作者"])
+        # 拦截不再是静默 ⏸：一条 TG 通知列出被拦命令与放行方式
+        self.assertEqual(self._notify_mock.call_count, 1)
+        notified = self._notify_mock.call_args[0][0]
+        self.assertIn("/cmdq confirm", notified)
+        self.assertIn("/pd", notified)
+
+    def test_confirm_cmd_actually_executes(self):
+        """/cmdq confirm 真正放行（2026-11-27 修复：confirm 再执行时再次
+        撞上写操作拦截，状态原地打回 CONFIRM——闸门只进不出，人工确认
+        永远放不了行，今早 4 条 /paw_plan 因此一直卡死）。"""
+        runtime_db.record_cmd("me", 30, "/paw_plan 作者")
+        row = runtime_db.get_cmd_status("me", 30)
+        st = asyncio.run(cmdq.execute_ledger_row(row))
+        self.assertEqual(st, runtime_db.CMD_CONFIRM, "回放先拦下来")
+        self.assertEqual(self.executed, [], "未确认前不执行")
+        parked = runtime_db.list_cmd_ledger(
+            status=runtime_db.CMD_CONFIRM, limit=10)
+        self.assertEqual(len(parked), 1)
+        tid = parked[0]["id"]
+        reply = asyncio.run(cmdq.confirm_cmd(str(tid)))
+        self.assertIn("✅", reply)
+        self.assertEqual(self.executed, ["/paw_plan 作者"],
+                         "确认后必须真执行（而非原地再拦一次）")
+        self.assertEqual(
+            runtime_db.get_cmd_status("me", 30)["status"],
+            runtime_db.CMD_SUCCESS)
+
+    def test_msg_age_unknown_parks_safely(self):
+        """无日期消息按陈旧处理（安全默认）；带年龄且新鲜 → 执行。"""
+        runtime_db.record_cmd("me", 40, "/wnacg 123 作者")
+        row = runtime_db.get_cmd_status("me", 40)
+        st = asyncio.run(cmdq.execute_ledger_row(row, msg_age=None))
+        self.assertEqual(st, runtime_db.CMD_CONFIRM, "未知年龄 = 拦截")
+        runtime_db.record_cmd("me", 41, "/wnacg 124 作者")
+        row = runtime_db.get_cmd_status("me", 41)
+        st = asyncio.run(cmdq.execute_ledger_row(row, msg_age=30))
+        self.assertEqual(st, runtime_db.CMD_SUCCESS, "30 秒前 = 现发指令")
+        self.assertEqual(runtime_db.get_cmd_status("me", 40)["status"],
+                         runtime_db.CMD_CONFIRM)
 
 
 def _chat_key(chat):
