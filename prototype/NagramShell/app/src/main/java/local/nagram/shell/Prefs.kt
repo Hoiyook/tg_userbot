@@ -30,6 +30,7 @@ object Prefs {
     private const val KEY_URL = "server_url"      // 家里地址（同一 WiFi）
     private const val KEY_AWAY = "away_url"       // 外网地址（Tailscale 等）
     private const val KEY_LAST_GOOD = "last_good_url"  // 探活赢家缓存
+    private const val KEY_LOADED_BUILD = "loaded_build" // 看板加载时的构建号
     private const val KEY_TOKEN = "token"
     private const val KEY_BOT_TOKEN = "bot_token"
     private const val KEY_CHAT_ID = "chat_id"
@@ -56,6 +57,15 @@ object Prefs {
 
     fun setLastGood(ctx: Context, base: String) {
         sp(ctx).edit().putString(KEY_LAST_GOOD, base.trim().trimEnd('/')).apply()
+    }
+
+    /** 看板上次加载时的服务端构建号（git short hash）；空 = 还没记过。
+     *  ON_RESUME 时与 /api/version 比对，不一致就重载（2026-11-27）。 */
+    fun loadedBuild(ctx: Context): String =
+        sp(ctx).getString(KEY_LOADED_BUILD, "")!!.trim()
+
+    fun setLoadedBuild(ctx: Context, commit: String) {
+        sp(ctx).edit().putString(KEY_LOADED_BUILD, commit.trim()).apply()
     }
 
     /** 快速解析（不探活）：上次赢家优先 → 家里 → 外网。 */

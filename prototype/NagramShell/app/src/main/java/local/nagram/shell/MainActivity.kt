@@ -457,6 +457,31 @@ fun DashboardScreen(onEdit: () -> Unit, onOpenSpool: () -> Unit,
         }
     }
 
+    // 服务端构建号核对（2026-11-27）：WebView 只在地址/触发器变化时
+    // loadUrl，服务端重启部署后看板会一直停在旧 HTML（SSE 会自动重连，
+    // 看着像活的）。回到前台时比对 /api/version 的 commit，变了就重载。
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val obs = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                probeTrigger.value += 1
+                // 记下加载时的构建号；首次为空时只记录不重载
+                val loaded = Prefs.loadedBuild(ctx)
+                Thread {
+                    val cur = Api.buildOf(ctx)
+                    if (cur.isNotEmpty()) {
+                        if (loaded.isNotEmpty() && cur != loaded) {
+                            refreshTrigger.value += 1
+                        }
+                        Prefs.setLoadedBuild(ctx, cur)
+                    }
+                }.start()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
+
     Box(Modifier.fillMaxSize()) {
         // 下拉刷新：SwipeRefresh 包 WebView——WebView 内部滚动到顶时
         // 才触发刷新手势，刷新 = 用同一个 URL 重新 loadUrl（看板由后端

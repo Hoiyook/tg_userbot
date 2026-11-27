@@ -23,6 +23,8 @@ import unittest
 
 _HTML = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "tg_userbot", "api_dashboard.html")
+_SW = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "tg_userbot", "pwa", "sw.js")
 
 _HAS_NODE = shutil.which("node") is not None
 
@@ -115,6 +117,35 @@ class DashboardBuildCheckGuardTest(unittest.TestCase):
         self.assertIn("if (_buildChecking || !APP_BUILD) return;",
                       self.js, "页面构建号为空（旧缓存页/git 失败）不得刷"
                       "——防刷新死循环")
+
+
+class ServiceWorkerCacheGuardTest(unittest.TestCase):
+    """P4 控制（陈旧缓存）：SW 绝不能缓存看板 HTML。
+
+    2026-11-27 事故：旧 SW 把 HTML 也进缓存兜底——网络抖动时拿几天前的
+    页面顶上，页面看着"活着"（SSE 自动重连），实际是旧 UI；owner 三次
+    部署都看到旧布局。导航请求必须纯网络，失败宁可显示离线提示。"""
+
+    def setUp(self):
+        self.sw = open(_SW, encoding="utf-8").read()
+
+    def test_navigation_never_cache_fallback(self):
+        self.assertIn('e.request.mode === "navigate"', self.sw,
+                      "导航请求必须单独处理")
+        self.assertIn('cache: "no-store"', self.sw,
+                      "导航 fetch 必须绕过 HTTP 缓存")
+        nav_block = self.sw.split('e.request.mode === "navigate"')[1][:600]
+        self.assertNotIn("caches.match", nav_block,
+                         "导航失败绝不回退到缓存 HTML（旧 UI 伪装新版本）")
+
+    def test_only_static_assets_cached(self):
+        self.assertIn("ASSETS =", self.sw)
+        self.assertIn("manifest.json", self.sw)
+
+    def test_sw_registration_bypasses_http_cache(self):
+        js = open(_HTML, encoding="utf-8").read()
+        self.assertIn('updateViaCache: "none"', js,
+                      "SW 脚本自身必须绕过 HTTP 缓存，否则旧 SW 常驻")
 
 
 class DashboardActionWhitelistGuardTest(unittest.TestCase):

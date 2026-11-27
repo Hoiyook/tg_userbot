@@ -1740,7 +1740,11 @@ refresh();
 loadBackup();
 // PWA：注册 Service Worker（可安装到主屏幕 + 系统分享面板接收）
 if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("/sw.js").catch(() => {});
+  // updateViaCache:none（2026-11-27）：SW 脚本自身不吃 HTTP 缓存，否则
+  // 旧 SW 会一直跑旧逻辑（旧逻辑缓存 HTML → 手机永远看到旧面板）。
+  navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" })
+    .then(reg => { try { reg.update(); } catch (e) {} })
+    .catch(() => {});
 }
 </script>
 </body>

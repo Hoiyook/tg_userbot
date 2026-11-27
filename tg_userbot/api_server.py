@@ -2162,8 +2162,11 @@ async def handle_pwa_file(request):
     ctype = _PWA_FILES[name][1]
     if ctype.startswith("image/"):
         return web.Response(body=path.read_bytes(), content_type=ctype)
+    # sw.js / manifest：no-cache（2026-11-27）——SW 自身被 HTTP 缓存住
+    # 就永远跑旧逻辑（旧逻辑会缓存 HTML → 手机永远看到旧面板）。
     return web.Response(text=path.read_text(encoding="utf-8"),
-                        content_type=ctype)
+                        content_type=ctype,
+                        headers={"Cache-Control": "no-cache"})
 
 
 async def handle_share_page(request):

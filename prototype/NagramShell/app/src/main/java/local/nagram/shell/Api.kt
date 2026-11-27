@@ -162,6 +162,32 @@ object Api {
         false
     }
 
+    /** 当前服务端构建号（git short hash）；不可达/旧服务（无该字段）返回 ""。
+     *  用途：回到前台时比对，不一致就重载看板（2026-11-27：WebView 只在
+     *  地址变化时 loadUrl，服务端重启部署后面板一直停在旧 HTML）。 */
+    fun buildOf(ctx: android.content.Context): String = try {
+        val base = Prefs.resolveCached(ctx)
+        if (!base.startsWith("http")) "" else {
+            val conn = URL("$base/api/version").openConnection()
+                    as HttpURLConnection
+            conn.connectTimeout = 2_000
+            conn.readTimeout = 2_000
+            conn.instanceFollowRedirects = false
+            val token = Prefs.token(ctx)
+            if (token.isNotEmpty()) conn.setRequestProperty("X-Token", token)
+            var out = ""
+            if (conn.responseCode == 200) {
+                val body = conn.inputStream?.bufferedReader()?.use { it.readText() }
+                    ?: ""
+                out = try { JSONObject(body).optString("commit", "") } catch (e: Exception) { "" }
+            }
+            conn.disconnect()
+            out
+        }
+    } catch (e: Exception) {
+        ""
+    }
+
     fun postEnqueue(ctx: android.content.Context, text: String,
                     requestId: String): Result {
         val base = Prefs.resolveCached(ctx)

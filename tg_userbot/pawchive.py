@@ -53,11 +53,17 @@ _SPAWNED_SCANS = set()
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def _http_get_json(url, cookie=None, timeout=30, retries=4):
+def _http_get_json(url, cookie=None, timeout=30, retries=4, deadline=None):
     """GET 并解析 JSON；429/5xx/网络抖动按指数退避重试。
 
     收藏接口单次可能 >30s（返回全量收藏帖子），调用方给足 timeout。
-    """
+
+    慢滴防护（2026-11-27，Unajyu 两次扫描失败的根因之二）：站点会把
+    body 以 ~16 KB/s 慢滴再断——urllib 的 timeout 是**单次 socket 读**
+    超时，服务器每滴一块就续命一次，`r.read()` 可以无限挂。这里改成
+    分块读 + 挂钟总上限（默认 max(timeout*2, 120)s），到点抛
+    TimeoutError 交给重试/降级，绝不无限等。"""
+    limit = float(deadline if deadline is not None else max(timeout * 2, 120))
     last = None
     for attempt in range(retries):
         try:
@@ -65,8 +71,19 @@ def _http_get_json(url, cookie=None, timeout=30, retries=4):
             req.add_header("User-Agent", _UA)
             if cookie:
                 req.add_header("Cookie", cookie)
+            t0 = time.monotonic()
             with _DIRECT_OPENER.open(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
+                buf = bytearray()
+                while True:
+                    if time.monotonic() - t0 > limit:
+                        raise TimeoutError(
+                            f"慢滴超限：{limit:.0f}s 内只收到 "
+                            f"{len(buf) // 1024} KB（{url}）")
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                return json.loads(bytes(buf).decode("utf-8"))
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
                 last = e
@@ -1402,7 +1419,7 @@ def fetch_creator_posts(service, creator_id, cookie=None, progress=None,
     while True:
         page = _http_get_json(
             f"{config.PAWCHIVE_API_BASE}/api/v1/{service}/user/{creator_id}"
-            f"/posts?o={offset}", cookie=cookie, timeout=90)
+            f"/posts?o={offset}", cookie=cookie, timeout=90, deadline=60)
         posts.extend(page)
         if progress:
             progress(f"已拉取 {len(posts)} 条")
@@ -1429,45 +1446,17 @@ def fetch_creator_posts(service, creator_id, cookie=None, progress=None,
         offset += _PAGE
 
 
-def fetch_favorited_ids(cookie, deadline_seconds=120):
+def fetch_favorited_ids(cookie):
     """当前账号收藏的全部帖子 id（Cookie 会话）。阻塞且慢（>30s 常态）。
 
     2026-11-27 实测（Unajyu 扫描卡 53 分钟的根因）：favorites 接口会
-    header 5s 后以 ~16 KB/s 慢滴 body 再断——urllib 的 timeout=180 是
-    **单次 socket 读**的超时，服务器每滴一块就续命，永远触发不了。
-    必须用挂钟 deadline 兜底：到点 raise，调用方降级为「无收藏对比」
-    （本来就有降级路径），不能让整场扫描无限挂。"""
-    url = f"{config.PAWCHIVE_API_BASE}/api/v1/account/favorites?type=post"
-    deadline = time.monotonic() + float(deadline_seconds)
-    total = 0
-    t0 = time.time()
-    # 不走 _http_get_json（它是重试循环，单次超时语义兜不住慢滴）——
-    # 直接读，每次 read 前查挂钟，一次网络异常直接放弃（不再重试：慢滴
-    # 场景重试只会翻倍等待，降级比硬等强）。
-    req = urllib.request.Request(url)
-    req.add_header("User-Agent", _UA)
-    if cookie:
-        req.add_header("Cookie", cookie)
-    try:
-        with _DIRECT_OPENER.open(req, timeout=30) as r:
-            raw = bytearray()
-            while True:
-                if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        f"收藏清单 {deadline_seconds}s 内没收完"
-                        f"（{total // 1024} KB，{time.time() - t0:.0f}s）"
-                        "——站点慢滴，本次降级为无收藏对比")
-                chunk = r.read(65536)
-                if not chunk:
-                    break
-                raw.extend(chunk)
-                total += len(chunk)
-            favs = json.loads(bytes(raw).decode("utf-8"))
-            logger.info(f"🐾 收藏清单 {total // 1024} KB 收完"
-                        f"（{time.time() - t0:.0f}s）")
-            return {str(f["id"]) for f in favs}
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"HTTP {e.code}: {url}") from e
+    header 5s 后以 ~16 KB/s 慢滴 body 再断——交给 _http_get_json 的
+    挂钟 deadline 兜底，到点抛错，调用方降级为「无收藏对比」（本来就有
+    降级路径），不让整场扫描无限挂。"""
+    favs = _http_get_json(
+        f"{config.PAWCHIVE_API_BASE}/api/v1/account/favorites?type=post",
+        cookie=cookie, timeout=30, retries=2, deadline=150)
+    return {str(f["id"]) for f in favs}
 
 
 def validate_cookie_blocking(cookie=None, timeout=20, retries=2):

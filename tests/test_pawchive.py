@@ -220,7 +220,7 @@ class EarlyStopTest(unittest.TestCase):
         """pages: 每页返回的帖子 id 列表；known: 预置已入库集合。"""
         calls = []
 
-        def fake_get_json(url, cookie=None, timeout=30, retries=4):
+        def fake_get_json(url, cookie=None, timeout=30, retries=4, **kw):
             offset = int(url.split("o=")[1])
             calls.append(offset)
             idx = offset // 50
@@ -1036,38 +1036,65 @@ class PlanPendingTest(unittest.TestCase):
 
 
 class SlowDripFavoritesTest(unittest.TestCase):
-    """收藏接口慢滴兜底（2026-11-27 Unajyu 卡 53 分钟根因）：favorites
-    以 ~16 KB/s 慢滴再断——urllib 单次读 timeout 永远触发不了（每滴
-    一块续命一次）。挂钟 deadline 到点必须抛，让扫描降级为无收藏对比，
-    而不是无限挂死。"""
+    """接口慢滴兜底（2026-11-27 Unajyu 两次扫描失败根因）：站点把 body
+    以 ~16 KB/s 慢滴再断——urllib 单次读 timeout 永远触发不了（每滴一块
+    续命一次）。挂钟 deadline 到点必须抛，交给重试/降级，不许无限挂。"""
+
+    class _DripBody:
+        """模拟站点慢滴：每 read 都给一小块，永不停。"""
+        reads = 0
+
+        def read(self, n=-1):
+            type(self).reads += 1
+            return b"x" * 1024
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _DripOpener:
+        def open(self, req, timeout=None):
+            return SlowDripFavoritesTest._DripBody()
 
     def test_deadline_aborts_slow_drip(self):
-        import urllib.error
+        from unittest import mock
+        SlowDripFavoritesTest._DripBody.reads = 0
+        with mock.patch.object(pawchive, "_DIRECT_OPENER", self._DripOpener()):
+            with self.assertRaises(RuntimeError) as cm:
+                pawchive._http_get_json("https://x/api", timeout=5,
+                                        retries=1, deadline=0.3)
+        self.assertIn("慢滴超限", str(cm.exception))
+        self.assertGreater(SlowDripFavoritesTest._DripBody.reads, 0,
+                           "至少读了几块才判超限（不是零字节秒抛）")
+
+    def test_normal_body_still_parses(self):
+        """正常响应改成分块读后仍能正确解析（防修 A 坏 B）。"""
+        import json as _json
         from unittest import mock
 
-        class _DripBody:
-            """模拟站点慢滴：每 read 都给一小块，永不停。"""
-            def __init__(self):
-                self.reads = 0
+        class _OkBody:
+            def __init__(self, data):
+                self._b = data
+
             def read(self, n=-1):
-                self.reads += 1
-                return b"x" * 1024
+                out, self._b = self._b, b""
+                return out
+
             def __enter__(self):
                 return self
+
             def __exit__(self, *a):
                 return False
 
-        class _DripOpener:
+        class _OkOpener:
             def open(self, req, timeout=None):
-                return _DripBody()
+                return _OkBody(_json.dumps([{"id": "1"}, {"id": "2"}]).encode())
 
-        with mock.patch.object(pawchive, "_DIRECT_OPENER", _DripOpener()):
-            with self.assertRaises(TimeoutError):
-                pawchive.fetch_favorited_ids("cookie=session",
-                                            deadline_seconds=1)
-        # deadline 极短也应等到至少几块再判——不是零字节秒抛
-        self.assertGreaterEqual(_DripBody.reads if hasattr(_DripBody, "reads")
-                                else 0, 0)
+        with mock.patch.object(pawchive, "_DIRECT_OPENER", _OkOpener()):
+            self.assertEqual(
+                pawchive.fetch_favorited_ids("cookie=session"), {"1", "2"})
 
 
 class RefreshOnMissTest(unittest.TestCase):

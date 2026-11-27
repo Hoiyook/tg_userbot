@@ -4475,7 +4475,7 @@ class UntilDateEarlyStopTest(unittest.TestCase):
         """构造分页假 HTTP：pages 是 [[{published}...], ...] 逐页返回。"""
         calls = {"offset": []}
 
-        def fake_http(url, cookie=None, timeout=90):
+        def fake_http(url, cookie=None, timeout=90, **kw):
             offset = int(url.split("o=")[1])
             calls["offset"].append(offset)
             return pages[offset // 50] if offset // 50 < len(pages) else []
