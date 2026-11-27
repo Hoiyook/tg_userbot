@@ -851,6 +851,61 @@ def take_plan_pending() -> str:
     return name
 
 
+_PAW_ACTIVE_FILE = os.path.join(config.RUNTIME_DIR, "paw_scan_active.json")
+
+
+def _active_path():
+    return _PAW_ACTIVE_FILE
+
+
+def _mark_active_scan(creator, scope, since):
+    """扫描开跑前落盘（2026-11-27 事故：待办队列弹出的 Rat_Huang 扫描
+    被重启打断——队列项已弹走、状态只在内存，重启即静默丢失）。"""
+    try:
+        os.makedirs(config.RUNTIME_DIR, exist_ok=True)
+        tmp = _active_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"label": _creator_label(creator),
+                       "creator": creator, "scope": scope,
+                       "since": since, "ts": time.time()},
+                      f, ensure_ascii=False)
+        os.replace(tmp, _active_path())
+    except Exception as e:
+        logger.warning(f"🐾 在飞扫描登记失败（不影响扫描）：{e}")
+
+
+def _clear_active_scan():
+    try:
+        os.remove(_active_path())
+    except OSError:
+        pass
+
+
+def recover_interrupted_scan():
+    """启动时：上次扫描被重启打断 → 重新排队 + 通知（返回说明文案）。"""
+    try:
+        with open(_active_path(), encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    _clear_active_scan()
+    label = str(rec.get("label") or "").strip()
+    if not label:
+        return ""
+    pending, note = enqueue_plan_pending(label)
+    msg = (f"♻️ 上次扫描「{label}」被重启打断，已重新排队（{note}），"
+           "结束后自动执行")
+    logger.info(f"🐾 恢复被打断的扫描：{label}（{note}）")
+    try:
+        import asyncio as _a
+        loop = _a.get_event_loop()
+        if loop.is_running():
+            loop.create_task(notify_user(msg))
+    except Exception:
+        pass
+    return msg
+
+
 def plan_queue_view():
     """待扫描队列（面板展示用）：FIFO 位次 + 作者名。"""
     q = [str(x).strip() for x in _load_plan_pending() if str(x).strip()]
@@ -923,12 +978,29 @@ async def _kick_plan_pending():
         else:
             creator = None
         if creator is not None:
-            start_scan(creator)
+            out = await start_scan(creator)
+            # 回执（2026-11-27）：自动执行必须有动静——此前静默启动，
+            # 用户只看到"已排队"然后再无下文（Rat_Huang 两次无声失踪）
+            logger.info(f"🐾 待办自动扫描：{name} → {str(out)[:60]}")
+            if "已排队" in str(out):
+                logger.warning(f"🐾 待办自动扫描再次撞锁：{name}")
             return
         # 解析不出：按文本回填兜底（backfill_author 自带防混校验）
-        await backfill_author(name)
+        out = await backfill_author(name)
+        logger.info(f"🐾 待办按文本回填：{name} → {str(out)[:60]}")
+        if "没有叫" in str(out) or "❌" in str(out):
+            # 解析/回填都失败 → 必须让用户知道（否则就是静默丢弃）
+            try:
+                await notify_user(f"⚠️ 待办 /paw_plan「{name}」无法执行：\n"
+                                  f"{str(out)[:300]}")
+            except Exception:
+                pass
     except Exception as e:
         logger.exception(f"🐾 待办自动回填失败：{e}")
+        try:
+            await notify_user(f"❌ 待办 /paw_plan「{name}」执行异常：{e}")
+        except Exception:
+            pass
 
 
 # ---- 回填断点续跑（2026-11-27）：重启/让位打断后不从头再来 ----
@@ -2134,6 +2206,7 @@ async def start_scan(creator, scope="notfaved", since=None):
     state.PAW_SCAN_RUNNING = _creator_label(creator)
     state.PAW_SCAN_PROGRESS = {
         "started": time.monotonic(), "stage": "准备中", "detail": ""}
+    _mark_active_scan(creator, scope, since)
     task = asyncio.create_task(_scan_and_notify(creator, scope, since))
     _SPAWNED_SCANS.add(task)
     task.add_done_callback(_SPAWNED_SCANS.discard)
@@ -2315,6 +2388,7 @@ async def _scan_and_notify(creator, scope, since=None):
     finally:
         state.PAW_SCAN_RUNNING = None
         state.PAW_SCAN_PROGRESS = {}
+        _clear_active_scan()      # 扫描结束（成功/失败/取消）清在飞登记
         await _kick_plan_pending()
 
 

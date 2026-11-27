@@ -1949,6 +1949,12 @@ async def main():
         cmdq_task = asyncio.create_task(cmdq.replay_loop())
         # 卡死哨兵：DB 快照判卡死 + 代理失联，通知带 30min 冷却
         health_monitor_task = health.start_monitor()
+        # 上次扫描被重启打断 → 重新排队（2026-11-27：待办队列弹出的
+        # 扫描被重启打死时，队列项已弹走、状态只在内存——静默丢失）
+        try:
+            pawchive.recover_interrupted_scan()
+        except Exception as e:
+            logger.warning(f"🐾 恢复被打断的扫描失败：{e}")
         # Pawchive 定期 backfill：所有已扫作者轮巡回填（对账三层挡重复，
         # 串行+节流防风控），让位人工扫描
         pawb_task = asyncio.create_task(pawchive.backfill_loop())

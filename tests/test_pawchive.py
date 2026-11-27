@@ -1064,6 +1064,38 @@ class PlanPendingTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("空", msg)
 
+    def test_interrupted_scan_recovered_on_startup(self):
+        """重启打断的在飞扫描 → 启动时重新排队（2026-11-27 Rat_Huang
+        两次被排出队后静默失踪的修复）。"""
+        self._af = mock.patch.object(
+            pawchive, "_active_path",
+            return_value=os.path.join(_TMP, "paw_active_test.json"))
+        self._af.start()
+        self.addCleanup(self._af.stop)
+        pawchive._mark_active_scan(
+            {"service": "patreon", "id": "14959976", "name": "Rat_Huang"},
+            "all", None)
+        self.assertTrue(os.path.exists(pawchive._active_path()))
+        self.addCleanup(pawchive._clear_active_scan)
+        with mock.patch.object(pawchive, "notify_user", new=mock.AsyncMock()), \
+                mock.patch.object(pawchive.asyncio, "get_event_loop",
+                                  side_effect=RuntimeError("no loop")):
+            msg = pawchive.recover_interrupted_scan()
+        self.assertIn("Rat_Huang", msg)
+        self.assertIn("重新排队", msg)
+        self.assertFalse(os.path.exists(pawchive._active_path()),
+                         "恢复后必须清登记（防每次启动重复排队）")
+        names = [x["name"] for x in pawchive.plan_queue_view()]
+        self.assertIn("Rat_Huang", names)
+
+    def test_recover_noop_without_marker(self):
+        self._af = mock.patch.object(
+            pawchive, "_active_path",
+            return_value=os.path.join(_TMP, "paw_active_none.json"))
+        self._af.start()
+        self.addCleanup(self._af.stop)
+        self.assertEqual(pawchive.recover_interrupted_scan(), "")
+
     def test_legacy_single_name_migrates(self):
         """旧单待办位文件（JSON 字符串）→ 启动迁移成单元素列表。"""
         import json as _json
