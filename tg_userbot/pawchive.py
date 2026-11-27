@@ -1429,12 +1429,45 @@ def fetch_creator_posts(service, creator_id, cookie=None, progress=None,
         offset += _PAGE
 
 
-def fetch_favorited_ids(cookie):
-    """当前账号收藏的全部帖子 id（Cookie 会话）。阻塞且慢（>30s 常态）。"""
-    favs = _http_get_json(
-        f"{config.PAWCHIVE_API_BASE}/api/v1/account/favorites?type=post",
-        cookie=cookie, timeout=180)
-    return {str(f["id"]) for f in favs}
+def fetch_favorited_ids(cookie, deadline_seconds=120):
+    """当前账号收藏的全部帖子 id（Cookie 会话）。阻塞且慢（>30s 常态）。
+
+    2026-11-27 实测（Unajyu 扫描卡 53 分钟的根因）：favorites 接口会
+    header 5s 后以 ~16 KB/s 慢滴 body 再断——urllib 的 timeout=180 是
+    **单次 socket 读**的超时，服务器每滴一块就续命，永远触发不了。
+    必须用挂钟 deadline 兜底：到点 raise，调用方降级为「无收藏对比」
+    （本来就有降级路径），不能让整场扫描无限挂。"""
+    url = f"{config.PAWCHIVE_API_BASE}/api/v1/account/favorites?type=post"
+    deadline = time.monotonic() + float(deadline_seconds)
+    total = 0
+    t0 = time.time()
+    # 不走 _http_get_json（它是重试循环，单次超时语义兜不住慢滴）——
+    # 直接读，每次 read 前查挂钟，一次网络异常直接放弃（不再重试：慢滴
+    # 场景重试只会翻倍等待，降级比硬等强）。
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", _UA)
+    if cookie:
+        req.add_header("Cookie", cookie)
+    try:
+        with _DIRECT_OPENER.open(req, timeout=30) as r:
+            raw = bytearray()
+            while True:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"收藏清单 {deadline_seconds}s 内没收完"
+                        f"（{total // 1024} KB，{time.time() - t0:.0f}s）"
+                        "——站点慢滴，本次降级为无收藏对比")
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                raw.extend(chunk)
+                total += len(chunk)
+            favs = json.loads(bytes(raw).decode("utf-8"))
+            logger.info(f"🐾 收藏清单 {total // 1024} KB 收完"
+                        f"（{time.time() - t0:.0f}s）")
+            return {str(f["id"]) for f in favs}
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code}: {url}") from e
 
 
 def validate_cookie_blocking(cookie=None, timeout=20, retries=2):

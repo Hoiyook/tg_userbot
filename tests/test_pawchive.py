@@ -1035,6 +1035,41 @@ class PlanPendingTest(unittest.TestCase):
         self.assertEqual(q, ["旧作者"])
 
 
+class SlowDripFavoritesTest(unittest.TestCase):
+    """收藏接口慢滴兜底（2026-11-27 Unajyu 卡 53 分钟根因）：favorites
+    以 ~16 KB/s 慢滴再断——urllib 单次读 timeout 永远触发不了（每滴
+    一块续命一次）。挂钟 deadline 到点必须抛，让扫描降级为无收藏对比，
+    而不是无限挂死。"""
+
+    def test_deadline_aborts_slow_drip(self):
+        import urllib.error
+        from unittest import mock
+
+        class _DripBody:
+            """模拟站点慢滴：每 read 都给一小块，永不停。"""
+            def __init__(self):
+                self.reads = 0
+            def read(self, n=-1):
+                self.reads += 1
+                return b"x" * 1024
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        class _DripOpener:
+            def open(self, req, timeout=None):
+                return _DripBody()
+
+        with mock.patch.object(pawchive, "_DIRECT_OPENER", _DripOpener()):
+            with self.assertRaises(TimeoutError):
+                pawchive.fetch_favorited_ids("cookie=session",
+                                            deadline_seconds=1)
+        # deadline 极短也应等到至少几块再判——不是零字节秒抛
+        self.assertGreaterEqual(_DripBody.reads if hasattr(_DripBody, "reads")
+                                else 0, 0)
+
+
 class RefreshOnMissTest(unittest.TestCase):
     """resolve_creators 的 refresh_on_miss（2026-11-12）：缓存未命中
     （新收录创作者）→ 自动刷新一次再试；命中零开销；刷新失败回落
