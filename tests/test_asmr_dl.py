@@ -640,3 +640,47 @@ class FetchBudgetTest(_AsmrDbTestCase):
                                   new=mock.AsyncMock(return_value=True)):
             out = asyncio.run(asmr_dl._process_task(task))
         self.assertEqual(out["files"], 1)
+
+
+class SizeDriftTest(unittest.TestCase):
+    """CDN 偶发多吐字节（22:50 实测 20727940 vs 声明 20203652，+0.5MB）
+    → 压线容差内裁剪收下，不整文件重来；超容差仍是硬错。"""
+
+    def _prep(self, total):
+        import shutil as _sh
+        d = tempfile.mkdtemp(prefix="asmr_drift_", dir=_TMP)
+        self.addCleanup(_sh.rmtree, d, ignore_errors=True)
+        dest = os.path.join(d, "a.mp3")
+        with open(dest + ".part", "wb") as f:
+            f.write(b"x" * total)
+        return dest
+
+    def test_small_drift_truncated_and_accepted(self):
+        expected = 20203652
+        dest = self._prep(expected + 500000)
+        # _download_once 正常返回（part 已就位），只走对账段
+        with mock.patch.object(asmr_dl, "_download_once"), \
+                mock.patch.object(asmr_dl.os.path, "getsize",
+                                  return_value=expected + 500000):
+            size = asmr_dl.download_file_blocking("u", dest, expected)
+        self.assertEqual(size, expected)
+        self.assertEqual(os.path.getsize(dest), expected)
+        self.assertFalse(os.path.exists(dest + ".part"))
+
+    def test_huge_drift_still_raises(self):
+        dest = self._prep(99999999)
+        with mock.patch.object(asmr_dl, "_download_once"), \
+                mock.patch.object(asmr_dl.os.path, "getsize",
+                                  return_value=99999999):
+            with self.assertRaises(RuntimeError) as cm:
+                asmr_dl.download_file_blocking("u", dest, expected=1000)
+        self.assertIn("大小不符", str(cm.exception))
+
+    def test_exact_size_untouched(self):
+        expected = 1000
+        dest = self._prep(expected)
+        with mock.patch.object(asmr_dl, "_download_once"), \
+                mock.patch.object(asmr_dl.os.path, "getsize",
+                                  return_value=expected):
+            size = asmr_dl.download_file_blocking("u", dest, expected)
+        self.assertEqual(size, expected)

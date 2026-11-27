@@ -231,11 +231,20 @@ def download_file_blocking(url, dest, expected=None, attempts=3):
     if size < 0:
         raise RuntimeError(f"下载失败：{last_err or '无字节落盘'}")
     if expected and size != int(expected):
-        try:
-            os.remove(part)
-        except OSError:
-            pass
-        raise RuntimeError(f"大小不符：{size} ≠ API 声明 {expected}")
+        # CDN 偶发多吐字节（22:50 实测 20727940 vs 声明 20203652，多
+        # 524288B = 恰一个 512KB 分块）——容差内裁剪收下，超出才算真不符
+        drift = size - int(expected)
+        if 0 < drift <= max(2 * 1024 * 1024, int(expected) // 50):
+            with open(part, "r+b") as f:
+                f.truncate(int(expected))
+            logger.warning(f"🎧 CDN 多吐 {drift}B，裁剪到声明大小收下")
+            size = int(expected)
+        else:
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            raise RuntimeError(f"大小不符：{size} ≠ API 声明 {expected}")
     os.replace(part, dest)
     return size
 
