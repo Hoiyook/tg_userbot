@@ -2496,8 +2496,27 @@ async def start_api(bind=None, port=None, token=None):
     try:
         await site.start()
     except OSError as e:
+        # 占用者指认（2026-11-27 实测：遗留的 http.server 预览抢了 8765，
+        # 『address already in use』不给占用者 PID 就得人肉 lsof——直接把
+        # lsof 结果打进日志，一眼定位杀谁）
+        holder = ""
+        try:
+            p = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
+                capture_output=True, text=True, timeout=5)
+            pid_list = list(dict.fromkeys(
+                ln.strip()[1:] for ln in p.stdout.splitlines()
+                if ln.startswith("p")))
+            if pid_list:
+                ps = subprocess.run(
+                    ["ps", "-o", "command=", "-p", ",".join(pid_list)],
+                    capture_output=True, text=True, timeout=5)
+                holder = (f"｜占用者 PID {'、'.join(pid_list)}："
+                          + ps.stdout.strip()[:80])
+        except Exception:
+            pass
         logger.error(f"❌ 本地 API 启动失败（端口 {bind}:{port}）：{e}"
-                     "——不影响其余功能")
+                     f"{holder}——不影响其余功能")
         await runner.cleanup()
         return
     logger.info(
