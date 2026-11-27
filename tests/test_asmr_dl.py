@@ -6,6 +6,7 @@
 临时目录，退出时回收。运行方式（项目根目录）：
     .venv/bin/python -m unittest tests.test_asmr_dl -v
 """
+import asyncio
 import atexit
 import os
 import shutil
@@ -580,3 +581,62 @@ class DownloadStallWatchdogTest(unittest.TestCase):
         data = [b"a" * 4096] * 10
         out = self._run_once(iter(data), window=0.1, floor=256)
         self.assertEqual(len(out), 40960)
+
+
+class FetchBudgetTest(_AsmrDbTestCase):
+    """拉文件树必须有协程级超时（2026-11-27：worker 卡在"开始"后 10+
+    分钟零日志/零 .part/无 CDN 连接——socks 代理下连接挂死不认 httpx
+    超时，整个 worker 被一条僵尸线程占死）。"""
+
+    def test_hung_fetch_aborts_with_timeout(self):
+        import time as _t
+        import threading
+
+        def hang(*a, **k):
+            _t.sleep(2)          # 模拟挂死（不返回）
+            return {"files": []}
+
+        task = {"rj": 999001, "title": "T", "only_filter": ""}
+        runtime_db.enqueue_asmr_task(999001, title="T", circle="",
+                                     total_files=0, size_bytes=0)
+        with mock.patch.object(asmr_dl, "fetch_work_info_blocking",
+                               side_effect=hang), \
+                mock.patch.object(config, "ASMR_FETCH_BUDGET_SECONDS", 0.2):
+            t0 = _t.monotonic()
+            with self.assertRaises(TimeoutError) as cm:
+                asyncio.run(asmr_dl._process_task(task))
+            spent = _t.monotonic() - t0
+        self.assertIn("拉文件树超过", str(cm.exception))
+        # 注：asyncio.run 退出时会 join 默认执行器线程（挂死线程 2s 才返回），
+        # 所以整体耗时会接近挂死时长；常驻进程里不存在这个 join，僵尸线程
+        # 直接泄漏（与 download_with_watchdog 同策略）。这里断言"预算生效
+        # 且异常类型正确"即可。
+        self.assertLess(spent, 3.0)
+
+    def test_normal_fetch_unaffected(self):
+        from tg_userbot import task_worker
+        info = {"title": "T", "circle": "C", "source_id": "",
+                "files": [{"path": "a.wav", "size": 10, "url": "u"}]}
+        task = {"rj": 999002, "title": "T", "only_filter": ""}
+        runtime_db.enqueue_asmr_task(999002, title="T", circle="",
+                                     total_files=0, size_bytes=0)
+
+        async def fake_dl(*a, **k):
+            return ("done", 10, None)
+
+        async def fake_cp(*a, **k):
+            return 10
+
+        with mock.patch.object(asmr_dl, "fetch_work_info_blocking",
+                               return_value=info), \
+                mock.patch.object(task_worker, "download_with_watchdog",
+                                  new=fake_dl), \
+                mock.patch.object(task_worker, "copy_with_watchdog",
+                                  new=fake_cp), \
+                mock.patch("tg_userbot.extract_worker.mount_of",
+                           return_value=self.dir), \
+                mock.patch.object(config, "ASMR_THROTTLE_SECONDS", 0.0), \
+                mock.patch.object(asmr_dl, "_wait_remote_file",
+                                  new=mock.AsyncMock(return_value=True)):
+            out = asyncio.run(asmr_dl._process_task(task))
+        self.assertEqual(out["files"], 1)

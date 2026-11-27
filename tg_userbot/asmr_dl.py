@@ -326,7 +326,18 @@ async def _process_task(task):
     """处理一部：拉文件树 → 逐文件下载（幂等跳过已就位）→ 拷挂载 → 续租。"""
     rj = task["rj"]
     only = (task.get("only_filter") or "").strip() or None
-    info = await asyncio.to_thread(fetch_work_info_blocking, rj)
+    # 拉文件树必须有协程侧兜底（2026-11-27 实测：worker 卡在"开始"后
+    # 10+ 分钟零日志、零 .part、无 CDN 连接——socks 代理下的连接/DNS
+    # 挂死不吃 httpx 超时）。超时弃线程重试，同 download_with_watchdog 套路。
+    fetch_budget = float(getattr(config, "ASMR_FETCH_BUDGET_SECONDS", 120.0))
+    try:
+        info = await asyncio.wait_for(
+            asyncio.to_thread(fetch_work_info_blocking, rj),
+            timeout=fetch_budget)
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"拉文件树超过 {int(fetch_budget)}s 无响应"
+            "（代理/DNS 挂死），弃线程转重试")
     files = apply_only_filter(info["files"], only)
     if not files:
         raise RuntimeError(f"only「{only}」没有命中任何文件路径")

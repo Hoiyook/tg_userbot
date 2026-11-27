@@ -1716,6 +1716,9 @@ ASMR_API_BASE = ((os.environ.get("TG_ASMR_API") or "").strip()
 ASMR_REMOTE_DIR = "/115open/声音/asmr"   # 落盘：声音/asmr/RJ号/（盘上既有约定）
 ASMR_THROTTLE_SECONDS = 3.0              # 相邻文件间隔（社区公益库，克制）
 ASMR_FETCH_TIMEOUT_SECONDS = 25          # API 元数据/文件树超时
+# 拉文件树的协程级总预算（2026-11-27：socks 代理下连接挂死不吃 httpx
+# 超时，worker 卡"开始"后零日志零进度——超预算弃线程转重试）
+ASMR_FETCH_BUDGET_SECONDS = 120.0
 ASMR_FILE_TIMEOUT_SECONDS = 60.0         # 单文件下载读超时（流式分块）
 ASMR_MAX_ATTEMPTS = 5                    # 作品级失败重试上限（瞬时故障不占）
 ASMR_UPLOAD_WAIT_TRIES = 40              # 收尾等 CD2 后台上传的轮数
