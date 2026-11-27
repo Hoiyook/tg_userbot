@@ -96,6 +96,7 @@ ACTION_WHITELIST = {
     "paw_pause": "Pawchive 暂停下载 worker",
     "paw_resume": "Pawchive 恢复下载 worker",
     "paw_status": "Pawchive 状态视图",
+    "pawb_run": "把作者提到回填第一顺位并立即唤醒（body: {\"id\": 作者id或名字}）",
     "bili_status": "B站 下载状态视图",
     # CD2 / 健康
     "cd2_start": "启动 CloudDrive2（慢操作，最多 ~30s）",
@@ -1329,6 +1330,16 @@ async def handle_action(request):
             from . import pawchive
             return _json({"ok": True, "routed": "paw_status",
                           "message": pawchive.status_text()})
+        if name == "pawb_run":
+            # 面板「执行」：作者提到回填第一顺位 + 立即唤醒循环
+            from . import pawchive
+            key = str(body.get("id") or body.get("creator")
+                      or body.get("arg") or "").strip()
+            if not key:
+                return _json({"ok": False, "error": "缺少作者 id"}, 400)
+            ok, msg = pawchive.promote_to_front(key)
+            return _json({"ok": bool(ok), "routed": "pawb_run",
+                          "message": msg}, 200 if ok else 404)
         if name == "bili_status":
             from . import bili_dl
             return _json({"ok": True, "routed": "bili_status",

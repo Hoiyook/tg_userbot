@@ -1339,6 +1339,12 @@ class BackfillEtaTest(unittest.TestCase):
             return_value=os.path.join(self.dir, "state.json"))
         self._sp.start()
         self.addCleanup(self._sp.stop)
+        # 作者执行记录也隔离到本用例目录（防跨用例串数据）
+        self._al = mock.patch.object(
+            pawchive, "_author_last_path",
+            return_value=os.path.join(self.dir, "author_last.json"))
+        self._al.start()
+        self.addCleanup(self._al.stop)
         # 43 个作者（cursor 22 → 下一批是第 23~25 位）
         creators = [{"creator_id": str(i), "creator_name": f"c{i}",
                      "posts": 10} for i in range(43)]
@@ -1394,3 +1400,111 @@ class BackfillEtaTest(unittest.TestCase):
         names = [b["name"] for b in overview["next_batch"]]
         self.assertEqual(names, ["c22", "c23", "c24"],
                          "下一批应从游标 22 起连续取 3 个")
+
+
+class PawAuthorTableTest(unittest.TestCase):
+    """面板「作者回填情况」表格（2026-11-27）：全部作者 × 上次执行成功
+    × 最新帖子 × 执行（提到第一顺位）。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="paw_tab_", dir=_TMP)
+        import json as _json
+        with open(os.path.join(self.dir, "state.json"), "w") as f:
+            _json.dump({"cursor": 0, "loop_started": time.time() - 3600}, f)
+        self._sp = mock.patch.object(
+            pawchive, "_pawb_state_path",
+            return_value=os.path.join(self.dir, "state.json"))
+        self._sp.start()
+        self.addCleanup(self._sp.stop)
+        self._al = mock.patch.object(
+            pawchive, "_author_last_path",
+            return_value=os.path.join(self.dir, "author_last.json"))
+        self._al.start()
+        self.addCleanup(self._al.stop)
+        self._pr = mock.patch.object(
+            pawchive, "_priority_path",
+            return_value=os.path.join(self.dir, "priority.json"))
+        self._pr.start()
+        self.addCleanup(self._pr.stop)
+        self._hist_file = os.path.join(self.dir, "pawb_history.jsonl")
+        self._hf = mock.patch.object(
+            pawchive, "PAWB_HISTORY_FILE", self._hist_file)
+        self._hf.start()
+        self.addCleanup(self._hf.stop)
+        self.creators = [
+            {"creator_id": str(i), "creator_name": f"c{i}", "posts": 10 + i,
+             "latest_published": f"2026-11-{10 + i:02d}T09:00:00"}
+            for i in range(5)]
+        self._lc = mock.patch.object(pawchive, "list_scanned_creators",
+                                     return_value=self.creators)
+        self._lc.start()
+        self.addCleanup(self._lc.stop)
+
+    def _write_hist(self, rows):
+        import json as _json
+        with open(self._hist_file, "w") as f:
+            for r in rows:
+                f.write(_json.dumps(r) + "\n")
+
+    def test_overview_lists_all_authors_with_latest_post(self):
+        self._write_hist([])
+        d = pawchive.backfill_status_overview()
+        authors = d["authors"]
+        self.assertEqual([a["name"] for a in authors],
+                         ["c0", "c1", "c2", "c3", "c4"],
+                         "全部作者、按轮转位次排序")
+        self.assertEqual(authors[0]["latest_post"], "2026-11-10")
+        self.assertTrue(authors[0]["next"])
+        self.assertFalse(authors[3]["next"], "第 4 位起不是下一批")
+        self.assertEqual(authors[0]["pos"], 0)
+        self.assertEqual(authors[4]["pos"], 4)
+
+    def test_record_author_backfill_fills_last_run(self):
+        pawchive.record_author_backfill("3", ts=time.time() - 7200)
+        a = {x["id"]: x for x in
+             pawchive.backfill_status_overview()["authors"]}["3"]
+        self.assertTrue(a["last_run"])
+        self.assertFalse(a["seeded"], "实测值不标 ≈")
+
+    def test_seed_from_history_on_first_use(self):
+        """首次启用：按历史（cursor, author_count）回放最近一轮，标 ≈。"""
+        t_old = time.time() - 20 * 3600
+        t_new = time.time() - 2 * 3600
+        # 新→旧：cursor=3 的一轮覆盖位次 0,1,2；更早 cursor=1 覆盖 3,4,0
+        self._write_hist([
+            {"ts": t_old, "author_count": 3, "cursor": 1, "summary": ""},
+            {"ts": t_new, "author_count": 3, "cursor": 3, "summary": ""},
+        ])
+        authors = {a["id"]: a for a in
+                   pawchive.backfill_status_overview()["authors"]}
+        self.assertEqual(authors["0"]["last_run"],
+                         time.strftime("%m-%d %H:%M",
+                                       time.localtime(t_new)),
+                         "较新的一轮优先")
+        self.assertEqual(authors["3"]["last_run"],
+                         time.strftime("%m-%d %H:%M",
+                                       time.localtime(t_old)))
+        self.assertTrue(authors["3"]["seeded"])
+        self.assertTrue(authors["0"]["seeded"])
+
+    def test_promote_moves_author_to_front_without_duplicate(self):
+        ok, msg = pawchive.promote_to_front("c4")
+        self.assertTrue(ok)
+        self.assertIn("c4", msg)
+        self.assertEqual(pawchive._load_priority()[0]["id"], "4")
+        pawchive.promote_to_front("c2")
+        self.assertEqual([x["id"] for x in pawchive._load_priority()],
+                         ["2", "4"], "后点的排到最前")
+        pawchive.promote_to_front("c4")
+        self.assertEqual([x["id"] for x in pawchive._load_priority()],
+                         ["4", "2"], "重复点只挪位不重复入队")
+        head = pawchive.take_priority()
+        self.assertEqual(head["id"], "4")
+        self.assertEqual([x["id"] for x in pawchive._load_priority()], ["2"])
+
+    def test_promote_unknown_author_rejected(self):
+        ok, msg = pawchive.promote_to_front("不存在")
+        self.assertFalse(ok)
+        self.assertIn("找不到", msg)
+        self.assertEqual(pawchive._load_priority(), [])
+

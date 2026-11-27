@@ -201,6 +201,15 @@ async def _wait_remote_size(name, expect, remote_dir, tries=120, gap=15.0):
     return None
 
 
+def _cbz_name(filename):
+    """zip → cbz（漫画阅读器按后缀识别 cbz；容器就是 zip，只改后缀）。
+    无扩展名也补 .cbz。"""
+    name = str(filename or "").strip()
+    if name.lower().endswith(".zip"):
+        name = name[:-4]
+    return (name or "download") + ".cbz"
+
+
 async def _process_task(task):
     """处理一本：解析（若缺直链）→ 下载 → 落 115 → 解压入队。"""
     aid = task["aid"]
@@ -248,12 +257,19 @@ async def _process_task(task):
     # 后续 gRPC 列目录/上传对账才有处可查（首跑实测教训）
     os.makedirs(mount_dir, exist_ok=True)
     if local_dest:
-        # 本地直落：目标即 remote_dir（V1 本地卷，copy 完即到位）
-        target = os.path.join(remote_dir, task["filename"])
-        await asyncio.to_thread(_copy_with_progress, local, target)
+        # 本地直落：目标即 remote_dir（V1 本地卷，copy 完即到位）。
+        # 2026-11-27 owner：本地落盘一律 zip→cbz（容器不变，只换后缀），
+        # 任务文件名同步改掉——面板/通知/重试都按 cbz 显示。
+        out_name = _cbz_name(task["filename"] or f"aid_{aid}.zip")
+        target = os.path.join(remote_dir, out_name)
+        if not (os.path.exists(target) and os.path.getsize(target) == size):
+            await asyncio.to_thread(_copy_with_progress, local, target)
         got = os.path.getsize(target) if os.path.exists(target) else None
         if got != size:
             raise RuntimeError("本地落盘校验失败（大小不符），稍后重试")
+        if out_name != task.get("filename"):
+            runtime_db.update_wnacg_task(aid, filename=out_name)
+            task["filename"] = out_name
     else:
         remote_now = await asyncio.to_thread(
             _remote_size_blocking, task["filename"], remote_dir)
@@ -269,13 +285,14 @@ async def _process_task(task):
         pass
 
     # ④ 解压管线：本地落盘（/Volumes）跳过——extract worker 只认 /115open
-    # 路径，本地 zip 由用户自行解压（或后续做本地解压支持）；115 路径照旧
+    # 路径，本地落盘已是可直接读的 .cbz；115 路径照旧
     if not local_dest:
         ins, _skip = runtime_db.enqueue_extract_tasks(
             remote_dir, [(task["filename"], size)])
         if not ins:
             logger.info(f"📖 [aid {aid}] 解压任务已存在（幂等跳过）")
-    return {"size": size, "title": task.get("title") or info["title"]}
+    return {"size": size, "title": task.get("title") or info["title"],
+            "local": local_dest, "filename": task.get("filename")}
 
 
 def _copy_with_progress(src, dst):
@@ -312,13 +329,20 @@ async def _run_one(task):
             f"{time.strftime('%Y-%m-%d %H:%M:%S')} | wnacg | "
             f"{title} | {format_size(result['size'])} | 来源：wnacg下载")
         logger.info(f"📖 [aid {aid}] 完成：{title}（{format_size(result['size'])}）"
-                    "→ 已入解压管线")
+                    + ("→ V1/wnacg（cbz 本地直落）" if result.get("local")
+                       else "→ 已入解压管线"))
         try:
-            await notify.notify_user(
-                f"📖 漫画已转 115 并入解压管线\n\n{title}\n"
-                f"大小：{format_size(result['size'])}\n"
-                f"位置：{_remote_dir_for(task)}/{task['filename']}\n"
-                "解压回传的进度与结果由 115 解压管线另行通知。")
+            if result.get("local"):
+                msg = (f"📖 漫画已下载（本地 cbz，可直接阅读）\n\n{title}\n"
+                       f"大小：{format_size(result['size'])}\n"
+                       f"位置：{_remote_dir_for(task)}/"
+                       f"{result.get('filename') or task['filename']}")
+            else:
+                msg = (f"📖 漫画已转 115 并入解压管线\n\n{title}\n"
+                       f"大小：{format_size(result['size'])}\n"
+                       f"位置：{_remote_dir_for(task)}/{task['filename']}\n"
+                       "解压回传的进度与结果由 115 解压管线另行通知。")
+            await notify.notify_user(msg)
         except Exception:
             pass
     except asyncio.CancelledError:

@@ -545,6 +545,8 @@ async def backfill_author(name, months=None):
                 "id": rows[0]["creator_id"],
                 "name": rows[0]["creator_name"],
             })
+            # 面板「作者回填情况」的最近执行时间（成功跑完才记）
+            record_author_backfill(rows[0]["creator_id"])
             summary = (
                 f"🐾 回填完成：{rows[0]['creator_name']}\n"
                 f"检查 {len(rows)} 帖｜站点已无 {gone} 帖"
@@ -721,6 +723,164 @@ def _save_pawb_state(st):
     os.replace(tmp, _pawb_state_path())
 
 
+# ---- 作者级回填执行记录（2026-11-27 owner：面板表格「最近一次执行成功时间」）
+# 每个作者一条：回填跑完就落一次时间。首次启用时用 pawb_history 的
+# （cursor, author_count）回放到最近一轮——作者序按首帖入库 id 升序、
+# 只增不改，游标映射稳定；推算值标 seeded，面板显示 ≈。
+def _author_last_path():
+    return os.path.join(config.PAWCHIVE_DATA_DIR, "pawb_author_last.json")
+
+
+def _load_author_last() -> dict:
+    try:
+        with open(_author_last_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_author_last(data):
+    try:
+        os.makedirs(config.PAWCHIVE_DATA_DIR, exist_ok=True)
+        tmp = _author_last_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, _author_last_path())
+    except Exception as e:
+        logger.warning(f"🐾 作者回填记录落盘失败：{e}")
+
+
+def record_author_backfill(creator_id, ts=None):
+    """一次回填正常跑完 → 记该作者的执行成功时间（失败只告警）。"""
+    cid = str(creator_id or "").strip()
+    if not cid:
+        return
+    try:
+        data = _load_author_last()
+        data[cid] = {"ts": float(ts or time.time()), "seeded": False}
+        _save_author_last(data)
+    except Exception as e:
+        logger.warning(f"🐾 作者回填记录写入失败：{e}")
+
+
+def _seed_author_last(creators):
+    """首次启用：按执行历史回放作者位次，推算每作者最近一次执行时间。
+
+    只补缺失项、不改实测值；条目带 seeded=True 供面板标注 ≈。"""
+    data = _load_author_last()
+    if data or not creators:
+        return data
+    hist = read_backfill_history(PAWB_HISTORY_MAX)
+    n = len(creators)
+    per = int(PAWB_MAX_AUTHORS_PER_ROUND)
+    for h in hist:                      # 新→旧
+        try:
+            cur = int(h.get("cursor") or 0) % n
+            cnt = min(int(h.get("author_count") or 0), per)
+        except (TypeError, ValueError):
+            continue
+        for k in range(cnt):            # 该轮覆盖位次 [cur-cnt, cur-1]
+            idx = (cur - cnt + k) % n
+            cid = str(creators[idx].get("creator_id") or "")
+            if cid and cid not in data:
+                data[cid] = {"ts": float(h.get("ts") or 0), "seeded": True}
+        if len(data) >= n:
+            break
+    if data:
+        _save_author_last(data)
+    return data
+
+
+# ---- 回填优先队列（面板「执行」= 提到第一顺位）---------------------
+# 点「执行」把作者压到队头并唤醒轮巡循环：下一次醒（立即）先单独跑他，
+# 游标轮转不动——不影响其余作者的顺序。落盘重启不丢。
+_PAWB_PRIORITY_MAX = 50
+_PAWB_WAKE = None
+_PAWB_WAKE_LOOP = None
+
+
+def _priority_path():
+    return os.path.join(config.RUNTIME_DIR, "pawb_priority.json")
+
+
+def _pawb_wake_event():
+    """循环唤醒开关。Event 绑在首次使用的 loop 上；loop 变了就重建
+    （测试里每个用例一个 loop，复用旧 Event 会 RuntimeError）。"""
+    global _PAWB_WAKE, _PAWB_WAKE_LOOP
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if _PAWB_WAKE is None or (
+            loop is not None and _PAWB_WAKE_LOOP is not loop):
+        _PAWB_WAKE = asyncio.Event()
+        _PAWB_WAKE_LOOP = loop
+    return _PAWB_WAKE
+
+
+def _load_priority() -> list:
+    try:
+        with open(_priority_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_priority(q):
+    try:
+        os.makedirs(config.RUNTIME_DIR, exist_ok=True)
+        tmp = _priority_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(q[:_PAWB_PRIORITY_MAX], f, ensure_ascii=False)
+        os.replace(tmp, _priority_path())
+    except Exception as e:
+        logger.warning(f"🐾 回填优先队列落盘失败：{e}")
+
+
+def enqueue_priority(creator_id, name):
+    """插到队头（重复点同一作者只挪位，不重复入队）。返回队列长度。"""
+    cid = str(creator_id or "").strip()
+    q = [x for x in _load_priority() if str(x.get("id")) != cid]
+    q.insert(0, {"id": cid, "name": str(name or ""), "ts": time.time()})
+    _save_priority(q)
+    return len(q)
+
+
+def take_priority():
+    """取走队头（无则 None）。"""
+    q = _load_priority()
+    if not q:
+        return None
+    head = q.pop(0)
+    _save_priority(q)
+    return head
+
+
+def promote_to_front(ref):
+    """面板「执行」：把作者提到回填第一顺位并立即唤醒循环。
+
+    ref 传 creator_id 或作者名。返回 (ok, 文案)。"""
+    creators = list_scanned_creators()
+    key = str(ref or "").strip()
+    hit = next((c for c in creators
+                if str(c.get("creator_id")) == key), None)
+    if hit is None:
+        hit = next((c for c in creators
+                    if str(c.get("creator_name")) == key), None)
+    if hit is None:
+        return False, f"找不到作者「{key}」（先 /paw_plan 扫描）"
+    pos = enqueue_priority(hit["creator_id"], hit["creator_name"])
+    try:
+        _pawb_wake_event().set()
+    except Exception:
+        pass
+    return True, (f"⏭ 已把 {hit['creator_name']} 提到回填第一顺位"
+                  f"（优先队列第 {pos} 位），循环立即唤醒")
+
+
+
 def list_scanned_creators():
     """已扫过的作者（按首帖时间升序稳定排序，含每作者帖数）。"""
     try:
@@ -807,6 +967,27 @@ def backfill_status_overview() -> dict:
     # （被让位/重启顺延了——如实报告，而不是干巴巴「已逾期」）
     deferred = bool(next_batch and next_batch[0].get("overdue")
                     and not (last_run and last_run.get("ts", 0) > now - 6 * 3600))
+    # 作者表格（2026-11-27）：全部作者 × 上次执行成功 × 最新帖子 ×
+    # 距下一批的位次（pos=0 即下一批；面板按 pos 升序展示）
+    last_map = _seed_author_last(creators)
+    authors = []
+    for i, c in enumerate(creators):
+        cid = str(c.get("creator_id") or "")
+        rec = last_map.get(cid) or {}
+        ts = float(rec.get("ts") or 0)
+        pos = (i - cursor) % len(creators)
+        authors.append({
+            "id": cid,
+            "name": c.get("creator_name") or "",
+            "posts": int(c.get("posts") or 0),
+            "latest_post": str(c.get("latest_published") or "")[:10],
+            "last_run": (time.strftime("%m-%d %H:%M",
+                                       time.localtime(ts)) if ts else ""),
+            "seeded": bool(rec.get("seeded")),
+            "pos": pos,
+            "next": pos < per,
+        })
+    authors.sort(key=lambda a: a["pos"])
     return {
         "current": {
             "cursor": cursor,
@@ -821,6 +1002,7 @@ def backfill_status_overview() -> dict:
             "deferred": deferred,
         },
         "next_batch": next_batch,
+        "authors": authors,
         "history": hist,
     }
 
@@ -922,18 +1104,37 @@ async def backfill_loop():
             _save_pawb_state(st)
     except Exception:
         pass
-    first_wake = True
+    delay = 300
     try:
         while True:
             # 重启快醒（2026-11-03）：首次醒只等 5 分钟——重启不该把 6h
             # 的醒次往后推（此前重启一次吞掉一个醒次，看板「已逾期」的
-            # 根因之一）；后续醒次仍每 6h
-            await asyncio.sleep(300 if first_wake else 6 * 3600)
-            first_wake = False
+            # 根因之一）；后续醒次仍每 6h。面板「执行」压队头会 set 事件，
+            # 这里立即醒（2026-11-27：插队不能等满 6h）。
+            ev = _pawb_wake_event()
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=delay)
+                ev.clear()
+                logger.info("🐾 回填循环被插队唤醒（面板「执行」）")
+            except asyncio.TimeoutError:
+                pass
+            delay = 6 * 3600
             try:
                 st = _load_pawb_state()
-                n_creators = len(list_scanned_creators())
-                if not n_creators:
+                creators_now = list_scanned_creators()
+                if not creators_now:
+                    continue
+                forced = take_priority()
+                if forced:
+                    # 优先队列：单跑该作者、不推进游标（其余作者顺序不变）
+                    done, text = await _backfill_priority_one(forced)
+                    log_backfill_round(done, text, st.get("cursor", 0))
+                    if done:
+                        st["loop_started"] = time.time()
+                        _save_pawb_state(st)
+                        logger.info(f"🐾 插队回填完成：{text[:80]}")
+                    else:
+                        delay = 600   # 撞锁让位 → 10 分钟后再试（别等 6h）
                     continue
                 # 全量摊销：每 6h 醒，一轮 72h=12 次醒；每次最多 3 作者
                 # 38 作者 → 约 2.2 天转完一圈
@@ -955,6 +1156,37 @@ async def backfill_loop():
     except asyncio.CancelledError:
         logger.info("🐾 定期 backfill 循环停止")
         raise
+
+
+async def _backfill_priority_one(item):
+    """优先队列单跑一个作者（不推进游标）。返回 (done, 摘要)。
+
+    撞锁让位时把条目塞回队头，交由循环 10 分钟后重试，绝不丢。"""
+    creators = list_scanned_creators()
+    cid = str(item.get("id") or "")
+    hit = next((c for c in creators
+                if str(c.get("creator_id")) == cid), None)
+    if hit is None:
+        # 作者已不在池子（被清理）：消费掉不重试，如实记一笔
+        return 1, f"⚠️ 优先作者已不在池子里：{item.get('name') or cid}"
+    if state.PAW_SCAN_RUNNING is not None:
+        q = _load_priority()
+        q.insert(0, item)
+        _save_priority(q)
+        return 0, f"⏸ 让位进行中任务（{state.PAW_SCAN_RUNNING}）"
+    out = await backfill_author(f"{hit['creator_name']}#{hit['creator_id']}")
+    first = out.strip().splitlines()[0][:80]
+    if "⏳ 已有扫描" in out:
+        # 抢锁失败（检查与调用之间有空隙）：塞回队头，10 分钟后重试
+        q = _load_priority()
+        q.insert(0, item)
+        _save_priority(q)
+        return 0, first
+    for _ in range(240):
+        if state.PAW_SCAN_RUNNING is None:
+            break
+        await asyncio.sleep(60)
+    return 1, first
 
 def author_progress_text(name):
     """/paw progress <作者名|名字#id|数字id>：按作者的处理进度总览（只读）。

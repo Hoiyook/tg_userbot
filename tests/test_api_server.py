@@ -980,6 +980,32 @@ class ActionV2Test(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已暂停", d1["message"])
         self.assertIn("CD2", d2["message"])
 
+    async def test_pawb_run_promotes_author(self):
+        """面板「执行」：body.id → pawchive.promote_to_front，404 如实报错。"""
+        from tg_userbot import pawchive
+        seen = {}
+
+        def _fake(ref):
+            seen["ref"] = ref
+            return (True, "⏭ 已把 c3 提到回填第一顺位") if ref == "3" \
+                else (False, f"找不到作者「{ref}」")
+
+        with mock.patch.object(pawchive, "promote_to_front", side_effect=_fake):
+            client = make_client()
+            await client.start_server()
+            try:
+                d1 = await _post_json(client, "/api/action/pawb_run", {"id": "3"})
+                resp = await client.post("/api/action/pawb_run",
+                                         data=json.dumps({"id": "9"}))
+                d2 = await resp.json()
+            finally:
+                await client.close()
+        self.assertTrue(d1["ok"])
+        self.assertIn("第一顺位", d1["message"])
+        self.assertEqual(seen["ref"], "9", "第二次请求也带到了后端")
+        self.assertEqual(resp.status, 404)
+        self.assertFalse(d2["ok"])
+
     async def test_health_and_now(self):
         from tg_userbot import health
         with mock.patch.object(health, "render_health",

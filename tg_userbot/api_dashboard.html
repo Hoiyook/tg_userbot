@@ -86,6 +86,17 @@
   .hline { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:9px 12px;
            margin-bottom:7px; font-size:12px; color:var(--tx2); word-break:break-all; line-height:1.5;
            font-variant-numeric:tabular-nums; }
+  /* 作者回填情况表（2026-11-27）：4 列网格，手机窄屏压成两段式可读 */
+  .ptab { display:grid; grid-template-columns:1.7fr .95fr .7fr auto; gap:8px;
+          align-items:center; background:var(--card); border:1px solid var(--line);
+          border-radius:10px; padding:8px 11px; margin-bottom:6px; }
+  .ptab.hd { background:transparent; border:0; padding:0 11px 2px; margin-bottom:2px;
+             font-size:11px; color:var(--tx3); }
+  .ptab .cell { font-size:11.5px; color:var(--tx3); font-variant-numeric:tabular-nums; }
+  .ptab .mini { font-size:11.5px; padding:4px 10px; border-radius:8px; border:1px solid var(--line2);
+                background:var(--card); color:var(--blue); font-weight:600; cursor:pointer;
+                white-space:nowrap; }
+  .ptab .mini:active { background:var(--blue-bg); }
   .out { background:var(--code); border-radius:12px; padding:13px;
          font-family:Menlo,monospace; font-size:11.5px; color:var(--code-tx); line-height:1.65;
          white-space:pre-wrap; word-break:break-all; max-height:320px; overflow-y:auto;
@@ -302,15 +313,16 @@
   <section class="page" id="p-paw">
     <h2>当前状态（游标 / 节奏）</h2>
     <div id="pawCur"><div class="note">加载中…</div></div>
-    <h2>下一批作者</h2>
-    <div id="pawNext"></div>
-    <h2>回填执行记录（每轮一条，新→旧）</h2>
+    <h2>作者回填情况（全部 /paw_plan 作者）</h2>
     <div class="chips">
       <span class="chip" onclick="loadPawBackfill()">🔄 刷新</span>
       <span class="chip" onclick="runCmdDirect('/paw_backfill status')">🧩 补扫状态</span>
       <span class="chip" onclick="runCmdDirect('/paw schedule')">📅 执行计划文本</span>
     </div>
-    <div id="pawHist"></div>
+    <div class="note">按轮转顺序排列（最上面 3 个 = 下一批）。「执行」= 把该作者提到
+      回填第一顺位，循环立即唤醒先跑他，其余作者顺序不变。
+      上次执行带 ≈ 的，是首次启用表格时按历史游标推算的（之后为实测）。</div>
+    <div id="pawAuthors"><div class="note">加载中…</div></div>
     <h2>执行计划（/paw schedule 同源）</h2>
     <div class="note">每 6h 醒一次 × 每次最多 3 个作者；人工扫描进行时该轮让位顺延。
       与 /paw_schedule 完全同一份数据（单一真相源）。</div>
@@ -870,22 +882,40 @@ async function loadPawBackfill() {
       (c.deferred ? ' · <span style="color:var(--amber)">⏳ 该醒次被顺延'
         + '（撞人工扫描或重启）——游标没丢，下轮自动补</span>' : '') +
       '</div></div>';
-    document.getElementById("pawNext").innerHTML = (d.next_batch||[]).map(p =>
-      '<div class="qrow"><div class="info"><div class="nm wrap">' + esc(p.name) +
-      '</div><div class="dt">' + p.posts + ' 帖 · 预计 ' + esc(p.eta) +
-      (p.overdue ? " · 已逾期（撞人工扫描会顺延）" : "") +
-      '</div></div><span class="tag ' + (p.overdue?"t-retry":"t-run") + '">' +
-      (p.overdue ? "🕒" : "⏭") + '</span></div>').join("")
-      || '<div class="note">还没有已扫作者（先 /paw_plan）</div>';
-    document.getElementById("pawHist").innerHTML = (d.history||[]).map(h => {
-      const when = new Date(h.ts * 1000).toLocaleString("zh-CN", {hour12: false});
-      return '<div class="hline">🐾 ' + when + ' · 回填 ' + h.author_count +
-        ' 作者 · 游标→' + h.cursor + '\n' + esc(h.summary) + '</div>';
-    }).join("") || '<div class="note">还没有执行记录（每 6h 一轮，'
-      + '轮完自动记录在这里）</div>';
+    document.getElementById("pawAuthors").innerHTML = renderPawAuthors(d.authors || []);
   } catch (e) {
     document.getElementById("pawCur").innerHTML = '<div class="note">❌ ' + e + '</div>';
   }
+}
+
+// 作者回填情况表（2026-11-27）：作者 / 上次执行成功 / 最新帖子 / 执行
+function renderPawAuthors(rows) {
+  if (!rows.length) return '<div class="note">还没有已扫作者（先 /paw_plan）</div>';
+  const head = '<div class="ptab hd"><div>作者</div><div>上次执行</div>' +
+               '<div>最新帖</div><div></div></div>';
+  const body = rows.map(a => {
+    const last = a.last_run ? (a.seeded ? "≈" : "") + esc(a.last_run) : "—";
+    const latest = a.latest_post ? esc(String(a.latest_post).slice(5)) : "—";
+    const safeId = String(a.id).replace(/[^0-9A-Za-z_-]/g, "");
+    return '<div class="ptab">' +
+      '<div class="nm wrap">' + esc(a.name) +
+        (a.next ? ' <span class="tag t-run">下一批</span>' : "") + '</div>' +
+      '<div class="cell">' + last + '</div>' +
+      '<div class="cell">' + latest + '</div>' +
+      '<div><button class="mini" onclick="runPawAuthor(\'' + safeId +
+        '\')">执行</button></div>' +
+    '</div>';
+  }).join("");
+  return head + body;
+}
+
+async function runPawAuthor(id) {
+  try {
+    const d = await api("/api/action/pawb_run", {method:"POST",
+      body: JSON.stringify({id: id})});
+    showResult(!!d.ok, d.message || d.error || (d.ok ? "已插队" : "失败"));
+    loadPawBackfill();
+  } catch (e) { showResult(false, String(e)); }
 }
 
 async function applyThread() {

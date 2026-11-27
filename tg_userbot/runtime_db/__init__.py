@@ -4049,15 +4049,19 @@ def queue_health_counts(now=None, recent_minutes=30):
 
 
 def list_backfill_creators():
-    """已扫过的作者清单（定期 backfill 轮巡用）：按最早入库升序稳定排序。"""
+    """已扫过的作者清单（定期 backfill 轮巡用）：按最早入库升序稳定排序。
+
+    latest_published：库里该作者最新一帖的发布时间（站点 ISO 串），
+    供面板「作者回填情况」表格的「最新帖子」列。"""
 
     def do(conn):
         rows = _execute(
             conn, "SELECT creator_id, creator_name, COUNT(*) n, "
-            "MIN(id) first_row FROM pawchive_posts "
+            "MIN(id) first_row, MAX(published) latest FROM pawchive_posts "
             "GROUP BY creator_id, creator_name ORDER BY first_row").fetchall()
         return [{"creator_id": r["creator_id"],
-                 "creator_name": r["creator_name"], "posts": int(r["n"])}
+                 "creator_name": r["creator_name"], "posts": int(r["n"]),
+                 "latest_published": r["latest"] or ""}
                 for r in rows]
 
     return _read(do, "列已扫作者")
