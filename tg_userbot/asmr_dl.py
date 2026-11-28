@@ -211,6 +211,22 @@ def fetch_work_info_blocking(rj, retries=5):
     raise RuntimeError(last or "API 请求失败：未知错误")
 
 
+# asmr 专用 I/O 线程池（2026-11-28）：拉树/下载此前都走默认 to_thread
+# 执行器（~14 线程），被 pawchive 10 路慢 CDN 下载 + 全库 DB 调用塞满
+# 后，任务在队列里根本不执行——120s 预算超时的真相是"排队"，不是网络。
+# 独立 3 线程池，与 pawchive 互不抢。
+_ASMR_POOL = None
+
+
+def _asmr_pool():
+    global _ASMR_POOL
+    if _ASMR_POOL is None:
+        import concurrent.futures
+        _ASMR_POOL = concurrent.futures.ThreadPoolExecutor(
+            max_workers=3, thread_name_prefix="asmr-io")
+    return _ASMR_POOL
+
+
 _CDN_LAST_GOOD_MODE = {"proxy": False}   # 记住上次成功的路径，后续文件先走它
 
 
@@ -425,7 +441,8 @@ async def _process_task(task):
     fetch_budget = float(getattr(config, "ASMR_FETCH_BUDGET_SECONDS", 120.0))
     try:
         info = await asyncio.wait_for(
-            asyncio.to_thread(fetch_work_info_blocking, rj),
+            asyncio.get_event_loop().run_in_executor(
+                _asmr_pool(), fetch_work_info_blocking, rj),
             timeout=fetch_budget)
     except asyncio.TimeoutError:
         # 弃线程前先清代理隧道（2026-11-27 深挖：每次失败轮泄漏 1 条
@@ -484,7 +501,8 @@ async def _process_task(task):
                 f["url"], local, f["size"],
                 check=float(getattr(config, "ASMR_DL_CHECK_SECONDS", 30)),
                 stall=float(getattr(config, "ASMR_DL_STALL_SECONDS", 240)),
-                download_fn=download_file_blocking, label=f"🎧 RJ{rj}")
+                download_fn=download_file_blocking, label=f"🎧 RJ{rj}",
+                executor=_asmr_pool())
         await copy_with_watchdog(
             local, target, f["size"],
             check=float(getattr(config, "ASMR_COPY_CHECK_SECONDS", 60)),

@@ -182,7 +182,8 @@ class DomainWorker(SerialTaskWorker):
 
 
 async def download_with_watchdog(url, dest, expected=None, check=30.0,
-                                 stall=240.0, download_fn=None, label="下载"):
+                                 stall=240.0, download_fn=None, label="下载",
+                                 executor=None):
     """下载 + .part 增长看门狗（协程侧，兜住同步层一切无超时挂死）。
 
     download_file_blocking 的读超时/流速看门狗只覆盖「连接已建立后」；
@@ -197,8 +198,9 @@ async def download_with_watchdog(url, dest, expected=None, check=30.0,
     if download_fn is None:
         raise ValueError("download_fn required")
     part = dest + ".part"
+    loop = asyncio.get_event_loop()
     job = asyncio.ensure_future(
-        asyncio.to_thread(download_fn, url, dest, expected))
+        loop.run_in_executor(executor, download_fn, url, dest, expected))
     last = -1
     stall_acc = 0.0
     while True:

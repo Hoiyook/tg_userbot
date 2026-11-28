@@ -845,3 +845,23 @@ class CdnProxyFallbackTest(unittest.TestCase):
             asmr_dl.download_file_blocking(
                 "u", os.path.join(self.d, "c.mp3"), expected=2)
         self.assertEqual(calls, [False])
+
+
+class AsmrPoolTest(unittest.TestCase):
+    """asmr 拉树/下载必须走专用线程池（2026-11-28：默认 to_thread 执行器
+    被 pawchive 10 路慢下载塞满后，任务在队列里根本不执行——120s 预算
+    超时的真相是"排队"，不是网络）。"""
+
+    def test_pool_shape(self):
+        import concurrent.futures as _cf
+        pool = asmr_dl._asmr_pool()
+        self.assertIsInstance(pool, _cf.ThreadPoolExecutor)
+        self.assertEqual(pool._thread_name_prefix, "asmr-io")
+        self.assertLessEqual(pool._max_workers, 4, "小池子，够用且不抢主池")
+
+    def test_wiring_present(self):
+        src = open("tg_userbot/task_worker.py", encoding="utf-8").read()
+        self.assertIn("run_in_executor(executor, download_fn", src)
+        src2 = open("tg_userbot/asmr_dl.py", encoding="utf-8").read()
+        self.assertIn("executor=_asmr_pool()", src2)
+        self.assertIn("_asmr_pool(), fetch_work_info_blocking", src2)
