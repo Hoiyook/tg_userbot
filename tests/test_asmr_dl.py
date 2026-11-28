@@ -692,30 +692,47 @@ class OrphanSocketCleanupTest(unittest.TestCase):
 
     def test_cleanup_closes_only_proxy_sockets(self):
         import socket as _s
-        # 真开一对本地 socket 模拟：一个"代理连接"一个无关连接
-        lst = _s.socket()
-        lst.bind(("127.0.0.1", 0))
-        lst.listen(1)
-        port = lst.getsockname()[1]
-        # 假装这是 12334：把 _kill_orphan_sockets 指到测试端口
-        client = _s.socket()
-        client.connect(("127.0.0.1", port))
-        other = _s.socket()
-        other.bind(("127.0.0.1", 0))
-        other.listen(1)
-        other_port = other.getsockname()[1]
-        self.addCleanup(lambda: (_s.close(fd) for fd in []) or None)
-        self.addCleanup(client.close)
-        self.addCleanup(other.close)
-        self.addCleanup(lst.close)
-        # 本地端口在测试里拿不到"对端 fd"——直接验证函数不炸 + 关闭逻辑
-        # 通过 lsof 语义测：mock subprocess 返回空（安全空转路径）
         import subprocess as _sp
         from unittest import mock as _m
+        # 空 lsof 输出：不抛、安全空转
         with _m.patch.object(_sp, "run") as run:
             run.return_value.stdout = ""
-            asmr_dl._kill_orphan_sockets()   # 不抛 = 空 fds 安全
+            asmr_dl._kill_orphan_sockets()
         run.assert_called_once()
+
+    def test_loop_owned_fd_is_spared(self):
+        """asyncio selector 里注册的 fd 绝不能被关（2026-11-28 事故：
+        第一版把 TG 主客户端的连接全杀了，bot 冻结 7.5 小时）。"""
+        import socket as _s
+        import subprocess as _sp
+        from unittest import mock as _m
+
+        async def drive():
+            loop = asyncio.get_running_loop()
+            # loop 持有的 socket：注册进 selector
+            owned = _s.socket()
+            owned.bind(("127.0.0.1", 0))
+            owned.listen(1)
+            loop.add_reader(owned.fileno(), lambda: None)
+            self.addCleanup(owned.close)
+            # 非 loop 持有的 socket（模拟弃线程的隧道）
+            orphan = _s.socket()
+            orphan.bind(("127.0.0.1", 0))
+            orphan.listen(1)
+            self.addCleanup(orphan.close)
+            # 两个 fd 都"到 12334"（lsof mock 伪造）
+            out = f"f{owned.fileno()}\np127.0.0.1:12334\n" \
+                  + f"f{orphan.fileno()}\np127.0.0.1:12334\n"
+            with _m.patch.object(_sp, "run") as run:
+                run.return_value.stdout = out
+                asmr_dl._kill_orphan_sockets()
+            # owned 还活着且在 selector 里；orphan 收到 shutdown
+            self.assertIn(owned.fileno(),
+                          set(loop._selector.get_map().keys()),
+                          "loop 持有的 fd 不得被关")
+            with self.assertRaises(OSError):
+                orphan.shutdown(_s.SHUT_RDWR)   # 已被 shutdown → ENOTCONN
+        asyncio.run(drive())
 
     def test_hung_fetch_also_cleans_sockets(self):
         """fetch 超时路径必须调用清理（防只改一处漏另一处）。"""

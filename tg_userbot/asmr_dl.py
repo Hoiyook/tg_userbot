@@ -332,33 +332,60 @@ def _copy_file(src, dst):
 
 
 def _kill_orphan_sockets():
-    """强制关掉本进程到 socks 代理端口的 ESTABLISHED 连接。
+    """强制关掉**非 asyncio 持有**的 socks 代理连接（弃线程遗留）。
 
-    弃线程后 socket 还握在被弃线程手里，进程退出前不会释放；Hiddify
-    侧对僵尸会话没有超时，累积后新握手越来越慢。直接 close() 让内核发
-    FIN——被弃线程的 recv 会立刻弹错退出，代理侧会话也清掉。"""
+    2026-11-28 事故复盘：第一版把本进程到 12334 的 fd 一律
+    shutdown+close，而 TG 主客户端/下载 worker 走同一个代理——等于把
+    Telethon 的连接全杀了（auto_reconnect=False 不自愈），整个 bot
+    静默冻结 7.5 小时。两处修正：
+      * 只杀**不在事件循环 selector 里**的 fd——TG/aiohttp 的 socket
+        都注册在 loop 上，弃线程的阻塞 socket 不在；
+      * os.dup() 复制 fd 再 shutdown/close——直接 close 原 fd 会让
+        持有它的线程拿到被复用的坏 fd。"""
+    import os as _os
     import socket as _s
     import subprocess as _sp
+    killed = 0
     try:
-        pid = os.getpid()
+        loop_fds = set()
+        try:
+            loop = asyncio.get_running_loop()
+            sel = getattr(loop, "_selector", None)
+            if sel is not None:
+                loop_fds = set(sel.get_map().keys())
+        except Exception:
+            loop_fds = set()
+        pid = _os.getpid()
         out = _sp.run(
             ["lsof", "-a", "-nP", f"-p{pid}", "-iTCP:12334",
              "-sTCP:ESTABLISHED", "-Fpn"],
             capture_output=True, text=True, timeout=10)
-        fds = [ln.strip()[1:] for ln in out.stdout.splitlines()
-               if ln.startswith("f")]
-        n = 0
-        for fd_s in fds:
+        fd_s = None
+        for ln in out.stdout.splitlines():
+            if ln.startswith("f"):
+                fd_s = ln.strip()[1:]
+                continue
+            if not ln.startswith("p") or fd_s is None:
+                continue
             try:
                 fd = int(fd_s)
-                sock = _s.socket(fileno=fd)   # 复制引用，不接管所有权
+            except ValueError:
+                fd_s = None
+                continue
+            fd_s = None
+            if fd in loop_fds:
+                continue    # asyncio 持有（TG/API），绝不动
+            try:
+                dup = _os.dup(fd)          # 复制后再 shutdown
+                sock = _s.socket(fileno=dup)
                 sock.shutdown(_s.SHUT_RDWR)
-                sock.close()                  # 只关复制出的描述符
-                n += 1
+                sock.close()               # 只关 dup 出来的描述符
+                killed += 1
             except (OSError, ValueError):
                 continue
-        if n:
-            logger.info(f"🎧 已清 {n} 条挂死的代理隧道（弃线程遗留）")
+        if killed:
+            logger.info(f"🎧 已清 {killed} 条弃线程遗留的代理隧道"
+                        "（已避开 asyncio 持有的连接）")
     except Exception as e:
         logger.warning(f"🎧 清理代理隧道失败（忽略）：{e}")
 
