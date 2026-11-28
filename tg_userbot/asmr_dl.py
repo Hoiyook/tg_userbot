@@ -158,7 +158,7 @@ def _proxy_url():
     return (os.environ.get("TG_PROXY") or "").strip() or None
 
 
-def fetch_work_info_blocking(rj, retries=3):
+def fetch_work_info_blocking(rj, retries=5):
     """元数据 + 文件树一次拉齐（阻塞，放线程跑）。失败抛 RuntimeError。
 
     网络类瞬时错误（代理抖动）内部重试 3 次；400/404（作品不在库）与
@@ -172,8 +172,12 @@ def fetch_work_info_blocking(rj, retries=3):
     last = None
     for attempt in range(retries):
         try:
+            # 每次尝试 15s（代理抖动时握手挂 20s+ 白等）+ 5 次尝试
+            # ——在 120s 预算内塞更多彩票（实测节点成功率 33% 时，
+            # 3 次尝试 ≈70% 过，5 次 ≈87% 过）
             with httpx.Client(proxy=proxy, trust_env=False,
-                              timeout=float(config.ASMR_FETCH_TIMEOUT_SECONDS),
+                              timeout=min(15.0,
+                                  float(config.ASMR_FETCH_TIMEOUT_SECONDS)),
                               follow_redirects=True, headers=headers) as cli:
                 r = cli.get(f"{base}/api/work/{int(rj)}")
                 if r.status_code in (400, 404):
@@ -207,8 +211,15 @@ def fetch_work_info_blocking(rj, retries=3):
     raise RuntimeError(last or "API 请求失败：未知错误")
 
 
-def download_file_blocking(url, dest, expected=None, attempts=3):
-    """直连下载到 dest.part（Range 断点续传）→ 按 expected 对账 → rename。
+_CDN_LAST_GOOD_MODE = {"proxy": False}   # 记住上次成功的路径，后续文件先走它
+
+
+def download_file_blocking(url, dest, expected=None, attempts=4):
+    """下载到 dest.part（Range 断点续传）→ 按 expected 对账 → rename。
+
+    直连优先、失败自动走代理（2026-11-28：Cloudflare 对本机直连路由
+    整个废掉——0 字节挂死，但走代理 2.2s 通；反过来昨天直连 150KB/s
+    而代理挂）。路径按"上次成功的"优先，少走弯路。
 
     大小不符删除 .part 重来（对账基准是 API 的精确字节数；短读续传可能
     接不齐，从头下最稳）。CDN 不支持 HEAD，预检语义只能靠这里的 GET。
@@ -217,15 +228,25 @@ def download_file_blocking(url, dest, expected=None, attempts=3):
     永久事实立即抛，不烧重试。"""
     part = dest + ".part"
     last_err = None
-    for attempt in range(max(1, int(attempts))):
+    proxy = _proxy_url()
+    modes = []
+    if _CDN_LAST_GOOD_MODE["proxy"]:
+        modes = [True, False, True, False] if proxy else [False] * attempts
+    else:
+        modes = [False, True, False, True] if proxy else [False] * attempts
+    modes = modes[:max(1, int(attempts))]
+    for attempt, use_proxy in enumerate(modes):
         try:
-            _download_once(url, part)
+            _download_once(url, part, proxy=proxy if use_proxy else None)
+            _CDN_LAST_GOOD_MODE["proxy"] = use_proxy
+            if use_proxy:
+                logger.info("🎧 CDN 直连失败，走代理成功（后续文件优先代理）")
             break
         except RuntimeError:
             raise          # 403/404：直链失效，永久事实
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
-            if attempt < attempts - 1:
+            if attempt < len(modes) - 1:
                 time.sleep(5)
     size = os.path.getsize(part) if os.path.isfile(part) else -1
     if size < 0:
@@ -249,8 +270,10 @@ def download_file_blocking(url, dest, expected=None, attempts=3):
     return size
 
 
-def _download_once(url, part):
+def _download_once(url, part, proxy=None):
     """单次尝试：Range 续传写 part（异常原样上抛给调用方重试）。
+
+    proxy=None 直连；socks5://… 走代理（直连路由废时的回退路径）。
 
     含**流速看门狗**（2026-10-26 生产事故：RJ1267237 的 CDN 连接涓流——
     每块间隔 <60s 读超时、但 21 分钟下不完一个 34MB 文件，串行 worker
@@ -265,10 +288,12 @@ def _download_once(url, part):
     floor = int(getattr(config, "ASMR_STALL_FLOOR_BYTES", 256 * 1024))
     win_t0 = time.monotonic()
     win_bytes = 0
-    with httpx.Client(trust_env=False,
-                      timeout=httpx.Timeout(float(
-                          config.ASMR_FILE_TIMEOUT_SECONDS)),
-                      follow_redirects=True) as cli:
+    kw = {"trust_env": False,
+          "timeout": httpx.Timeout(float(config.ASMR_FILE_TIMEOUT_SECONDS)),
+          "follow_redirects": True}
+    if proxy:
+        kw["proxy"] = proxy
+    with httpx.Client(**kw) as cli:
         with cli.stream("GET", url, headers=headers) as resp:
             if resp.status_code in (403, 404):
                 raise RuntimeError(f"CDN HTTP {resp.status_code}（直链失效）")

@@ -398,7 +398,9 @@ class DownloadRetryTest(unittest.TestCase):
             with self.assertRaises(RuntimeError) as cm:
                 asmr_dl.download_file_blocking("https://x/a.mp3", self.dest)
         self.assertIn("下载失败", str(cm.exception))
-        self.assertEqual(calls["n"], 3)
+        # 2026-11-28 起尝试次数 = 4（直连/代理交替）；无代理环境时
+        # _proxy_url 返回 None，但 modes 数组长度取 attempts=4
+        self.assertEqual(calls["n"], 4)
         self.assertFalse(os.path.isfile(self.dest))
 
     def test_403_is_permanent_no_retry(self):
@@ -780,3 +782,66 @@ class StagingReuseTest(_AsmrDbTestCase):
                                   new=mock.AsyncMock(return_value=True)):
             out = asyncio.run(asmr_dl._process_task(task))
         self.assertEqual(out["files"], 1)
+
+
+class CdnProxyFallbackTest(unittest.TestCase):
+    """CDN 直连挂死时自动走代理回退（2026-11-28：Cloudflare 直连路由废，
+    走代理 2.2s 通）；记住上次成功的路径。"""
+
+    def setUp(self):
+        asmr_dl._CDN_LAST_GOOD_MODE["proxy"] = False
+        self.addCleanup(asmr_dl._CDN_LAST_GOOD_MODE.update, {"proxy": False})
+        self.d = tempfile.mkdtemp(prefix="asmr_fb_", dir=_TMP)
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+
+    def test_direct_fail_falls_back_to_proxy(self):
+        calls = []
+
+        def once(url, part, proxy=None):
+            calls.append(bool(proxy))
+            if not proxy:
+                raise TimeoutError("read timed out")   # 直连挂
+            with open(part, "wb") as f:
+                f.write(b"ok")
+
+        with mock.patch.object(asmr_dl, "_download_once",
+                               side_effect=once), (
+                mock.patch.object(asmr_dl, "_proxy_url",
+                                  return_value="socks5://127.0.0.1:12334")):
+            size = asmr_dl.download_file_blocking(
+                "u", os.path.join(self.d, "a.mp3"), expected=2)
+        self.assertEqual(size, 2)
+        self.assertEqual(calls, [False, True], "先直连、失败走代理")
+        self.assertTrue(asmr_dl._CDN_LAST_GOOD_MODE["proxy"])
+
+    def test_remembered_proxy_path_tries_proxy_first(self):
+        asmr_dl._CDN_LAST_GOOD_MODE["proxy"] = True
+        calls = []
+
+        def once(url, part, proxy=None):
+            calls.append(bool(proxy))
+            with open(part, "wb") as f:
+                f.write(b"ok")
+
+        with mock.patch.object(asmr_dl, "_download_once",
+                               side_effect=once), (
+                mock.patch.object(asmr_dl, "_proxy_url",
+                                  return_value="socks5://127.0.0.1:12334")):
+            asmr_dl.download_file_blocking(
+                "u", os.path.join(self.d, "b.mp3"), expected=2)
+        self.assertEqual(calls, [True], "记住上次成功路径：先走代理")
+
+    def test_no_proxy_env_stays_direct(self):
+        calls = []
+
+        def once(url, part, proxy=None):
+            calls.append(bool(proxy))
+            with open(part, "wb") as f:
+                f.write(b"ok")
+
+        with mock.patch.object(asmr_dl, "_download_once",
+                               side_effect=once), (
+                mock.patch.object(asmr_dl, "_proxy_url", return_value=None)):
+            asmr_dl.download_file_blocking(
+                "u", os.path.join(self.d, "c.mp3"), expected=2)
+        self.assertEqual(calls, [False])
